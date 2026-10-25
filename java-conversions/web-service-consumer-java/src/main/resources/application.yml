@@ -1,0 +1,21 @@
+# web-service-consumer-java runtime configuration
+# Replaces web-service-consumer/src/main/app/mule-app.properties (empty) and the listener and
+# web service consumer settings of tshirt-service-consumer.xml.
+http:
+  port: 8081
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0
+spring:
+  application:
+    name: web-service-consumer-java
+  web:
+    resources:
+      add-mappings: false   # unknown paths must reach GlobalExceptionHandler as 404 "No listener for endpoint: <path>"
+tshirt:
+  service-address: http://tshirt-service.cloudhub.io
+  # TODO: supply the T-shirt service API key (replaces the literal hard-coded at tshirt-service-consumer.xml:22)
+  api-key: ${TSHIRT_API_KEY:}
+  # Mule's default response timeout; upstream timeouts are never retried
+  connect-timeout: 10s
+  read-timeout: 10s
