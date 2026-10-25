@@ -1,0 +1,52 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<wsdl:definitions xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/"
+    xmlns:tns="http://security.example.mule.mulesoft.com/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+    xmlns:ns1="http://schemas.xmlsoap.org/soap/http" name="GreeterService"
+    targetNamespace="http://security.example.mule.mulesoft.com/">
+  <wsdl:types>
+    <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:tns="http://security.example.mule.mulesoft.com/"
+        elementFormDefault="unqualified" targetNamespace="http://security.example.mule.mulesoft.com/" version="1.0">
+      <xs:element name="greet" type="tns:greet"/>
+      <xs:element name="greetResponse" type="tns:greetResponse"/>
+      <xs:complexType name="greet">
+        <xs:sequence>
+          <xs:element minOccurs="0" name="name" type="xs:string"/>
+        </xs:sequence>
+      </xs:complexType>
+      <xs:complexType name="greetResponse">
+        <xs:sequence>
+          <xs:element minOccurs="0" name="name" type="xs:string"/>
+        </xs:sequence>
+      </xs:complexType>
+    </xs:schema>
+  </wsdl:types>
+  <wsdl:message name="greetResponse">
+    <wsdl:part element="tns:greetResponse" name="parameters"/>
+  </wsdl:message>
+  <wsdl:message name="greet">
+    <wsdl:part element="tns:greet" name="parameters"/>
+  </wsdl:message>
+  <wsdl:portType name="Greeter">
+    <wsdl:operation name="greet">
+      <wsdl:input message="tns:greet" name="greet"/>
+      <wsdl:output message="tns:greetResponse" name="greetResponse"/>
+    </wsdl:operation>
+  </wsdl:portType>
+  <wsdl:binding name="GreeterServiceSoapBinding" type="tns:Greeter">
+    <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
+    <wsdl:operation name="greet">
+      <soap:operation soapAction="" style="document"/>
+      <wsdl:input name="greet">
+        <soap:body use="literal"/>
+      </wsdl:input>
+      <wsdl:output name="greetResponse">
+        <soap:body use="literal"/>
+      </wsdl:output>
+    </wsdl:operation>
+  </wsdl:binding>
+  <wsdl:service name="GreeterService">
+    <wsdl:port binding="tns:GreeterServiceSoapBinding" name="GreeterPort">
+      <soap:address location="http://localhost:63081/services/unsecure"/>
+    </wsdl:port>
+  </wsdl:service>
+</wsdl:definitions>
