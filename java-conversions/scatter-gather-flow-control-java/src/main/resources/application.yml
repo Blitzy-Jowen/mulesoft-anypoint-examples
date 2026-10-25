@@ -1,0 +1,48 @@
+# scatter-gather-flow-control-java runtime configuration
+# Replaces scatter-gather-flow-control/src/main/app/mule-app.properties (empty) and the http:listener-config,
+# smtp:gmail-connector and smtp:outbound-endpoint of scatter-gather.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (scatter-gather.xml:4)
+spring:
+  application:
+    name: scatter-gather-flow-control-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mail:
+    # JavaMailSender of client/AggregationReportMailer, fed by the original smtp.* placeholders below
+    host: ${smtp.host}
+    port: ${smtp.port}
+    username: ${smtp.user}
+    password: ${smtp.password}
+    default-encoding: UTF-8
+    properties:
+      # smtp:gmail-connector (scatter-gather.xml:3): STARTTLS and authentication for smtp and smtps
+      "[mail.smtp.starttls.enable]": true
+      "[mail.smtp.auth]": true
+      "[mail.smtps.starttls.enable]": true
+      "[mail.smtps.auth]": true
+      # smtp:outbound-endpoint responseTimeout="10000" (scatter-gather.xml:64)
+      "[mail.smtp.connectiontimeout]": 10000
+      "[mail.smtp.timeout]": 10000
+      "[mail.smtp.writetimeout]": 10000
+# smtp:outbound-endpoint attributes (scatter-gather.xml:64) under their original placeholder names
+smtp:
+  # TODO: supply the SMTP server host (the original README suggests smtp.gmail.com)
+  host: ${SMTP_HOST:}
+  port: ${SMTP_PORT:587}   # submission port of the original README and Gmail (AAP 0.6.6)
+  # TODO: supply the SMTP account as a plain address; the %40 encoding the original README shows was needed only
+  # inside Mule's endpoint URI
+  user: ${SMTP_USER:}
+  # TODO: supply the SMTP password
+  password: ${SMTP_PASSWORD:}
+# The subject "Scatter gather example - aggregation" is a literal of the flow, so it stays a constant of
+# client/AggregationReportMailer rather than a key here.
+mail:
+  # TODO: supply the sender address
+  from: ${MAIL_FROM:}
+  # TODO: supply the recipient address(es), comma-separated allowed
+  to: ${MAIL_TO:}
