@@ -1,0 +1,21 @@
+# upload-to-ftp-after-converting-json-to-xml-java runtime configuration
+# Replaces upload-to-ftp-after-converting-json-to-xml/src/main/app/mule-app.properties (empty) and the
+# http:listener-config and ftp:outbound-endpoint of upload-to-ftp.xml. The ftp.* keys are the names the
+# original test read from mule.test.properties; the original flow hard-coded the FTP host and credentials.
+http:
+  port: 8081                       # original placeholder name ${http.port}; listener port (upload-to-ftp.xml:4)
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0                 # original listener host (upload-to-ftp.xml:4)
+spring:
+  application:
+    name: upload-to-ftp-after-converting-json-to-xml-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+ftp:
+  host: ${FTP_HOST:}               # TODO: supply the FTP server host (original hard-coded ftp-server.demo.solarwinds.com)
+  port: 21                         # original fixed port (non-secret default)
+  path: /Upload/                   # original fixed remote directory (non-secret default)
+  user: ${FTP_USER:}               # TODO: supply the FTP user (original hard-coded the login in the flow)
+  password: ${FTP_PASSWORD:}       # TODO: supply the FTP password (original hard-coded the password in the flow)
