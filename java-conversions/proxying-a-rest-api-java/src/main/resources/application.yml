@@ -1,0 +1,34 @@
+# proxying-a-rest-api-java runtime configuration, from proxying-a-rest-api/src/main/app/proxying-a-rest-api.xml
+# (the original mule-app.properties was empty). The keystore.* keys keep their Mule placeholder names and meanings:
+# keystore.key is the store password and keystore.password the private-key password, as in the original tls:key-store.
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); port used throughout the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (proxying-a-rest-api.xml:3)
+spring:
+  application:
+    name: proxying-a-rest-api-java
+  web:
+    resources:
+      add-mappings: false   # SC-1, and no static-resource handler competes with the /** proxy mapping
+  mvc:
+    formcontent:
+      filter:
+        enabled: false      # FormContentFilter would consume PUT/PATCH/DELETE form bodies before they are forwarded
+  servlet:
+    multipart:
+      enabled: false        # multipart/form-data is forwarded as raw bytes, never parsed
+  autoconfigure:
+    # No BasicErrorController: the listener path is /*, so /error is proxied like any other path
+    exclude: org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration
+proxy:
+  upstream-url: https://api.box.com:443   # http:request-config host, port and protocol (proxying-a-rest-api.xml:5)
+  response-timeout-ms: 10000              # Mule default response timeout
+keystore:
+  # TODO: supply the path of the keystore created with keytool (README); the original read keystore.jks from the application classpath
+  path: ${KEYSTORE_PATH:}
+  # TODO: supply the keystore (store) password — Mule tls:key-store password
+  key: ${KEYSTORE_KEY:}
+  # TODO: supply the private-key password — Mule tls:key-store keyPassword
+  password: ${KEYSTORE_PASSWORD:}

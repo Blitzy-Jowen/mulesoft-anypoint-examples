@@ -1,0 +1,75 @@
+# foreach-processing-and-choice-routing-java runtime configuration
+# Original: foreach-processing-and-choice-routing/src/main/app/loanbroker-simple.xml (mule-app.properties holds no keys),
+# so every value is a fixed default taken from the flow's literals.
+spring:
+  application:
+    name: foreach-processing-and-choice-routing-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404
+  mvc:
+    dispatch-trace-request: true   # TRACE on 11081 reaches LoanBrokerController (original listener accepts every method)
+  webservices:
+    path: /mule                    # MessageDispatcherServlet registered as "messageDispatcherServlet" at /mule/*; dispatcherServlet stays at /
+    servlet:
+      init:                        # bracketed so the case-sensitive servlet init parameter names keep their camelCase
+        "[dispatchOptionsRequest]": "true"
+        "[dispatchTraceRequest]": "true"
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # /error on 11081 belongs to the loan broker
+
+server:
+  port: 11081                      # loanbroker-simple.xml:4
+  address: 0.0.0.0
+
+ports:
+  credit-agency: 18080             # loanbroker-simple.xml:5,7
+  bank1: 10080                     # :8
+  bank2: 20080                     # :9
+  bank3: 30080                     # :10
+  bank4: 40080                     # :11
+  bank5: 50080                     # :12
+
+loanbroker:
+  outbound-host: 0.0.0.0           # host of the outbound request config and bank URIs, :5, :83-89
+  response-timeout: 10000          # responseTimeout, :73, :108 (milliseconds)
+
+listeners:
+  host: 0.0.0.0
+  disallowed-methods: []           # every original listener accepts every method, TRACE included
+  main:
+    routes:
+      - servlet: dispatcherServlet
+        patterns: ["/**"]          # path="/*" without basePath: every path on 11081, /mule/** and /error included, belongs to the loan broker
+  additional:
+    - name: credit-agency
+      port: ${ports.credit-agency}
+      routes:
+        - servlet: messageDispatcherServlet
+          patterns: ["/mule/TheCreditAgencyService", "/mule/TheCreditAgencyService/**"]
+    - name: bank1
+      port: ${ports.bank1}
+      routes:
+        - servlet: messageDispatcherServlet
+          patterns: ["/mule/TheBank1", "/mule/TheBank1/**"]
+    - name: bank2
+      port: ${ports.bank2}
+      routes:
+        - servlet: messageDispatcherServlet
+          patterns: ["/mule/TheBank2", "/mule/TheBank2/**"]
+    - name: bank3
+      port: ${ports.bank3}
+      routes:
+        - servlet: messageDispatcherServlet
+          patterns: ["/mule/TheBank3", "/mule/TheBank3/**"]
+    - name: bank4
+      port: ${ports.bank4}
+      routes:
+        - servlet: messageDispatcherServlet
+          patterns: ["/mule/TheBank4", "/mule/TheBank4/**"]
+    - name: bank5
+      port: ${ports.bank5}
+      routes:
+        - servlet: messageDispatcherServlet
+          patterns: ["/mule/TheBank5", "/mule/TheBank5/**"]
