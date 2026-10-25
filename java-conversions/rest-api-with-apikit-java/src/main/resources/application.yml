@@ -1,0 +1,20 @@
+# Original: rest-api-with-apikit/src/main/app/mule-app.properties (http.port=8080)
+http:
+  port: 8080
+
+# http:listener-config host="0.0.0.0" port="${http.port}"; Undertow (AAP 0.4.9)
+server:
+  port: ${http.port:8080}
+
+# apikit:config raml="leagues.raml" consoleEnabled="true" consolePath="console"; listener path /api/*
+apikit:
+  base-path: /api
+  raml: leagues.raml
+  console-path: console
+
+# No static resource handler: unknown paths raise NoHandlerFoundException / NoResourceFoundException,
+# answered by ApiKitExceptionHandler under /api and GlobalExceptionHandler elsewhere (AAP 0.4.7)
+spring:
+  web:
+    resources:
+      add-mappings: false
