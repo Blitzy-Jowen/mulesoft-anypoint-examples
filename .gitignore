@@ -62,5 +62,6 @@
 # Test credentials to be use locally only #
 # --------------------------------------- #
 **/src/test/resources/mule.test.properties
+**/src/test/resources/application-it.yml
 **/pom.xml.releaseBackup
 **/release.properties
