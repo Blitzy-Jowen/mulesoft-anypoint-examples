@@ -77,12 +77,20 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-        <!-- In-process SMTP/IMAP server that stands in for the Gmail account the original test read. -->
+        <!-- In-process SMTP/IMAP server that stands in for the Gmail account the original test read. The starter's
+             org.eclipse.angus:jakarta.mail already bundles the jakarta.mail API with Angus, so GreenMail's separate
+             API jar is excluded to keep a single copy of every jakarta.mail class on the test classpath. -->
         <dependency>
             <groupId>com.icegreen</groupId>
             <artifactId>greenmail-junit5</artifactId>
             <version>2.1.14</version>
             <scope>test</scope>
+            <exclusions>
+                <exclusion>
+                    <groupId>jakarta.mail</groupId>
+                    <artifactId>jakarta.mail-api</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
         <!-- WireMock and Awaitility form the test-classpath contract of the shared FixtureParityTest replay engine;
              the shaded WireMock edition cannot clash with Undertow or the Boot-managed Jackson. -->
