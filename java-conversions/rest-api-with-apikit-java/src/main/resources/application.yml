@@ -18,3 +18,8 @@ spring:
   web:
     resources:
       add-mappings: false
+  mvc:
+    dispatch-trace-request: true   # /api/* listener has no allowedMethods: TRACE reaches the APIkit 405 mapping
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404

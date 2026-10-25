@@ -12,6 +12,11 @@ spring:
   web:
     resources:
       add-mappings: false   # unknown paths must reach GlobalExceptionHandler as 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # /orders and /inventory listeners have no allowedMethods: TRACE reaches TshirtController
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404
 tshirt:
   service-address: http://tshirt-service.cloudhub.io
   # TODO: supply the T-shirt service API key (replaces the literal hard-coded at tshirt-service-consumer.xml:22)
