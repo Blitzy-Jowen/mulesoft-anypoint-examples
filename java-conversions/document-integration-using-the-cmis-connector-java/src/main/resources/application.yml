@@ -1,0 +1,23 @@
+# document-integration-using-the-cmis-connector-java runtime configuration
+# Replaces document-integration-using-the-cmis-connector/src/main/app/mule-app.properties (empty) and the
+# http:listener-config and cmis:config of cmis-document-integration.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (cmis-document-integration.xml:4)
+spring:
+  application:
+    name: document-integration-using-the-cmis-connector-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+cmis:
+  base-url: http://demo.openkm.com/OpenKM/cmis/atom   # cmis:config baseUrl (public OpenKM demo, CMIS 1.1 AtomPub)
+  repository-id: default                              # cmis:config repositoryId
+  # TODO: supply the OpenKM (CMIS) user name; the original hard-coded the demo account in cmis:config
+  username: ${CMIS_USERNAME:}
+  # TODO: supply the OpenKM (CMIS) password; the original hard-coded the demo password in cmis:config
+  password: ${CMIS_PASSWORD:}
+  connect-timeout: 10s  # Mule default response timeout (AAP 0.4.8)
+  read-timeout: 10s

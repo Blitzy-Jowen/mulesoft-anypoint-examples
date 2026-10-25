@@ -1,0 +1,35 @@
+# sending-json-data-to-a-jms-queue-java runtime configuration
+# Replaces sending-json-data-to-a-jms-queue/src/main/app/mule-app.properties (empty) and the
+# jms:activemq-connector / http:listener-config of json-to-jms.xml (lines 3-4)
+http:
+  port: 8081            # original placeholder ${http.port} (json-to-jms.xml:4); port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (json-to-jms.xml:4)
+spring:
+  application:
+    name: sending-json-data-to-a-jms-queue-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  artemis:
+    # The activemq-connector declares no brokerURL, so Mule ran ActiveMQ's in-VM, non-persistent broker
+    # (vm://localhost?broker.persistent=false); an embedded, non-persistent Artemis server takes its place.
+    mode: embedded
+    embedded:
+      enabled: true
+      persistent: false
+      queues: sales
+    # To send to an external Artemis broker instead (the original README points at tcp://localhost:61616):
+    #   mode: native
+    #   broker-url: tcp://localhost:61616
+    #   user: ${ARTEMIS_USER:}          # TODO: supply broker user
+    #   password: ${ARTEMIS_PASSWORD:}  # TODO: supply broker password
+  jms:
+    pub-sub-domain: false   # jms:outbound-endpoint queue= is point-to-point
+    template:
+      # Mule 3.8 JmsConnector.persistentDelivery defaults to false, so the original sent NON_PERSISTENT.
+      # Setting the delivery mode enables explicit QoS; Spring's default priority 4 and time-to-live 0 equal Mule's.
+      delivery-mode: non-persistent
+jms:
+  queue: sales          # jms:outbound-endpoint queue="sales" (json-to-jms.xml:9), read by service/SalesQueueService
