@@ -9,7 +9,6 @@
 package com.mulesoft.examples.sending_json_data_to_a_jms_queue.controller;
 
 import java.io.IOException;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
@@ -34,9 +33,8 @@ import com.mulesoft.examples.sending_json_data_to_a_jms_queue.service.SalesQueue
  *   <li>line 6, {@code http:listener path="sales" allowedMethods="POST"}: this class, mapped to {@code POST /sales}
  *       with no {@code consumes}, {@code produces}, parameter or header condition, because the Mule listener
  *       accepted any {@code Content-Type} and ignored {@code Accept};</li>
- *   <li>line 8, {@code byte-array-to-string-transformer}: the decoding of the raw body bytes with the request's
- *       charset, or UTF-8, the application encoding of {@code mule-deploy.properties}, when the request names
- *       none or names one that cannot be used;</li>
+ *   <li>line 8, {@code byte-array-to-string-transformer}: {@link SalesQueueService#send(byte[], String)}, which
+ *       this class hands the raw body bytes and the raw {@code Content-Type} header;</li>
  *   <li>lines 9-10, the one-way {@code jms:outbound-endpoint queue="sales"} and the {@code logger}:
  *       {@link SalesQueueService#send(String)}.</li>
  * </ul>
@@ -70,7 +68,8 @@ public class SalesController {
     private final SalesQueueService salesQueueService;
 
     /**
-     * @param salesQueueService sends the decoded body to queue {@code sales} and logs the message
+     * @param salesQueueService decodes the body, sends it to queue {@code sales}, logs the message and encodes the
+     *                          response body
      */
     public SalesController(SalesQueueService salesQueueService) {
         this.salesQueueService = salesQueueService;
@@ -84,10 +83,12 @@ public class SalesController {
      * runs, and it rebuilds an {@code application/x-www-form-urlencoded} body from the parsed request parameters.
      * No request parameter is read before the stream, which would consume a form body.
      *
-     * <p>The response is written to the servlet response directly, so content negotiation can never reject it.
+     * <p>The raw body bytes and the raw {@code Content-Type} header go to
+     * {@link SalesQueueService#send(byte[], String)}, which decodes, sends and logs, and returns the response body
+     * bytes. The response is written to the servlet response directly, so content negotiation can never reject it.
      * Its {@code Content-Type} is the request's, unchanged, or {@link #DEFAULT_CONTENT_TYPE} when the request has
-     * none. The body is the queued payload encoded with the charset it was decoded with, written as bytes, because
-     * the writer would fail on an echoed charset name the JVM does not support.
+     * none. The body is written as the bytes the service returns, because the writer would fail on an echoed
+     * charset name the JVM does not support.
      *
      * @param request  the {@code POST /sales} request
      * @param response the response the echoed payload is written to
@@ -99,12 +100,10 @@ public class SalesController {
         // getContentType() is the raw header; getCharacterEncoding() is not used, because Boot's
         // CharacterEncodingFilter forces the request encoding to UTF-8.
         String rawContentType = request.getContentType();
-        Charset charset = resolveCharset(rawContentType);
         byte[] body = request.getInputStream().readAllBytes();
 
-        String result = salesQueueService.send(new String(body, charset));
+        byte[] out = salesQueueService.send(body, rawContentType);
 
-        byte[] out = result.getBytes(charset);
         response.setStatus(HttpServletResponse.SC_OK);
         response.setContentType(isBlank(rawContentType) ? DEFAULT_CONTENT_TYPE.toString() : rawContentType);
         response.setContentLength(out.length);
@@ -128,27 +127,6 @@ public class SalesController {
     @RequestMapping(path = PATH, method = {RequestMethod.OPTIONS, RequestMethod.TRACE})
     public void rejectUnsupportedMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
         throw new HttpRequestMethodNotSupportedException(request.getMethod(), Set.of(ALLOWED_METHOD));
-    }
-
-    /**
-     * Returns the charset {@code rawContentType} names, or UTF-8, the application encoding of the original, when
-     * the header is absent or blank, names no charset, cannot be parsed, or names a charset that is malformed or
-     * unsupported.
-     */
-    private static Charset resolveCharset(String rawContentType) {
-        if (isBlank(rawContentType)) {
-            return StandardCharsets.UTF_8;
-        }
-        try {
-            Charset charset = MediaType.parseMediaType(rawContentType).getCharset();
-            return charset != null ? charset : StandardCharsets.UTF_8;
-        } catch (IllegalArgumentException unusable) {
-            // One catch covers every failure: InvalidMediaTypeException (an unparseable header, or a charset the
-            // parser cannot resolve) and Charset.forName's IllegalCharsetNameException and
-            // UnsupportedCharsetException all extend IllegalArgumentException, so a multi-catch of them would not
-            // compile.
-            return StandardCharsets.UTF_8;
-        }
     }
 
     private static boolean isBlank(String value) {

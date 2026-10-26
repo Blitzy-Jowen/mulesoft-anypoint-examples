@@ -8,17 +8,26 @@
 
 package com.mulesoft.examples.sending_json_data_to_a_jms_queue.service;
 
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.stereotype.Service;
 
 /**
- * Reproduces the {@code jms:outbound-endpoint} and {@code logger} processors of flow {@code json-to-jmsFlow}
- * (sending-json-data-to-a-jms-queue/src/main/app/json-to-jms.xml:9-10).
+ * Reproduces the {@code byte-array-to-string-transformer}, {@code jms:outbound-endpoint} and {@code logger}
+ * processors of flow {@code json-to-jmsFlow} (sending-json-data-to-a-jms-queue/src/main/app/json-to-jms.xml:8-10).
+ *
+ * <p>The transformer is {@link #send(byte[], String)}: it decodes the raw body bytes with the charset the request's
+ * {@code Content-Type} names, or UTF-8, the application encoding of {@code mule-deploy.properties}, when it names
+ * none or names one that cannot be used, and encodes the flow's result back with the same charset for the
+ * response. The endpoint and the logger are {@link #send(String)}, which runs in the processors' order.
  *
  * <p>The endpoint is one-way: the payload is sent to the queue synchronously on the caller's thread, with no
  * reply-to and no receive, so a failed send fails the request before anything is logged.
@@ -67,6 +76,30 @@ public class SalesQueueService {
     }
 
     /**
+     * Runs the flow from the raw request body to the response body: decodes {@code body} as the
+     * {@code byte-array-to-string-transformer} did, sends and logs the text through {@link #send(String)}, and
+     * encodes the payload the flow ends with in the charset it was decoded with.
+     *
+     * <p>The charset is the one {@code contentType} names, or UTF-8 when the header is absent or blank, names no
+     * charset, cannot be parsed, or names a charset that is malformed or unsupported. Encoding the result with that
+     * same charset gives back the request bytes for every body valid in its charset, apart from a byte-order mark
+     * the charset's encoder writes its own way, as {@code UTF-16} writes big-endian. The body is never parsed or
+     * validated, because the original forwards bodies that are not valid JSON.
+     *
+     * @param body        the raw request body; an empty array is sent as the empty string
+     * @param contentType the request's raw {@code Content-Type} header, or {@code null} when it has none
+     * @return the queued payload encoded with the charset it was decoded with
+     * @throws NullPointerException when {@code body} is {@code null}; nothing is sent or logged
+     * @throws org.springframework.jms.JmsException when the send fails; it is deliberately left to propagate
+     */
+    public byte[] send(byte[] body, String contentType) {
+        Objects.requireNonNull(body, "body");
+        Charset charset = resolveCharset(contentType);
+        String result = send(new String(body, charset));
+        return result.getBytes(charset);
+    }
+
+    /**
      * Sends {@code payload} to the queue, logs a description of the message at INFO, and returns the payload
      * unchanged as the flow's response payload.
      *
@@ -75,7 +108,7 @@ public class SalesQueueService {
      * valid JSON. The log line names the payload's class and the message metadata only; the request body is
      * never logged.
      *
-     * @param payload the request body as decoded by the controller
+     * @param payload the decoded request body, the payload the transformer produced
      * @return the same {@code payload} instance
      * @throws org.springframework.jms.JmsException when the send fails; it is deliberately left to propagate
      */
@@ -98,8 +131,8 @@ public class SalesQueueService {
      * <p>The request body is deliberately kept out of the rendering: only its class name appears, so caller
      * data, credentials and line breaks in the body never reach the log. The {@code id} is a fresh random UUID,
      * as each Mule message carried its own unique ID. The {@code encoding} line shows the application default,
-     * {@code UTF-8}, because this service receives only the decoded {@code String} and no encoding travels with
-     * it. No property entries are listed under the scope headers, because this service carries no Mule message
+     * {@code UTF-8}, because the rendering is built from the decoded {@code String} alone, which carries no
+     * encoding. No property entries are listed under the scope headers, because this service carries no Mule message
      * properties: the HTTP inbound properties, which include caller headers such as {@code Authorization}, and
      * Mule's {@code MULE_*} transport properties have no counterpart here.
      *
@@ -124,5 +157,30 @@ public class SalesQueueService {
             buf.append("  ").append(scope).append(" scoped properties:").append(ls);
         }
         return buf.append('}').toString();
+    }
+
+    /**
+     * Returns the charset {@code rawContentType} names, or UTF-8, the application encoding of the original, when
+     * the header is absent or blank, names no charset, cannot be parsed, or names a charset that is malformed or
+     * unsupported.
+     */
+    private static Charset resolveCharset(String rawContentType) {
+        if (isBlank(rawContentType)) {
+            return StandardCharsets.UTF_8;
+        }
+        try {
+            Charset charset = MediaType.parseMediaType(rawContentType).getCharset();
+            return charset != null ? charset : StandardCharsets.UTF_8;
+        } catch (IllegalArgumentException unusable) {
+            // One catch covers every failure: InvalidMediaTypeException (an unparseable header, or a charset the
+            // parser cannot resolve) and Charset.forName's IllegalCharsetNameException and
+            // UnsupportedCharsetException all extend IllegalArgumentException, so a multi-catch of them would not
+            // compile.
+            return StandardCharsets.UTF_8;
+        }
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 }

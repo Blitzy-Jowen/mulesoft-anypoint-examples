@@ -18,7 +18,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * (the original {@code authDn}) and {@code ldap.password} (the original {@code authPassword}).
  *
  * <p>The bind DN and password are a configured service account and come only from configuration; nothing in a
- * request can set them. Neither has a built-in value: an empty DN means an anonymous bind.
+ * request can set them. Neither has a built-in value, and both are required: an empty DN or password fails the
+ * first directory search, never the application start.
  *
  * <p>The class is registered solely through {@code @EnableConfigurationProperties} on the application class,
  * so it carries no stereotype annotation that would register a second bean.
@@ -31,7 +32,7 @@ public class LdapProperties {
     /** Connector URL, for example {@code ldap://localhost:389/dc=my-domain,dc=com}. */
     private String url;
 
-    /** Bind DN; empty for an anonymous bind. */
+    /** Bind DN; required, empty until configured. */
     private String dn = "";
 
     /** Bind password. */
@@ -54,7 +55,7 @@ public class LdapProperties {
     /**
      * Returns the bind DN.
      *
-     * @return the bind DN, never {@code null}; empty means an anonymous bind
+     * @return the bind DN, never {@code null}; empty when not configured, which fails the first search
      */
     public String getDn() {
         return dn;

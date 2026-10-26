@@ -18,8 +18,10 @@ import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -38,10 +40,14 @@ import org.springframework.jms.UncategorizedJmsException;
 import org.springframework.jms.core.JmsTemplate;
 
 /**
- * Unit test of {@link SalesQueueService}, which replaces the one-way {@code jms:outbound-endpoint queue="sales"}
- * and the {@code logger level="INFO"} of flow {@code json-to-jmsFlow}
- * (sending-json-data-to-a-jms-queue/src/main/app/json-to-jms.xml:9-10), with a mocked {@link JmsTemplate}: no
+ * Unit test of {@link SalesQueueService}, which replaces the {@code byte-array-to-string-transformer}, the one-way
+ * {@code jms:outbound-endpoint queue="sales"} and the {@code logger level="INFO"} of flow {@code json-to-jmsFlow}
+ * (sending-json-data-to-a-jms-queue/src/main/app/json-to-jms.xml:8-10), with a mocked {@link JmsTemplate}: no
  * Spring context and no broker.
+ *
+ * <p>The byte path, {@link SalesQueueService#send(byte[], String)}, is the transformer: its tests cover the charset
+ * a {@code Content-Type} names and every header from which UTF-8 is taken instead, assert the text queued and the
+ * bytes returned, and assert that a failed send or an absent body logs nothing.
  *
  * <p>The original logger declares no message, so it logged Mule's description of the message, which names the
  * payload's class and never the body. The log tests therefore assert that description and the body's absence
@@ -174,6 +180,70 @@ class SalesQueueServiceTest {
 
         assertThat(descriptionCount(output)).as("descriptions logged by the failed send").isEqualTo(descriptionsBefore);
         assertThat(output.getAll()).doesNotContain(payload);
+    }
+
+    /**
+     * A request's {@code Content-Type}, its raw body and the text the transformer must queue. The UTF-8 bodies
+     * carry a multi-byte character, so decoding them with any other charset would queue different text.
+     */
+    static Stream<Arguments> bytePathBodies() {
+        String json = "{\n\t\"ITEM_ID\"= 008, \n\t\"ITEM_NAME\" = \"Shirt\u2122\", \n\t\"QTY\" = 1, "
+                + "\n\t\"PRICE\" = 20\n}";
+        return Stream.of(
+                // No charset parameter on a JSON type: the application encoding, UTF-8.
+                Arguments.of("application/json", utf8(json), json),
+                // The named charset: four ISO-8859-1 bytes, the last 0xE9 for the e acute.
+                Arguments.of("text/plain; charset=ISO-8859-1", new byte[] {'C', 'a', 'f', (byte) 0xE9}, "Caf\u00e9"),
+                Arguments.of(null, utf8("null-type-payload-9 \u20ac"), "null-type-payload-9 \u20ac"),
+                Arguments.of("   ", utf8("blank-type-payload-10 \u20ac"), "blank-type-payload-10 \u20ac"),
+                Arguments.of(";;;", utf8("unparseable-type-payload-11 \u20ac"), "unparseable-type-payload-11 \u20ac"),
+                Arguments.of("text/plain; charset=bogus", utf8("unsupported-charset-payload-12 \u20ac"),
+                        "unsupported-charset-payload-12 \u20ac"),
+                Arguments.of("text/plain; charset=x*y", utf8("illegal-charset-payload-13 \u20ac"),
+                        "illegal-charset-payload-13 \u20ac"),
+                Arguments.of("text/plain", utf8("no-charset-payload-14 \u20ac"), "no-charset-payload-14 \u20ac"),
+                Arguments.of("application/json", new byte[0], ""));
+    }
+
+    @ParameterizedTest(name = "{index}: Content-Type [{0}]")
+    @MethodSource("bytePathBodies")
+    void bytePathQueuesDecodedTextAndReturnsSameBytes(String contentType, byte[] body, String expectedText) {
+        byte[] result = new SalesQueueService(jmsTemplate, SALES).send(body, contentType);
+
+        verify(jmsTemplate).convertAndSend(eq(SALES), eq(expectedText));
+        verifyNoMoreInteractions(jmsTemplate);
+        assertThat(result).containsExactly(body);
+    }
+
+    @Test
+    void bytePathPropagatesJmsExceptionUnchangedAndLogsNothing(CapturedOutput output) {
+        String payload = "failing-byte-payload-15";
+        UncategorizedJmsException ex = new UncategorizedJmsException("broker down");
+        doThrow(ex).when(jmsTemplate).convertAndSend(anyString(), any(Object.class));
+        SalesQueueService service = new SalesQueueService(jmsTemplate, SALES);
+        long descriptionsBefore = descriptionCount(output);
+
+        JmsException thrown = assertThrows(JmsException.class,
+                () -> service.send(utf8(payload), "text/plain; charset=UTF-8"));
+
+        assertSame(ex, thrown);
+        assertThat(descriptionCount(output)).as("descriptions logged by the failed send").isEqualTo(descriptionsBefore);
+        assertThat(output.getAll()).doesNotContain(payload);
+    }
+
+    @Test
+    void bytePathRejectsNullBodyWithoutSendingOrLogging(CapturedOutput output) {
+        SalesQueueService service = new SalesQueueService(jmsTemplate, SALES);
+        long descriptionsBefore = descriptionCount(output);
+
+        assertThrows(NullPointerException.class, () -> service.send((byte[]) null, "application/json"));
+
+        verifyNoInteractions(jmsTemplate);
+        assertThat(descriptionCount(output)).as("descriptions logged for an absent body").isEqualTo(descriptionsBefore);
+    }
+
+    private static byte[] utf8(String text) {
+        return text.getBytes(StandardCharsets.UTF_8);
     }
 
     private static long descriptionCount(CapturedOutput output) {
