@@ -1,0 +1,5 @@
+# Spring profile "test": original demo credentials of the Mule example
+# (hard-coded at login-form-using-the-http-connector.xml:21,39-40); tests only.
+login:
+  username: mule
+  password: mule

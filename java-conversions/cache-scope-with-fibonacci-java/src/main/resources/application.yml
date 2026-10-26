@@ -1,0 +1,34 @@
+# cache-scope-with-fibonacci-java runtime configuration
+# Replaces cache-scope-with-fibonacci/src/main/app/mule-app.properties (empty), the http:listener-config of
+# cache-scope.xml:40 (host localhost, port ${http.port}) and the ee:object-store-caching-strategy of cache-scope.xml:35
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: localhost    # http:listener-config host (cache-scope.xml:40)
+spring:
+  application:
+    name: cache-scope-with-fibonacci-java
+  web:
+    resources:
+      # SC-1: every path but /fibonacci, /favicon.ico included, must raise NoHandlerFoundException
+      # -> 404 text/plain "No listener for endpoint: <path>"
+      add-mappings: false
+  mvc:
+    formcontent:
+      filter:
+        # FormContentFilter would consume PUT/PATCH/DELETE form bodies before controller/FibonacciController
+        # reads the raw payload the favicon wildcard-filter is evaluated on (cache-scope.xml:45-49)
+        enabled: false
+  cache:
+    # ee:cache scope -> Spring Cache over Caffeine; service/FibonacciCacheService uses the single cache
+    # "fibonacci", keyed by n. Listing cache names makes the CaffeineCacheManager static.
+    type: caffeine
+    cache-names: fibonacci
+    # No caffeine spec: unbounded and without expiry, like the default in-memory object store the caching
+    # strategy falls back to (it declares no objectStore). The Mule default object-store limits (entry count,
+    # TTL) are a Tier 2A verification point; a capture showing eviction or expiry adds the spec here.
+logging:
+  level:
+    # the cache scope's INFO logger "aaa: #[]" (cache-scope.xml:64)
+    com.mulesoft.examples.cache_scope_with_fibonacci: INFO

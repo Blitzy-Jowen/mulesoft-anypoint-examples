@@ -1,0 +1,28 @@
+# proxying-a-soap-api-java runtime configuration, from proxying-a-soap-api/src/main/app/soap-api-proxy.xml
+# (the original mule-app.properties was empty). The original holds no credentials: the caller's headers and envelope,
+# including any security header, are forwarded to the upstream as data, so no secret or TODO key belongs here.
+http:
+  port: 8081            # original placeholder name ${http.port} of HTTP_Listener_Configuration (DynamicPort in the original test)
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (soap-api-proxy.xml:3)
+spring:
+  application:
+    name: proxying-a-soap-api-java
+  web:
+    resources:
+      add-mappings: false   # SC-1 404 "No listener for endpoint: <path>" instead of static-resource handling
+  mvc:
+    formcontent:
+      filter:
+        enabled: false      # the controller forwards the raw request body bytes
+  servlet:
+    multipart:
+      enabled: false        # request bodies are forwarded as raw bytes, never parsed
+  autoconfigure:
+    # No BasicErrorController or whitelabel page: SC-1 answers unhandled paths and failures itself
+    exclude: org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration
+proxy:
+  upstream-url: http://www.predic8.com:8080/shop/ShopService        # http:request-config host/port + http:request path, method POST (soap-api-proxy.xml:4,10)
+  wsdl-location: http://www.predic8.com:8080/shop/ShopService?wsdl  # cxf:proxy-service wsdlLocation, served at GET /?wsdl (soap-api-proxy.xml:7)
+  response-timeout-ms: 10000                                        # Mule default http:request response timeout
