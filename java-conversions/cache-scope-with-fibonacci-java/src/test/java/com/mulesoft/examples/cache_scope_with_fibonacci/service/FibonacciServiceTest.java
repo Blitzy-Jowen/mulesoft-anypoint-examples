@@ -1,0 +1,132 @@
+/**
+ * MuleSoft Examples
+ * Copyright 2014 MuleSoft, Inc.
+ *
+ * This product includes software developed at
+ * MuleSoft, Inc. (http://www.mulesoft.com/).
+ */
+
+package com.mulesoft.examples.cache_scope_with_fibonacci.service;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
+
+import java.util.stream.Stream;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import com.mulesoft.examples.cache_scope_with_fibonacci.model.FibonacciResult;
+import com.mulesoft.examples.cache_scope_with_fibonacci.service.FibonacciService.FibonacciReply;
+
+/**
+ * {@link FibonacciService} against flow {@code cache-exampleFlow1}
+ * (cache-scope-with-fibonacci/src/main/app/cache-scope.xml:43-59): the favicon {@code message-filter} with its
+ * case-sensitive {@code wildcard-filter} on the payload, the {@code n < 20} choice, the call to
+ * {@code calculateFibonacci} and the two {@code expression-component} payloads.
+ *
+ * <p>Expected texts are the reference flow's own: {@code "Fibonacci(" + n + ") = " + payload + "\nCOST: " + cost}
+ * (cache-scope.xml:53) and {@code "ERROR: n must be less than 20"} (cache-scope.xml:56). The cache service is a
+ * strict Mockito mock, so a call with arguments other than the stubbed ones fails the test.
+ */
+@ExtendWith(MockitoExtension.class)
+class FibonacciServiceTest {
+
+    /** Payload of the choice's {@code otherwise} branch (cache-scope.xml:56). */
+    private static final String TOO_HIGH = "ERROR: n must be less than 20";
+
+    @Mock
+    private FibonacciCacheService cacheService;
+
+    private FibonacciService service;
+
+    @BeforeEach
+    void setUp() {
+        service = new FibonacciService(cacheService);
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"5", "20"})
+    void faviconBodyIsFilteredWithAnEmptyReplyAndNoCost(String n) {
+        assertEquals(new FibonacciReply("", null), service.handle(n, "/favicon.ico", false, false));
+        verifyNoInteractions(cacheService);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/FAVICON.ICO", "x/favicon.ico"})
+    void filterMatchesOnlyTheExactCaseSensitiveText(String body) {
+        when(cacheService.calculate("5", true, true)).thenReturn(new FibonacciResult("5", 6));
+
+        assertEquals(new FibonacciReply("Fibonacci(5) = 5\nCOST: 6", 6), service.handle("5", body, false, false));
+        verify(cacheService).calculate("5", true, true);
+        verifyNoMoreInteractions(cacheService);
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"20"})
+    void missingOrTooHighNTakesTheOtherwiseBranch(String n) {
+        assertEquals(new FibonacciReply(TOO_HIGH, null), service.handle(n, null, false, false));
+        verifyNoInteractions(cacheService);
+    }
+
+    static Stream<Arguments> belowTwenty() {
+        return Stream.of(
+                Arguments.of("19", new FibonacciResult("4181", 20), "Fibonacci(19) = 4181\nCOST: 20"),
+                // The raw query text is the cache key and is echoed unchanged in the reply.
+                Arguments.of("05", new FibonacciResult("5", 6), "Fibonacci(05) = 5\nCOST: 6"),
+                Arguments.of("-3", new FibonacciResult("-3", 1), "Fibonacci(-3) = -3\nCOST: 1"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("belowTwenty")
+    void belowTwentyCallsTheCacheWithTheRawNAndComposesTheReply(String n, FibonacciResult result, String expected) {
+        when(cacheService.calculate(n, true, true)).thenReturn(result);
+
+        assertEquals(new FibonacciReply(expected, result.cost()), service.handle(n, "", false, false));
+        verify(cacheService).calculate(n, true, true);
+        verifyNoMoreInteractions(cacheService);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        // nocacheHeader, nocacheQuery, useCache, childrenUseCache
+        "true,  false, false, true",
+        "false, true,  true,  false",
+        "true,  true,  false, false"
+    })
+    void nocacheFlagsReachTheCacheServiceInverted(boolean nocacheHeader, boolean nocacheQuery, boolean useCache,
+            boolean childrenUseCache) {
+        when(cacheService.calculate("10", useCache, childrenUseCache)).thenReturn(new FibonacciResult("55", 11));
+
+        assertEquals(new FibonacciReply("Fibonacci(10) = 55\nCOST: 11", 11),
+                service.handle("10", null, nocacheHeader, nocacheQuery));
+        verify(cacheService).calculate("10", useCache, childrenUseCache);
+        verifyNoMoreInteractions(cacheService);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"abc", "", " 5"})
+    void nonNumericNIsRejectedWithoutTouchingTheCache(String n) {
+        IllegalArgumentException thrown =
+                assertThrows(IllegalArgumentException.class, () -> service.handle(n, null, false, false));
+
+        assertEquals("Invalid value for n: " + n, thrown.getMessage());
+        assertInstanceOf(NumberFormatException.class, thrown.getCause());
+        verifyNoInteractions(cacheService);
+    }
+}
