@@ -121,7 +121,7 @@ class SalesPublisherServiceTest {
 
     @Test
     @DisplayName("checks sales_exchange and sales_queue passively")
-    void checksExchangeAndQueuePassively() throws Exception {
+    void publishChecksExchangeAndQueuePassively() throws Exception {
         runChannelCallbackOnMockedChannel();
 
         service.publish(bytes(PAYLOAD));
@@ -132,7 +132,7 @@ class SalesPublisherServiceTest {
 
     @Test
     @DisplayName("never declares, binds or otherwise changes the exchange or the queue")
-    void neverDeclaresOrBinds() throws Exception {
+    void publishNeverDeclaresOrBindsAnything() throws Exception {
         runChannelCallbackOnMockedChannel();
 
         service.publish(bytes(PAYLOAD));
@@ -149,7 +149,7 @@ class SalesPublisherServiceTest {
 
     @Test
     @DisplayName("logs, then checks the exchange and the queue, then publishes, in the flow's order")
-    void logsThenChecksThenPublishes() throws Exception {
+    void passiveChecksRunBeforeSend() throws Exception {
         runChannelCallbackOnMockedChannel();
 
         service.publish(bytes(PAYLOAD));
@@ -167,7 +167,7 @@ class SalesPublisherServiceTest {
     @ParameterizedTest(name = "{0}")
     @MethodSource("payloads")
     @DisplayName("publishes the unchanged body as a persistent message to sales_exchange with the empty routing key")
-    void publishesUnchangedBodyAsPersistentMessage(String description, byte[] payload) {
+    void publishSendsUnchangedBodyAsPersistentMessage(String description, byte[] payload) {
         runChannelCallbackOnMockedChannel();
         byte[] sent = payload.clone();
 
@@ -196,7 +196,7 @@ class SalesPublisherServiceTest {
 
     @Test
     @DisplayName("returns the body of the reply")
-    void returnsReplyBody() {
+    void publishReturnsReplyBody() {
         runChannelCallbackOnMockedChannel();
         byte[] replyBody = bytes("{\"status\": \"received\"}");
         when(rabbitTemplate.sendAndReceive(eq(EXCHANGE), eq(AmqpConfig.DEFAULT_ROUTING_KEY), any(Message.class)))
@@ -209,7 +209,7 @@ class SalesPublisherServiceTest {
 
     @Test
     @DisplayName("returns null when no reply arrives within the reply timeout, without publishing again")
-    void returnsNullWhenNoReplyArrives() {
+    void publishReturnsNullWhenReplyTimesOut() {
         runChannelCallbackOnMockedChannel();
         when(rabbitTemplate.sendAndReceive(eq(EXCHANGE), eq(AmqpConfig.DEFAULT_ROUTING_KEY), any(Message.class)))
                 .thenReturn(null);
@@ -226,7 +226,7 @@ class SalesPublisherServiceTest {
     @ParameterizedTest(name = "missing {0}")
     @EnumSource(PassiveCheck.class)
     @DisplayName("a failed passive check reaches the caller unchanged and nothing is published")
-    void passiveCheckFailurePropagatesWithoutSend(PassiveCheck failing) throws Exception {
+    void passiveCheckFailurePropagatesUnchangedWithoutSend(PassiveCheck failing) throws Exception {
         runChannelCallbackOnMockedChannel();
         IOException notFound =
                 new IOException("NOT_FOUND - no " + failing.kind + " '" + failing.destination + "' in vhost '/'");
@@ -250,7 +250,7 @@ class SalesPublisherServiceTest {
     @ParameterizedTest(name = "{0}")
     @MethodSource("sendFailures")
     @DisplayName("a failed publish reaches the caller unchanged after exactly one attempt")
-    void sendFailurePropagatesAfterOneAttempt(String description, AmqpException failure) {
+    void sendFailurePropagatesUnchangedAfterOneAttempt(String description, AmqpException failure) {
         runChannelCallbackOnMockedChannel();
         when(rabbitTemplate.sendAndReceive(eq(EXCHANGE), eq(AmqpConfig.DEFAULT_ROUTING_KEY), any(Message.class)))
                 .thenThrow(failure);
@@ -277,7 +277,7 @@ class SalesPublisherServiceTest {
 
     @Test
     @DisplayName("logs 'payload to be sent: <body>' at INFO")
-    void logsPayloadAtInfo() {
+    void publishLogsPayloadAtInfo() {
         runChannelCallbackOnMockedChannel();
 
         service.publish(bytes(PAYLOAD));
