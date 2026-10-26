@@ -33,7 +33,6 @@ public class ContactsMergeTest {
 		ContactMerge contactMerge = new ContactMerge();
 		List<Map<String, String>> mergedList = contactMerge.mergeList(contactsA, contactsB);
 
-		System.out.println(mergedList);
 		Assertions.assertEquals(createExpectedList(), mergedList, "The merged list obtained is not as expected");
 
 	}
