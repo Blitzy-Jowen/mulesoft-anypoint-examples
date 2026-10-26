@@ -1,0 +1,4 @@
+# Maven build output
+target/
+# Live Salesforce sandbox credentials (sfdc.username, sfdc.password, sfdc.securityToken); local only, never committed (template: application-it.yml.example)
+src/test/resources/application-it.yml

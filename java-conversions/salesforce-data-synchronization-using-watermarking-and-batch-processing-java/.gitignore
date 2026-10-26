@@ -1,0 +1,5 @@
+# salesforce-data-synchronization-using-watermarking-and-batch-processing-java
+# Maven build output, test reports and the test-tier watermark files (target/test-watermark/, target/it-watermark/)
+target/
+# Live Salesforce sandbox credentials for SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT (sfdc.username, sfdc.password, sfdc.securityToken); never committed. application-it.yml.example is the committed template
+src/test/resources/application-it.yml
