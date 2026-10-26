@@ -13,6 +13,7 @@ spring:
     resources:
       add-mappings: false   # SC-1, and no static-resource handler competes with the /** proxy mapping
   mvc:
+    dispatch-trace-request: true   # the /* listener has no allowedMethods: TRACE reaches RestProxyController and is forwarded upstream like every other method instead of the servlet's message/http echo
     formcontent:
       filter:
         enabled: false      # FormContentFilter would consume PUT/PATCH/DELETE form bodies before they are forwarded

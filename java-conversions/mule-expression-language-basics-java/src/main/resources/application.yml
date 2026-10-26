@@ -11,6 +11,11 @@ spring:
   web:
     resources:
       add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the /greet1../greet6 listeners have no allowedMethods: TRACE reaches GreetingController like every other method instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
 greeting:
   # file:outbound-endpoint path of greet3..greet6 (greeting.xml:35,57,69,81); relative to the working directory, as in Mule
   output-dir: Path_of_your_choice

@@ -9,3 +9,8 @@ spring:
   web:
     resources:
       add-mappings: false
+  mvc:
+    dispatch-trace-request: true   # the / listener accepts POST only: TRACE reaches the dispatcher and gets SC-1's 405 instead of the servlet's 200 TRACE echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

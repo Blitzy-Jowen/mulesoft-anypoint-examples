@@ -12,3 +12,11 @@ spring:
   web:
     resources:
       add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    # With TRACE dispatched, FrameworkServlet still writes the servlet's message/http echo into a reply left uncommitted
+    # after the handler, so every reply on / must be committed with its Content-Length, the empty 200 filter rejection
+    # included; a ResponseEntity built without a body (even with contentLength(0)) is not committed.
+    dispatch-trace-request: true   # the / listener has no allowedMethods: TRACE reaches ValidationController like every other method instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

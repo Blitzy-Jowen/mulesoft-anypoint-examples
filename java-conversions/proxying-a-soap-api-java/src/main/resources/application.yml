@@ -13,6 +13,7 @@ spring:
     resources:
       add-mappings: false   # SC-1 404 "No listener for endpoint: <path>" instead of static-resource handling
   mvc:
+    dispatch-trace-request: true   # the / listener has no allowedMethods: TRACE enters SoapProxyController's proxy flow like every other method instead of the servlet's message/http echo
     formcontent:
       filter:
         enabled: false      # the controller forwards the raw request body bytes

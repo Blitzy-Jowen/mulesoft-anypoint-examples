@@ -15,11 +15,15 @@ spring:
       # -> 404 text/plain "No listener for endpoint: <path>"
       add-mappings: false
   mvc:
+    dispatch-trace-request: true   # the /fibonacci listener has no allowedMethods: TRACE reaches FibonacciController like every other method instead of the servlet's message/http echo
     formcontent:
       filter:
         # FormContentFilter would consume PUT/PATCH/DELETE form bodies before controller/FibonacciController
         # reads the raw payload the favicon wildcard-filter is evaluated on (cache-scope.xml:45-49)
         enabled: false
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
   cache:
     # ee:cache scope -> Spring Cache over Caffeine; service/FibonacciCacheService uses the single cache
     # "fibonacci", keyed by n. Listing cache names makes the CaffeineCacheManager static.

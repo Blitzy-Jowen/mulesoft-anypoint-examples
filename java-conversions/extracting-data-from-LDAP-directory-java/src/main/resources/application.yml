@@ -9,6 +9,11 @@ spring:
   web:
     resources:
       add-mappings: false   # SC-1: unknown paths reach GlobalExceptionHandler's 404 text
+  mvc:
+    dispatch-trace-request: true   # the / listener has no allowedMethods: TRACE reaches LdapController like every other method instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
 ldap:
   port: 389
   url: ldap://localhost:${ldap.port}/dc=my-domain,dc=com

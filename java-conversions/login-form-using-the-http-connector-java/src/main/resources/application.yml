@@ -12,6 +12,11 @@ spring:
   web:
     resources:
       add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # /login accepts GET and POST only, /requesterLogin every method: TRACE gets SC-1's 405 on /login and reaches LoginController on /requesterLogin instead of the servlet's TRACE echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
 login:
   # TODO: supply the login form username
   username: ${LOGIN_USERNAME:}
