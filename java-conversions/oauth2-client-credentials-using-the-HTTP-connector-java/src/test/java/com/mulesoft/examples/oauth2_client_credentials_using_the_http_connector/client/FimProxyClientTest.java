@@ -18,20 +18,27 @@ import static com.github.tomakehurst.wiremock.client.WireMock.request;
 import static com.github.tomakehurst.wiremock.client.WireMock.requestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -40,6 +47,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
@@ -52,7 +60,8 @@ import com.github.tomakehurst.wiremock.verification.LoggedRequest;
  * raw request URI reach the upstream unchanged, a body and Content-Type are sent only when supplied, a success
  * comes back with its status, headers and body, a status of 400 or above fails once with Mule's
  * {@code Response code <code> mapped as failure.}, redirects are followed as {@code http:request} follows them by
- * default, and a refused connection surfaces its {@link ConnectException}.
+ * default, a refused connection surfaces its {@link ConnectException}, and a body still arriving when the
+ * response timeout ends fails once with an {@link HttpTimeoutException} cause.
  */
 class FimProxyClientTest {
 
@@ -166,6 +175,67 @@ class FimProxyClientTest {
 
         assertThat(thrown).isNotNull();
         assertThat(causeChain(thrown)).anyMatch(ConnectException.class::isInstance);
+    }
+
+    @Test
+    void bodyStalledAfterHeadersTimesOutOnceWithinTheTimeout() throws IOException {
+        // A raw socket rather than WireMock, whose dribble delay also holds back the headers: the response head
+        // arrives at once and the body stalls after 10 of its 1000 bytes, so only a deadline on the body read,
+        // not the request factory's header timeout, can end the call.
+        AtomicInteger requests = new AtomicInteger();
+        List<Socket> connections = Collections.synchronizedList(new ArrayList<>());
+        try (ServerSocket upstream = new ServerSocket(0)) {
+            Thread server = new Thread(() -> sendHeadersThenStall(upstream, requests, connections),
+                    "stalled-fim-upstream");
+            server.setDaemon(true);
+            server.start();
+            FimProxyClient shortTimeoutClient =
+                    new FimProxyClient("http://127.0.0.1:" + upstream.getLocalPort(), Duration.ofMillis(300));
+
+            long start = System.nanoTime();
+            Throwable thrown = catchThrowable(() -> shortTimeoutClient.send("GET", "/FIM/stalled", null, null));
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+
+            assertThat(thrown).isInstanceOf(ResourceAccessException.class);
+            assertThat(causeChain(thrown)).anyMatch(HttpTimeoutException.class::isInstance);
+            assertThat(elapsed).isBetween(Duration.ofMillis(250), Duration.ofMillis(2000));
+            // Exactly one attempt: a timed-out request is never retried.
+            assertThat(requests).hasValue(1);
+        } finally {
+            synchronized (connections) {
+                for (Socket connection : connections) {
+                    connection.close();
+                }
+            }
+        }
+    }
+
+    /**
+     * Accepts connections until {@code upstream} is closed. On each it reads the request head, counts it, sends a
+     * complete response head announcing 1000 body bytes and then only the first 10, and leaves the connection
+     * open, so the body never completes.
+     */
+    private static void sendHeadersThenStall(ServerSocket upstream, AtomicInteger requests,
+                                             List<Socket> connections) {
+        try {
+            while (!upstream.isClosed()) {
+                Socket connection = upstream.accept();
+                connections.add(connection);
+                BufferedReader reader =
+                        new BufferedReader(new InputStreamReader(connection.getInputStream(), US_ASCII));
+                String line;
+                do {
+                    line = reader.readLine();
+                } while (line != null && !line.isEmpty());
+                requests.incrementAndGet();
+                OutputStream out = connection.getOutputStream();
+                out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 1000\r\n\r\n"
+                        + "0123456789").getBytes(US_ASCII));
+                out.flush();
+            }
+        } catch (IOException closed) {
+            // The test closed the listening socket, or the client dropped the connection: nothing more to serve.
+        }
     }
 
     /** The throwable and every cause beneath it, each once, so a cyclic cause chain cannot loop. */

@@ -8,10 +8,15 @@
 
 package com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.client;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.Charset;
 import java.time.Duration;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -42,8 +47,9 @@ import org.springframework.web.client.RestClientResponseException;
  *       the final URI.</li>
  * </ul>
  *
- * <p>Connect and read timeouts are 10 s, the Mule requester's default response timeout. A response outside
- * the requester's default success range 0..399 fails with Mule 3.8's response-validator message
+ * <p>Connect and response timeouts are 10 s, the Mule requester's default response timeout; the response
+ * timeout bounds the whole response, headers and body, and a timed-out request is never retried. A response
+ * outside the requester's default success range 0..399 fails with Mule 3.8's response-validator message
  * {@code Response code <code> mapped as failure.}, carried by a {@link RestClientResponseException}.
  */
 @Component
@@ -56,6 +62,9 @@ public class FimProxyClient {
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
 
     private final String baseUrl;
+
+    /** Connect timeout, and the bound on each whole response from sending the request to its last body byte. */
+    private final Duration timeout;
 
     private final RestClient restClient;
 
@@ -70,15 +79,17 @@ public class FimProxyClient {
     }
 
     /**
-     * Creates a client for {@code baseUrl} with the given connect and read timeout. Building the JDK client
+     * Creates a client for {@code baseUrl} with the given connect and response timeout. Building the JDK client
      * opens no connection, so construction never contacts a host.
      *
      * @param baseUrl scheme, host and port of the FIM server, without a trailing slash; the raw URI passed to
      *                {@link #send} always begins with {@code /FIM/} and is appended unchanged
-     * @param timeout connect timeout and per-request read timeout
+     * @param timeout connect timeout, and the time within which each request's whole response, headers and
+     *                body, must arrive
      */
     public FimProxyClient(String baseUrl, Duration timeout) {
         this.baseUrl = baseUrl;
+        this.timeout = timeout;
         // HTTP/1.1 as Mule's requester speaks it: the JDK default (HTTP/2) would add Upgrade: h2c and
         // HTTP2-Settings headers on http URIs. Redirects are followed, as http:request does by default.
         HttpClient httpClient = HttpClient.newBuilder()
@@ -101,8 +112,9 @@ public class FimProxyClient {
      * @return the upstream status, headers and body; the body is {@code null} when the upstream sent none
      * @throws RestClientResponseException when the upstream status is 400 or above, with the message
      *         {@code Response code <code> mapped as failure.} and the upstream status, headers and body
-     * @throws org.springframework.web.client.ResourceAccessException on an I/O failure, including connect
-     *         and read timeouts
+     * @throws org.springframework.web.client.ResourceAccessException on an I/O failure, including a connect
+     *         timeout and a response, headers or body, not complete within the timeout (its cause is then a
+     *         {@link HttpTimeoutException}); nothing is retried after one
      */
     public ResponseEntity<byte[]> send(String method, String rawUri, MediaType contentType, byte[] body) {
         // URI.create, not a URI template or builder: the caller's encoding must reach the wire byte for byte.
@@ -119,9 +131,11 @@ public class FimProxyClient {
             StreamingHttpOutputMessage.Body requestBody = outputStream -> outputStream.write(body);
             request = request.contentLength(body.length).body(requestBody);
         }
+        // Taken before the request is sent, so the headers and the body share the one response timeout.
+        long deadline = System.nanoTime() + timeout.toNanos();
         // exchange bypasses RestClient's default status handlers and adds no converter-derived Accept header.
         return request.exchange((clientRequest, clientResponse) -> {
-            byte[] bytes = clientResponse.getBody().readAllBytes();
+            byte[] bytes = readBody(clientResponse.getBody(), deadline, timeout);
             HttpHeaders headers = new HttpHeaders();
             headers.addAll(clientResponse.getHeaders());
             HttpStatusCode statusCode = clientResponse.getStatusCode();
@@ -133,6 +147,43 @@ public class FimProxyClient {
             }
             return ResponseEntity.status(statusCode).headers(headers).body(bytes.length == 0 ? null : bytes);
         });
+    }
+
+    /**
+     * Reads the whole response body, failing once {@code deadline} (a {@link System#nanoTime()} value) passes.
+     *
+     * <p>The request factory's read timeout ends when the response headers arrive; the JDK client then streams
+     * the body with no timeout of its own, so a server that sends headers and stalls its body would block this
+     * read indefinitely. When the deadline passes first, the stream is closed from the timer thread, which
+     * unblocks the read, and the read fails with an {@link HttpTimeoutException}.
+     *
+     * @throws HttpTimeoutException when the body is not complete by the deadline
+     * @throws IOException          on any other I/O failure while reading
+     */
+    private static byte[] readBody(InputStream body, long deadline, Duration timeout) throws IOException {
+        long remainingMillis = TimeUnit.NANOSECONDS.toMillis(Math.max(0L, deadline - System.nanoTime()));
+        CompletableFuture<Void> expiry = new CompletableFuture<Void>()
+                .completeOnTimeout(null, remainingMillis, TimeUnit.MILLISECONDS);
+        expiry.thenRun(() -> {
+            try {
+                body.close();
+            } catch (IOException ignored) {
+                // The stream is being abandoned; the reading thread reports the timeout.
+            }
+        });
+        try {
+            return body.readAllBytes();
+        } catch (IOException ex) {
+            if (expiry.isDone() && !expiry.isCompletedExceptionally()) {
+                HttpTimeoutException timedOut = new HttpTimeoutException(
+                        "Response not received within " + timeout.toMillis() + " ms");
+                timedOut.initCause(ex);
+                throw timedOut;
+            }
+            throw ex;
+        } finally {
+            expiry.cancel(false);
+        }
     }
 
     /**

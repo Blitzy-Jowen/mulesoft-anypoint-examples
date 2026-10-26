@@ -9,17 +9,23 @@
 package com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.client;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 
+import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
@@ -65,10 +71,13 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * requests it lazily, on the first {@link #authorize()}, so the application starts without contacting Box and
  * with blank {@code oauth.client.*} and key-store passwords. For the same reason the HTTPS resource client, and
  * with it the TLS context, is built on the first {@link #authorize()} and before the token request, so a broken
- * TLS configuration fails the call before any client secret is sent.
+ * TLS configuration fails the call before any client secret is sent. A blank {@code oauth.client.id} or
+ * {@code oauth.client.secret} fails each {@link #authorize()}, naming the key, before either step.
  *
- * <p>Connect and read timeouts are 10 s, the Mule requester's default response timeout. Redirects are followed,
- * as {@code http:request} follows them by default. The client is thread-safe.
+ * <p>Connect and response timeouts are 10 s, the Mule requester's default response timeout; the response
+ * timeout bounds each whole response, headers and body, of the token request and of the resource request, and a
+ * timed-out request is never retried. Redirects are followed, as {@code http:request} follows them by default.
+ * The client is thread-safe.
  */
 @Component
 public class BoxOAuthClient {
@@ -85,11 +94,20 @@ public class BoxOAuthClient {
 
     private static final String HTTPS_SCHEME = "https";
 
+    private static final String CLIENT_ID_KEY = "oauth.client.id";
+    private static final String CLIENT_SECRET_KEY = "oauth.client.secret";
+
     /** The whole client-credentials token request body: no scope, and the client credentials travel in Basic. */
     private static final byte[] CLIENT_CREDENTIALS_FORM =
             "grant_type=client_credentials".getBytes(StandardCharsets.US_ASCII);
 
-    private static final ObjectMapper JSON = new ObjectMapper();
+    /*
+     * Jackson can quote the input it fails on, and a token response is where the secrets are, so the parser never
+     * includes the source in its locations and parse failures are reported without the Jackson exception.
+     */
+    private static final ObjectMapper JSON = JsonMapper.builder()
+            .disable(StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION)
+            .build();
 
     private final String tokenUrl;
     private final String clientId;
@@ -131,16 +149,19 @@ public class BoxOAuthClient {
     }
 
     /**
-     * Creates a client with the given connect and read timeout. Construction only records the values and
+     * Creates a client with the given connect and response timeout. Construction only records the values and
      * builds the plain token client; it opens no connection and never reads {@code tls}.
      *
      * @param tokenUrl     the client-credentials token endpoint
-     * @param clientId     the client id sent in the Basic header of the token request
-     * @param clientSecret the client secret sent in the Basic header of the token request
+     * @param clientId     the client id sent in the Basic header of the token request; accepted blank here and
+     *                     rejected by {@link #authorize()}
+     * @param clientSecret the client secret sent in the Basic header of the token request; accepted blank here and
+     *                     rejected by {@link #authorize()}
      * @param baseUrl      scheme, host and port of the resource request, without a trailing slash
      * @param basePath     path prefix of the resource request; {@code "/"} is appended to it
      * @param tls          TLS stores of the resource request; may be {@code null} unless {@code baseUrl} is https
-     * @param timeout      connect timeout and per-request read timeout of both requests
+     * @param timeout      connect timeout of both requests, and the time within which each one's whole response,
+     *                     headers and body, must arrive
      */
     public BoxOAuthClient(String tokenUrl, String clientId, String clientSecret, String baseUrl, String basePath,
                           TlsProperties tls, Duration timeout) {
@@ -163,13 +184,19 @@ public class BoxOAuthClient {
      * @throws RestClientResponseException when the final status is 400 or above, with the message
      *         {@code Response code <code> mapped as failure.} and the upstream status, headers and body; a 401 or
      *         403 is final only after one token refresh and retry
-     * @throws IllegalStateException when the token request fails or its response carries no access token, when
-     *         the TLS context of an https base URL cannot be built, or when an https base URL has no
+     * @throws IllegalStateException with the message {@code <key> is not configured} when {@code oauth.client.id}
+     *         or {@code oauth.client.secret} is {@code null} or blank, checked first so that no TLS context is
+     *         built and no request is sent; when the token request fails or its response carries no access token;
+     *         when the TLS context of an https base URL cannot be built; or when an https base URL has no
      *         {@link TlsProperties}
      * @throws org.springframework.web.client.ResourceAccessException on an I/O failure of either request,
-     *         including connect and read timeouts; nothing is retried after one
+     *         including a connect timeout and a response, headers or body, not complete within the timeout (its
+     *         cause is then a {@link HttpTimeoutException}); nothing is retried after one
      */
     public ResponseEntity<byte[]> authorize() {
+        // Checked here rather than at construction, so the application still starts with the blank placeholders.
+        requireConfigured(clientId, CLIENT_ID_KEY);
+        requireConfigured(clientSecret, CLIENT_SECRET_KEY);
         RestClient client = resourceClient();
         // URI.create, not a URI template: the configured path reaches the wire as written.
         URI uri = URI.create(baseUrl + basePath + "/");
@@ -184,14 +211,23 @@ public class BoxOAuthClient {
         return toResult(response);
     }
 
+    /** Fails, naming {@code key}, when its configured {@code value} is {@code null} or blank. */
+    private static void requireConfigured(String value, String key) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalStateException(key + " is not configured");
+        }
+    }
+
     private UpstreamResponse get(RestClient client, URI uri, Token bearer) {
+        // Taken before the request is sent, so the headers and the body share the one response timeout.
+        long deadline = System.nanoTime() + timeout.toNanos();
         // exchange bypasses RestClient's default status handlers, so every status reaches the checks above,
         // and adds no converter-derived Accept header. No inbound header is copied: line 34 builds none.
         return client.get()
                 .uri(uri)
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + bearer.accessToken())
                 .exchange((clientRequest, clientResponse) -> {
-                    byte[] body = clientResponse.getBody().readAllBytes();
+                    byte[] body = readBody(clientResponse.getBody(), deadline, timeout);
                     HttpHeaders headers = new HttpHeaders();
                     headers.addAll(clientResponse.getHeaders());
                     String statusText = clientResponse.getStatusText();
@@ -241,6 +277,9 @@ public class BoxOAuthClient {
     private Token requestToken() {
         String credentials = Base64.getEncoder()
                 .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
+        // One response timeout for headers and body; it also bounds how long a stalled token response holds this
+        // instance's lock, so a waiting authorize() is released by a timed failure.
+        long deadline = System.nanoTime() + timeout.toNanos();
         // The form is sent as raw bytes with an explicit Content-Type, so no converter adds a charset parameter.
         return tokenClient.post()
                 .uri(URI.create(tokenUrl))
@@ -249,7 +288,7 @@ public class BoxOAuthClient {
                 .body(CLIENT_CREDENTIALS_FORM)
                 .exchange((clientRequest, clientResponse) -> {
                     HttpStatusCode status = clientResponse.getStatusCode();
-                    byte[] body = clientResponse.getBody().readAllBytes();
+                    byte[] body = readBody(clientResponse.getBody(), deadline, timeout);
                     if (!status.is2xxSuccessful()) {
                         throw new IllegalStateException("Token request to " + tokenUrl
                                 + " failed with HTTP status " + status.value());
@@ -263,7 +302,9 @@ public class BoxOAuthClient {
         try {
             response = JSON.readTree(body);
         } catch (IOException e) {
-            throw new IllegalStateException(noAccessToken(status), e);
+            // The cause is dropped on purpose: Jackson's message can quote the body, which may hold the access
+            // or refresh token, and its parser keeps a reference to the input buffer.
+            throw new IllegalStateException(noAccessToken(status));
         }
         String accessToken = response == null ? null : textField(response, "access_token");
         if (accessToken == null || accessToken.isBlank()) {
@@ -275,6 +316,44 @@ public class BoxOAuthClient {
 
     private String noAccessToken(int status) {
         return "Token response from " + tokenUrl + " (HTTP status " + status + ") contains no access_token";
+    }
+
+    /**
+     * Reads the whole response body, failing once {@code deadline} (a {@link System#nanoTime()} value) passes.
+     *
+     * <p>The request factory's read timeout ends when the response headers arrive; the JDK client then streams
+     * the body with no timeout of its own, so a server that sends headers and stalls its body would block this
+     * read indefinitely, and for the token request hold the token lock with it. When the deadline passes first,
+     * the stream is closed from the timer thread, which unblocks the read, and the read fails with an
+     * {@link HttpTimeoutException}.
+     *
+     * @throws HttpTimeoutException when the body is not complete by the deadline
+     * @throws IOException          on any other I/O failure while reading
+     */
+    private static byte[] readBody(InputStream body, long deadline, Duration timeout) throws IOException {
+        long remainingMillis = TimeUnit.NANOSECONDS.toMillis(Math.max(0L, deadline - System.nanoTime()));
+        CompletableFuture<Void> expiry = new CompletableFuture<Void>()
+                .completeOnTimeout(null, remainingMillis, TimeUnit.MILLISECONDS);
+        expiry.thenRun(() -> {
+            try {
+                body.close();
+            } catch (IOException ignored) {
+                // The stream is being abandoned; the reading thread reports the timeout.
+            }
+        });
+        try {
+            return body.readAllBytes();
+        } catch (IOException ex) {
+            if (expiry.isDone() && !expiry.isCompletedExceptionally()) {
+                HttpTimeoutException timedOut = new HttpTimeoutException(
+                        "Response not received within " + timeout.toMillis() + " ms");
+                timedOut.initCause(ex);
+                throw timedOut;
+            }
+            throw ex;
+        } finally {
+            expiry.cancel(false);
+        }
     }
 
     /** Returns the scalar value of {@code name} as text, or {@code null} when it is absent, null or not a scalar. */

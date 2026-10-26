@@ -14,6 +14,7 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -51,7 +52,8 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * {@link FimProxyClient} mocked.
  *
  * <p>It covers the {@code uri-param client_id=${client.id}} substitution of every literal {@code {client_id}}
- * placeholder (a blank or unset {@code client.id} substituting nothing), the unchanged method, the requester's
+ * placeholder (the value percent-encoded exactly once, the rest of the raw URI unchanged; a blank or unset
+ * {@code client.id} refused before any call only where a placeholder needs it), the unchanged method, the requester's
  * {@code sendBodyMode} AUTO (no body and no Content-Type for GET, HEAD and OPTIONS in any letter case; both sent
  * unchanged otherwise), the listener's response (always 200, the upstream body bytes, only the upstream
  * Content-Type, an empty body when the upstream sent none) and the absence of an exception strategy (every client
@@ -83,7 +85,7 @@ class FimProxyServiceTest {
     ArgumentCaptor<byte[]> sentBody;
 
     @ParameterizedTest(name = "[{index}] client.id={0}, {1} {2}")
-    @CsvSource(nullValues = "NULL", value = {
+    @CsvSource({
             // no placeholder: forwarded unchanged
             "cid-1, GET,    /FIM/sps/oauth/oauth20/authorize?response_type=code, "
                     + "/FIM/sps/oauth/oauth20/authorize?response_type=code",
@@ -94,11 +96,7 @@ class FimProxyServiceTest {
                     + "/FIM/sps/oauth/oauth20/authorize?client_id=cid-1",
             // every placeholder, in the path and the query alike
             "cid-1, get,    /FIM/{client_id}/x?client_id={client_id}&y={client_id}, "
-                    + "/FIM/cid-1/x?client_id=cid-1&y=cid-1",
-            // blank client.id: the placeholder is removed
-            "'',    PATCH,  /FIM/token?client_id={client_id}, /FIM/token?client_id=",
-            // unset client.id behaves as blank
-            "NULL,  DELETE, /FIM/token?client_id={client_id}, /FIM/token?client_id="
+                    + "/FIM/cid-1/x?client_id=cid-1&y=cid-1"
     })
     void clientIdPlaceholdersAreSubstitutedAndMethodIsForwardedUnchanged(String clientId, String method,
             String rawUri, String expectedUri) {
@@ -109,6 +107,62 @@ class FimProxyServiceTest {
         verify(fimProxyClient).send(sentMethod.capture(), sentUri.capture(), any(), any());
         assertThat(sentMethod.getValue()).isEqualTo(method);
         assertThat(sentUri.getValue()).isEqualTo(expectedUri);
+        verifyNoMoreInteractions(fimProxyClient);
+    }
+
+    @ParameterizedTest(name = "[{index}] client.id={0}")
+    @CsvSource({
+            // unreserved characters are kept as they are
+            "cid-1._~,      /FIM/token?client_id={client_id}, /FIM/token?client_id=cid-1._~",
+            // path, query and fragment delimiters, and '+', stay inside the one value
+            "a/b,           /FIM/token?client_id={client_id}, /FIM/token?client_id=a%2Fb",
+            "a?b=c&d#e,     /FIM/token?client_id={client_id}, /FIM/token?client_id=a%3Fb%3Dc%26d%23e",
+            "a+b,           /FIM/token?client_id={client_id}, /FIM/token?client_id=a%2Bb",
+            // a space, which URI.create would reject
+            "a b,           /FIM/token?client_id={client_id}, /FIM/token?client_id=a%20b",
+            // encoded once: a '%' in the value is itself encoded, never read as an escape
+            "%41,           /FIM/token?client_id={client_id}, /FIM/token?client_id=%2541",
+            // non-ASCII as UTF-8 octets
+            "\u00e9,        /FIM/token?client_id={client_id}, /FIM/token?client_id=%C3%A9",
+            // a value spelling the placeholder is encoded, not substituted again
+            "{client_id},   /FIM/token?client_id={client_id}, /FIM/token?client_id=%7Bclient_id%7D",
+            // every placeholder gets the same encoded value; the rest of the raw URI is not re-encoded
+            "a/b,           /FIM/{client_id}/x?client_id={client_id}&x=%2F, /FIM/a%2Fb/x?client_id=a%2Fb&x=%2F"
+    })
+    void clientIdIsPercentEncodedOnceAndTheRestOfTheUriIsForwardedUnchanged(String clientId, String rawUri,
+            String expectedUri) {
+        when(fimProxyClient.send(any(), any(), any(), any())).thenReturn(ResponseEntity.ok().build());
+
+        serviceWith(clientId).forward("GET", rawUri, null, null);
+
+        verify(fimProxyClient).send(any(), sentUri.capture(), any(), any());
+        assertThat(sentUri.getValue()).isEqualTo(expectedUri);
+        verifyNoMoreInteractions(fimProxyClient);
+    }
+
+    @ParameterizedTest(name = "[{index}] client.id=\"{0}\"")
+    @NullAndEmptySource
+    @ValueSource(strings = {" ", "\t"})
+    void blankClientIdIsRefusedBeforeAnyCallWhenThePlaceholderNeedsIt(String clientId) {
+        Throwable thrown = catchThrowable(
+                () -> serviceWith(clientId).forward("GET", "/FIM/token?client_id={client_id}", null, null));
+
+        assertThat(thrown).isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("client.id is not configured");
+        verifyNoInteractions(fimProxyClient);
+    }
+
+    @ParameterizedTest(name = "[{index}] client.id=\"{0}\"")
+    @NullAndEmptySource
+    @ValueSource(strings = {" "})
+    void blankClientIdStillForwardsAUriWithoutThePlaceholderUnchanged(String clientId) {
+        String rawUri = "/FIM/a%20b?x=%7Bclient_id%7D&client_id=";
+        when(fimProxyClient.send(any(), any(), any(), any())).thenReturn(ResponseEntity.ok().build());
+
+        serviceWith(clientId).forward("POST", rawUri, null, null);
+
+        verify(fimProxyClient).send(any(), sentUri.capture(), any(), any());
+        assertThat(sentUri.getValue()).isEqualTo(rawUri);
         verifyNoMoreInteractions(fimProxyClient);
     }
 
