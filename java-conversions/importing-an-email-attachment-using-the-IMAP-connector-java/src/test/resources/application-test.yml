@@ -1,0 +1,29 @@
+# Spring profile "test", activated for every test by surefire (spring.profiles.active=test in pom.xml); tests only.
+# Points the original imap.* placeholders of imap-to-xml.xml:10, and the smtp.* sender keys the original
+# integration test read from its uncommitted mule.test.properties, at the in-process GreenMail server the tests
+# start (ServerSetupTest.SMTP on 3025 plus ServerSetupTest.IMAPS on 3993) instead of a public mail provider. These
+# are GreenMail test values, not credentials, and this file must never hold a real host, account or password: real
+# values come from the environment variables behind the placeholders of src/main/resources/application.yml. The
+# original test's imap.user_enc (the %40-encoded address Mule needed in its endpoint URI) has no counterpart,
+# because Jakarta Mail takes the plain address. A test that binds GreenMail elsewhere overrides the ports with
+# @DynamicPropertySource.
+imap:
+  host: 127.0.0.1
+  port: 3993                         # GreenMail ServerSetupTest.IMAPS (the original fixes 993)
+  user: receiver@localhost
+  password: receiver-test-pw         # test-only literal; tests create the GreenMail user with exactly this value
+  initial-delay: 86400000            # holds back the @Scheduled poll(); tests call pollOnce() or override this to 0
+  properties:
+    # GreenMail presents a self-signed certificate and Angus Mail checks the server identity by default. The keys
+    # are bracketed so the dots stay inside the map key the poller copies into the jakarta.mail Session.
+    "[mail.imaps.ssl.trust]": "*"
+    "[mail.imaps.ssl.checkserveridentity]": "false"
+
+smtp:
+  host: 127.0.0.1
+  port: 3025                         # GreenMail ServerSetupTest.SMTP
+  user: sender@localhost
+  password: sender-test-pw           # test-only literal
+
+orders:
+  output-dir: target/test-output     # tests override it with a @TempDir through @DynamicPropertySource

@@ -1,0 +1,12 @@
+# Spring profile "test", activated with @ActiveProfiles("test") by the surefire tests only; overlays
+# src/main/resources/application.yml. Points the AMQP client at the embedded Qpid Broker-J the tests start.
+# The broker's port is free-chosen at start-up and registered with @DynamicPropertySource, so none is set here.
+# guest/guest is the embedded broker's demo user declared in src/test/resources/config.json (the original
+# test broker's work/etc/passwd held the same guest:guest entry); it is not a real credential.
+amqp:
+  host: localhost   # original test property amqp.host (SendingJsonDataToAmqpQueueIT.java:131)
+spring:
+  rabbitmq:
+    host: localhost
+    username: guest
+    password: guest
