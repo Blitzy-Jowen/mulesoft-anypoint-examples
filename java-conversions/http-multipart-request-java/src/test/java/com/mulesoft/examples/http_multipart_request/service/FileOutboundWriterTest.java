@@ -19,12 +19,7 @@ import java.nio.file.AccessDeniedException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.nio.file.StandardWatchEventKinds;
-import java.nio.file.WatchEvent;
-import java.nio.file.WatchKey;
-import java.nio.file.WatchService;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -33,7 +28,6 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -80,6 +74,10 @@ class FileOutboundWriterTest {
     private static final Pattern DEFAULT_NAME =
             Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.dat");
 
+    /** The name of a temporary file: hidden, a random version-4 UUID and {@code .tmp}. */
+    private static final Pattern TEMPORARY_NAME =
+            Pattern.compile("\\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.tmp");
+
     /** Simultaneous writers of one file name. */
     private static final int WRITERS = 8;
 
@@ -94,9 +92,6 @@ class FileOutboundWriterTest {
 
     /** Upper bound, in seconds, of every wait on another thread. */
     private static final long WAIT_SECONDS = 60;
-
-    /** Sixteen MiB and seven bytes: content whose write keeps a temporary file in place long enough to watch. */
-    private static final int WATCHED_SIZE = 16 * 1024 * 1024 + 7;
 
     /** Readable and writable by the owner only. */
     private static final Set<PosixFilePermission> OWNER_ONLY = PosixFilePermissions.fromString("rw-------");
@@ -536,44 +531,47 @@ class FileOutboundWriterTest {
     }
 
     /**
-     * While an owner-only file is replaced several times with content far larger than one write buffer, a watcher
-     * of the directory reads the permissions of each temporary file it catches before its rename: none is
-     * readable or writable by anyone but its owner. Only the temporary files the watcher catches are asserted on.
+     * A file of an owner-only or a wider mode is replaced several times, each time with new content far larger than
+     * one write buffer, by a writer whose temporary-file observer runs in the writing thread once the temporary file
+     * holds the whole content, before it takes the replaced file's mode and is renamed into place. Each write must
+     * show the observer exactly one temporary file, and at that point the file is a hidden {@code .<uuid>.tmp} beside
+     * the target, readable and writable by its owner only, holding the whole new content, while the target still
+     * holds the previous content. After each write that temporary file is gone, and the target, alone in its
+     * directory, holds the new content with its own mode, which for the wider modes the temporary file did not have.
      *
-     * @throws Exception when a file operation or a wait on another thread fails
+     * @param permissions the mode of the file being replaced
+     * @throws IOException when a file operation of the test fails
      */
-    @Test
-    @Timeout(value = 5, unit = TimeUnit.MINUTES)
-    void temporaryFilesCaughtDuringReplacementAreOwnerOnly() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {"rw-------", "rw-r-----", "rw-r--r--"})
+    void temporaryFileIsOwnerOnlyOnceItHoldsTheContentOfEachReplacement(String permissions) throws IOException {
         Path dir = tempDir.resolve("out");
         Path target = writer.write(dir, "private.dat", "old");
-        Files.setPosixFilePermissions(target, OWNER_ONLY);
-        byte[] content = new byte[WATCHED_SIZE];
-        Arrays.fill(content, (byte) 'S');
-        AtomicBoolean writing = new AtomicBoolean(true);
-        ExecutorService pool = Executors.newSingleThreadExecutor();
-        try (WatchService watcher = dir.getFileSystem().newWatchService()) {
-            dir.register(watcher, StandardWatchEventKinds.ENTRY_CREATE);
-            Future<List<Set<PosixFilePermission>>> caught =
-                    pool.submit(() -> watchTemporaryFiles(watcher, dir, writing));
-            try {
-                for (int round = 0; round < ROUNDS; round++) {
-                    writer.write(dir, "private.dat", content);
-                }
-            } finally {
-                writing.set(false);
-            }
-            for (Set<PosixFilePermission> mode : await(caught)) {
-                assertThat(OWNER_ONLY).containsAll(mode);
-            }
-        } finally {
-            pool.shutdownNow();
-            assertThat(pool.awaitTermination(WAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
-        }
+        Set<PosixFilePermission> mode = PosixFilePermissions.fromString(permissions);
+        Files.setPosixFilePermissions(target, mode);
+        byte[] previous = Files.readAllBytes(target);
+        for (int round = 1; round <= ROUNDS; round++) {
+            byte[] content = filled((byte) round);
+            byte[] replaced = previous;
+            List<Path> observed = new ArrayList<>();
+            FileOutboundWriter observing = new FileOutboundWriter(temp -> {
+                assertThat(temp.getParent()).isEqualTo(dir);
+                assertThat(temp.getFileName().toString()).matches(TEMPORARY_NAME);
+                assertThat(OWNER_ONLY).containsAll(Files.getPosixFilePermissions(temp, LinkOption.NOFOLLOW_LINKS));
+                assertThat(Arrays.mismatch(Files.readAllBytes(temp), content)).isEqualTo(-1);
+                assertThat(Arrays.mismatch(Files.readAllBytes(target), replaced)).isEqualTo(-1);
+                observed.add(temp);
+            });
 
-        assertThat(Files.getPosixFilePermissions(target)).isEqualTo(OWNER_ONLY);
-        assertThat(Arrays.mismatch(Files.readAllBytes(target), content)).isEqualTo(-1);
-        assertThat(names(dir)).containsExactly("private.dat");
+            observing.write(dir, "private.dat", content);
+
+            assertThat(observed).hasSize(1);
+            assertThat(observed.get(0)).doesNotExist();
+            assertThat(Files.getPosixFilePermissions(target)).isEqualTo(mode);
+            assertThat(Arrays.mismatch(Files.readAllBytes(target), content)).isEqualTo(-1);
+            assertThat(names(dir)).containsExactly("private.dat");
+            previous = content;
+        }
     }
 
     /**
@@ -876,50 +874,6 @@ class FileOutboundWriterTest {
                 throw exception;
             }
             throw failed;
-        }
-    }
-
-    /**
-     * Collects, until {@code writing} turns false, the POSIX permissions of each temporary file whose creation in
-     * {@code dir} {@code watcher} reports and that still exists when it is read; one already renamed into place by
-     * then is not collected.
-     *
-     * @param watcher the watch service {@code dir} is registered with for creations
-     * @param dir     the watched directory
-     * @param writing true while the writes being watched go on
-     * @return the permissions of every temporary file caught, in the order caught
-     * @throws IOException          when the permissions of a caught file cannot be read
-     * @throws InterruptedException when the wait for an event is interrupted
-     */
-    private static List<Set<PosixFilePermission>> watchTemporaryFiles(WatchService watcher, Path dir,
-            AtomicBoolean writing) throws IOException, InterruptedException {
-        List<Set<PosixFilePermission>> caught = new ArrayList<>();
-        while (writing.get()) {
-            WatchKey key = watcher.poll(10, TimeUnit.MILLISECONDS);
-            if (key != null) {
-                for (WatchEvent<?> event : key.pollEvents()) {
-                    if (event.context() instanceof Path name && name.toString().endsWith(".tmp")) {
-                        permissionsIfPresent(dir.resolve(name)).ifPresent(caught::add);
-                    }
-                }
-                key.reset();
-            }
-        }
-        return caught;
-    }
-
-    /**
-     * Reads the POSIX permissions of {@code file} without following a link.
-     *
-     * @param file the file
-     * @return its permissions, or empty when it no longer exists
-     * @throws IOException when the permissions cannot be read for another reason
-     */
-    private static Optional<Set<PosixFilePermission>> permissionsIfPresent(Path file) throws IOException {
-        try {
-            return Optional.of(Files.getPosixFilePermissions(file, LinkOption.NOFOLLOW_LINKS));
-        } catch (NoSuchFileException renamedAway) {
-            return Optional.empty();
         }
     }
 

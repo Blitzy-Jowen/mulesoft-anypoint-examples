@@ -110,11 +110,26 @@ public class FileOutboundWriter {
      */
     private static final ConcurrentMap<Path, TargetLock> LOCKS = new ConcurrentHashMap<>();
 
+    /** The observer each temporary file is shown to once it holds the content, or {@code null} for none. */
+    private final TemporaryFileObserver temporaryFileObserver;
+
     /**
-     * Creates a writer; every instance shares the class's per-destination locks, so one instance or several serve
-     * callers alike.
+     * Creates a writer, with no temporary-file observer; every instance shares the class's per-destination locks, so
+     * one instance or several serve callers alike.
      */
     public FileOutboundWriter() {
+        this.temporaryFileObserver = null;
+    }
+
+    /**
+     * Creates a writer that shows {@code temporaryFileObserver} the temporary file of each whole-file write once it
+     * holds the content, before it takes the replaced file's POSIX permissions and is renamed into place; it shares
+     * the class's per-destination locks like every instance. Package-private for the unit test only.
+     *
+     * @param temporaryFileObserver the observer of each temporary file
+     */
+    FileOutboundWriter(TemporaryFileObserver temporaryFileObserver) {
+        this.temporaryFileObserver = Objects.requireNonNull(temporaryFileObserver, "temporaryFileObserver");
     }
 
     /**
@@ -125,7 +140,9 @@ public class FileOutboundWriter {
      * ordinary create gives it. A symbolic link at {@code dir/name} is followed and the file it links to is the one
      * replaced or created. An existing file that is neither a regular file nor a directory is written in place, and
      * so is an existing file in a directory that refuses the process the temporary file or its rename, as a sticky
-     * directory refuses the rename over a file another user owns; readers can then see it part-written.
+     * directory refuses the rename over a file another user owns; readers can then see it part-written. A writer
+     * created with a temporary-file observer shows it the temporary file once it holds the content, and a failure of
+     * the observer ends the write as a failed write does.
      *
      * @param dir     the target directory, created with its missing parents
      * @param name    the resolved output file name
@@ -152,7 +169,7 @@ public class FileOutboundWriter {
         try {
             entry.lock.lock();
             try {
-                replace(destination, content);
+                replace(destination, content, temporaryFileObserver);
             } finally {
                 entry.lock.unlock();
             }
@@ -239,8 +256,9 @@ public class FileOutboundWriter {
     /**
      * Writes {@code content} to {@code destination}; the caller holds the destination's lock. A regular file, or a
      * missing one, is replaced as a whole: the content is written to a new hidden file in the destination's
-     * directory, created by {@link #createTemporaryFile(Path, Path)} before any content reaches it, then given the
-     * existing file's POSIX permissions and renamed over the destination. When the directory refuses to create the
+     * directory, created by {@link #createTemporaryFile(Path, Path)} before any content reaches it, shown to
+     * {@code observer} once it holds the whole content and is closed, then given the existing file's POSIX
+     * permissions and renamed over the destination. When the directory refuses to create the
      * temporary file with an {@link AccessDeniedException}, before any content is written, the destination is
      * written in place by {@link #writeInPlace(Path, byte[])} instead, as Mule wrote it: an existing file the
      * process may write is overwritten, keeping its inode, owner and mode but not atomically for its readers, and a
@@ -248,18 +266,20 @@ public class FileOutboundWriter {
      * directory refuses it over a file another user owns, the temporary file is removed and a destination that is
      * still an existing regular file is written in place the same way: the in-place write's outcome is the one
      * reported, a failure of it carrying the refused rename as a suppressed exception, while the refused rename of a
-     * new file is thrown unchanged. On any other failure the temporary file is removed and the destination is left
-     * as it was. An existing file that is neither a regular file nor a directory, such as a named pipe or a device,
-     * is written in place the same way.
+     * new file is thrown unchanged. On any other failure, a failure of {@code observer} included, the temporary file
+     * is removed and the destination is left as it was. An existing file that is neither a regular file nor a
+     * directory, such as a named pipe or a device, is written in place the same way.
      *
      * @param destination the file to replace or create, never a symbolic link
      * @param content     the bytes the file must hold
+     * @param observer    the observer of the temporary file, or {@code null} for none
      * @throws AccessDeniedException when the destination is a regular file the process may not write, or a new file
      *                               its directory does not let the process create; no file is created
-     * @throws IOException           when the destination is a directory, the file cannot be written, or a new file
-     *                               cannot be renamed into place
+     * @throws IOException           when the destination is a directory, the file cannot be written, a new file
+     *                               cannot be renamed into place, or {@code observer} throws it
      */
-    private static void replace(Path destination, byte[] content) throws IOException {
+    private static void replace(Path destination, byte[] content, TemporaryFileObserver observer)
+            throws IOException {
         if (Files.isDirectory(destination)) {
             throw new FileSystemException(destination.toString(), null, "Is a directory");
         }
@@ -288,6 +308,9 @@ public class FileOutboundWriter {
                 while (remaining.hasRemaining()) {
                     channel.write(remaining);
                 }
+            }
+            if (observer != null) {
+                observer.contentWritten(temp);
             }
             copyPosixPermissions(destination, temp);
         } catch (IOException | RuntimeException | Error failure) {
@@ -406,6 +429,25 @@ public class FileOutboundWriter {
         } catch (IOException cleanupFailure) {
             failure.addSuppressed(cleanupFailure);
         }
+    }
+
+    /**
+     * Observes the temporary file of a whole-file write once it holds the content. Package-private for the unit test
+     * only.
+     */
+    interface TemporaryFileObserver {
+
+        /**
+         * Called in the writing thread, under the destination's lock, once the temporary file that will replace or
+         * create the destination holds the whole content and its channel is closed, before it takes the replaced
+         * file's POSIX permissions and is renamed into place. A failure it throws ends the write like any write
+         * failure: the temporary file is removed, the destination is left as it was and the failure reaches the
+         * caller unchanged.
+         *
+         * @param temp the temporary file, holding the whole content
+         * @throws IOException to end the write with this failure
+         */
+        void contentWritten(Path temp) throws IOException;
     }
 
     /**
