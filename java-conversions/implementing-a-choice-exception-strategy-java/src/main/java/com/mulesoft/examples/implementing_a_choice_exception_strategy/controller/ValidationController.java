@@ -9,15 +9,16 @@
 package com.mulesoft.examples.implementing_a_choice_exception_strategy.controller;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Optional;
 
 import com.mulesoft.examples.implementing_a_choice_exception_strategy.exception.ChoiceExceptionHandler;
 import com.mulesoft.examples.implementing_a_choice_exception_strategy.service.InputValidationService;
+import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -40,13 +41,18 @@ import org.springframework.web.bind.annotation.RestController;
  * {@link ChoiceExceptionHandler#PAYLOAD_ATTRIBUTE}. The validator's {@link IllegalArgumentException} and
  * {@link NullPointerException} therefore propagate unwrapped, and every other failure reaches the platform-default
  * 500.
+ *
+ * <p>The success reply and the filter-rejection reply are written to the servlet response directly, with a
+ * {@code Content-Length} and no {@code Content-Type}: the flow's {@code set-payload} declares no MIME type, and the
+ * Mule listener sent no Content-Type for such a payload.
  */
 @RestController
 public class ValidationController {
 
     /**
-     * Content-Type of the success body and of the two error-branch bodies; preset on each entity so Spring writes it
-     * without consulting {@code Accept}. A Tier 2A verification point of the conversion plan.
+     * Content-Type of the two error-branch bodies, which {@link ChoiceExceptionHandler} presets on each entity so
+     * Spring writes it without consulting {@code Accept}; the success body carries none. A Tier 2A verification
+     * point of the conversion plan.
      */
     public static final MediaType RESPONSE_CONTENT_TYPE = MediaType.parseMediaType("text/plain;charset=UTF-8");
 
@@ -62,15 +68,14 @@ public class ValidationController {
      *
      * @param body     the raw request body, {@code null} when the request has none
      * @param request  the current request, which carries the payload to the error branches
-     * @param response the current response, committed directly for the empty filter-rejection reply
-     * @return 200 {@code text/plain;charset=UTF-8} {@code Input data validation passed.}, or an empty 200 with no
-     *         {@code Content-Type} when a filter rejects the message
-     * @throws IOException if the empty filter-rejection reply cannot be written
+     * @param response the current response, to which 200 {@code Input data validation passed.} is written, or an
+     *                 empty 200 when a filter rejects the message
+     * @throws IOException if the reply cannot be written
      */
     @RequestMapping("/")
-    public ResponseEntity<String> handle(@RequestBody(required = false) byte[] body, HttpServletRequest request,
-                                         HttpServletResponse response) throws IOException {
-        return respond(body, request, response);
+    public void handle(@RequestBody(required = false) byte[] body, HttpServletRequest request,
+                       HttpServletResponse response) throws IOException {
+        respond(body, request, response);
     }
 
     /**
@@ -80,19 +85,21 @@ public class ValidationController {
      *
      * @param body     the raw request body, {@code null} when the request has none
      * @param request  the current request, which carries the payload to the error branches
-     * @param response the current response, committed directly for the empty filter-rejection reply
-     * @return the same response as {@link #handle}
-     * @throws IOException if the empty filter-rejection reply cannot be written
+     * @param response the current response, written as by {@link #handle}
+     * @throws IOException if the reply cannot be written
      */
     @RequestMapping(path = "/", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> handleOptions(@RequestBody(required = false) byte[] body,
-                                                HttpServletRequest request,
-                                                HttpServletResponse response) throws IOException {
-        return respond(body, request, response);
+    public void handleOptions(@RequestBody(required = false) byte[] body, HttpServletRequest request,
+                              HttpServletResponse response) throws IOException {
+        respond(body, request, response);
     }
 
-    private ResponseEntity<String> respond(byte[] body, HttpServletRequest request, HttpServletResponse response)
-            throws IOException {
+    /**
+     * Runs the flow and writes its result. Nothing is written before validation returns, so the validator's
+     * exceptions still find an uncommitted response for {@link ChoiceExceptionHandler} and every other failure for
+     * the 500 of {@code GlobalExceptionHandler}.
+     */
+    private void respond(byte[] body, HttpServletRequest request, HttpServletResponse response) throws IOException {
         // Spring binds an absent body as null; an empty array makes it fail as unreadable JSON (the 500) rather than
         // as a null argument, which would be an IllegalArgumentException and select the "Invalid input data" branch.
         byte[] input = body == null ? new byte[0] : body;
@@ -100,15 +107,19 @@ public class ValidationController {
         // Stored before validation: the error branches render "#[payload]" from it.
         request.setAttribute(ChoiceExceptionHandler.PAYLOAD_ATTRIBUTE, payload);
         Optional<String> result = inputValidationService.validate(payload);
+        response.setStatus(HttpServletResponse.SC_OK);
         if (result.isPresent()) {
-            return ResponseEntity.ok().contentType(RESPONSE_CONTENT_TYPE).body(result.get());
+            byte[] bytes = result.get().getBytes(StandardCharsets.UTF_8);
+            response.setContentLength(bytes.length);
+            ServletOutputStream stream = response.getOutputStream();
+            stream.write(bytes);
+            stream.flush();
+            return;
         }
-        // Filter rejection: an empty 200 with no Content-Type. A body-less ResponseEntity leaves the response
-        // uncommitted, and after the handler FrameworkServlet completes an uncommitted TRACE reply with HttpServlet's
-        // message/http echo and an uncommitted OPTIONS reply with an Allow header; committing it here keeps the reply
-        // of every method identical, which is why this method also takes the servlet response.
+        // Filter rejection: an empty 200 with no Content-Type, committed here. After the handler FrameworkServlet
+        // completes an uncommitted TRACE reply with HttpServlet's message/http echo and an uncommitted OPTIONS reply
+        // with an Allow header; committing the empty reply keeps the reply of every method identical.
         response.setContentLength(0);
         response.flushBuffer();
-        return ResponseEntity.ok().build();
     }
 }

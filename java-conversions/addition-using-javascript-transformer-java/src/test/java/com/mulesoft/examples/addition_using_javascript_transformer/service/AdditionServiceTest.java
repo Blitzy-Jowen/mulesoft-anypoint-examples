@@ -15,6 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -33,8 +35,9 @@ import ch.qos.logback.core.read.ListAppender;
 /**
  * Unit tests of {@link AdditionService}, the flow {@code javascript-calculatorFlow1}
  * (addition-using-javascript-transformer/src/main/app/javascript-calculator.xml:6-15): the result types of
- * {@link AdditionService#sum(String)}, the response and log line of {@link AdditionService#handle}, and the
- * conversions {@link AdditionService#render(Object)} and {@link AdditionService#jsToString(Object)}.
+ * {@link AdditionService#sum(String)}, the response and log line of {@link AdditionService#handle}, the conversions
+ * {@link AdditionService#render(Object)} and {@link AdditionService#jsToString(Object)}, and the rendering and
+ * evaluation of the parameter map the listener made of a form-urlencoded body.
  *
  * <p>The corpus of Rhino 1.7R4 literal forms and failures lives in {@link AdditionServiceLiteralParityTest} and is
  * not repeated here: primitive and empty roots, duplicate keys, comments, signs, empty, blank and missing bodies,
@@ -170,6 +173,68 @@ class AdditionServiceTest {
         assertTrue(e.getMessage().startsWith("SyntaxError: "), e.getMessage());
     }
 
+    /**
+     * Parameter maps of a form-urlencoded body, with the response the script gives their rendering: an absent or
+     * empty map renders as {@code {}}, which sums to {@code 0.0}, and a name that closes the literal and comments
+     * out the rest of the rendering shows that the rendering reaches the script unchanged.
+     */
+    static Stream<Arguments> evaluableParameterMaps() {
+        return Stream.of(
+                arguments(Map.of(), "Sum is: 0.0."),
+                arguments(null, "Sum is: 0.0."),
+                arguments(Collections.singletonMap("x:1})//", null), "Sum is: 1.0."));
+    }
+
+    /**
+     * Parameter maps whose rendering is not a JavaScript literal, so the original script failed on them: a name
+     * without a value, the original test's JSON body posted with curl's default form type, which decodes to that
+     * JSON text as a name without a value, and two named values.
+     */
+    static Stream<Map<String, String>> unevaluableParameterMaps() {
+        Map<String, String> namedValues = new LinkedHashMap<>();
+        namedValues.put("a", "1");
+        namedValues.put("b", "2");
+        return Stream.of(
+                Collections.singletonMap("k", null),
+                Collections.singletonMap(ORIGINAL_MESSAGE, null),
+                namedValues);
+    }
+
+    /**
+     * Parameter maps with Mule's rendering of them: hash order rather than body order, {@code null} for an absent
+     * value, and {@code *****} for the value of {@code password} alone, compared case-sensitively.
+     */
+    static Stream<Arguments> parameterMapRenderings() {
+        return Stream.of(
+                arguments(Map.of(), "{}"),
+                arguments(orderedMap("c", "1", "a", "1"), "{a=1, c=1}"),
+                arguments(orderedMap("user", "mule", "password", "secret", "Password", "x", "passwd", "y"),
+                        "{Password=x, password=*****, passwd=y, user=mule}"),
+                arguments(orderedMap("password", null, "k", null), "{password=null, k=null}"),
+                arguments(orderedMap("purchases", "2000", "months", "12", "membership", "free"),
+                        "{months=12, membership=free, purchases=2000}"));
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("evaluableParameterMaps")
+    void evaluatesTheRenderingOfAParameterMap(Map<String, String> parameters, String expectedResponse) {
+        assertEquals(expectedResponse, service.handle(parameters));
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("unevaluableParameterMaps")
+    void rejectsAParameterMapAsTheScriptDid(Map<String, String> parameters) {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> service.handle(parameters));
+
+        assertTrue(e.getMessage().startsWith("SyntaxError: "), e.getMessage());
+    }
+
+    @ParameterizedTest(name = "[{index}] {1}")
+    @MethodSource("parameterMapRenderings")
+    void rendersAParameterMapAsMuleDid(Map<String, String> parameters, String expected) {
+        assertEquals(expected, AdditionService.renderParameterMap(parameters));
+    }
+
     @Test
     void rejectsAMissingText() {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> service.sum(null));
@@ -200,6 +265,15 @@ class AdditionServiceTest {
 
     private String handleUtf8(String json) {
         return service.handle(json.getBytes(StandardCharsets.UTF_8), StandardCharsets.UTF_8);
+    }
+
+    /** A map of the given name and value pairs in that order; values may be {@code null}. */
+    private static Map<String, String> orderedMap(String... namesAndValues) {
+        Map<String, String> map = new LinkedHashMap<>();
+        for (int i = 0; i < namesAndValues.length; i += 2) {
+            map.put(namesAndValues[i], namesAndValues[i + 1]);
+        }
+        return map;
     }
 
     /**

@@ -14,6 +14,7 @@ import java.math.MathContext;
 import java.math.RoundingMode;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.AbstractMap;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -143,6 +144,12 @@ public class AdditionService {
 
     private static final BigDecimal PLAIN_UPPER_BOUND = new BigDecimal("1e21");
 
+    /** The property name Mule 3.8's {@code PropertiesUtils} registers for masking when it renders a map. */
+    private static final String MASKED_PARAMETER = "password";
+
+    /** The text Mule 3.8's {@code PropertiesUtils} writes in place of a masked value. */
+    private static final String MASKED_VALUE = "*****";
+
     /**
      * Runs the flow from the request body to the response payload.
      *
@@ -156,12 +163,89 @@ public class AdditionService {
     public String handle(byte[] body, Charset cs) {
         Charset charset = cs == null ? StandardCharsets.UTF_8 : cs;
         String text = body == null ? "" : new String(body, charset);
+        return evaluate(text);
+    }
+
+    /**
+     * Runs the flow from the listener's parameter-map payload to the response payload. The Mule 3.8 listener made a
+     * non-empty {@code application/x-www-form-urlencoded} body a parameter map rather than a stream, and line 6's
+     * {@code byte-array-to-string-transformer}, which Mule's namespace handler implements with {@code ObjectToString},
+     * turned that map into the text {@link #renderParameterMap(Map)} reproduces; the script then evaluates that text
+     * like any other. A rendering such as {@code {a=1}} is not a JavaScript literal and fails with Rhino's
+     * {@code SyntaxError}, while an empty map renders as {@code {}} and sums to {@code 0.0}.
+     *
+     * @param parameters the decoded form parameters in first-occurrence order, each name with its last value or
+     *                   {@code null}; {@code null} is read as an empty map
+     * @return {@code Sum is: <sum>.}
+     * @throws IllegalArgumentException when the rendering fails as the script failed, see {@link #sum(String)}; or
+     *         when the rendering or the response would be longer than {@link #MAX_STRING_LENGTH}
+     */
+    public String handle(Map<String, String> parameters) {
+        return evaluate(renderParameterMap(parameters));
+    }
+
+    /**
+     * Lines 7-15 for the payload text: the script's sum, MEL's rendering of it, the logger and the response payload.
+     */
+    private String evaluate(String text) {
         Object result = sum(text);
         String rendered = render(result);
         // The response is the longest string the flow builds, so checking it first keeps the logged line in bounds.
         requireStringLength("Sum is: ".length() + (long) rendered.length() + ".".length());
         log.info("Sum is: {}", rendered);
         return "Sum is: " + rendered + ".";
+    }
+
+    /**
+     * Renders a parameter map as Mule 3.8's {@code ObjectToString} rendered the listener's {@code ParameterMap},
+     * through {@code StringMessageUtils.toString} and {@code MapUtils.toString(map, false)}:
+     * <ul>
+     *   <li>an empty map is {@code {}};</li>
+     *   <li>otherwise the entries are visited in the order of the {@link HashSet} of
+     *       {@link AbstractMap.SimpleEntry} that {@code ParameterMap.entrySet()} built by adding one entry per name,
+     *       in the map's name order, so the order is the set's hash order rather than the body's;</li>
+     *   <li>each entry is written {@code name=value}, the value being {@code null} when absent and {@code *****} for
+     *       the name {@code password}, the one name {@code PropertiesUtils} masks by default;</li>
+     *   <li>entries are separated by {@code ", "} and the whole is enclosed in braces.</li>
+     * </ul>
+     *
+     * @param parameters the parameter map; {@code null} renders as {@code {}}, as {@code MapUtils} rendered it
+     * @return the rendering
+     * @throws IllegalArgumentException when the rendering would be longer than {@link #MAX_STRING_LENGTH}
+     */
+    static String renderParameterMap(Map<String, String> parameters) {
+        if (parameters == null || parameters.isEmpty()) {
+            return "{}";
+        }
+        Set<Map.Entry<String, String>> entries = new HashSet<>();
+        for (Map.Entry<String, String> parameter : parameters.entrySet()) {
+            entries.add(new AbstractMap.SimpleEntry<>(parameter.getKey(), parameter.getValue()));
+        }
+        StringBuilder rendering = new StringBuilder("{");
+        long length = rendering.length() + "}".length();
+        String separator = "";
+        for (Map.Entry<String, String> entry : entries) {
+            String text = separator + entry.getKey() + "=" + maskedValue(entry);
+            length += text.length();
+            requireStringLength(length);
+            rendering.append(text);
+            separator = ", ";
+        }
+        return rendering.append('}').toString();
+    }
+
+    /**
+     * Mule's {@code PropertiesUtils.maskedPropertyValue}: the text {@code null} for an absent value, whatever the name;
+     * {@code *****} for the masked name {@code password}; otherwise the value.
+     */
+    private static String maskedValue(Map.Entry<String, String> entry) {
+        if (entry.getKey() == null || entry.getValue() == null) {
+            return "null";
+        }
+        if (MASKED_PARAMETER.equals(entry.getKey())) {
+            return MASKED_VALUE;
+        }
+        return entry.getValue();
     }
 
     /**

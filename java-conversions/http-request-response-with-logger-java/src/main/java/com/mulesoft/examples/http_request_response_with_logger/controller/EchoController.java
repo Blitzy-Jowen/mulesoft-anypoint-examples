@@ -8,12 +8,15 @@
 
 package com.mulesoft.examples.http_request_response_with_logger.controller;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
 import com.mulesoft.examples.http_request_response_with_logger.service.EchoService;
 
+import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -31,15 +34,16 @@ import org.springframework.web.bind.annotation.RestController;
  * sent, without the query string and without percent-decoding, the same value as Mule's
  * {@code http.request.path} inbound property; the context path is empty, so nothing is stripped.
  *
- * <p>Three details are Mule platform defaults the flow does not state, and are Tier 2A verification points that
- * a captured fixture of the original overrides: the response Content-Type {@code text/plain;charset=UTF-8}, the
- * retention of percent-encoding in the echoed path ({@code /hello%20world}), and the root path {@code /} being
- * served and echoed as {@code /}.
+ * <p>The reply carries a {@code Content-Length} and no {@code Content-Type}: the flow's {@code set-payload}
+ * declares no MIME type, and the Mule listener sent no Content-Type for such a payload. It is written to the servlet
+ * response directly, so no message converter adds one.
+ *
+ * <p>Two details are Mule platform defaults the flow does not state, and are Tier 2A verification points that a
+ * captured fixture of the original overrides: the retention of percent-encoding in the echoed path
+ * ({@code /hello%20world}), and the root path {@code /} being served and echoed as {@code /}.
  */
 @RestController
 public class EchoController {
-
-    private static final MediaType TEXT_PLAIN_UTF8 = MediaType.parseMediaType("text/plain;charset=UTF-8");
 
     private final EchoService echoService;
 
@@ -52,12 +56,13 @@ public class EchoController {
      * headers without the body. {@code TRACE} reaches this mapping only because {@code application.yml} sets
      * {@code spring.mvc.dispatch-trace-request}; without it the servlet answers {@code TRACE} itself.
      *
-     * @param request the inbound request, read for its raw path only
-     * @return 200 {@code text/plain;charset=UTF-8} with the request path as body
+     * @param request  the inbound request, read for its raw path only
+     * @param response the response the request path is written to, as 200 with its UTF-8 bytes
+     * @throws IOException when writing the response fails
      */
     @RequestMapping("/**")
-    public ResponseEntity<String> echo(HttpServletRequest request) {
-        return echoResponse(request);
+    public void echo(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        echoResponse(request, response);
     }
 
     /**
@@ -65,19 +70,26 @@ public class EchoController {
      * does not match {@code OPTIONS}, which Spring MVC would otherwise answer itself with an {@code Allow} header
      * and no body; the Mule listener ran the flow for {@code OPTIONS} too.
      *
-     * @param request the inbound request, read for its raw path only
-     * @return 200 {@code text/plain;charset=UTF-8} with the request path as body
+     * @param request  the inbound request, read for its raw path only
+     * @param response the response the request path is written to, as 200 with its UTF-8 bytes
+     * @throws IOException when writing the response fails
      */
     @RequestMapping(value = "/**", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> echoOptions(HttpServletRequest request) {
-        return echoResponse(request);
+    public void echoOptions(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        echoResponse(request, response);
     }
 
     /**
-     * The Content-Type is preset on the entity, so Spring writes the body without consulting {@code Accept} and
-     * can never answer 406.
+     * Writes 200 with the payload's UTF-8 bytes and their {@code Content-Length}. The payload is obtained before the
+     * response is touched, so a failure still finds an uncommitted response for the 500 of
+     * {@code GlobalExceptionHandler}.
      */
-    private ResponseEntity<String> echoResponse(HttpServletRequest request) {
-        return ResponseEntity.ok().contentType(TEXT_PLAIN_UTF8).body(echoService.echo(request.getRequestURI()));
+    private void echoResponse(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        byte[] bytes = echoService.echo(request.getRequestURI()).getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        response.setContentLength(bytes.length);
+        ServletOutputStream stream = response.getOutputStream();
+        stream.write(bytes);
+        stream.flush();
     }
 }

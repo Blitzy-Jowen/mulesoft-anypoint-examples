@@ -11,6 +11,7 @@ package com.mulesoft.examples.hello_world.controller;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -92,7 +93,7 @@ class HelloWorldControllerTest {
     }
 
     @Test
-    void acceptJsonStillReturnsPlainText() {
+    void acceptHeaderIsIgnored() {
         assertHelloWorld(client().get(HELLO_WORLD_PATH, Map.of("Accept", "application/json")));
     }
 
@@ -136,15 +137,16 @@ class HelloWorldControllerTest {
         }
     }
 
+    /**
+     * The original's {@code set-payload} declares no MIME type, so its listener sent no {@code Content-Type}: the
+     * reply carries none, only the length of its 11 bytes.
+     */
     private static void assertHelloWorld(HttpTestClient.Response response) {
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
         assertEquals(200, response.status(), response::toString);
         assertEquals("OK", response.reason(), response::toString);
-        String contentType = response.header("Content-Type");
-        assertEquals("text/plain;charset=UTF-8", contentType, response::toString);
-        MediaType mediaType = MediaType.parseMediaType(contentType);
-        assertTrue(mediaType.equalsTypeAndSubtype(MediaType.TEXT_PLAIN), response::toString);
-        assertEquals(StandardCharsets.UTF_8, mediaType.getCharset(), response::toString);
+        assertNull(response.header("Content-Type"), response::toString);
+        assertEquals("11", response.header("Content-Length"), response::toString);
         assertArrayEquals("Hello World".getBytes(StandardCharsets.UTF_8), response.body(), response::toString);
     }
 

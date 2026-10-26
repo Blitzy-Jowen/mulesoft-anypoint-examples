@@ -13,11 +13,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.Collections;
+import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.system.CapturedOutput;
@@ -26,7 +30,8 @@ import org.springframework.boot.test.system.OutputCaptureExtension;
 /**
  * Unit test of {@link LanguageRoutingService}, which replaces flow {@code content-based-routingFlow} and sub-flow
  * {@code replyInDefaultLanguage} of content-based-routing/src/main/app/content-based-routing.xml: the favicon
- * {@code expression-filter}, the {@code choice} on the {@code language} query parameter and both INFO loggers.
+ * {@code expression-filter} over text, parameter-map and null payloads, the {@code choice} on the {@code language}
+ * query parameter and both INFO loggers.
  *
  * <p>Expected values are string literals copied from the flow rather than the service's constants, so the tests pin
  * the original payload and log bytes instead of whatever the constants hold.
@@ -112,6 +117,30 @@ class LanguageRoutingServiceTest {
     @ValueSource(strings = {"hello", "/favicon.ico/", "/FAVICON.ICO", "/"})
     void otherPayloadPassesTheFilter(String payload) {
         assertEquals(Optional.of("Hola!"), service.reply(payload, "Spanish"));
+    }
+
+    /**
+     * A form-urlencoded body is the listener's parameter map, never the text {@code /favicon.ico}, so it passes the
+     * filter and routes even when it names that path: the body {@code /favicon.ico} decodes to the name
+     * {@code /favicon.ico} without a value.
+     */
+    @ParameterizedTest
+    @MethodSource("formParameterPayloads")
+    void formParameterMapPassesTheFilterAndRoutes(Map<String, String> payload, CapturedOutput output) {
+        int mark = output.getOut().length();
+
+        Optional<String> result = service.reply(payload, "Spanish");
+
+        String logged = output.getOut().substring(mark);
+        assertEquals(Optional.of("Hola!"), result);
+        assertTrue(logged.contains("The reply \"Hola!\" means \"hello\" in Spanish."), logged);
+    }
+
+    static Stream<Map<String, String>> formParameterPayloads() {
+        return Stream.of(
+                Collections.singletonMap("/favicon.ico", null),
+                Map.of("payload", "/favicon.ico"),
+                Map.of());
     }
 
     @Test

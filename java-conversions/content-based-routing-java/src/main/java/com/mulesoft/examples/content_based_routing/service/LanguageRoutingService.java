@@ -20,8 +20,9 @@ import org.springframework.stereotype.Service;
  *
  * <ul>
  *   <li>{@code expression-filter #[payload != '/favicon.ico']} (line 7) is the guard clause that ends the
- *       call with {@link Optional#empty()}; the filter declares no {@code throwOnUnaccepted}, so a
- *       rejection is not an error and the caller answers it with an empty 200;</li>
+ *       call with {@link Optional#empty()}; only a text payload equal to {@value #FAVICON_PATH} fails it.
+ *       The filter declares no {@code throwOnUnaccepted}, so a rejection is not an error and the caller
+ *       answers it with an empty 200;</li>
  *   <li>{@code set-variable language} (line 8) is the local variable holding the decoded {@code language}
  *       query parameter;</li>
  *   <li>{@code choice} (lines 9-19) is the {@code if / else if / else} below, with the original exact,
@@ -69,14 +70,18 @@ public class LanguageRoutingService {
     /**
      * Routes one request on its {@code language} query parameter.
      *
-     * @param payload  the request body as text; {@code null} or empty when the request has none, which
-     *                 passes the favicon filter as the original's null payload does
+     * @param payload  the listener's payload, one of three kinds: {@code null} for a request without a
+     *                 body or with a multipart body, the original's {@code NullPayload}; a {@link java.util.Map}
+     *                 of the decoded parameters of a form-urlencoded body, the original's
+     *                 {@code ParameterMap}; or the text of any other body. Only the text
+     *                 {@value #FAVICON_PATH} fails the favicon filter: a map, even one naming that path,
+     *                 and {@code null} pass it, as the original's map and null payloads did
      * @param language the decoded {@code language} query parameter, or {@code null} when it is absent
      * @return {@link Optional#empty()} when the favicon filter rejects the payload (nothing is logged),
      *         otherwise the reply: {@value #SPANISH_REPLY}, {@value #FRENCH_REPLY} or
      *         {@value #DEFAULT_REPLY}
      */
-    public Optional<String> reply(String payload, String language) {
+    public Optional<String> reply(Object payload, String language) {
         if (FAVICON_PATH.equals(payload)) {
             return Optional.empty();
         }
