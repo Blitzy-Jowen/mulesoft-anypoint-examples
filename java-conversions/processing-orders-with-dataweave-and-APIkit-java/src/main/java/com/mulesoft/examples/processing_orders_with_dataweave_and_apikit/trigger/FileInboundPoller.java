@@ -10,9 +10,12 @@ package com.mulesoft.examples.processing_orders_with_dataweave_and_apikit.trigge
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -45,6 +48,15 @@ import org.slf4j.LoggerFactory;
  * endpoint's polling frequency. It is thread-safe; concurrent polls never hand the same file to the handler
  * twice.
  *
+ * <p>Every diagnostic it logs stays on one line and discloses no file content or exception text. A file or
+ * directory is named by its path or file name with the reverse solidus, CR, LF and TAB written as {@code \\},
+ * {@code \r}, {@code \n} and {@code \t}, every other ISO control character and the line and paragraph separators
+ * written as {@code \}{@code uXXXX}, and the rendering cut to a bounded length with a {@code ...[truncated]}
+ * marker, so a file name cannot forge a log record. An exception is named only by its class, the frame that threw
+ * it and the classes of its causes, never by its message, a cause's message, a suppressed exception or a stack
+ * trace, and it is never handed to the logger as a throwable; for a {@link FileSystemException} raised by the
+ * poller's own file operations the operating system's reason is added, escaped and bounded in the same way.
+ *
  * <p>It depends on the JDK and SLF4J alone, and names no project type, so that every file-triggered project can
  * copy it with only its {@code package} line changed.
  */
@@ -52,9 +64,28 @@ public class FileInboundPoller {
 
     private static final Logger LOG = LoggerFactory.getLogger(FileInboundPoller.class);
 
+    /** Longest logged rendering of one path, name or text, in characters after escaping. */
+    private static final int LOG_TEXT_LIMIT = 256;
+
+    /** Number of causes named after the outermost exception before the chain is cut short. */
+    private static final int CAUSE_LOG_LIMIT = 4;
+
+    private static final String TRUNCATION_LOG_MARKER = "...[truncated]";
+
+    private static final String CAUSE_SEPARATOR = " <- ";
+
+    private static final String MORE_CAUSES_MARKER = "...";
+
+    private static final String CIRCULAR_CAUSE_MARKER = "[circular]";
+
+    private static final String UNAVAILABLE_LOG_MARKER = "[unavailable]";
+
+    private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
     /**
-     * The flow a polled file is handed to. Any exception it throws is logged at ERROR by the poller and the file
-     * is still consumed, as Mule's default exception strategy ends the flow normally.
+     * The flow a polled file is handed to. Any exception it throws is logged at ERROR by the poller, naming only
+     * the file and the exception's type and throw site, never its message, and the file is still consumed, as
+     * Mule's default exception strategy ends the flow normally.
      */
     @FunctionalInterface
     public interface FileHandler {
@@ -141,7 +172,7 @@ public class FileInboundPoller {
         // comparator, and none is.
         File[] listed = inputDirectory.toFile().listFiles();
         if (listed == null) {
-            LOG.warn("Could not list input directory {}", inputDirectory);
+            LOG.warn("Could not list input directory {}", safeText(inputDirectory));
             return 0;
         }
 
@@ -180,7 +211,7 @@ public class FileInboundPoller {
             try {
                 content = readContent(path);
             } catch (IOException | RuntimeException e) {
-                LOG.warn("Could not open file {}, leaving it for the next poll: {}", path, e.toString());
+                LOG.warn("Could not open file {}, leaving it for the next poll: {}", safeText(path), describe(e, true));
                 return false;
             }
 
@@ -192,7 +223,9 @@ public class FileInboundPoller {
                     // The file is still consumed below; the interrupt is kept for the scheduler that owns the thread.
                     Thread.currentThread().interrupt();
                 }
-                LOG.error("Exception processing file {}", name, e);
+                // Only the exception's type identifiers are logged: the handler parses and forwards file records,
+                // so its exception texts can repeat record fields or credentials.
+                LOG.error("Exception processing file {}: {}", safeText(name), describe(e, false));
             }
 
             dispose(path, name);
@@ -207,10 +240,10 @@ public class FileInboundPoller {
         if (moveToDirectory == null) {
             try {
                 if (!Files.deleteIfExists(path)) {
-                    LOG.warn("Failed to delete file {}: it no longer exists", path);
+                    LOG.warn("Failed to delete file {}: it no longer exists", safeText(path));
                 }
             } catch (IOException | RuntimeException e) {
-                LOG.warn("Failed to delete file {}: {}", path, e.toString());
+                LOG.warn("Failed to delete file {}: {}", safeText(path), describe(e, true));
             }
             return;
         }
@@ -225,7 +258,7 @@ public class FileInboundPoller {
                 Files.delete(path);
             } catch (IOException | RuntimeException copyFailure) {
                 LOG.warn("Failed to move file {} to {}: rename failed with {}, copy and delete failed with {}",
-                        path, target, renameFailure.toString(), copyFailure.toString());
+                        safeText(path), safeText(target), describe(renameFailure, true), describe(copyFailure, true));
             }
         }
     }
@@ -235,8 +268,178 @@ public class FileInboundPoller {
             Files.createDirectories(directory);
             return true;
         } catch (IOException | RuntimeException e) {
-            LOG.warn("Could not create directory {}: {}", directory, e.toString());
+            LOG.warn("Could not create directory {}: {}", safeText(directory), describe(e, true));
             return false;
         }
+    }
+
+    /**
+     * Describes {@code failure} by its type identifiers alone: its class name and throw-site frame, then the class
+     * name of each cause, separated by {@code " <- "}, for example {@code java.io.UncheckedIOException at
+     * a.b.C.d(C.java:18) <- java.nio.file.NoSuchFileException}. No message, localized message or
+     * {@code toString()} of any exception and nothing of its suppressed exceptions is read. The walk stops at a
+     * cause already named, marked {@code [circular]}, and after {@link #CAUSE_LOG_LIMIT} causes, marked
+     * {@code ...}; a stack trace or cause that cannot be read is marked {@code [unavailable]}. Never throws.
+     *
+     * @param failure    the exception to describe
+     * @param withReason whether to add {@code [reason: <reason>]} when {@code failure} is a
+     *                   {@link FileSystemException} carrying a reason, which the JDK fills with the operating
+     *                   system's error text and never with the path; only the poller's own file operations pass
+     *                   {@code true}, because a handler may construct such an exception with any text
+     * @return the description, escaped and bounded part by part as {@link #safeText(Object)} does
+     */
+    private static String describe(Throwable failure, boolean withReason) {
+        if (failure == null) {
+            return safeText(null);
+        }
+        StringBuilder out = new StringBuilder(160);
+        appendTypeAndThrowSite(out, failure);
+        if (withReason && failure instanceof FileSystemException fileSystemFailure) {
+            appendReason(out, fileSystemFailure);
+        }
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(failure);
+        int causes = 0;
+        Throwable current = failure;
+        while (true) {
+            Throwable cause;
+            try {
+                cause = current.getCause();
+            } catch (RuntimeException unreadable) {
+                out.append(CAUSE_SEPARATOR).append(UNAVAILABLE_LOG_MARKER);
+                break;
+            }
+            if (cause == null) {
+                break;
+            }
+            out.append(CAUSE_SEPARATOR);
+            if (causes == CAUSE_LOG_LIMIT) {
+                out.append(MORE_CAUSES_MARKER);
+                break;
+            }
+            if (!named.add(cause)) {
+                out.append(CIRCULAR_CAUSE_MARKER);
+                break;
+            }
+            out.append(safeText(cause.getClass().getName()));
+            causes++;
+            current = cause;
+        }
+        return out.toString();
+    }
+
+    /**
+     * Appends the class name of {@code failure} and {@code " at <class>.<method>(<file>:<line>)"} for the frame
+     * that threw it, in the form {@link StackTraceElement#toString()} uses without its class loader and module
+     * prefix; the frame is left out when the stack trace is empty.
+     */
+    private static void appendTypeAndThrowSite(StringBuilder out, Throwable failure) {
+        out.append(safeText(failure.getClass().getName()));
+        StackTraceElement frame;
+        try {
+            StackTraceElement[] trace = failure.getStackTrace();
+            frame = trace == null || trace.length == 0 ? null : trace[0];
+        } catch (RuntimeException unreadable) {
+            out.append(" at ").append(UNAVAILABLE_LOG_MARKER);
+            return;
+        }
+        if (frame == null) {
+            return;
+        }
+        out.append(" at ")
+                .append(safeText(frame.getClassName()))
+                .append('.')
+                .append(safeText(frame.getMethodName()))
+                .append('(');
+        if (frame.isNativeMethod()) {
+            out.append("Native Method");
+        } else if (frame.getFileName() == null) {
+            out.append("Unknown Source");
+        } else {
+            out.append(safeText(frame.getFileName()));
+            if (frame.getLineNumber() >= 0) {
+                out.append(':').append(frame.getLineNumber());
+            }
+        }
+        out.append(')');
+    }
+
+    /** Appends {@code " [reason: <reason>]"} when the reason is present and readable. */
+    private static void appendReason(StringBuilder out, FileSystemException failure) {
+        String reason;
+        try {
+            reason = failure.getReason();
+        } catch (RuntimeException unreadable) {
+            return;
+        }
+        if (reason != null) {
+            out.append(" [reason: ").append(safeText(reason)).append(']');
+        }
+    }
+
+    /**
+     * Renders {@code value} for a log line, so a path, name or text cannot break the line or forge a record.
+     *
+     * <p>The reverse solidus, CR, LF and TAB are written as {@code \\}, {@code \r}, {@code \n} and {@code \t};
+     * every other ISO control character (C0, DEL and C1, NEL included) and the line and paragraph separators
+     * U+2028 and U+2029 are written as {@code \}{@code u} and four lower-case hex digits. Escaping the reverse
+     * solidus keeps an escape distinguishable from the same characters in the value. Every other character, a
+     * surrogate pair included, is copied unchanged. Never throws.
+     *
+     * @param value the value, rendered with {@link String#valueOf(Object)}, so {@code null} is written as
+     *              {@code null}; a value whose {@code toString()} throws is written as {@code [unavailable]}
+     * @return the rendering, at most {@link #LOG_TEXT_LIMIT} characters before the {@code ...[truncated]} marker
+     *         appended to a longer value, which is cut before the first character or escape that would exceed the
+     *         limit, never inside an escape or a surrogate pair
+     */
+    private static String safeText(Object value) {
+        String text;
+        try {
+            text = String.valueOf(value);
+        } catch (RuntimeException unreadable) {
+            return UNAVAILABLE_LOG_MARKER;
+        }
+        if (text == null) {
+            text = "null";
+        }
+        StringBuilder out = new StringBuilder(Math.min(text.length(), LOG_TEXT_LIMIT) + TRUNCATION_LOG_MARKER.length());
+        int i = 0;
+        while (i < text.length()) {
+            int codePoint = text.codePointAt(i);
+            int units = Character.charCount(codePoint);
+            String escape = escapeOf(codePoint);
+            if (out.length() + (escape == null ? units : escape.length()) > LOG_TEXT_LIMIT) {
+                return out.append(TRUNCATION_LOG_MARKER).toString();
+            }
+            if (escape == null) {
+                out.append(text, i, i + units);
+            } else {
+                out.append(escape);
+            }
+            i += units;
+        }
+        return out.toString();
+    }
+
+    /** Returns the escape {@link #safeText(Object)} writes for {@code codePoint}, or {@code null} to copy it. */
+    private static String escapeOf(int codePoint) {
+        return switch (codePoint) {
+            case '\\' -> "\\\\";
+            case '\r' -> "\\r";
+            case '\n' -> "\\n";
+            case '\t' -> "\\t";
+            case '\u2028', '\u2029' -> unicodeEscape(codePoint);
+            default -> Character.isISOControl(codePoint) ? unicodeEscape(codePoint) : null;
+        };
+    }
+
+    private static String unicodeEscape(int codePoint) {
+        return new String(new char[] {
+            '\\', 'u',
+            HEX_DIGITS[(codePoint >> 12) & 0xF],
+            HEX_DIGITS[(codePoint >> 8) & 0xF],
+            HEX_DIGITS[(codePoint >> 4) & 0xF],
+            HEX_DIGITS[codePoint & 0xF]
+        });
     }
 }

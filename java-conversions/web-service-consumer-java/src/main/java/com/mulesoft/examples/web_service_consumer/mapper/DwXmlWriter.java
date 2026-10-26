@@ -46,7 +46,7 @@ import org.springframework.stereotype.Component;
  *   <li>An element with neither text nor children is {@code <q/>}.</li>
  *   <li>An element with children writes its start tag, each child at depth + 1, then its end tag on its own
  *       line at its own depth. An element cannot hold both text and children.</li>
- *   <li>Line ends are LF only and nothing follows the root end tag.</li>
+ *   <li>Line ends are LF only.</li>
  * </ul>
  *
  * <pre>{@code
@@ -57,6 +57,21 @@ import org.springframework.stereotype.Component;
  * </ns0:OrderTshirt>
  * }</pre>
  * (indentation shown as spaces; the writer emits tabs)
+ *
+ * <p>Terminal line feed: nothing follows the root end tag, for every caller alike (SOAP bodies, HTTP
+ * responses, uploaded and written files), because DataWeave 1.0 writes the same bytes to each of them.
+ * Recorded DataWeave output shows it: {@code salesforce-data-retrieval/src/test/resources/index.html} is
+ * {@code salesforce-data-retrieval/src/main/resources/retrieval/index.html} rendered with
+ * {@code #[message.payload]} (line 17) replaced by the DataWeave XML payload, and that payload's {@code </div>}
+ * (line 311) is followed directly by the template's {@code </select>} line (line 312), with no empty line
+ * between; {@code service-orchestration-and-choice-routing/src/test/resources/sample_data/summary_1.xml}
+ * (490 bytes) ends at {@code </summary>} (line 22). The final line feed of
+ * {@code upload-to-ftp-after-converting-json-to-xml/src/test/resources/reply.xml} is not writer output: that
+ * file was edited by hand (its street values lost their inner spaces), and the original test compares it with
+ * all whitespace removed (line 98 of the same example's
+ * {@code src/test/java/org/mule/examples/UploadToFtpAfterConvertingJsonToXmlIT.java}), so the writer does not
+ * follow it. Output recorded from the original runtime that differs from this writer is fixed in this writer,
+ * never by editing the recorded output.
  *
  * <p>Start tags hold the qualified name ({@code prefix:name}, or {@code name} without a prefix), then the
  * namespace declarations, then the attributes in insertion order. An element declares its explicit

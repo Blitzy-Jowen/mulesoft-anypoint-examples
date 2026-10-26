@@ -8,6 +8,11 @@ spring:
     name: sending-json-data-to-a-amqp-queue-java
   rabbitmq:
     host: ${amqp.host:localhost}   # original test property amqp.host (SendingJsonDataToAmqpQueueIT.java:131)
+    # Transport budgets, separate from amqp.response-timeout, which bounds only the reply wait after the publish.
+    # 10 s is the Mule default response timeout; 0 (wait forever) is rejected by config/AmqpConfig at start-up.
+    # The AMQP handshake keeps amqp-client's own 10 s default.
+    connection-timeout: 10s    # TCP connect to the broker (amqp-client default 60 s)
+    channel-rpc-timeout: 10s   # each channel RPC: channel.open, the temporary reply queue.declare, basic.consume, basic.cancel (amqp-client default 10 min)
   web:
     resources:
       add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
@@ -29,4 +34,4 @@ amqp:
   host: localhost                 # original test property amqp.host; feeds spring.rabbitmq.host
   exchange-name: sales_exchange   # amqp:outbound-endpoint exchangeName (xml:9)
   queue-name: sales_queue         # amqp:outbound-endpoint queueName (xml:9)
-  response-timeout: 10000         # ms; amqp:outbound-endpoint responseTimeout (xml:9), the RabbitTemplate reply timeout set by config/AmqpConfig
+  response-timeout: 10000         # ms, positive; amqp:outbound-endpoint responseTimeout (xml:9), the RabbitTemplate reply timeout set by config/AmqpConfig

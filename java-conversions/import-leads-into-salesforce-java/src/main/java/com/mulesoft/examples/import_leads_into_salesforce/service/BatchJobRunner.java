@@ -54,13 +54,21 @@ public class BatchJobRunner {
 
     private static final Logger LOG = LoggerFactory.getLogger(BatchJobRunner.class);
 
+    /** Causes named after the outermost exception in a logged failure before the chain is cut short. */
+    private static final int CAUSE_LOG_LIMIT = 5;
+
+    /** Most characters of one class, method or file name copied into a logged failure. */
+    private static final int NAME_LOG_LIMIT = 256;
+
+    private static final String TRUNCATION_LOG_MARKER = "...[truncated]";
+
     /**
      * Runs one instance of {@code job}: input phase, process phase, then on-complete.
      *
      * <p>On-complete runs after the process phase ends or stops, and also after an empty input, which completes with
      * zero counts and status {@code SUCCESSFUL}; that empty-input behaviour is a Tier 2A verification point. An
-     * exception thrown by on-complete is logged at ERROR and turns the returned status into
-     * {@code FAILED_ON_COMPLETE}; it is not rethrown.
+     * exception thrown by on-complete is logged at ERROR by its type and throw site, never its message, and turns the
+     * returned status into {@code FAILED_ON_COMPLETE}; it is not rethrown.
      *
      * @param job        the job to run
      * @param inputPhase produces the record payloads, in record order; elements may be {@code null}
@@ -104,8 +112,8 @@ public class BatchJobRunner {
             onComplete.get().accept(result);
             return result;
         } catch (RuntimeException ex) {
-            LOG.error("Exception in on-complete phase of job instance '{}' of job '{}'", result.jobInstanceId(),
-                    result.jobName(), ex);
+            LOG.error("Exception in on-complete phase of job instance '{}' of job '{}': {}", result.jobInstanceId(),
+                    result.jobName(), describe(ex));
             return new BatchJobResult(result.jobName(), result.jobInstanceId(),
                     BatchJobResult.Status.FAILED_ON_COMPLETE, result.loadedRecords(), result.processedRecords(),
                     result.successfulRecords(), result.failedRecords(), result.elapsedTimeInMillis());
@@ -210,8 +218,8 @@ public class BatchJobRunner {
                 Thread.currentThread().interrupt();
             }
             if (loggedFailures.add(step.name() + '\u0000' + ex.getClass().getName())) {
-                LOG.error("Found exception processing record on step '{}' for job instance '{}' of job '{}'",
-                        step.name(), jobInstanceId, job.name(), ex);
+                LOG.error("Found exception processing record on step '{}' for job instance '{}' of job '{}': {}",
+                        step.name(), jobInstanceId, job.name(), describe(ex));
             }
             for (BatchRecord<T> record : failedRecords) {
                 if (!record.isFailed()) {
@@ -241,6 +249,78 @@ public class BatchJobRunner {
             throw new IllegalArgumentException(kind + " name must not be null or blank");
         }
         return name;
+    }
+
+    /**
+     * Describes {@code ex} for the log by type and throw site only, on one line, for example
+     * {@code java.lang.IllegalStateException at a.b.C.d(C.java:18) [suppressed: 1] <- java.io.IOException at
+     * x.y.Z.w(Z.java:5)}.
+     *
+     * <p>The exception is never handed to the logger, and no message, localized message, {@code toString()} or stack
+     * trace of it, its causes or its suppressed exceptions is written: exceptions thrown by accept expressions,
+     * processors, commits and on-complete callbacks, vendor exceptions included, can carry record data such as names
+     * and e-mail addresses, vendor payloads or credentials, and line breaks that forge log lines. The exception itself
+     * stays available, unchanged, through {@link BatchRecord#failures()}.
+     *
+     * <p>The outermost exception is followed by at most {@value #CAUSE_LOG_LIMIT} causes and then {@code <- ...} when
+     * more remain, which also ends a cyclic cause chain; suppressed exceptions are only counted. Each class, method and
+     * file name is cut to {@value #NAME_LOG_LIMIT} characters, marked {@code ...[truncated]}, and each control, line
+     * or paragraph separator, format or unpaired surrogate character in it is written as {@code ?}.
+     *
+     * @param ex the exception to describe
+     * @return the one-line description
+     */
+    private static String describe(Throwable ex) {
+        StringBuilder out = new StringBuilder(128);
+        appendTypeAndThrowSite(out, ex);
+        Throwable cause = ex.getCause();
+        for (int depth = 0; cause != null && depth < CAUSE_LOG_LIMIT; depth++) {
+            appendTypeAndThrowSite(out.append(" <- "), cause);
+            cause = cause.getCause();
+        }
+        if (cause != null) {
+            out.append(" <- ...");
+        }
+        return out.toString();
+    }
+
+    /**
+     * Appends {@code "<exception class> at <class>.<method>(<file>:<line>)"}, the throwing frame in
+     * {@link StackTraceElement#toString()} form without its class loader and module prefix, then
+     * {@code " [suppressed: <count>]"} when the exception has suppressed exceptions.
+     */
+    private static void appendTypeAndThrowSite(StringBuilder out, Throwable ex) {
+        out.append(logSafe(ex.getClass().getName())).append(" at ");
+        StackTraceElement[] trace = ex.getStackTrace();
+        if (trace == null || trace.length == 0 || trace[0] == null) {
+            out.append("(no stack trace)");
+        } else {
+            StackTraceElement frame = trace[0];
+            String file = frame.getFileName();
+            out.append(logSafe(frame.getClassName())).append('.').append(logSafe(frame.getMethodName())).append('(')
+                    .append(file == null ? "Unknown Source" : logSafe(file))
+                    .append(file != null && frame.getLineNumber() >= 0 ? ":" + frame.getLineNumber() : "")
+                    .append(')');
+        }
+        int suppressed = ex.getSuppressed().length;
+        if (suppressed > 0) {
+            out.append(" [suppressed: ").append(suppressed).append(']');
+        }
+    }
+
+    /** Cuts {@code name} to {@link #NAME_LOG_LIMIT} characters and writes each character not log-safe as '?'. */
+    private static String logSafe(String name) {
+        boolean cut = name.length() > NAME_LOG_LIMIT;
+        StringBuilder out = new StringBuilder(NAME_LOG_LIMIT + TRUNCATION_LOG_MARKER.length());
+        (cut ? name.substring(0, NAME_LOG_LIMIT) : name).codePoints()
+                .forEach(c -> out.appendCodePoint(isLogSafe(c) ? c : '?'));
+        return cut ? out.append(TRUNCATION_LOG_MARKER).toString() : out.toString();
+    }
+
+    private static boolean isLogSafe(int codePoint) {
+        int type = Character.getType(codePoint);
+        return !Character.isISOControl(codePoint) && type != Character.LINE_SEPARATOR
+                && type != Character.PARAGRAPH_SEPARATOR && type != Character.FORMAT && type != Character.SURROGATE;
     }
 
     /** Which records a step takes, by their failure state; Mule's {@code accept-policy}. */

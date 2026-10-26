@@ -12,6 +12,7 @@ import java.util.Objects;
 
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.amqp.ConnectionFactoryCustomizer;
 import org.springframework.boot.autoconfigure.amqp.RabbitTemplateCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -31,6 +32,16 @@ import org.springframework.context.annotation.Configuration;
  * <p>The connector's {@code validateConnections="true"} is deliberately not reproduced: the connection
  * opens lazily on the first publish so the application starts without a broker, a difference the
  * project README records.
+ *
+ * <p>Transport budgets are separate from the reply timeout. Before a {@code sendAndReceive} publishes,
+ * the client may have to open the TCP connection and a channel, then declares the temporary reply queue
+ * and registers its consumer. {@code spring.rabbitmq.connection-timeout} bounds the TCP connect, and
+ * {@code spring.rabbitmq.channel-rpc-timeout} bounds each channel RPC ({@code channel.open},
+ * {@code queue.declare}, {@code basic.consume}, {@code basic.cancel}); {@code application.yml} sets both
+ * to 10 s, and the AMQP handshake keeps amqp-client's 10 s default. A broker that withholds one of those
+ * replies fails the call with an {@code AmqpException} once its budget is spent, and nothing retries it.
+ * {@code amqp.response-timeout} starts only after the request is published and bounds only the wait
+ * for its reply.
  */
 @Configuration(proxyBeanMethods = false)
 public class AmqpConfig {
@@ -54,7 +65,10 @@ public class AmqpConfig {
      * @param exchangeName          the exchange published to ({@code exchangeName})
      * @param queueName             the queue the original endpoint names ({@code queueName})
      * @param responseTimeoutMillis how long a publish waits for its reply, in milliseconds
-     *                              ({@code responseTimeout})
+     *                              ({@code responseTimeout}); must be positive
+     * @throws IllegalArgumentException if {@code amqp.response-timeout} is zero or negative, which
+     *                                  would make the template wait for a reply without limit (negative)
+     *                                  or not at all (zero), so the application refuses to start
      */
     public AmqpConfig(
             @Value("${amqp.exchange-name:sales_exchange}") String exchangeName,
@@ -62,7 +76,7 @@ public class AmqpConfig {
             @Value("${amqp.response-timeout:10000}") long responseTimeoutMillis) {
         this.exchangeName = exchangeName;
         this.queueName = queueName;
-        this.responseTimeoutMillis = responseTimeoutMillis;
+        this.responseTimeoutMillis = requirePositiveTimeout(responseTimeoutMillis, "amqp.response-timeout");
     }
 
     /**
@@ -86,8 +100,10 @@ public class AmqpConfig {
      *       with {@code channel.queueDeclare()}. This also keeps the template from probing direct
      *       reply-to ({@code amq.rabbitmq.reply-to}), which only RabbitMQ provides and the Qpid
      *       Broker-J test broker lacks.</li>
-     *   <li>Reply timeout: the endpoint's {@code responseTimeout}. When no reply arrives in time,
-     *       {@code sendAndReceive} returns {@code null} instead of throwing.</li>
+     *   <li>Reply timeout: the endpoint's {@code responseTimeout}, always positive because the
+     *       constructor rejects zero and negative values. It starts once the request is published and
+     *       bounds only the wait for the reply; when no reply arrives in time, {@code sendAndReceive}
+     *       returns {@code null} instead of throwing.</li>
      * </ul>
      *
      * @return the customizer Boot applies to its auto-configured template
@@ -101,6 +117,34 @@ public class AmqpConfig {
     }
 
     /**
+     * Refuses to start when Boot's connection factory would wait for the broker without limit. Boot
+     * applies connection factory customizers to the native RabbitMQ factory while it builds its
+     * auto-configured connection factory, after copying {@code spring.rabbitmq.*} onto it and before any
+     * connection is opened, so this check keeps the lazy connection. It only reads the two timeouts: their
+     * values come from {@code spring.rabbitmq.connection-timeout} and
+     * {@code spring.rabbitmq.channel-rpc-timeout}, and it adds no retry or recovery. amqp-client already
+     * rejects negative values; zero is the one it accepts as "wait forever", so the customizer throws
+     * {@link IllegalStateException} for a zero timeout and the context fails to start.
+     *
+     * @return the customizer Boot applies to its native connection factory
+     */
+    @Bean
+    public ConnectionFactoryCustomizer salesTransportTimeoutValidator() {
+        return factory -> {
+            if (factory.getConnectionTimeout() <= 0) {
+                throw new IllegalStateException("spring.rabbitmq.connection-timeout must be a positive duration,"
+                        + " but was " + factory.getConnectionTimeout() + " ms, which waits for the TCP connect"
+                        + " without limit");
+            }
+            if (factory.getChannelRpcTimeout() <= 0) {
+                throw new IllegalStateException("spring.rabbitmq.channel-rpc-timeout must be a positive duration,"
+                        + " but was " + factory.getChannelRpcTimeout() + " ms, which waits for every channel RPC"
+                        + " reply without limit");
+            }
+        };
+    }
+
+    /**
      * The only destination contract {@code service/SalesPublisherService} consumes. The publish goes to
      * {@code exchangeName} with {@code routingKey}; {@code queueName} is the queue the original endpoint
      * names, which the broker is expected to have bound to the exchange.
@@ -108,21 +152,45 @@ public class AmqpConfig {
      * @param exchangeName          the exchange every publish goes to
      * @param queueName             the queue bound to the exchange on the broker
      * @param routingKey            the routing key of every publish
-     * @param responseTimeoutMillis how long a publish waits for its reply, in milliseconds
+     * @param responseTimeoutMillis how long a publish waits for its reply, in milliseconds; positive
      */
     public record SalesDestination(String exchangeName, String queueName, String routingKey,
             long responseTimeoutMillis) {
 
         /**
-         * Rejects a missing exchange, queue or routing key.
+         * Rejects a missing exchange, queue or routing key, and a reply timeout that is not positive.
          *
-         * @throws NullPointerException if {@code exchangeName}, {@code queueName} or {@code routingKey}
-         *                              is {@code null}
+         * @param exchangeName          the exchange every publish goes to
+         * @param queueName             the queue bound to the exchange on the broker
+         * @param routingKey            the routing key of every publish
+         * @param responseTimeoutMillis how long a publish waits for its reply, in milliseconds
+         * @throws NullPointerException     if {@code exchangeName}, {@code queueName} or
+         *                                  {@code routingKey} is {@code null}
+         * @throws IllegalArgumentException if {@code responseTimeoutMillis} is zero or negative
          */
         public SalesDestination {
             Objects.requireNonNull(exchangeName, "exchangeName");
             Objects.requireNonNull(queueName, "queueName");
             Objects.requireNonNull(routingKey, "routingKey");
+            requirePositiveTimeout(responseTimeoutMillis, "responseTimeoutMillis");
         }
+    }
+
+    /**
+     * Rejects a reply timeout that is not positive. {@link RabbitTemplate#setReplyTimeout(long)} accepts
+     * any value, but a negative one makes {@code sendAndReceive} wait for its reply without limit and
+     * zero makes it give up before any reply can arrive.
+     *
+     * @param timeoutMillis the timeout, in milliseconds
+     * @param name          the configuration key or record component the value came from, for the message
+     * @return {@code timeoutMillis}, unchanged
+     * @throws IllegalArgumentException if {@code timeoutMillis} is zero or negative
+     */
+    private static long requirePositiveTimeout(long timeoutMillis, String name) {
+        if (timeoutMillis <= 0) {
+            throw new IllegalArgumentException(
+                    name + " must be a positive number of milliseconds, but was " + timeoutMillis);
+        }
+        return timeoutMillis;
     }
 }

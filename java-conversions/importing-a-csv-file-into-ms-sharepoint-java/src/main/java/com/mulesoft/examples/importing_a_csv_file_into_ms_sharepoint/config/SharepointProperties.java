@@ -8,6 +8,8 @@
 
 package com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.config;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -38,8 +40,11 @@ import org.springframework.stereotype.Component;
  * names.
  *
  * <p>Startup fails fast, as the original application failed to deploy on an unresolved placeholder: when any of
- * the four keys above is blank, the constructor throws one {@link IllegalStateException} naming every blank key
- * with its environment variable. The message never carries a configured value.
+ * the four keys above is blank, or {@code Sharepoint.SiteUrl} is set but, with its trailing {@code /} removed, is
+ * not an absolute {@code http} or {@code https} URL with a host and without user info, query or fragment, the
+ * constructor throws one {@link IllegalStateException} naming every blank key and the invalid site URL key with
+ * its environment variable. Plain {@code http} is accepted for any host, so tests can address a local stub. The
+ * message never carries a configured value.
  *
  * <p>Consumers:
  * <ul>
@@ -68,10 +73,14 @@ public final class SharepointProperties {
      *
      * @param username        {@code Sharepoint.Username}, the SharePoint Online account
      * @param password        {@code Sharepoint.Password}, stored exactly as supplied
-     * @param siteUrl         {@code Sharepoint.SiteUrl}, stored with every trailing {@code /} removed
+     * @param siteUrl         {@code Sharepoint.SiteUrl}, stored with every trailing {@code /} removed; the stored
+     *                        value must be an absolute {@code http} or {@code https} URL with a host and without
+     *                        user info, query or fragment
      * @param csvImportFolder {@code csvImportFolder}, the folder under {@code Shared Documents}
      * @param stsUrl          {@code sharepoint-online.sts-url}, stored as given and not validated
-     * @throws IllegalStateException when any of the first four values is {@code null} or blank
+     * @throws IllegalStateException when any of the first four values is {@code null} or blank, or when
+     *                               {@code siteUrl} is set but its stored value is not such a URL; one exception
+     *                               names every such key and none of the configured values
      */
     public SharepointProperties(
             @Value("${Sharepoint.Username:}") String username,
@@ -92,13 +101,23 @@ public final class SharepointProperties {
         if (isBlank(csvImportFolder)) {
             missing.add(CSV_IMPORT_FOLDER_KEY);
         }
-        if (!missing.isEmpty()) {
-            throw new IllegalStateException("Missing required SharePoint configuration: " + String.join(", ", missing)
-                    + ". # TODO: supply them in application.yml or as environment variables.");
+        String normalizedSiteUrl = isBlank(siteUrl) ? null : stripTrailingSlashes(siteUrl);
+        boolean invalidSiteUrl = normalizedSiteUrl != null && !isAbsoluteHttpUrl(normalizedSiteUrl);
+        if (!missing.isEmpty() || invalidSiteUrl) {
+            List<String> problems = new ArrayList<>();
+            if (!missing.isEmpty()) {
+                problems.add("Missing required SharePoint configuration: " + String.join(", ", missing) + ".");
+            }
+            if (invalidSiteUrl) {
+                problems.add("Invalid SharePoint configuration: " + SITE_URL_KEY + " must be an absolute http or https"
+                        + " URL with a host and without user info, query or fragment.");
+            }
+            throw new IllegalStateException(String.join(" ", problems)
+                    + " # TODO: supply them in application.yml or as environment variables.");
         }
         this.username = username;
         this.password = password;
-        this.siteUrl = stripTrailingSlashes(siteUrl);
+        this.siteUrl = normalizedSiteUrl;
         this.csvImportFolder = csvImportFolder;
         this.stsUrl = stsUrl;
     }
@@ -148,5 +167,33 @@ public final class SharepointProperties {
             end--;
         }
         return url.substring(0, end);
+    }
+
+    /**
+     * Checks the site URL after its trailing {@code /} characters were removed.
+     *
+     * @param url the normalized site URL, never {@code null}
+     * @return whether {@code url} is an absolute {@code http} or {@code https} URL (scheme in any case) with a host
+     *         and without user info, query or fragment; a path is allowed, and plain {@code http} is accepted for
+     *         any host
+     */
+    private static boolean isAbsoluteHttpUrl(String url) {
+        if (url.isEmpty()) {
+            return false;
+        }
+        URI uri;
+        try {
+            uri = new URI(url);
+        } catch (URISyntaxException e) {
+            // Not rethrown or chained: its message repeats the configured value, which the caller's error omits.
+            return false;
+        }
+        String scheme = uri.getScheme();
+        return uri.isAbsolute()
+                && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && uri.getHost() != null
+                && uri.getRawUserInfo() == null
+                && uri.getRawQuery() == null
+                && uri.getRawFragment() == null;
     }
 }

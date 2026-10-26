@@ -1,11 +1,14 @@
 package com.mulesoft.examples.get_customer_list_from_netsuite.config;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Pattern;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -32,10 +35,13 @@ import org.springframework.stereotype.Component;
  *       the select {@code typeId} override.</li>
  * </ul>
  *
- * <p>Missing values fail late: the application context starts with every credential placeholder empty, and only a
- * call that needs a value ({@link #accountHost()}, {@link #resolvedBaseUrl()}, {@link #tokenUrl()} and the
- * {@code require...} methods) throws {@link IllegalStateException} naming the missing key. That is why the class
- * carries no validation annotation and no start-up check.
+ * <p>Missing and invalid values fail late: the application context starts with every credential placeholder empty,
+ * and only a call that needs a value ({@link #accountHost()}, {@link #resolvedBaseUrl()}, {@link #tokenUrl()} and the
+ * {@code require...} methods) throws {@link IllegalStateException} naming the missing or invalid key. An account
+ * that is not a single DNS label and a base URL that is not an absolute {@code http}/{@code https} URL with a host
+ * and no user info, query or fragment are rejected there, before any URL is built from them, so neither can redirect
+ * the token request or the API calls; the message never repeats the configured value. That is why the class carries
+ * no validation annotation and no start-up check.
  */
 @Component
 @ConfigurationProperties(prefix = "netsuite")
@@ -48,6 +54,9 @@ public class NetsuiteProperties {
     private static final String ACCOUNT_DOMAIN_SUFFIX = ".suitetalk.api.netsuite.com";
 
     private static final String TOKEN_PATH = "/services/rest/auth/oauth2/v1/token";
+
+    /** One DNS label: 1 to 63 lower-case letters, digits or {@code -}, neither first nor last a {@code -}. */
+    private static final Pattern ACCOUNT_HOST_LABEL = Pattern.compile("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?");
 
     private String account;
 
@@ -179,26 +188,40 @@ public class NetsuiteProperties {
 
     /**
      * Returns the account in NetSuite's account-specific domain form: trimmed, lower-cased and with {@code _}
-     * replaced by {@code -} ({@code 1234567_SB1} → {@code 1234567-sb1}).
+     * replaced by {@code -} ({@code 1234567_SB1} → {@code 1234567-sb1}). The result must be a single DNS label (1 to
+     * 63 letters, digits or {@code -}, starting and ending with a letter or digit), so that it can only name a
+     * subdomain of {@code suitetalk.api.netsuite.com}; a value carrying {@code .}, {@code /}, {@code @}, {@code :},
+     * whitespace or any other character is rejected.
      *
      * @return the account host label
-     * @throws IllegalStateException when {@code netsuite.account} is not configured
+     * @throws IllegalStateException when {@code netsuite.account} is not configured, or when it does not form a
+     *         single DNS label; the message names the key and never repeats the configured value
      */
     public String accountHost() {
         String value = account == null ? "" : account.trim();
         if (value.isEmpty()) {
             throw new IllegalStateException("netsuite.account is not configured");
         }
-        return value.toLowerCase(Locale.ROOT).replace('_', '-');
+        String host = value.toLowerCase(Locale.ROOT).replace('_', '-');
+        if (!ACCOUNT_HOST_LABEL.matcher(host).matches()) {
+            throw new IllegalStateException("netsuite.account is not a valid NetSuite account ID: it must form a"
+                    + " single DNS label of at most 63 letters, digits, '-' or '_', starting and ending with a letter"
+                    + " or digit");
+        }
+        return host;
     }
 
     /**
      * Returns the base URL every NetSuite call is resolved against: {@code netsuite.base-url} trimmed and without
      * trailing {@code /} when it is set, otherwise {@code https://<accountHost>.suitetalk.api.netsuite.com}. A value
-     * made only of slashes is treated as not set.
+     * made only of slashes is treated as not set. A set value must be an absolute {@code http} or {@code https} URL
+     * with a host and no user info, query or fragment; a path is allowed, and {@code http} is accepted for any host
+     * so that tests can point it at a local WireMock server.
      *
      * @return the base URL, without a trailing {@code /}
-     * @throws IllegalStateException when the URL has to be derived and {@code netsuite.account} is not configured
+     * @throws IllegalStateException when {@code netsuite.base-url} is set but is not such a URL, or when the URL has
+     *         to be derived and {@code netsuite.account} is not configured or invalid (see {@link #accountHost()});
+     *         the message names the key and never repeats the configured value
      */
     public String resolvedBaseUrl() {
         if (baseUrl != null) {
@@ -208,7 +231,12 @@ public class NetsuiteProperties {
                 end--;
             }
             if (end > 0) {
-                return url.substring(0, end);
+                String stripped = url.substring(0, end);
+                if (!isHttpBaseUrl(stripped)) {
+                    throw new IllegalStateException("netsuite.base-url is not a valid base URL: it must be an"
+                            + " absolute http or https URL with a host and no user info, query or fragment");
+                }
+                return stripped;
             }
         }
         return "https://" + accountHost() + ACCOUNT_DOMAIN_SUFFIX;
@@ -219,8 +247,9 @@ public class NetsuiteProperties {
      * endpoint the client credentials grant is POSTed to and the {@code aud} claim of the JWT client assertion.
      *
      * @return the token URL
-     * @throws IllegalStateException when the base URL has to be derived and {@code netsuite.account} is not
-     *         configured
+     * @throws IllegalStateException when {@code netsuite.base-url} is set but invalid, or when the base URL has to be
+     *         derived and {@code netsuite.account} is not configured or invalid; the message names the key and never
+     *         repeats the configured value
      */
     public String tokenUrl() {
         return resolvedBaseUrl() + TOKEN_PATH;
@@ -290,6 +319,30 @@ public class NetsuiteProperties {
 
     private static Optional<String> nonBlank(String value) {
         return value == null || value.isBlank() ? Optional.empty() : Optional.of(value.trim());
+    }
+
+    /**
+     * Whether a value parses as an absolute {@code http} or {@code https} URI (scheme compared case-insensitively)
+     * with a host and without user info, query or fragment. A {@link URISyntaxException} counts as invalid and is
+     * not propagated, because its message repeats the input.
+     *
+     * @param value the trimmed base URL without trailing {@code /}
+     * @return {@code true} when the value is such a URL
+     */
+    private static boolean isHttpBaseUrl(String value) {
+        URI uri;
+        try {
+            uri = new URI(value);
+        } catch (URISyntaxException e) {
+            return false;
+        }
+        String scheme = uri.getScheme();
+        return uri.isAbsolute()
+                && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                && uri.getHost() != null
+                && uri.getRawUserInfo() == null
+                && uri.getRawQuery() == null
+                && uri.getRawFragment() == null;
     }
 
     /**
