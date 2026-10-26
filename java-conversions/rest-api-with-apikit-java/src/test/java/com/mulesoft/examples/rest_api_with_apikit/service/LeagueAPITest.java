@@ -20,6 +20,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -71,6 +72,9 @@ class LeagueAPITest {
 
     private static final int GAMES_PER_ROUND = FIXTURE_SIZE / 2;
 
+    /** First-round scores are drawn from {@code 0..4}, the range {@code League} seeds. */
+    private static final int MAX_SEEDED_SCORE = 4;
+
     /** The ranking {@code League.orderTeamsByPosition} applies: points, then goal difference, then goals scored. */
     private static final Comparator<Position> RANKING = Comparator.comparingInt(Position::getPoints)
             .thenComparingInt(position -> position.getGoalsInFavor() - position.getGoalsAgainst())
@@ -106,6 +110,10 @@ class LeagueAPITest {
 
         assertThat(teams).extracting(Team::getId).containsExactlyInAnyOrderElementsOf(SEEDED_IDS);
         assertThat(teams).extracting(Team::getMatches).containsOnlyNulls();
+        assertThat(teams).allSatisfy(team -> assertThat(team)
+                .as("fields of %s", team.getId())
+                .extracting(Team::getName, Team::getHomeCity, Team::getStadium)
+                .doesNotContainNull());
     }
 
     @Test
@@ -179,6 +187,8 @@ class LeagueAPITest {
     @Test
     void fixtureHoldsOnePlayedAndOneUnplayedLegOfEveryPairing() {
         Date now = new Date();
+        // First-round legs are dated six or seven days back at 18:00, so they all precede this bound.
+        Date fiveDaysAgo = new Date(now.getTime() - TimeUnit.DAYS.toMillis(5));
         List<Match> fixture = api.getFixture().getFixture();
 
         Set<String> expectedPairings = new HashSet<>();
@@ -196,7 +206,9 @@ class LeagueAPITest {
         List<Match> played = fixture.stream().filter(LeagueAPITest::isPlayed).toList();
         List<Match> unplayed = fixture.stream().filter(Predicate.not(LeagueAPITest::isPlayed)).toList();
         assertThat(played).hasSize(GAMES_PER_ROUND)
-                .allSatisfy(match -> assertThat(match.getDate()).isBefore(now));
+                .allSatisfy(match -> assertThat(match.getDate()).isBefore(fiveDaysAgo))
+                .allSatisfy(match -> assertThat(match.getHomeTeamScore()).isBetween(0, MAX_SEEDED_SCORE))
+                .allSatisfy(match -> assertThat(match.getAwayTeamScore()).isBetween(0, MAX_SEEDED_SCORE));
         assertThat(unplayed).hasSize(GAMES_PER_ROUND)
                 .allSatisfy(match -> assertThat(match.getHomeTeamScore()).isNull())
                 .allSatisfy(match -> assertThat(match.getAwayTeamScore()).isNull());

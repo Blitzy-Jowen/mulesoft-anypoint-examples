@@ -11,7 +11,6 @@ package com.mulesoft.examples.rest_api_with_apikit.mapper;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -33,6 +32,7 @@ import org.skyscreamer.jsonassert.JSONCompareMode;
 
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.io.JsonEOFException;
 import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import com.mulesoft.examples.rest_api_with_apikit.model.request.Score;
@@ -71,6 +71,16 @@ class LeagueJsonMapperTest {
 
     /** 2014-05-08T20:30:00Z, written as {@code 1399581000000} by the collection rendering. */
     private static final long RETURN_LEG_MILLIS = 1_399_581_000_000L;
+
+    /** A body that ends after a field name, before its value. */
+    private static final String TRUNCATED_BODY = "{\"id\":";
+
+    private static final String TRUNCATED_BODY_MESSAGE = "Unexpected end-of-input within/between Object entries";
+
+    /** A body that is not JSON at all. */
+    private static final String NON_JSON_BODY = "not json";
+
+    private static final String NON_JSON_BODY_MESSAGE = "Unrecognized token 'not': was expecting";
 
     private final LeagueJsonMapper mapper = new LeagueJsonMapper();
 
@@ -130,6 +140,9 @@ class LeagueJsonMapperTest {
                 rendering("single unplayed match omits its null scores",
                         m -> m.toJson(unplayedMatch()),
                         "{\"homeTeam\":\"RMA\",\"awayTeam\":\"BAR\",\"date\":\"" + formatted(RETURN_LEG_MILLIS) + "\"}"),
+                rendering("single match without a date omits it",
+                        m -> m.toJson(undatedMatch()),
+                        "{\"homeTeam\":\"BAR\",\"awayTeam\":\"RMA\",\"homeTeamScore\":2,\"awayTeamScore\":1}"),
                 rendering("team list writes null properties",
                         m -> m.toJson(teams(barcelona(), realMadridWithoutOptionals())),
                         "{\"teams\":["
@@ -167,24 +180,69 @@ class LeagueJsonMapperTest {
         JSONAssert.assertEquals(expectedJson, render.apply(mapper), JSONCompareMode.STRICT);
     }
 
+    /**
+     * One match instance written alternately through both renderings by the same mapper: each rendering
+     * keeps its own null handling and date form, so neither writer's configuration or cached serializers
+     * reach the other.
+     */
     @Test
-    void readsTeamBody() {
-        com.mulesoft.examples.rest_api_with_apikit.model.request.Team team = mapper.readTeam(
-                "{\"name\":\"Barcelona\",\"id\":\"BAR\",\"homeCity\":\"Barcelona\",\"stadium\":\"Camp Nou\"}");
+    void sameMatchRendersDifferentlyPerRendering() throws JSONException {
+        Match match = unplayedMatch();
+        String expectedSingle =
+                "{\"homeTeam\":\"RMA\",\"awayTeam\":\"BAR\",\"date\":\"" + formatted(RETURN_LEG_MILLIS) + "\"}";
+        String expectedFixture = "{\"fixture\":[{\"homeTeam\":\"RMA\",\"awayTeam\":\"BAR\",\"date\":"
+                + RETURN_LEG_MILLIS + ",\"homeTeamScore\":null,\"awayTeamScore\":null}]}";
+
+        String firstSingle = mapper.toJson(match);
+        String inFixture = mapper.toJson(fixture(match));
+        String secondSingle = mapper.toJson(match);
+
+        JSONAssert.assertEquals(expectedSingle, firstSingle, JSONCompareMode.STRICT);
+        JSONAssert.assertEquals(expectedFixture, inFixture, JSONCompareMode.STRICT);
+        assertEquals(firstSingle, secondSingle, "the single rendering is unchanged after a fixture rendering");
+    }
+
+    static Stream<Arguments> teamBodies() {
+        return Stream.of(
+                Arguments.of(Named.of("every field",
+                        "{\"name\":\"Barcelona\",\"id\":\"BAR\",\"homeCity\":\"Barcelona\",\"stadium\":\"Camp Nou\"}"),
+                        "Camp Nou"),
+                Arguments.of(Named.of("without the optional stadium",
+                        "{\"id\":\"BAR\",\"name\":\"Barcelona\",\"homeCity\":\"Barcelona\"}"),
+                        null));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("teamBodies")
+    void readsTeamBody(String json, String expectedStadium) {
+        com.mulesoft.examples.rest_api_with_apikit.model.request.Team team = mapper.readTeam(json);
 
         assertEquals("BAR", team.getId());
         assertEquals("Barcelona", team.getName());
         assertEquals("Barcelona", team.getHomeCity());
-        assertEquals("Camp Nou", team.getStadium());
+        assertEquals(expectedStadium, team.getStadium());
     }
 
-    @Test
-    void readsUpdateTeamBodyLeavingAbsentFieldsNull() {
-        UpdateTeam update = mapper.readUpdateTeam("{\"name\":\"Barcelona\",\"stadium\":\"Camp Nou\"}");
+    static Stream<Arguments> updateTeamBodies() {
+        return Stream.of(
+                Arguments.of(Named.of("name only", "{\"name\":\"FC Barcelona\"}"),
+                        "FC Barcelona", null, null),
+                Arguments.of(Named.of("name and stadium", "{\"name\":\"Barcelona\",\"stadium\":\"Camp Nou\"}"),
+                        "Barcelona", null, "Camp Nou"),
+                Arguments.of(Named.of("every field",
+                        "{\"name\":\"FC Barcelona\",\"homeCity\":\"Barcelona\",\"stadium\":\"Spotify Camp Nou\"}"),
+                        "FC Barcelona", "Barcelona", "Spotify Camp Nou"));
+    }
 
-        assertEquals("Barcelona", update.getName());
-        assertNull(update.getHomeCity(), "an absent homeCity stays null");
-        assertEquals("Camp Nou", update.getStadium());
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("updateTeamBodies")
+    void readsUpdateTeamBodyLeavingAbsentFieldsNull(String json, String expectedName, String expectedHomeCity,
+            String expectedStadium) {
+        UpdateTeam update = mapper.readUpdateTeam(json);
+
+        assertEquals(expectedName, update.getName());
+        assertEquals(expectedHomeCity, update.getHomeCity());
+        assertEquals(expectedStadium, update.getStadium());
     }
 
     @Test
@@ -208,6 +266,14 @@ class LeagueJsonMapperTest {
                         m -> m.readTeam("{id:\"BAR\"}"),
                         JsonParseException.class,
                         "Unexpected character ('i' (code 105)): was expecting double-quote to start field name"),
+                rejected("truncated team body",
+                        m -> m.readTeam(TRUNCATED_BODY),
+                        JsonEOFException.class,
+                        TRUNCATED_BODY_MESSAGE),
+                rejected("non-JSON team body",
+                        m -> m.readTeam(NON_JSON_BODY),
+                        JsonParseException.class,
+                        NON_JSON_BODY_MESSAGE),
                 rejected("update body with an unknown property",
                         m -> m.readUpdateTeam("{\"name\":\"Barcelona\",\"id\":\"BAR\"}"),
                         UnrecognizedPropertyException.class,
@@ -218,6 +284,14 @@ class LeagueJsonMapperTest {
                         m -> m.readUpdateTeam("{\"name\":'Barcelona'}"),
                         JsonParseException.class,
                         "Unexpected character (''' (code 39)): expected a valid value"),
+                rejected("truncated update body",
+                        m -> m.readUpdateTeam(TRUNCATED_BODY),
+                        JsonEOFException.class,
+                        TRUNCATED_BODY_MESSAGE),
+                rejected("non-JSON update body",
+                        m -> m.readUpdateTeam(NON_JSON_BODY),
+                        JsonParseException.class,
+                        NON_JSON_BODY_MESSAGE),
                 rejected("score body with an unknown property",
                         m -> m.readScore("{\"homeTeamScore\":2,\"awayTeamScore\":1,\"penalties\":3}"),
                         UnrecognizedPropertyException.class,
@@ -227,7 +301,15 @@ class LeagueJsonMapperTest {
                 rejected("malformed score body",
                         m -> m.readScore("{\"homeTeamScore\":2,,\"awayTeamScore\":1}"),
                         JsonParseException.class,
-                        "Unexpected character (',' (code 44)): was expecting double-quote to start field name"));
+                        "Unexpected character (',' (code 44)): was expecting double-quote to start field name"),
+                rejected("truncated score body",
+                        m -> m.readScore(TRUNCATED_BODY),
+                        JsonEOFException.class,
+                        TRUNCATED_BODY_MESSAGE),
+                rejected("non-JSON score body",
+                        m -> m.readScore(NON_JSON_BODY),
+                        JsonParseException.class,
+                        NON_JSON_BODY_MESSAGE));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -323,6 +405,13 @@ class LeagueJsonMapperTest {
         match.setDate(new Date(RETURN_LEG_MILLIS));
         match.setHomeTeamScore(null);
         match.setAwayTeamScore(null);
+        return match;
+    }
+
+    /** A played match whose date was never set. */
+    private static Match undatedMatch() {
+        Match match = playedMatch();
+        match.setDate(null);
         return match;
     }
 
