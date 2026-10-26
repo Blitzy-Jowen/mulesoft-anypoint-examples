@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Enumeration;
@@ -65,7 +67,9 @@ import org.springframework.web.util.UriUtils;
  *       tree {@code apikit-console/};</li>
  *   <li>{@code GET <base>/console?raml}, {@code GET <base>/console/?raml}, the same paths and {@code GET <base>/}
  *       with an {@code Accept} header naming {@code application/raml+yaml}: the RAML of {@code apikit.raml}
- *       with its {@code baseUri} set to the listener URL;</li>
+ *       with its {@code baseUri} set to the listener URL, whose host is the {@code Host} header's name only
+ *       when that is a legal DNS name, IPv4 address or IPv6 address and the listener socket's local address
+ *       otherwise;</li>
  *   <li>{@code GET <base>/<include>} and {@code GET <base>/console/<include>}: each file the RAML
  *       {@code !include}s, so the console resolves includes relative to the RAML it loaded.</li>
  * </ul>
@@ -85,7 +89,10 @@ import org.springframework.web.util.UriUtils;
  *       {@code ./?};</li>
  *   <li>the redirect's {@code Location} is the relative path {@code <base>/console/}, while
  *       {@code ConsoleHandler} wrote an absolute URL built from the scheme, the {@code Host} header and the
- *       request path.</li>
+ *       request path;</li>
+ *   <li>a {@code Host} header naming no legal DNS name, IPv4 address or IPv6 address gives the RAML's
+ *       {@code baseUri} the local address of the listener socket, while APIkit copied the {@code Host} header
+ *       into it unchanged.</li>
  * </ul>
  *
  * <p>Every RAML-backed project carries a copy that differs from this one in the {@code package} line and the
@@ -142,6 +149,18 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
 
     /** Characters an include target may hold, so that it is a literal path pattern. */
     private static final Pattern SAFE_INCLUDE = Pattern.compile("[A-Za-z0-9._/-]+");
+
+    /** One label of a host name: 1 to 63 letters, digits or {@code _}, with {@code -} only between them. */
+    private static final Pattern HOST_LABEL = Pattern.compile("[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?");
+
+    /** Characters of an IPv6 address without brackets or zone, IPv4-suffixed forms included. */
+    private static final Pattern IPV6_CHARACTERS = Pattern.compile("[0-9A-Fa-f:.]+");
+
+    /** Longest host name, without the optional trailing {@code .} of an absolute name. */
+    private static final int MAX_HOST_NAME_LENGTH = 253;
+
+    /** Host of the RAML's {@code baseUri} when neither the {@code Host} header nor the socket names a legal one. */
+    private static final String LOOPBACK_HOST = "127.0.0.1";
 
     private final String basePath;
 
@@ -363,9 +382,15 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
         return includes.containsKey(target) ? target : null;
     }
 
-    /** The RAML with its {@code baseUri} set to the URL of the listener that received {@code request}. */
+    /**
+     * The RAML with its {@code baseUri} set to the URL of the listener that received {@code request}: its
+     * scheme, a host, its local port and the base path. The host is the name the {@code Host} header carries
+     * only when that is a legal DNS name, IPv4 address or IPv6 address; any other name, an absent one or a
+     * {@code Host} header the server cannot parse falls back to the local address of the listener socket, so
+     * no other header byte reaches the unquoted YAML scalar.
+     */
     private ResponseEntity<byte[]> raml(HttpServletRequest request) {
-        String listenerUri = request.getScheme() + "://" + hostLiteral(request.getServerName()) + ":"
+        String listenerUri = request.getScheme() + "://" + hostLiteral(listenerHost(request)) + ":"
                 + request.getLocalPort() + basePath;
         return ok(withBaseUri(listenerUri).getBytes(StandardCharsets.UTF_8), RAML_MEDIA_TYPE, true);
     }
@@ -548,6 +573,73 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
             return StreamUtils.copyToByteArray(in);
         } catch (IOException ex) {
             throw new UncheckedIOException("Could not read " + resource.getDescription(), ex);
+        }
+    }
+
+    /**
+     * The host of the listener URL: the {@code Host} header's name, without its port or brackets, when
+     * {@link #isLegalHost} accepts it; otherwise the local address of the socket that accepted the connection
+     * without its zone, or {@link #LOOPBACK_HOST} should that be unavailable too. The rejected name is not
+     * logged, so header bytes reach neither the RAML nor the log.
+     */
+    private static String listenerHost(HttpServletRequest request) {
+        String serverName;
+        try {
+            serverName = request.getServerName();
+        } catch (RuntimeException ex) {
+            // Undertow cannot strip the brackets of a Host header with an unclosed '[', such as "[abc".
+            serverName = null;
+        }
+        if (isLegalHost(serverName)) {
+            return serverName;
+        }
+        LOGGER.debug("Host header names no legal host; the RAML baseUri uses the listener's local address");
+        String localAddress = request.getLocalAddr();
+        if (localAddress != null && localAddress.indexOf('%') >= 0) {
+            localAddress = localAddress.substring(0, localAddress.indexOf('%'));
+        }
+        return isLegalHost(localAddress) ? localAddress : LOOPBACK_HOST;
+    }
+
+    /**
+     * Whether {@code host} is a legal host: a DNS name, dotted IPv4 addresses included, of dot-separated
+     * {@link #HOST_LABEL labels} and at most {@link #MAX_HOST_NAME_LENGTH} characters besides one optional
+     * trailing {@code .}, or an IPv6 address without brackets or zone.
+     */
+    private static boolean isLegalHost(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        if (host.indexOf(':') >= 0) {
+            return isIpv6Address(host);
+        }
+        String name = host.endsWith(".") ? host.substring(0, host.length() - 1) : host;
+        if (name.isEmpty() || name.length() > MAX_HOST_NAME_LENGTH) {
+            return false;
+        }
+        for (String label : name.split("\\.", -1)) {
+            if (!HOST_LABEL.matcher(label).matches()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether {@code host} is an IPv6 address, checked by the JDK's literal parser without any name resolution:
+     * only hexadecimal digits, {@code :} and {@code .} with at least one {@code :} get that far, and in brackets
+     * {@link InetAddress#getByName} accepts nothing but an IPv6 literal, throwing for any other such text
+     * instead of looking it up.
+     */
+    private static boolean isIpv6Address(String host) {
+        if (host.indexOf(':') < 0 || !IPV6_CHARACTERS.matcher(host).matches()) {
+            return false;
+        }
+        try {
+            InetAddress.getByName("[" + host + "]");
+            return true;
+        } catch (UnknownHostException ex) {
+            return false;
         }
     }
 
