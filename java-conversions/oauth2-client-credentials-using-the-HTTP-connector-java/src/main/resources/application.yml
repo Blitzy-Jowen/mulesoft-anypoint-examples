@@ -21,6 +21,13 @@ http:
 server:
   port: ${http.port:8081}
   address: 0.0.0.0      # http:listener-config host (xml:9)
+  undertow:
+    options:
+      server:
+        # The /FIM/* flow forwards the raw http.request.uri, whose literal {client_id} placeholders the uri-param
+        # fills (xml:41-43). Mule's Grizzly listener accepted "{" and "}" unescaped in the request target; Undertow
+        # answers such a request 400 unless this option is on. Tier 2A verification point.
+        ALLOW_UNESCAPED_CHARACTERS_IN_URL: true
 
 # Box OAuth 2.0 client-credentials grant (original ${oauth.client.id} / ${oauth.client.secret}, xml:14)
 oauth:
