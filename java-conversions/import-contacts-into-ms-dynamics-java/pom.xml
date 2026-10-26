@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.12</version>
+        <!-- Empty on purpose: the repository-root pom.xml is the Mule examples aggregator, not this project's parent. -->
+        <relativePath/>
+    </parent>
+
+    <groupId>com.mulesoft.examples</groupId>
+    <artifactId>import-contacts-into-ms-dynamics-java</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>import-contacts-into-ms-dynamics-java</name>
+    <description>Spring Boot 3.2.12 conversion of the Mule 3.8 example import-contacts-into-ms-dynamics: a polled CSV file
+        whose records are created as contacts in Microsoft Dynamics 365 through the Dataverse Web API, authenticated with
+        a Microsoft Entra client-credentials token.</description>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!-- Versions outside the Spring Boot 3.2.12 BOM -->
+        <wiremock.version>3.13.2</wiremock.version>
+        <jacoco.version>0.8.15</jacoco.version>
+    </properties>
+
+    <dependencies>
+        <!-- WebClient over reactor-netty for the Dataverse Web API and the Entra token endpoint. No web or Undertow
+             starter: the original flow has no HTTP listener, so the application runs with
+             spring.main.web-application-type: none and never starts a server. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+        <!-- Spring Security's reactive OAuth2 client: the client-credentials manager, authorized-client service and
+             the WebClient exchange filter that attaches the Entra bearer token. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-oauth2-client</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Entra token endpoint and Dataverse Web API stubs. Shaded, so its Jetty and Jackson copies never meet the
+             BOM's Jackson. -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>${wiremock.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <execution>
+                        <id>enforce-banned-dependencies</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <searchTransitive>true</searchTransitive>
+                                    <excludes>
+                                        <exclude>javax.xml.ws:*</exclude>
+                                        <exclude>jakarta.xml.ws:*</exclude>
+                                        <exclude>javax.jws:*</exclude>
+                                        <exclude>jakarta.jws:*</exclude>
+                                        <exclude>javax.xml:jaxws-api</exclude>
+                                        <exclude>org.apache.cxf:*</exclude>
+                                        <exclude>com.sun.xml.ws:*</exclude>
+                                        <exclude>org.glassfish.metro:*</exclude>
+                                    </excludes>
+                                    <message>JAX-WS and CXF (APIs and providers) are banned in every converted project; SOAP is implemented with Spring WS only, and Dynamics 365 is reached through the Dataverse Web API.</message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <release>${java.version}</release>
+                    <parameters>true</parameters>
+                </configuration>
+            </plugin>
+
+            <!-- Unit tier (mvn test): credential-free; *IT classes are the live Dataverse tests and belong to failsafe
+                 only. No literal argLine, which would drop the JaCoCo agent that prepare-agent passes through it. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.1.2</version>
+                <configuration>
+                    <excludes>
+                        <exclude>**/*IT.java</exclude>
+                        <!-- Declaring excludes replaces surefire's default, so nested classes stay excluded explicitly;
+                             JUnit still runs @Nested classes through their enclosing test class. -->
+                        <exclude>**/*$*</exclude>
+                    </excludes>
+                    <!-- Every test context starts the scheduled ContactsFileTrigger; these system properties outrank
+                         application.yml, so tests never poll or move files in src/main/resources/input|output, and the
+                         hour-long delay leaves only the startup poll. Tests needing their own directories override
+                         them with @DynamicPropertySource. -->
+                    <systemPropertyVariables>
+                        <contacts.input-dir>${project.build.directory}/test-contacts/input</contacts.input-dir>
+                        <contacts.move-to-dir>${project.build.directory}/test-contacts/output</contacts.move-to-dir>
+                        <contacts.polling-frequency>3600000</contacts.polling-frequency>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+
+            <!-- Tier 2B (mvn verify): the live Dataverse test; ImportContactsIntoMSDynamicsIT skips itself by assumption
+                 when src/test/resources/application-it.yml or a required key is absent. Failsafe 3.1.2 reports a class
+                 aborted by an assumption in @BeforeAll as zero tests run, not as skipped; an assumption in @BeforeEach,
+                 or a class-level @EnabledIf, is reported as skipped. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>3.1.2</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
+                    <systemPropertyVariables>
+                        <contacts.input-dir>${project.build.directory}/it-contacts/input</contacts.input-dir>
+                        <contacts.move-to-dir>${project.build.directory}/it-contacts/output</contacts.move-to-dir>
+                        <contacts.polling-frequency>3600000</contacts.polling-frequency>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <!-- Whole-project report, so total coverage is recorded beside the gated figure. -->
+                    <execution>
+                        <id>report</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <!-- Gate: LINE coverage >= 80% over the service and mapper classes. The includes sit on the
+                         execution, because rule-level includes filter bundle names, not classes. -->
+                    <execution>
+                        <id>check</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>com/mulesoft/examples/import_contacts_into_ms_dynamics/service/**</include>
+                                <include>com/mulesoft/examples/import_contacts_into_ms_dynamics/mapper/**</include>
+                            </includes>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.80</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>3.2.12</version>
+                <executions>
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <mainClass>com.mulesoft.examples.import_contacts_into_ms_dynamics.ImportContactsIntoMsDynamicsApplication</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
