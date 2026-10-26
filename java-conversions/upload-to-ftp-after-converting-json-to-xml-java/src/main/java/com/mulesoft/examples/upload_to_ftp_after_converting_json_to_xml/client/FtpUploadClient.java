@@ -55,6 +55,17 @@ public class FtpUploadClient {
 
     private static final Logger LOG = LoggerFactory.getLogger(FtpUploadClient.class);
 
+    /** Most characters a value written to the log may occupy once escaped. */
+    private static final int LOG_VALUE_LIMIT = 256;
+
+    /** Written to the log in place of a {@code null} value. */
+    private static final String NULL_LOG_TOKEN = "(null)";
+
+    /** Appended to a logged value cut at {@link #LOG_VALUE_LIMIT}. */
+    private static final String TRUNCATION_LOG_MARKER = "...[truncated]";
+
+    private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
     private final FtpProperties properties;
 
     public FtpUploadClient(FtpProperties properties) {
@@ -66,8 +77,9 @@ public class FtpUploadClient {
      *
      * @param fileName name of the remote file, normally {@link #OUTPUT_PATTERN}
      * @param content  bytes to store, transferred unchanged in binary mode
-     * @throws IllegalStateException if the host is not configured or the server rejects the greeting, the
-     *                               login, the file type, the directory change or the store
+     * @throws IllegalStateException if the host, user or password is not configured or the server rejects
+     *                               the greeting, the login, the file type, the directory change or the
+     *                               store
      * @throws UncheckedIOException  if the connection or transfer fails (refused, unknown host, timeout,
      *                               reset)
      */
@@ -83,6 +95,14 @@ public class FtpUploadClient {
 
         if (host == null || host.isBlank()) {
             throw new IllegalStateException("FTP host is not configured (ftp.host)");
+        }
+        if (user == null || user.isBlank()) {
+            throw new IllegalStateException("FTP user is not configured (ftp.user)");
+        }
+        // Only an absent or empty password is missing: whitespace is a legal password, and the unset
+        // ${FTP_PASSWORD:} placeholder binds to "". The value itself never enters the message.
+        if (password == null || password.isEmpty()) {
+            throw new IllegalStateException("FTP password is not configured (ftp.password)");
         }
         String target = host + ":" + port;
 
@@ -121,19 +141,22 @@ public class FtpUploadClient {
             throw new UncheckedIOException("FTP upload to " + target + " failed: " + e.getMessage(), e);
         } finally {
             // Cleanup failures are logged only: they must neither mask the upload's own exception nor turn
-            // a completed store into a failure.
+            // a completed store into a failure. Only the escaped target and the exception type are logged,
+            // never the exception's text, which can quote raw multi-line server replies.
             if (loggedIn) {
                 try {
                     ftp.logout();
                 } catch (IOException | RuntimeException e) {
-                    LOG.debug("Ignoring FTP logout failure on {}: {}", target, e.toString());
+                    LOG.debug("Ignoring FTP logout failure on {}: {}", loggable(target),
+                            loggable(e.getClass().getName()));
                 }
             }
             if (ftp.isConnected()) {
                 try {
                     ftp.disconnect();
                 } catch (IOException | RuntimeException e) {
-                    LOG.debug("Ignoring FTP disconnect failure on {}: {}", target, e.toString());
+                    LOG.debug("Ignoring FTP disconnect failure on {}: {}", loggable(target),
+                            loggable(e.getClass().getName()));
                 }
             }
         }
@@ -147,5 +170,66 @@ public class FtpUploadClient {
     private static String reply(FTPClient ftp) {
         String replyString = ftp.getReplyString();
         return replyString == null ? "" : replyString.trim();
+    }
+
+    /**
+     * Makes {@code value} safe to log on one line, with the escaping policy of the application's error
+     * handler.
+     *
+     * <p>ISO control characters (C0, DEL and C1, so CR, LF, TAB, NUL and NEL included), line and paragraph
+     * separators, format characters (bidirectional overrides and isolates, zero-width characters, the byte
+     * order mark), unpaired surrogates and the reverse solidus are each written as {@code \}{@code u} and
+     * four lower-case hex digits per UTF-16 unit; escaping the reverse solidus keeps an escape in the log
+     * distinguishable from the same six characters in the input. Every other character, a valid surrogate
+     * pair included, is copied unchanged.
+     *
+     * @param value the value to log; {@code null} is written as {@code (null)}
+     * @return the escaped value, at most {@link #LOG_VALUE_LIMIT} characters; a longer value is cut before
+     *         the first character or escape that would exceed the limit, never inside a surrogate pair or an
+     *         escape, and {@code ...[truncated]} is appended
+     */
+    private static String loggable(String value) {
+        if (value == null) {
+            return NULL_LOG_TOKEN;
+        }
+        StringBuilder out = new StringBuilder(
+                Math.min(value.length(), LOG_VALUE_LIMIT) + TRUNCATION_LOG_MARKER.length());
+        int i = 0;
+        while (i < value.length()) {
+            int codePoint = value.codePointAt(i);
+            int units = Character.charCount(codePoint);
+            boolean escape = mustEscape(codePoint);
+            if (out.length() + (escape ? 6 * units : units) > LOG_VALUE_LIMIT) {
+                return out.append(TRUNCATION_LOG_MARKER).toString();
+            }
+            for (int unit = i; unit < i + units; unit++) {
+                if (escape) {
+                    appendUnicodeEscape(out, value.charAt(unit));
+                } else {
+                    out.append(value.charAt(unit));
+                }
+            }
+            i += units;
+        }
+        return out.toString();
+    }
+
+    private static boolean mustEscape(int codePoint) {
+        if (codePoint == '\\' || Character.isISOControl(codePoint)) {
+            return true;
+        }
+        int type = Character.getType(codePoint);
+        return type == Character.LINE_SEPARATOR
+                || type == Character.PARAGRAPH_SEPARATOR
+                || type == Character.FORMAT
+                || type == Character.SURROGATE;
+    }
+
+    private static void appendUnicodeEscape(StringBuilder out, char c) {
+        out.append("\\u")
+                .append(HEX_DIGITS[(c >> 12) & 0xF])
+                .append(HEX_DIGITS[(c >> 8) & 0xF])
+                .append(HEX_DIGITS[(c >> 4) & 0xF])
+                .append(HEX_DIGITS[c & 0xF]);
     }
 }

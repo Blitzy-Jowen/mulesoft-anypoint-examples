@@ -22,8 +22,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * credentials have none and stay unset until supplied.
  *
  * <p>Nothing is validated at bind time, so the application starts with blank values; the FTP client
- * rejects a blank host when an upload is attempted. The endpoint's output file name and response timeout
- * are constants of that client, not settings of this class.
+ * rejects a blank host or user, or an empty password, when an upload is attempted. The endpoint's output
+ * file name and response timeout are constants of that client, not settings of this class.
  *
  * <p>Registered by {@code @EnableConfigurationProperties(FtpProperties.class)} on the application class. It
  * carries no stereotype annotation, because one would register a second bean of this type.
