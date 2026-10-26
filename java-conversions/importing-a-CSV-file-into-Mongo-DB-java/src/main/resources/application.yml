@@ -1,0 +1,25 @@
+# importing-a-CSV-file-into-Mongo-DB-java runtime configuration
+# Original: importing-a-CSV-file-into-Mongo-DB/src/main/app/csv-to-mongodb.xml
+# (its app properties file is empty). The original placeholder names are kept unchanged.
+spring:
+  main:
+    web-application-type: none          # no HTTP listener in the original (AAP 0.5.1 list)
+  data:
+    mongodb:
+      host: localhost                   # Mule MongoDB connector default; the original flow sets none
+      port: 27017                       # Mule MongoDB connector default; the original flow sets none
+      database: ${database.name}
+      username: ${database.user}
+      password: ${database.password}
+
+# Original mongo:config placeholders (l.4). All three must be supplied: an empty password cannot
+# bind to spring.data.mongodb.password (char[]), so startup fails until it is set, even when
+# spring.data.mongodb.uri is set (test profiles included); an empty user fails the MongoClient.
+database:
+  name: ${DATABASE_NAME:}               # TODO: supply the MongoDB database name
+  user: ${DATABASE_USER:}               # TODO: supply the MongoDB user
+  password: ${DATABASE_PASSWORD:}       # TODO: supply the MongoDB user's password
+
+csv-import:
+  input-dir: src/main/resources/input   # original file:inbound-endpoint path (l.9)
+  polling-frequency: 1000               # Mule file-connector default in ms; the original declares none
