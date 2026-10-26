@@ -10,9 +10,11 @@ package com.mulesoft.examples.salesforce_data_retrieval.client;
 
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,9 +53,12 @@ import com.mulesoft.examples.salesforce_data_retrieval.exception.UpstreamUnavail
  *       <td>the vendor's exception</td></tr>
  * </table>
  *
- * <p>Each of the three upstream exceptions is preceded by one ERROR log line naming the upstream, the category and
- * the upstream's message, with the vendor failure's stack trace; file- and poll-triggered projects, which have no
- * caller to answer, rely on that line. An upstream exception thrown by a callback, for example by a nested
+ * <p>Each of the three upstream exceptions is preceded by one ERROR log line naming the upstream, the category, the
+ * vendor failure's class with the frame that threw it, and the classes of its causes in order; file- and
+ * poll-triggered projects, which have no caller to answer, rely on that line. The upstream's message is carried
+ * only by the raised exception, for the caller; neither it nor any other exception text, suppressed exception or
+ * stack trace is logged, because vendor text can repeat request data, identifiers or tokens and can carry line
+ * breaks that forge log lines. An upstream exception thrown by a callback, for example by a nested
  * executor, passes through unclassified. {@link Error}s are never caught. A caught {@link InterruptedException}
  * restores the thread's interrupt flag before it is classified.
  *
@@ -68,6 +73,24 @@ import com.mulesoft.examples.salesforce_data_retrieval.exception.UpstreamUnavail
 public class UpstreamCallExecutor {
 
     private static final Logger LOG = LoggerFactory.getLogger(UpstreamCallExecutor.class);
+
+    /** Longest logged class, method or file name, in characters after escaping. */
+    private static final int NAME_LOG_LIMIT = 256;
+
+    /** Number of causes named after the vendor failure before the chain is cut short. */
+    private static final int CAUSE_LOG_LIMIT = 10;
+
+    private static final String NULL_LOG_TOKEN = "(null)";
+
+    private static final String TRUNCATION_LOG_MARKER = "...[truncated]";
+
+    private static final String CAUSE_SEPARATOR = " <- ";
+
+    private static final String MORE_CAUSES_MARKER = "...";
+
+    private static final String CIRCULAR_CAUSE_MARKER = "[circular]";
+
+    private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
 
     private final Map<UpstreamSystem, UpstreamFailureClassifier> classifiers;
 
@@ -224,13 +247,135 @@ public class UpstreamCallExecutor {
     }
 
     /**
-     * Writes the ERROR line that precedes every upstream exception and returns the upstream's message. The
-     * message is the vendor's fault text, never a credential.
+     * Writes the ERROR line that precedes every upstream exception and returns the upstream's message.
+     *
+     * <p>The line names the upstream, the category and the failure's type identifiers only, for example
+     * {@code Upstream NetSuite call failed [UNAVAILABLE]: a.b.VendorException at a.b.C.d(C.java:18) <-
+     * java.net.SocketTimeoutException}. The returned message goes to the caller-facing exception alone and is never
+     * logged, and the failure itself is not handed to the logger: vendor text, cause messages, suppressed
+     * exceptions and stack traces can repeat request data, identifiers or tokens, and can carry line breaks.
      */
     private static String logFailure(UpstreamSystem system, UpstreamFailureClassifier classifier, Category category,
             Exception failure) {
         String message = classifier.upstreamMessage(failure);
-        LOG.error("Upstream {} call failed [{}]: {}", system.displayName(), category, message, failure);
+        LOG.error("Upstream {} call failed [{}]: {}", system.displayName(), category, describe(failure));
         return message;
+    }
+
+    /**
+     * Returns the type identifiers of {@code failure} without any of its text: its class name and throw-site
+     * frame, then the class name of each cause, separated by {@code " <- "}. The walk stops at a cause already
+     * named, marked {@code [circular]}, and after {@link #CAUSE_LOG_LIMIT} causes, marked {@code ...}, so cyclic
+     * and very deep chains terminate. Suppressed exceptions are not named.
+     */
+    private static String describe(Throwable failure) {
+        StringBuilder out = new StringBuilder(128);
+        out.append(sanitize(failure.getClass().getName(), NAME_LOG_LIMIT));
+        appendThrowSite(out, failure);
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(failure);
+        int causes = 0;
+        for (Throwable cause = failure.getCause(); cause != null; cause = cause.getCause()) {
+            out.append(CAUSE_SEPARATOR);
+            if (causes == CAUSE_LOG_LIMIT) {
+                out.append(MORE_CAUSES_MARKER);
+                break;
+            }
+            if (!named.add(cause)) {
+                out.append(CIRCULAR_CAUSE_MARKER);
+                break;
+            }
+            out.append(sanitize(cause.getClass().getName(), NAME_LOG_LIMIT));
+            causes++;
+        }
+        return out.toString();
+    }
+
+    /**
+     * Appends {@code " at <class>.<method>(<file>:<line>)"} for the frame that threw {@code failure}, in the form
+     * {@link StackTraceElement#toString()} uses but without its class loader and module prefix, or nothing when
+     * the failure has no stack trace.
+     */
+    private static void appendThrowSite(StringBuilder out, Throwable failure) {
+        StackTraceElement[] trace = failure.getStackTrace();
+        if (trace == null || trace.length == 0 || trace[0] == null) {
+            return;
+        }
+        StackTraceElement frame = trace[0];
+        out.append(" at ")
+                .append(sanitize(frame.getClassName(), NAME_LOG_LIMIT))
+                .append('.')
+                .append(sanitize(frame.getMethodName(), NAME_LOG_LIMIT))
+                .append('(');
+        if (frame.isNativeMethod()) {
+            out.append("Native Method");
+        } else if (frame.getFileName() == null) {
+            out.append("Unknown Source");
+        } else {
+            out.append(sanitize(frame.getFileName(), NAME_LOG_LIMIT));
+            if (frame.getLineNumber() >= 0) {
+                out.append(':').append(frame.getLineNumber());
+            }
+        }
+        out.append(')');
+    }
+
+    /**
+     * Makes {@code value} safe to log on one line.
+     *
+     * <p>ISO control characters (C0, DEL and C1, so CR, LF, TAB, NUL and NEL included), line and paragraph
+     * separators, format characters (bidirectional overrides and isolates, zero-width characters, the byte order
+     * mark), unpaired surrogates and the reverse solidus are each written as {@code \}{@code u} and four
+     * lower-case hex digits per UTF-16 unit; escaping the reverse solidus keeps an escape in the log
+     * distinguishable from the same six characters in the input. Every other character, a valid surrogate pair
+     * included, is copied unchanged.
+     *
+     * @param value the value to log; {@code null} is written as {@code (null)}
+     * @param limit the most characters the escaped value may occupy; a longer value is cut before the first
+     *              character or escape that would exceed it, never inside a surrogate pair or an escape, and
+     *              {@code ...[truncated]} is appended
+     */
+    private static String sanitize(String value, int limit) {
+        if (value == null) {
+            return NULL_LOG_TOKEN;
+        }
+        StringBuilder out = new StringBuilder(Math.min(value.length(), limit) + TRUNCATION_LOG_MARKER.length());
+        int i = 0;
+        while (i < value.length()) {
+            int codePoint = value.codePointAt(i);
+            int units = Character.charCount(codePoint);
+            boolean escape = mustEscape(codePoint);
+            if (out.length() + (escape ? 6 * units : units) > limit) {
+                return out.append(TRUNCATION_LOG_MARKER).toString();
+            }
+            for (int unit = i; unit < i + units; unit++) {
+                if (escape) {
+                    appendUnicodeEscape(out, value.charAt(unit));
+                } else {
+                    out.append(value.charAt(unit));
+                }
+            }
+            i += units;
+        }
+        return out.toString();
+    }
+
+    private static boolean mustEscape(int codePoint) {
+        if (codePoint == '\\' || Character.isISOControl(codePoint)) {
+            return true;
+        }
+        int type = Character.getType(codePoint);
+        return type == Character.LINE_SEPARATOR
+                || type == Character.PARAGRAPH_SEPARATOR
+                || type == Character.FORMAT
+                || type == Character.SURROGATE;
+    }
+
+    private static void appendUnicodeEscape(StringBuilder out, char c) {
+        out.append("\\u")
+                .append(HEX_DIGITS[(c >> 12) & 0xF])
+                .append(HEX_DIGITS[(c >> 8) & 0xF])
+                .append(HEX_DIGITS[(c >> 4) & 0xF])
+                .append(HEX_DIGITS[c & 0xF]);
     }
 }

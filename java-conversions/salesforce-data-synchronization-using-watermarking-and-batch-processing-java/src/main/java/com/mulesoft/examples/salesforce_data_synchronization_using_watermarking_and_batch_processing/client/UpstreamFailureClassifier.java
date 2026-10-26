@@ -53,10 +53,12 @@ public interface UpstreamFailureClassifier {
     /**
      * Classifies a throwable raised by a vendor call or by its re-authentication step.
      *
-     * <p>Implementations walk the {@link Throwable#getCause()} chain looking for the vendor's authentication and
-     * rate-limit signals (for example a Salesforce {@code INVALID_SESSION_ID} fault, or an HTTP 401 or 429 with its
-     * {@code Retry-After} value), then normally return {@link UpstreamFailureKind#UNAVAILABLE} when
-     * {@link #isUnavailable(Throwable)} holds, and {@link UpstreamFailureKind#OTHER} for anything they do not
+     * <p>Implementations first return {@link UpstreamFailureKind#UNAVAILABLE} when {@link #isUnavailable(Throwable)}
+     * holds, even when the chain also carries an authentication or rate-limit signal: a timed-out or disconnected
+     * request may already have been processed, so re-authenticating and retrying it could repeat a write. Only then
+     * do they walk the {@link Throwable#getCause()} chain looking for the vendor's authentication and rate-limit
+     * signals (for example a Salesforce {@code INVALID_SESSION_ID} fault, or an HTTP 401 or 429 with its
+     * {@code Retry-After} value), and they return {@link UpstreamFailureKind#OTHER} for anything they do not
      * recognise. An implementation never throws: the executor relies on the result to decide between retrying,
      * failing and rethrowing the original throwable.
      *

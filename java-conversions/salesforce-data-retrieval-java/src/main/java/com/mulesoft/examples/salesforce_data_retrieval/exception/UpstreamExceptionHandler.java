@@ -94,10 +94,17 @@ public class UpstreamExceptionHandler {
     /**
      * Logs the failure once at ERROR and builds its response; {@code retryAfter} becomes the
      * {@code Retry-After} header only when it is non-null and not blank.
+     *
+     * <p>The log line names the upstream, the response status and the exception's simple class name, for
+     * example {@code Upstream NetSuite failure (503): UpstreamUnavailableException}. The exception's message is
+     * the upstream's text and goes to the response body alone; neither it nor the exception with its vendor
+     * cause is handed to the logger, because vendor text can repeat request data, identifiers or tokens and can
+     * carry line breaks that forge log lines. The executor logs the vendor failure's type identifiers when it
+     * raises the exception.
      */
     private static ResponseEntity<String> respond(HttpStatus status, RuntimeException ex, UpstreamSystem system,
                                                   String retryAfter) {
-        log.error("Upstream {} failure ({}): {}", system.displayName(), status.value(), ex.getMessage(), ex);
+        log.error("Upstream {} failure ({}): {}", system.displayName(), status.value(), ex.getClass().getSimpleName());
         ResponseEntity.BodyBuilder response = ResponseEntity.status(status).contentType(JSON);
         if (retryAfter != null && !retryAfter.isBlank()) {
             response.header(HttpHeaders.RETRY_AFTER, retryAfter);

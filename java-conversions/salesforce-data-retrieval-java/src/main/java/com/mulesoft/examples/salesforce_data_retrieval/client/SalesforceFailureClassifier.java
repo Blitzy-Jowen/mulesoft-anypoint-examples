@@ -26,7 +26,14 @@ import org.springframework.stereotype.Component;
  * Classifies failed Salesforce Partner API calls for {@code UpstreamCallExecutor}: the Salesforce row of the
  * approved connector failure handling (AAP 0.4.8), part of shared component SC-15.
  *
- * <p>The cause chain of the failure is walked from the failure itself, each throwable visited once:
+ * <p>A timeout or connectivity failure anywhere in the cause chain → {@link UpstreamFailureKind#UNAVAILABLE},
+ * never retried. WSC wraps every transport {@code IOException} as a {@code ConnectionException} with the
+ * {@code IOException} as its cause, which {@link UpstreamFailureClassifier#isUnavailable(Throwable)} finds. This
+ * check comes first and wins over the Salesforce signals below, also when a fault carrying
+ * {@code INVALID_SESSION_ID} or {@code REQUEST_LIMIT_EXCEEDED} sits in the same chain: a timed-out or disconnected
+ * request may already have been processed, so logging in again and retrying it could repeat a write.
+ *
+ * <p>Otherwise the cause chain of the failure is walked from the failure itself, each throwable visited once:
  * <ul>
  *   <li>an {@link ApiFault} (including {@code LoginFault}) whose {@link ApiFault#getExceptionCode() exception code}
  *       is {@link ExceptionCode#INVALID_SESSION_ID} → {@link UpstreamFailureKind#AUTHENTICATION}: the executor logs
@@ -37,9 +44,6 @@ import org.springframework.stereotype.Component;
  *       {@code detail} element it can bind) is classified the same way by the local part of its fault code, which
  *       WSC parses from {@code sf:INVALID_SESSION_ID} as {@code INVALID_SESSION_ID}.</li>
  * </ul>
- * Otherwise a timeout or connectivity failure anywhere in the chain → {@link UpstreamFailureKind#UNAVAILABLE},
- * never retried. WSC wraps every transport {@code IOException} as a {@code ConnectionException} with the
- * {@code IOException} as its cause, which {@link UpstreamFailureClassifier#isUnavailable(Throwable)} finds.
  *
  * <p>Everything else, for example {@code INVALID_LOGIN}, {@code INVALID_TYPE}, {@code INVALID_FIELD} or
  * {@code MALFORMED_QUERY}, is {@link UpstreamFailureKind#OTHER}: the executor rethrows it unchanged, so the
@@ -70,6 +74,12 @@ public class SalesforceFailureClassifier implements UpstreamFailureClassifier {
     /**
      * Classifies a throwable raised by a Partner API call or by the re-login that follows a session rejection.
      *
+     * <p>A timeout or connectivity failure anywhere in the cause chain is checked first and yields
+     * {@link UpstreamFailureKind#UNAVAILABLE} even when the chain also holds an {@code INVALID_SESSION_ID} or
+     * {@code REQUEST_LIMIT_EXCEEDED} signal: a timed-out or disconnected request may already have been processed,
+     * so logging in again and retrying it could repeat a write. Only a chain without such a cause is searched for
+     * those two Salesforce signals.
+     *
      * @param failure the throwable exactly as the call raised it; {@code null} is classified as
      *                {@link UpstreamFailureKind#OTHER}
      * @return the classification; never {@code null}
@@ -79,15 +89,16 @@ public class SalesforceFailureClassifier implements UpstreamFailureClassifier {
         if (failure == null) {
             return UpstreamFailureKind.OTHER;
         }
+        if (UpstreamFailureClassifier.isUnavailable(failure)) {
+            return UpstreamFailureKind.UNAVAILABLE;
+        }
         for (Throwable current : causeChain(failure)) {
             UpstreamFailureKind signalled = salesforceSignal(current);
             if (signalled != null) {
                 return signalled;
             }
         }
-        return UpstreamFailureClassifier.isUnavailable(failure)
-                ? UpstreamFailureKind.UNAVAILABLE
-                : UpstreamFailureKind.OTHER;
+        return UpstreamFailureKind.OTHER;
     }
 
     /**
