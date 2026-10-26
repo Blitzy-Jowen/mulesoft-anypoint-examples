@@ -253,112 +253,126 @@ class OrderXmlMapperTest {
         String converted = xstreamIntText("0x1F");
         XMLStreamReader plain = XMLInputFactory.newDefaultFactory()
                 .createXMLStreamReader(new StringReader("<order><itemId>0x1F</itemId></order>"));
-        plain.nextTag();
-        OrderXmlMapper.IntegerTextReader reader = new OrderXmlMapper.IntegerTextReader(plain);
+        try {
+            plain.nextTag();
+            OrderXmlMapper.IntegerTextReader reader = new OrderXmlMapper.IntegerTextReader(plain);
 
-        assertThat(reader.next()).isEqualTo(XMLStreamConstants.START_ELEMENT);
-        assertThat(reader.next()).isEqualTo(XMLStreamConstants.CHARACTERS);
+            assertThat(reader.next()).isEqualTo(XMLStreamConstants.START_ELEMENT);
+            assertThat(reader.next()).isEqualTo(XMLStreamConstants.CHARACTERS);
 
-        assertThat(reader.getEventType()).isEqualTo(XMLStreamConstants.CHARACTERS);
-        assertThat(reader.isCharacters()).isTrue();
-        assertThat(reader.isStartElement()).isFalse();
-        assertThat(reader.isEndElement()).isFalse();
-        assertThat(reader.hasText()).isTrue();
-        assertThat(reader.hasName()).isFalse();
-        assertThat(reader.isWhiteSpace()).isFalse();
-        assertThat(reader.getText()).isEqualTo(converted);
-        assertThat(new String(reader.getTextCharacters(), reader.getTextStart(), reader.getTextLength()))
-                .isEqualTo(converted);
-        char[] target = new char[4];
-        assertThat(reader.getTextCharacters(0, target, 1, 3)).isEqualTo(converted.length());
-        assertThat(target).containsExactly('\0', converted.charAt(0), converted.charAt(1), '\0');
-        assertThat(reader.getTextCharacters(1, target, 0, 1)).isEqualTo(1);
-        assertThat(target[0]).isEqualTo(converted.charAt(1));
-        assertThat(reader.getTextCharacters(5, target, 0, 4)).isZero();
-        assertThatThrownBy(() -> reader.getTextCharacters(-1, target, 0, 1))
-                .isInstanceOf(IndexOutOfBoundsException.class);
-        assertThatThrownBy(() -> reader.getTextCharacters(0, target, 3, 2))
-                .isInstanceOf(IndexOutOfBoundsException.class);
+            assertThat(reader.getEventType()).isEqualTo(XMLStreamConstants.CHARACTERS);
+            assertThat(reader.isCharacters()).isTrue();
+            assertThat(reader.isStartElement()).isFalse();
+            assertThat(reader.isEndElement()).isFalse();
+            assertThat(reader.hasText()).isTrue();
+            assertThat(reader.hasName()).isFalse();
+            assertThat(reader.isWhiteSpace()).isFalse();
+            assertThat(reader.getText()).isEqualTo(converted);
+            assertThat(new String(reader.getTextCharacters(), reader.getTextStart(), reader.getTextLength()))
+                    .isEqualTo(converted);
+            char[] target = new char[4];
+            assertThat(reader.getTextCharacters(0, target, 1, 3)).isEqualTo(converted.length());
+            assertThat(target).containsExactly('\0', converted.charAt(0), converted.charAt(1), '\0');
+            assertThat(reader.getTextCharacters(1, target, 0, 1)).isEqualTo(1);
+            assertThat(target[0]).isEqualTo(converted.charAt(1));
+            assertThat(reader.getTextCharacters(5, target, 0, 4)).isZero();
+            assertThatThrownBy(() -> reader.getTextCharacters(-1, target, 0, 1))
+                    .isInstanceOf(IndexOutOfBoundsException.class);
+            assertThatThrownBy(() -> reader.getTextCharacters(0, target, 3, 2))
+                    .isInstanceOf(IndexOutOfBoundsException.class);
 
-        assertThat(reader.next()).isEqualTo(XMLStreamConstants.END_ELEMENT);
-        assertThat(reader.isEndElement()).isTrue();
-        assertThat(reader.getLocalName()).isEqualTo("itemId");
-        assertThat(reader.next()).isEqualTo(XMLStreamConstants.END_ELEMENT);
-        assertThat(reader.getLocalName()).isEqualTo("order");
+            assertThat(reader.next()).isEqualTo(XMLStreamConstants.END_ELEMENT);
+            assertThat(reader.isEndElement()).isTrue();
+            assertThat(reader.getLocalName()).isEqualTo("itemId");
+            assertThat(reader.next()).isEqualTo(XMLStreamConstants.END_ELEMENT);
+            assertThat(reader.getLocalName()).isEqualTo("order");
+        } finally {
+            // Closing the wrapped reader also releases the IntegerTextReader, which delegates its close to it.
+            plain.close();
+        }
     }
 
     @Test
     void readerElementTextAndNextTagGoThroughConversion() throws XMLStreamException {
         OrderXmlMapper.IntegerTextReader reader = readerOf("<?xml version=\"1.0\"?><!--c--><?pi x?>\n<order>\n"
                 + " <itemId>010</itemId>\n <itemUnits>1 2</itemUnits>\n <customerId>5</customerId>\n</order>");
-
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
-        assertThat(reader.getLocalName()).isEqualTo("order");
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
-        assertThat(reader.getElementText()).isEqualTo(xstreamIntText("010"));
-        assertThat(reader.isEndElement()).isTrue();
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
-        assertThatThrownBy(reader::getElementText)
-                .isInstanceOf(XMLStreamException.class)
-                .hasMessage("element itemUnits does not hold an integer")
-                .hasCauseInstanceOf(NumberFormatException.class);
-        assertThat(reader.isEndElement()).isTrue();
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
-        assertThat(reader.getLocalName()).isEqualTo("customerId");
-        assertThatThrownBy(reader::nextTag)
-                .as("the converted text is not whitespace")
-                .isInstanceOf(XMLStreamException.class)
-                .hasMessageContaining("expected start or end tag");
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
-        assertThat(reader.getLocalName()).isEqualTo("customerId");
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
-        assertThat(reader.getLocalName()).isEqualTo("order");
+        try {
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
+            assertThat(reader.getLocalName()).isEqualTo("order");
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
+            assertThat(reader.getElementText()).isEqualTo(xstreamIntText("010"));
+            assertThat(reader.isEndElement()).isTrue();
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
+            assertThatThrownBy(reader::getElementText)
+                    .isInstanceOf(XMLStreamException.class)
+                    .hasMessage("element itemUnits does not hold an integer")
+                    .hasCauseInstanceOf(NumberFormatException.class);
+            assertThat(reader.isEndElement()).isTrue();
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.START_ELEMENT);
+            assertThat(reader.getLocalName()).isEqualTo("customerId");
+            assertThatThrownBy(reader::nextTag)
+                    .as("the converted text is not whitespace")
+                    .isInstanceOf(XMLStreamException.class)
+                    .hasMessageContaining("expected start or end tag");
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
+            assertThat(reader.getLocalName()).isEqualTo("customerId");
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
+            assertThat(reader.getLocalName()).isEqualTo("order");
+        } finally {
+            reader.close();
+        }
     }
 
     @Test
     void readerPassesOtherTextThrough() throws XMLStreamException {
         OrderXmlMapper.IntegerTextReader reader = readerOf("<order><note>a<!--c-->b<?pi x?>c</note>"
                 + "<itemId xmlns=\"urn:other\">1 2</itemId><wrapper><itemId> 3 </itemId></wrapper></order>");
-
-        reader.nextTag();
-        reader.nextTag();
-        assertThat(reader.getElementText()).isEqualTo("abc");
-        reader.nextTag();
-        assertThat(reader.getElementText()).as("an itemId in another namespace").isEqualTo("1 2");
-        reader.nextTag();
-        reader.nextTag();
-        assertThat(reader.next()).as("an itemId below a direct child").isEqualTo(XMLStreamConstants.CHARACTERS);
-        assertThat(reader.isCharacters()).isTrue();
-        assertThat(reader.hasText()).isTrue();
-        assertThat(reader.hasName()).isFalse();
-        assertThat(reader.isWhiteSpace()).isFalse();
-        assertThat(reader.getText()).isEqualTo(" 3 ");
-        assertThat(new String(reader.getTextCharacters(), reader.getTextStart(), reader.getTextLength()))
-                .isEqualTo(" 3 ");
-        char[] target = new char[3];
-        assertThat(reader.getTextCharacters(0, target, 0, 3)).isEqualTo(3);
-        assertThat(target).containsExactly(' ', '3', ' ');
-        assertThat(reader.next()).isEqualTo(XMLStreamConstants.END_ELEMENT);
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
-        assertThat(reader.getLocalName()).isEqualTo("wrapper");
-        assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
-        assertThat(reader.getLocalName()).isEqualTo("order");
+        try {
+            reader.nextTag();
+            reader.nextTag();
+            assertThat(reader.getElementText()).isEqualTo("abc");
+            reader.nextTag();
+            assertThat(reader.getElementText()).as("an itemId in another namespace").isEqualTo("1 2");
+            reader.nextTag();
+            reader.nextTag();
+            assertThat(reader.next()).as("an itemId below a direct child").isEqualTo(XMLStreamConstants.CHARACTERS);
+            assertThat(reader.isCharacters()).isTrue();
+            assertThat(reader.hasText()).isTrue();
+            assertThat(reader.hasName()).isFalse();
+            assertThat(reader.isWhiteSpace()).isFalse();
+            assertThat(reader.getText()).isEqualTo(" 3 ");
+            assertThat(new String(reader.getTextCharacters(), reader.getTextStart(), reader.getTextLength()))
+                    .isEqualTo(" 3 ");
+            char[] target = new char[3];
+            assertThat(reader.getTextCharacters(0, target, 0, 3)).isEqualTo(3);
+            assertThat(target).containsExactly(' ', '3', ' ');
+            assertThat(reader.next()).isEqualTo(XMLStreamConstants.END_ELEMENT);
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
+            assertThat(reader.getLocalName()).isEqualTo("wrapper");
+            assertThat(reader.nextTag()).isEqualTo(XMLStreamConstants.END_ELEMENT);
+            assertThat(reader.getLocalName()).isEqualTo("order");
+        } finally {
+            reader.close();
+        }
     }
 
     @Test
     void readerRejectsElementTextOutsideTextOnlyElement() throws XMLStreamException {
         OrderXmlMapper.IntegerTextReader reader = readerOf("<order><note>text</note></order>");
-
-        assertThatThrownBy(reader::getElementText)
-                .isInstanceOf(XMLStreamException.class)
-                .hasMessageContaining("must be on START_ELEMENT");
-        reader.nextTag();
-        assertThatThrownBy(reader::getElementText)
-                .isInstanceOf(XMLStreamException.class)
-                .hasMessageContaining("may not contain event type " + XMLStreamConstants.START_ELEMENT);
-        assertThatThrownBy(reader::nextTag)
-                .isInstanceOf(XMLStreamException.class)
-                .hasMessageContaining("expected start or end tag");
+        try {
+            assertThatThrownBy(reader::getElementText)
+                    .isInstanceOf(XMLStreamException.class)
+                    .hasMessageContaining("must be on START_ELEMENT");
+            reader.nextTag();
+            assertThatThrownBy(reader::getElementText)
+                    .isInstanceOf(XMLStreamException.class)
+                    .hasMessageContaining("may not contain event type " + XMLStreamConstants.START_ELEMENT);
+            assertThatThrownBy(reader::nextTag)
+                    .isInstanceOf(XMLStreamException.class)
+                    .hasMessageContaining("expected start or end tag");
+        } finally {
+            reader.close();
+        }
     }
 
     /** An order whose three children each hold the given content. */
