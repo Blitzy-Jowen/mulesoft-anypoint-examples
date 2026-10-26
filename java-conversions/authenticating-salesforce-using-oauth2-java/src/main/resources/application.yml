@@ -1,0 +1,33 @@
+# authenticating-salesforce-using-oauth2-java runtime configuration
+# Replaces authenticating-salesforce-using-oauth2/src/main/app/mule-app.properties (empty) and the values of the
+# sfdc:config-with-oauth, sfdc:authorize and http:listener-config of salesforce-oauth.xml; key names keep the original placeholder names.
+http:
+  port: 8081
+
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0
+
+spring:
+  application:
+    name: authenticating-salesforce-using-oauth2-java
+  web:
+    resources:
+      add-mappings: false   # unknown paths raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+
+sfdc:
+  # TODO: supply the Salesforce connected app consumer key
+  key: ${SFDC_KEY:}
+  # TODO: supply the Salesforce connected app consumer secret
+  secret: ${SFDC_SECRET:}
+  # Connect and read timeouts: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s
+  oauth:
+    authorization-url: https://login.salesforce.com/services/oauth2/authorize
+    access-token-url: https://login.salesforce.com/services/oauth2/token
+    callback:
+      domain: localhost
+      # The callback is served by this application's own listener, so it follows http.port (the original fixed 8081, its default).
+      local-port: ${http.port:8081}
+      path: oauth2callback

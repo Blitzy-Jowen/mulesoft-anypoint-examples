@@ -1,0 +1,27 @@
+# import-contacts-into-salesforce-java runtime configuration
+# Replaces import-contacts-into-salesforce/src/main/app/mule-app.properties (comments only, no keys) and the
+# sfdc:config placeholders and file:inbound-endpoint values of contacts-to-SFDC.xml.
+spring:
+  application:
+    name: import-contacts-into-salesforce-java
+  main:
+    web-application-type: none          # no HTTP listener in the original (AAP 0.5.1 list)
+
+# The endpoint's responseTimeout is not carried: a one-way file inbound sends no reply.
+contacts:
+  input-dir: src/main/resources/input       # original file:inbound-endpoint path (l.9)
+  move-to-dir: src/main/resources/output    # original moveToDirectory (l.9)
+  polling-frequency: 10000                  # original pollingFrequency in ms (l.9)
+
+# The sfdc:connection-pooling-profile is not carried: SC-15 keeps one cached PartnerConnection.
+sfdc:
+  # TODO: supply the Salesforce username (original key: sfdc.user)
+  username: ${SFDC_USERNAME:}
+  # TODO: supply the Salesforce password
+  password: ${SFDC_PASSWORD:}
+  # TODO: supply the Salesforce security token
+  securityToken: ${SFDC_SECURITYTOKEN:}
+  auth-endpoint: https://login.salesforce.com/services/Soap/u/65.0   # Partner SOAP login, API 65.0 (force-partner-api 65.0.0)
+  # Connect and read timeouts: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s

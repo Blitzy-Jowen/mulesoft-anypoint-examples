@@ -1,0 +1,42 @@
+MuleSoft Examples
+Copyright 2014 MuleSoft, Inc.
+ 
+This product includes software developed at
+MuleSoft, Inc. (http://www.mulesoft.com/).
+
+This product includes the Mule Ajax transport JavaScript client, located in
+src/main/resources/mule-resource/js/ and served at /services/wmqExample/mule-resource/js/**:
+
+  mule.js
+  _mule.js
+  dojo/dojo.js
+  dojo/dojo.js.uncompressed.js
+  dojox/cometd.js
+  dojox/cometd.js.uncompressed.js
+  dojox/cometd/timestamp.js
+  dojox/cometd/timesync.js
+  dojox/uuid/generateRandomUuid.js
+
+These files are copied unchanged from the Mule 3.8.0 source tree
+(https://github.com/mulesoft/mule, tag mule-3.8.0, path
+transports/ajax/src/main/resources/js/).
+
+mule.js and _mule.js are part of MuleSoft Mule. All portions of the code are
+Copyright (c) 2003-2015 MuleSoft Inc. All Rights Reserved. They are distributed
+under the Common Public Attribution License Version 1.0 (CPAL 1.0), available
+at http://www.MuleSoft.com/CPAL/ and as LICENSE.txt at the root of the Mule
+source tree. Attribution Information (CPAL 1.0, Exhibit B):
+  Attribution Copyright Notice: Copyright (c) 2003-2015 MuleSoft Inc.
+  Attribution Phrase: Powered by Mule. MuleSoft is Open for Integration.
+  Attribution URL: http://www.MuleSoft.com
+
+The files under dojo/ and dojox/ are part of the Dojo Toolkit,
+Copyright (c) 2004-2008, The Dojo Foundation (dojox/uuid/generateRandomUuid.js:
+Copyright (c) 2004-2009, The Dojo Foundation). All Rights Reserved. They are
+licensed under the Academic Free License version 2.1 or above OR the modified
+BSD license, at the recipient's option. For more information on Dojo
+licensing, see: http://dojotoolkit.org/license
+
+Every licence header these files carry is retained unchanged. mule.js,
+_mule.js, dojox/cometd/timestamp.js and dojox/cometd/timesync.js carry no
+licence header in the Mule source tree; the notices above apply to them.
