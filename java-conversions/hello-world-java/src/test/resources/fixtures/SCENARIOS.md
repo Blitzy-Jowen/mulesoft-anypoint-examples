@@ -36,7 +36,7 @@ Fixtures are `fixtures/<scenario>.json` beside this file (`src/test/resources/fi
 - `method`: the request method as sent.
 - `path`: the request path, without the query.
 - `query`: the raw query string without `?`, appended as `?<query>` when non-empty; `""` when there is none.
-- `headers`: an ordered array of `[name, value]` pairs, in the order they were sent. `Host` is recorded as sent; the replay client writes its own `Host` for the replay port, drops the recorded `Host`, `Content-Length`, `Connection` and `Transfer-Encoding`, and joins repeated names with `, `.
+- `headers`: an ordered array of `[name, value]` pairs, in the order they were sent. `Host` is recorded as sent. Only transport fields are regenerated: the replay drops the recorded `Host`, `Content-Length`, `Connection` and `Transfer-Encoding` and writes its own `Host` for the replay port, and ST-1 writes `Content-Length` for the body and `Connection: close`. Every other recorded pair is sent as its own header line, in recorded order, through ST-1's `HttpTestClient.sendHeaderPairs`; a repeated name, such as two `Cookie` pairs, stays on separate lines and is never joined.
 - `body` (UTF-8 text) or `bodyBase64` (binary); an empty body is `""` or omitted.
 - `port`: the listener port the capture targeted (`8081` in this project). It is the port replaced inside `Location` on replay.
 - `portProperty`: optional; the Spring property that holds the replay port of the targeted listener, default `local.server.port`. Multi-port projects (SC-10) name the extra listener's port key here.
@@ -63,16 +63,16 @@ Fixtures are `fixtures/<scenario>.json` beside this file (`src/test/resources/fi
 
 `upstream`, the recorded outbound calls:
 
-- An ordered array of `{request, response}` pairs, one per outbound call the original made, in call order. `request` holds `method`, `url`, `headers` and `body` or `bodyBase64`; `response` holds `status`, `headers` and `body` or `bodyBase64`. Headers are either `[[name, value]]` pairs or a `{name: value}` object.
+- An ordered array of `{request, response}` pairs, one per outbound call the original made, in call order. `request` holds `method`, `url`, `headers` and `body` or `bodyBase64`; `response` holds `status`, `headers` and `body` or `bodyBase64`. Headers are either `[[name, value]]` pairs or a `{name: value}` object. Each pair is converted from the request journal of the WireMock recording proxy (Capture steps 2 and 7): `url` is the path and query relative to the WireMock base, so no live host is named, and bodies are the entity bytes exchanged, de-chunked, with a response `Content-Encoding` left encoded.
 - On replay WireMock serves the recording in order. Every recorded call must be made, in order, with the same method, URL, body and headers, and no other call may be made. `Host`, `Content-Length`, `Connection` and `Transfer-Encoding` are ignored; `User-Agent` and `Accept-Encoding` are compared only when the inbound `request.headers` carried the same header with the same value.
 - `"upstream": []` means the scenario was recorded and made no outbound calls. This is true of every hello-world scenario.
-- A missing `upstream` key means the recording is incomplete: the scenario is skipped and reported `UNVERIFIED-no-upstream`.
+- A missing `upstream` key means the recording is incomplete: the scenario is skipped and reported `UNVERIFIED-no-upstream`. Capture leaves it out where an exchange cannot be recorded locally or without live values (steps 2, 7 and 8).
 
 `response`, the captured result:
 
-- `status` and `reason`: the status code and reason phrase of the raw status line.
-- `headers`: `{Content-Type, Location}`, each only when the original sent it. An absent or null value means the Java response must not send that header. Other headers are not recorded.
-- `body` (UTF-8 text) or `bodyBase64` (binary).
+- `status` and `reason`: the status code, as a JSON number, and the reason phrase of the final raw status line.
+- `headers`: `{Content-Type, Location}`, each only when the original sent it, with its value as received. An absent or null value means the Java response must not send that header. Other headers are not recorded.
+- `body` (UTF-8 text) or `bodyBase64` (binary): the entity bytes with only the transport framing removed (chunked coding de-chunked, a `Content-Length` body taken exactly) and any `Content-Encoding` left encoded, extracted from the raw capture as Capture step 6 defines.
 - Non-HTTP effects:
   - `directories`: the exact final file set of each named directory, so a consumed input directory is `[]` (SC-5 disposition).
   - `messages`: `[{destination, pubSub, body or bodyBase64, properties}]`, in arrival order; for `amqp`, `destination` is the queue. Only the listed properties are compared, and no further message may follow.
@@ -135,21 +135,154 @@ The fallback never reports PASS. The README lists the unverified scenarios by na
 
 ## Capture (Tier 2A)
 
+The capture output of each scenario is kept unedited as the evidence for its fixture and is committed with it in `src/test/capture/<scenario>/`, outside `fixtures/` and off the test classpath: `response.http` holds the `curl --raw -i` output, `curl-trace.txt` curl's `-v` trace with the request as sent, and `upstream-journal.json`, for an original with upstream calls, the recorded exchanges. Working files that can hold live values stay under `target/fixture-capture/` and are never committed. Every command after step 1 runs in the project directory (`java-conversions/hello-world-java/`).
+
 1. Build the unmodified original `hello-world` with `mvn -B package`, with the EE repository credentials in `settings.xml`. Never edit the original folder.
-2. Deploy the archive to a licensed Mule 3.8 EE runtime and pass `http.port=8081` as a runtime property (for example `-M-Dhttp.port=8081`), because `hello-world/src/main/app/mule-app.properties` defines no value.
-3. Send each scenario's request:
+2. HTTP and SOAP upstreams; skipped for hello-world, whose flow makes no outbound call. Every exchange is recorded through WireMock standalone 3.13.2 (`org.wiremock:wiremock-standalone`, the version the projects pin) running as a recording proxy in front of the real services, and its request journal is the recording. WireMock's `--record-mappings` files are not used, because they store a gzip-encoded body decoded and without its `Content-Encoding`.
+   - Start WireMock on a free port `W` with an empty root directory. `--disable-gzip` passes a proxied response's `Content-Encoding` and bytes to the original unchanged, and `--preserve-user-agent-proxy-header` forwards the original's `User-Agent` on the proxied leg. Then add one proxy mapping per real upstream, whose `proxyBaseUrl` is that upstream's scheme, host and port:
+
+     ```sh
+     W=8089; rm -rf target/fixture-capture/wiremock; mkdir -p target/fixture-capture/wiremock
+     java -jar "$HOME/.m2/repository/org/wiremock/wiremock-standalone/3.13.2/wiremock-standalone-3.13.2.jar" --port "$W" --root-dir target/fixture-capture/wiremock --disable-gzip --preserve-user-agent-proxy-header > target/fixture-capture/wiremock.log 2>&1 &
+     WM=$!; until curl -sf "http://localhost:$W/__admin/health" > /dev/null; do sleep 1; done
+     curl -sS -X POST "http://localhost:$W/__admin/mappings" -d '{"request": {"urlPattern": ".*"}, "response": {"proxyBaseUrl": "https://upstream.example.com"}}'
+     ```
+
+     With several upstreams, each mapping matches only its own upstream's paths (`"urlPathPattern": "/<prefix>(/.*)?"`); upstreams whose paths overlap cannot be told apart through one WireMock, so those scenarios omit `upstream`. `kill "$WM"` stops WireMock after the last scenario.
+   - The original is pointed at WireMock by runtime properties only (`-M-D<key>=<value>` at deployment, step 3): each upstream placeholder or host setting becomes `http://localhost:<W>`, or host `localhost` and port `W`, keeping its path. An original that cannot reach WireMock this way (a hard-coded host, or a TLS setting that rejects WireMock) cannot have its calls recorded, so its scenarios omit `upstream`.
+   - Live credentials (values supplied for the capture that the original folder does not already contain) are never committed. The original runs with a fixed marker in place of each, such as `capture-marker`, which the fixture records and `state.properties` gives the Java app under the same key (step 8), so the replay compares the same values. A credential sent in a request header is replaced by the live value on the proxied leg only, in that upstream's mapping, here for an `X-Api-Key` header whose live value is in the environment variable `LIVE_API_KEY`, never in a file:
+
+     ```sh
+     curl -sS -X POST "http://localhost:$W/__admin/mappings" -d '{"request": {"urlPattern": ".*"}, "response": {"proxyBaseUrl": "https://upstream.example.com", "removeProxyRequestHeaders": ["x-api-key"], "additionalProxyRequestHeaders": {"X-Api-Key": "'"$LIVE_API_KEY"'"}}}'
+     ```
+
+     WireMock 3.13.2 removes a header only when `removeProxyRequestHeaders` lists its name in lower case. A credential WireMock cannot replace (in a body, a query or a signature), a token or session the live service issues into a recorded exchange, and a response that sends the original to a host it does not reach through WireMock cannot be recorded locally without live values: those scenarios are captured with the live values in place, omit `upstream`, and keep their journal out of the evidence.
+3. Deploy the archive to a licensed Mule 3.8 EE runtime and pass `http.port=8081` as a runtime property (for example `-M-Dhttp.port=8081`), because `hello-world/src/main/app/mule-app.properties` defines no value, together with the upstream properties of step 2 for an original that has upstreams.
+4. Send each scenario's request with `curl --raw -i`, writing its output unedited into the evidence files. `-sS -v` sends the trace and any error to `curl-trace.txt`, and a non-zero exit status means the capture failed. `--http1.1` keeps an HTTPS listener (captured with `-k` added) on HTTP/1.1, whose status line carries the reason phrase.
 
    ```sh
-   # get-hello-world
-   curl --raw -i -H 'Accept: */*' http://localhost:8081/helloWorld
-   # post-hello-world
-   curl --raw -i -X POST -H 'Content-Type: text/plain' --data-binary ping http://localhost:8081/helloWorld
-   # get-unknown-path
-   curl --raw -i http://localhost:8081/unknown
+   capture() { d="src/test/capture/$1"; shift; mkdir -p "$d"; curl --raw -i -sS -v --http1.1 "$@" > "$d/response.http" 2> "$d/curl-trace.txt"; }
+   capture get-hello-world -H 'Accept: */*' http://localhost:8081/helloWorld
+   capture post-hello-world -X POST -H 'Content-Type: text/plain' --data-binary ping http://localhost:8081/helloWorld
+   capture get-unknown-path http://localhost:8081/unknown
    ```
 
-4. Record the exact request headers sent, as `curl -v` shows them (its `>` lines), into `request.headers` in order, with `"port": 8081` and `"query": ""`.
-5. Write the raw status, reason, headers and body unedited into `fixtures/<scenario>.json`, with `"upstream": []` and `"state": {}`.
+   With upstreams, the journal is cleared before each scenario and saved once the flow has made its last outbound call:
+
+   ```sh
+   curl -sS -X DELETE "http://localhost:$W/__admin/requests"
+   capture <scenario> <request arguments>
+   curl -sS "http://localhost:$W/__admin/requests" > "target/fixture-capture/<scenario>-journal.json"
+   ```
+
+5. `request` comes from the `> ` lines of `curl-trace.txt`, each read without its line ending: `method`, `path` and `query` (the raw query string without `?`, `""` when there is none) from the request line; then each `> Name: value` line is one `[name, value]` pair of `headers`, in the order sent, so a repeated name stays in separate pairs and is never joined; `body` is the bytes curl sent (the `--data-binary` argument, or the content of its `@file`); and `"port": 8081`.
+6. `response` comes from `response.http` with only the HTTP/1.1 message framing removed, under the framing rules ST-1 applies on replay:
+   - `status` and `reason`: the code and the reason phrase of the final status line, skipping any interim `1xx` response curl wrote before it.
+   - `headers`: the `Content-Type` and `Location` values as received.
+   - `body` or `bodyBase64`: the exact entity bytes. Under a `Transfer-Encoding` whose last coding is `chunked`, they are the chunk data concatenated, without the chunk-size lines, chunk extensions, CRLFs, last chunk or trailer fields; under `Content-Length`, exactly that many bytes; under neither, every byte to the end of the output; none for a `HEAD` request or a `1xx`, `204` or `304` status. No `Content-Encoding` is decoded, and nothing is trimmed or normalized (no line-ending or charset conversion). The bytes go into `body` when they are valid UTF-8, otherwise into `bodyBase64`.
+
+   This command prints the `response` object from the evidence file and the request method:
+
+   ```sh
+   python3 - src/test/capture/get-hello-world/response.http GET <<'PY'
+   import base64, io, json, pathlib, re, sys
+   raw, method = io.BytesIO(pathlib.Path(sys.argv[1]).read_bytes()), sys.argv[2]
+   MAX_BODY_LENGTH = 2**31 - 1 - 8
+
+   def line():
+       data = raw.readline()
+       if not data.endswith(b'\n'):
+           sys.exit('capture ends inside a line')
+       return data[:-2] if data.endswith(b'\r\n') else data[:-1]
+
+   while True:
+       status_line = line().decode('latin-1')
+       version, _, rest = status_line.partition(' ')
+       code, _, reason = rest.partition(' ')
+       digits = code.lstrip('0') or '0'
+       if not version or not re.fullmatch('[0-9]+', code) or len(digits) > 10 or int(digits) > 2**31 - 1:
+           sys.exit('malformed status line: ' + repr(status_line))
+       status = int(digits)
+       headers = []
+       while field := line():
+           if field[:1] in (b' ', b'\t'):
+               sys.exit('folded header line')
+           name, colon, value = field.decode('latin-1').partition(':')
+           if not colon:
+               sys.exit('malformed header line: ' + repr(name))
+           headers.append((name.lower(), value.strip(' \t')))
+       if status // 100 != 1 or status == 101:
+           break
+
+   def values(name):
+       return [v for n, v in headers if n == name]
+
+   def number(text, base, what, limit=MAX_BODY_LENGTH):
+       text = text.strip(' \t')
+       if not re.fullmatch('[0-9A-Fa-f]+' if base == 16 else '[0-9]+', text):
+           sys.exit('malformed ' + what + ': ' + repr(text))
+       digits = text.lstrip('0') or '0'
+       if len(digits) > 10 or int(digits, base) > limit:
+           sys.exit(what + ' too large for an in-memory body: ' + text)
+       return int(digits, base)
+
+   coding = ','.join(values('transfer-encoding')).split(',')[-1].split(';')[0].strip(' \t').lower()
+   if method == 'HEAD' or status // 100 == 1 or status in (204, 304):
+       body = b''
+   elif coding == 'chunked':
+       body = b''
+       while size := number(line().decode('latin-1').split(';')[0], 16, 'chunk size',
+                            MAX_BODY_LENGTH - len(body)):
+           chunk = raw.read(size)
+           if len(chunk) != size or line():
+               sys.exit('malformed chunk')
+           body += chunk
+       while line():
+           pass
+   elif coding or not values('content-length'):
+       body = raw.read()
+   else:
+       lengths = {number(n, 10, 'Content-Length') for n in ','.join(values('content-length')).split(',')}
+       if len(lengths) > 1:
+           sys.exit('conflicting Content-Length values: ' + ', '.join(values('content-length')))
+       length = lengths.pop()
+       body = raw.read(length)
+       if len(body) != length:
+           sys.exit('capture ends inside the body')
+   if raw.read():
+       sys.exit('bytes after the message')
+   response = {'status': status, 'reason': reason, 'headers': {}}
+   for name in ('Content-Type', 'Location'):
+       found = values(name.lower())
+       if len(found) > 1:
+           sys.exit('repeated ' + name)
+       if found:
+           response['headers'][name] = found[0]
+   try:
+       response['body'] = body.decode('utf-8')
+   except UnicodeDecodeError:
+       response['bodyBase64'] = base64.b64encode(body).decode('ascii')
+   print(json.dumps(response, indent=2))
+   PY
+   ```
+
+7. `upstream` is `[]` when the original made no outbound call, as in every hello-world scenario. Otherwise this command writes the committed evidence `upstream-journal.json`, which keeps only the journal's `request` and `response` objects because its stub mappings name the real hosts and hold the live values, and prints the `upstream` array:
+
+   ```sh
+   S=<scenario>; J="target/fixture-capture/$S-journal.json"
+   jq '[.requests | reverse[] | {request, response}]' "$J" > "src/test/capture/$S/upstream-journal.json"
+   jq 'def pairs: [to_entries[] | .key as $k | (.value | if type == "array" then .[] else . end) | [$k, .]];
+     [.requests | reverse[]
+      | if .responseDefinition.proxyBaseUrl == null then error("not proxied: \(.request.method) \(.request.url)")
+        elif (.response.body // "") | startswith("Network failure trying to make a proxied request") then error("upstream not reached: \(.request.url)")
+        elif .request.headers // {} | keys | map(ascii_downcase) | index("content-encoding") then error("encoded request body: \(.request.url)")
+        else {request: {method: .request.method, url: .request.url, headers: (.request.headers // {} | pairs), bodyBase64: .request.bodyAsBase64},
+              response: {status: .response.status, headers: (.response.headers // {} | pairs), bodyBase64: .response.bodyAsBase64}}
+        end]' "$J"
+   ```
+
+   The journal lists the newest call first, so its entries are reversed into call order. `url` is the path and query relative to the WireMock base, so the fixture names no live host. A repeated header name becomes consecutive pairs at the position of its first occurrence, the order the journal keeps. Bodies are `bodyBase64`, the entity bytes as recorded: a chunked body in either direction is de-chunked with its trailer fields dropped, and a gzip-encoded response body keeps its encoded bytes and its `Content-Encoding` header, as step 6 defines for `response`. The command fails on a call no mapping proxied or that did not reach its upstream, which is captured again once the mapping is fixed, and on a request body with a `Content-Encoding`, which WireMock stores decoded and re-encodes on the proxied leg, so that scenario omits `upstream`.
+8. Write `fixtures/<scenario>.json` from `request` (step 5), `state` (`{}` for hello-world), `upstream` (step 7) and `response` (step 6), every value as produced. For an original with upstreams, `state.properties` points each upstream key of the Java project at `${wiremock.baseUrl}`, or host `localhost` and port `${wiremock.port}`, with the path the capture used, and gives each credential key its marker. Before committing, `grep -rF -e "<live value>" src/test/resources/fixtures src/test/capture` runs for every live value: a match in `upstream` or a journal means that scenario omits `upstream` and drops its journal, and a match in `request` or `response` means it gets no fixture. Captured values and entity bytes are never adjusted afterwards, to match the Java output or for any other reason.
 
 ## Integrity rule
 

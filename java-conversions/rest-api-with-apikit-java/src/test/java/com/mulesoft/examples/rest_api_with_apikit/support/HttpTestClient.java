@@ -63,6 +63,9 @@ public final class HttpTestClient {
 
     private static final byte[] CRLF = {'\r', '\n'};
 
+    /** Largest response body buffered in memory: the largest byte array a JVM reliably allocates. */
+    private static final int MAX_BODY_LENGTH = Integer.MAX_VALUE - 8;
+
     private final String host;
     private final int port;
     /** {@code null} in plain HTTP mode. */
@@ -160,7 +163,8 @@ public final class HttpTestClient {
      * {@code Host} value(s) in its place; every other caller header in the map's iteration order with the
      * caller's name casing; {@code Content-Length} when a body is sent and the caller supplied none;
      * {@code Connection: close} unless the caller supplied a {@code Connection} header. Pass a
-     * {@link LinkedHashMap} to control header order.
+     * {@link LinkedHashMap} to control header order. A map carries one value per name; to send a name on several
+     * header lines, as a recorded request may, use {@link #sendHeaderPairs}.
      *
      * @param method  any HTTP method token ({@code GET}, {@code PATCH}, {@code PROPFIND}, ...), sent verbatim
      * @param path    request target sent byte-for-byte as given, query string included
@@ -172,6 +176,33 @@ public final class HttpTestClient {
      *                                  names the request line and the endpoint
      */
     public Response send(String method, String path, Map<String, String> headers, byte[] body) {
+        return sendHeaderPairs(method, path, headers == null ? null : new ArrayList<>(headers.entrySet()), body);
+    }
+
+    /**
+     * Sends one request whose headers are ordered name/value pairs on a new connection and reads the complete
+     * response; fixture replay uses it to send a recorded request's header lines as recorded.
+     *
+     * <p>Each pair is written as its own header line {@code name: value} with the caller's name casing, in list
+     * order; a name given in several pairs, such as two {@code Cookie} pairs, is sent as that many separate lines
+     * and never joined. Head order is otherwise that of {@link #send}: the request line
+     * {@code METHOD path HTTP/1.1}; {@code Host: host:port}, or every caller {@code Host} pair in list order in its
+     * place; every other pair in list order; {@code Content-Length} when a body is sent and no pair supplies one;
+     * {@code Connection: close} unless a pair supplies {@code Connection}.
+     *
+     * @param method  any HTTP method token ({@code GET}, {@code PATCH}, {@code PROPFIND}, ...), sent verbatim
+     * @param path    request target sent byte-for-byte as given, query string included
+     * @param headers request header pairs in sending order, or {@code null} for none
+     * @param body    {@code null} sends no body and no {@code Content-Length}; any other array, a zero-length one
+     *                included, is sent with {@code Content-Length: <length>}
+     * @return the complete response
+     * @throws IllegalArgumentException if the method, path or a header is not valid on the wire, or a pair is
+     *                                  {@code null}
+     * @throws UncheckedIOException     if connecting, the TLS handshake, writing or reading fails; the message
+     *                                  names the request line and the endpoint
+     */
+    public Response sendHeaderPairs(String method, String path, List<Map.Entry<String, String>> headers,
+            byte[] body) {
         checkMethod(method);
         checkPath(path);
         byte[] head = requestHead(method, path, headers, body);
@@ -296,13 +327,16 @@ public final class HttpTestClient {
         }
     }
 
-    private byte[] requestHead(String method, String path, Map<String, String> headers, byte[] body) {
+    private byte[] requestHead(String method, String path, List<Map.Entry<String, String>> headers, byte[] body) {
         List<Map.Entry<String, String>> hostHeaders = new ArrayList<>();
         List<Map.Entry<String, String>> otherHeaders = new ArrayList<>();
         boolean contentLengthSupplied = false;
         boolean connectionSupplied = false;
         if (headers != null) {
-            for (Map.Entry<String, String> header : headers.entrySet()) {
+            for (Map.Entry<String, String> header : headers) {
+                if (header == null) {
+                    throw new IllegalArgumentException("header pairs must not contain null");
+                }
                 String name = header.getKey();
                 String value = header.getValue();
                 checkHeader(name, value);
@@ -552,18 +586,18 @@ public final class HttpTestClient {
         for (String header : contentLengths) {
             for (String element : header.split(",", -1)) {
                 String token = trimSpacesAndTabs(element);
-                if (token.isEmpty() || !isDigits(token) || token.length() > 10) {
+                if (token.isEmpty() || !isDigits(token)) {
                     throw new IOException("malformed Content-Length: " + header);
                 }
-                long value = Long.parseLong(token);
+                long value = boundedValue(token, 10);
+                if (value > MAX_BODY_LENGTH) {
+                    throw new IOException("Content-Length too large for an in-memory body: " + token);
+                }
                 if (length >= 0 && value != length) {
                     throw new IOException("conflicting Content-Length values: " + contentLengths);
                 }
                 length = value;
             }
-        }
-        if (length > Integer.MAX_VALUE - 8) {
-            throw new IOException("Content-Length too large for an in-memory body: " + length);
         }
         return (int) length;
     }
@@ -571,36 +605,57 @@ public final class HttpTestClient {
     private static byte[] readChunked(InputStream in) throws IOException {
         ByteArrayOutputStream body = new ByteArrayOutputStream();
         while (true) {
-            String sizeLine = readLine(in);
-            if (sizeLine == null) {
-                throw new IOException("premature EOF in chunked body: expected a chunk size line");
-            }
+            String sizeLine = readChunkedLine(in, "a chunk size line");
             int extension = sizeLine.indexOf(';');
             String size = trimSpacesAndTabs(extension < 0 ? sizeLine : sizeLine.substring(0, extension));
             int chunkSize = parseChunkSize(size, sizeLine);
             if (chunkSize == 0) {
                 break;
             }
-            body.writeBytes(readExactly(in, chunkSize, "premature EOF in chunked body"));
-            String terminator = readLine(in);
-            if (terminator == null) {
-                throw new IOException("premature EOF in chunked body: expected CRLF after chunk data");
+            if (chunkSize > MAX_BODY_LENGTH - body.size()) {
+                throw new IOException("chunked body too large for an in-memory body: at least "
+                        + ((long) body.size() + chunkSize) + " bytes");
             }
+            body.writeBytes(readExactly(in, chunkSize, "premature EOF in chunked body"));
+            String terminator = readChunkedLine(in, "CRLF after chunk data");
             if (!terminator.isEmpty()) {
                 throw new IOException("malformed chunked body: chunk data not followed by CRLF");
             }
         }
-        // Trailer fields are read off the stream and ignored; a server closing right after the last chunk is
-        // tolerated.
+        // Trailer fields are read off the stream and ignored; the body is complete only once the empty line
+        // ending the trailer section has arrived.
         String trailer;
         do {
-            trailer = readLine(in);
-        } while (trailer != null && !trailer.isEmpty());
+            trailer = readChunkedLine(in, "a trailer field or the empty line ending the chunked body");
+        } while (!trailer.isEmpty());
         return body.toByteArray();
     }
 
+    /**
+     * Reads one line of chunked framing (a chunk size line, the line ending after chunk data, or a trailer line)
+     * like {@link #readLine}, ending at CRLF or a bare LF, terminator excluded, but requires the terminator:
+     * end of stream before the line's LF means the response was cut off, whether or not bytes were read.
+     *
+     * @param expected what the framing requires next, for the premature-EOF message
+     */
+    private static String readChunkedLine(InputStream in, String expected) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream(128);
+        int b;
+        while ((b = in.read()) != '\n') {
+            if (b == -1) {
+                String partial = line.size() == 0
+                        ? "" : ", got unterminated \"" + line.toString(StandardCharsets.ISO_8859_1) + "\"";
+                throw new IOException("premature EOF in chunked body: expected " + expected + partial);
+            }
+            line.write(b);
+        }
+        byte[] bytes = line.toByteArray();
+        int length = bytes.length > 0 && bytes[bytes.length - 1] == '\r' ? bytes.length - 1 : bytes.length;
+        return new String(bytes, 0, length, StandardCharsets.ISO_8859_1);
+    }
+
     private static int parseChunkSize(String size, String sizeLine) throws IOException {
-        if (size.isEmpty() || size.length() > 7) {
+        if (size.isEmpty()) {
             throw new IOException("malformed chunk size: " + sizeLine);
         }
         for (int i = 0; i < size.length(); i++) {
@@ -608,20 +663,39 @@ public final class HttpTestClient {
                 throw new IOException("malformed chunk size: " + sizeLine);
             }
         }
-        return Integer.parseInt(size, 16);
+        long chunkSize = boundedValue(size, 16);
+        if (chunkSize > MAX_BODY_LENGTH) {
+            throw new IOException("chunk size too large for an in-memory body: " + sizeLine);
+        }
+        return (int) chunkSize;
     }
 
-    private static byte[] readExactly(InputStream in, int length, String eofMessage) throws IOException {
-        byte[] buffer = new byte[length];
-        int read = 0;
-        while (read < length) {
-            int count = in.read(buffer, read, length - read);
-            if (count < 0) {
-                throw new IOException(eofMessage + ": expected " + length + " bytes, got " + read);
+    /**
+     * The value of a non-empty run of digits valid in {@code radix}, any number of leading zeros included, or
+     * {@code MAX_BODY_LENGTH + 1} as soon as the accumulated value exceeds {@link #MAX_BODY_LENGTH}, so no digit
+     * count can overflow it.
+     */
+    private static long boundedValue(String digits, int radix) {
+        long value = 0;
+        for (int i = 0; i < digits.length(); i++) {
+            value = value * radix + Character.digit(digits.charAt(i), radix);
+            if (value > MAX_BODY_LENGTH) {
+                return MAX_BODY_LENGTH + 1L;
             }
-            read += count;
         }
-        return buffer;
+        return value;
+    }
+
+    /**
+     * Reads exactly {@code length} bytes; buffers grow with the bytes actually received, so a large declared
+     * length that the stream does not deliver ends in an {@link IOException}, not an allocation of that length.
+     */
+    private static byte[] readExactly(InputStream in, int length, String eofMessage) throws IOException {
+        byte[] bytes = in.readNBytes(length);
+        if (bytes.length < length) {
+            throw new IOException(eofMessage + ": expected " + length + " bytes, got " + bytes.length);
+        }
+        return bytes;
     }
 
     /**
