@@ -1,0 +1,31 @@
+# Runtime configuration of adding-a-new-customer-to-workday-revenue-management-java.
+# Converted from adding-a-new-customer-to-workday-revenue-management/src/main/app/mule-app.properties (empty)
+# and the ${...} placeholders of src/main/app/add_a_new_customer.xml (lines 3 and 5); key names keep the original names.
+# Never commit credentials here; live-test values go in src/test/resources/application-it.yml (git-ignored).
+# Each "TODO: supply" marks a value the operator provides through the named environment variable, not unfinished
+# configuration; the empty default lets the application start, and tests run, without it.
+spring:
+  application:
+    name: adding-a-new-customer-to-workday-revenue-management-java
+  web:
+    resources:
+      add-mappings: false        # unknown paths raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+
+http:
+  port: 8081                     # original ${http.port}; the original README's example used 9090
+
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0               # original listener host
+
+wday:
+  hostname: ${WDAY_HOSTNAME:}    # TODO: supply the Workday host name, e.g. impl-cc.workday.com
+  tenant: ${WDAY_TENANT:}        # TODO: supply the Workday tenant ID (usually ends with _pt1)
+  user: ${WDAY_USER:}            # TODO: supply the Workday integration user (sent as user@tenant)
+  password: ${WDAY_PASSWORD:}    # TODO: supply the Workday integration user's password
+  # Endpoint the Workday connector derived from host and tenant. Kept at v25.0 because Put_Customer is replaced by
+  # Submit_Customer from v31.1; the WSDL's own soap:address is relative, so the client always uses this key.
+  endpoint: https://${wday.hostname}/ccx/service/${wday.tenant}/Revenue_Management/v25.0
+  # Connect and read timeouts: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s
