@@ -112,16 +112,16 @@ class GreetingServiceTest {
                 // The original melFlow2Test calls greet2 without a query: the absent parameter is empty.
                 Arguments.of(Named.of("null", null), "No username provided"),
                 Arguments.of(Named.of("\"\"", ""), "No username provided"),
-                // GreetingService#greet2 Javadoc: a whitespace-only String is empty, as the expression language's
-                // blank literal trims before testing; a Tier 2A verification point against Mule's engine fork.
-                Arguments.of(Named.of("\"   \"", "   "), "No username provided"),
-                Arguments.of(Named.of("\" \\t\\n\"", " \t\n"), "No username provided"),
+                // GreetingService#greet2 Javadoc: the engine's blank literal does not trim, so a whitespace-only
+                // username is not empty.
+                Arguments.of(Named.of("\"   \"", "   "), "Hello    "),
+                Arguments.of(Named.of("\" \\t\\n\"", " \t\n"), "Hello  \t\n"),
                 Arguments.of(Named.of("\"Mule\"", "Mule"), "Hello Mule"),
                 // The README's example request ?username=yourName.
                 Arguments.of(Named.of("\"yourName\"", "yourName"), "Hello yourName"),
                 // GreetingService#greet2 Javadoc: a String "0" is not empty.
                 Arguments.of(Named.of("\"0\"", "0"), "Hello 0"),
-                // Only the emptiness test trims; the greeting keeps the username as given.
+                // The greeting keeps the username exactly as given.
                 Arguments.of(Named.of("\" Mule \"", " Mule "), "Hello  Mule "));
     }
 
@@ -146,6 +146,11 @@ class GreetingServiceTest {
                 Arguments.of(Named.of("\"18.5\"", "18.5"), true),
                 Arguments.of(Named.of("\"0022\"", "0022"), true),
                 Arguments.of(Named.of("\"100\"", "100"), true),
+                // The engine's number test accepts a terminal decimal point, which Double.parseDouble reads.
+                Arguments.of(Named.of("\"19.\"", "19."), true),
+                Arguments.of(Named.of("\"5.\"", "5."), false),
+                Arguments.of(Named.of("\"18.\"", "18."), false),
+                Arguments.of(Named.of("\"-5.\"", "-5."), false),
                 // A null left operand is not comparable, and the comparison yields false.
                 Arguments.of(Named.of("null", null), false),
                 // Both operands become Booleans (18 becomes true); nothing compares greater than true.
@@ -195,8 +200,10 @@ class GreetingServiceTest {
                 Arguments.of(Named.of("\"0x20\"", "0x20"), "uncomparable values <<0x20>> and <<18>>"),
                 Arguments.of(Named.of("\"22L\"", "22L"), "uncomparable values <<22L>> and <<18>>"),
                 Arguments.of(Named.of("\"-\"", "-"), "uncomparable values <<->> and <<18>>"),
-                Arguments.of(Named.of("\"5.\"", "5."), "uncomparable values <<5.>> and <<18>>"),
                 Arguments.of(Named.of("\"1.2.3\"", "1.2.3"), "uncomparable values <<1.2.3>> and <<18>>"),
+                // The engine's number test admits these digitless forms, which then fail Double.parseDouble there.
+                Arguments.of(Named.of("\".\"", "."), "uncomparable values <<.>> and <<18>>"),
+                Arguments.of(Named.of("\"-.\"", "-."), "uncomparable values <<-.>> and <<18>>"),
                 // Any other Comparable fails, as its compareTo(18) did.
                 Arguments.of(Named.of("Character 'a'", 'a'), "uncomparable values <<a>> and <<18>>"),
                 Arguments.of(Named.of("LocalDate 2014-11-04", LocalDate.of(2014, 11, 4)),
@@ -221,6 +228,8 @@ class GreetingServiceTest {
                 Arguments.of("yourName", "22", "Hello yourName", "yourName, 22, true"),
                 Arguments.of("Mule", "18", "Hello Mule", "Mule, 18, false"),
                 Arguments.of("Mule", "18.5", "Hello Mule", "Mule, 18.5, true"),
+                // A terminal decimal point: compared as 19.0, the age rendered as given.
+                Arguments.of("Mule", "19.", "Hello Mule", "Mule, 19., true"),
                 // GreetingService Javadoc: absent inputs appear as the text null in responses and files.
                 Arguments.of(null, null, "Hello null", "null, null, false"));
     }
@@ -292,6 +301,8 @@ class GreetingServiceTest {
                         "Hello test", "test, 21, true"),
                 Arguments.of(Named.of("age 18.5", "<user><username>Mule</username><age>18.5</age></user>"),
                         "Hello Mule", "Mule, 18.5, true"),
+                Arguments.of(Named.of("age 19.", "<user><username>Mule</username><age>19.</age></user>"),
+                        "Hello Mule", "Mule, 19., true"),
                 // GreetingService#greet5 Javadoc: .text is dom4j's Element.getText(), the direct text and CDATA
                 // without the text of child elements and comments.
                 Arguments.of(Named.of("text, comment, CDATA and child element",
@@ -414,6 +425,8 @@ class GreetingServiceTest {
                 Arguments.of("18", "test, 18, false"),
                 Arguments.of("21.5", "test, 21.5, true"),
                 Arguments.of("\"21\"", "test, 21, true"),
+                // A JSON String with a terminal decimal point (a bare 19. is not valid JSON).
+                Arguments.of("\"19.\"", "test, 19., true"),
                 Arguments.of("12345678901234567890", "test, 12345678901234567890, true"),
                 // GreetingService Javadoc: a null value renders as null and is not greater than 18.
                 Arguments.of("null", "test, null, false"),

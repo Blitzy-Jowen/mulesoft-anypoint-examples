@@ -129,16 +129,16 @@ public class GreetingService {
      * {@code greetingFlow2}: the choice {@code #[...username == empty]} returns {@code No username provided}, and
      * otherwise {@code Hello <username>}.
      *
-     * <p>MEL's {@code empty} literal is the expression language's blank literal: {@code null} and the empty String
-     * are empty, and so, here, is a String of whitespace only, as the upstream blank literal trims before testing.
-     * Mule 3.8 runs MuleSoft's fork of the 2.1.9 expression engine, whose blank literal does not trim, so the
-     * answer to a whitespace-only username is a Tier 2A verification point. A String {@code "0"} is not empty.
+     * <p>MEL's {@code empty} literal is the blank literal of the expression engine Mule 3.8.0 runs
+     * ({@code org.mule.mvel:mule-mvel2:2.1.9-MULE-010}). Its equality test accepts {@code null} and the empty String
+     * and does not trim, so a whitespace-only username is not empty and is greeted as given ({@code "   "} gives
+     * {@code "Hello    "}). A String {@code "0"} is not empty either.
      *
      * @param username the {@code username} query parameter, or {@code null} when absent
      * @return {@code No username provided} for an empty username, otherwise {@code Hello <username>}
      */
     public String greet2(String username) {
-        if (username == null || username.trim().isEmpty()) {
+        if (username == null || username.isEmpty()) {
             return NO_USERNAME;
         }
         return HELLO + username;
@@ -252,20 +252,21 @@ public class GreetingService {
      *       value, {@link BigInteger} and {@link BigDecimal} by {@code compareTo}, any other number by its
      *       {@code double} value, so {@code NaN} is not greater.</li>
      *   <li>A String the engine reads as a plain number (an optional {@code -}, then decimal digits with at most one
-     *       {@code .}, ending in a digit) is compared by its {@code double} value: {@code "22"}, {@code "18.5"} and
-     *       {@code "0022"} are greater, {@code "1"}, {@code "18"} and {@code "18.0"} are not. Any other String, such
-     *       as {@code ""}, {@code "abc"}, {@code " 22"}, {@code "1e3"}, {@code "0x20"} or {@code "22L"}, cannot be
-     *       compared and fails the expression.</li>
+     *       {@code .}, holding at least one digit, a terminal {@code .} included) is compared by its {@code double}
+     *       value: {@code "22"}, {@code "18.5"}, {@code "0022"} and {@code "19."} are greater, {@code "1"},
+     *       {@code "18"}, {@code "18.0"} and {@code "5."} are not. Any other String, such as {@code ""},
+     *       {@code "abc"}, {@code " 22"}, {@code "1e3"}, {@code "0x20"} or {@code "22L"}, cannot be compared and
+     *       fails the expression.</li>
      *   <li>A {@link Boolean} is compared after both operands become Booleans (18 becomes {@code true}), and neither
      *       {@code true} nor {@code false} compares greater than {@code true}.</li>
      *   <li>Any other {@link Comparable} fails the expression, as its {@code compareTo(18)} did.</li>
      *   <li>Anything else, a map or a list for instance, is not comparable and is not greater.</li>
      * </ul>
      *
-     * <p>Tier 2A verification points: the engine's own number test also accepts {@code ~}-prefixed text and
-     * possibly a trailing {@code .} ({@code "5."}); such values either fail to parse there as well, answering 500,
-     * or compare as doubles. Exponent, hexadecimal and type-suffixed forms are refused here. The message of a failed
-     * comparison differs from the text of Mule's expression failure, which the platform-default 500 carried.
+     * <p>The engine's own number test also admits {@code ~}-prefixed text and the digitless {@code "."} and
+     * {@code "-."}, which then fail {@link Double#parseDouble(String)} there, so they fail here as well. Exponent,
+     * hexadecimal and type-suffixed forms are refused. Tier 2A verification point: the message of a failed comparison
+     * differs from the text of Mule's expression failure, which the platform-default 500 carried.
      *
      * @param value the left operand as the flow holds it
      * @return whether {@code value} is greater than 18
@@ -309,7 +310,8 @@ public class GreetingService {
 
     /**
      * Tells whether the engine compares {@code text} as a number: an optional single leading {@code -}, then ASCII
-     * digits with at most one {@code .}, holding at least one digit and not ending in {@code .}.
+     * digits with at most one {@code .}, holding at least one digit. A terminal {@code .}, as in {@code "19."}, is
+     * accepted, as the engine's number test accepts it and {@link Double#parseDouble(String)} reads it.
      */
     private static boolean isMvelPlainNumber(String text) {
         int length = text.length();
@@ -326,7 +328,7 @@ public class GreetingService {
                 return false;
             }
         }
-        return digit && text.charAt(length - 1) != '.';
+        return digit;
     }
 
     private static IllegalArgumentException uncomparable(String value) {
