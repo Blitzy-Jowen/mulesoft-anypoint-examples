@@ -57,6 +57,12 @@
                 </exclusion>
             </exclusions>
         </dependency>
+        <!-- BoxProxyClient transport: it forwards Expect and Upgrade per client, and its socket timeout
+             bounds every response body read. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
