@@ -15,8 +15,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Pattern;
 
+import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.exc.MismatchedInputException;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.springframework.stereotype.Service;
 
 /**
@@ -35,7 +38,10 @@ import org.springframework.stereotype.Service;
  * returns {@link Optional#empty()} and the caller answers it with an empty 200. The validator's
  * {@link NullPointerException} and {@link IllegalArgumentException} propagate unwrapped, because they select
  * the "Missing input data" and "Invalid input data" branches of the choice exception strategy. Unreadable
- * JSON raises neither, so it reaches the platform-default 500 as it did in the original.
+ * JSON raises neither, so it reaches the platform-default 500 as it did in the original. That 500 returns the
+ * exception's message, so {@link #toPayload} replaces Jackson's diagnostic, which can quote request bytes and
+ * name internal types, with a fixed text: {@code Payload is not valid JSON} or {@code JSON payload is not an
+ * object}.
  *
  * <p>The payload is a real {@link HashMap}, the type the original transformer produced, because its
  * {@code toString()} reaches callers through the error bodies {@code Missing input data: #[payload]} and
@@ -64,6 +70,12 @@ public class InputValidationService {
     /** How Mule rendered a null payload when the {@code regex-filter} read it as a string. */
     private static final String NULL_PAYLOAD_TEXT = "{NullPayload}";
 
+    /** Message of the failure for a body that is not readable JSON: malformed, truncated or not decodable. */
+    private static final String MALFORMED_JSON_MESSAGE = "Payload is not valid JSON";
+
+    /** Message of the failure for a body that is empty or whose JSON value is not an object. */
+    private static final String NOT_AN_OBJECT_MESSAGE = "JSON payload is not an object";
+
     private static final TypeReference<HashMap<String, Object>> HASH_MAP_TYPE =
             new TypeReference<HashMap<String, Object>>() {
             };
@@ -71,11 +83,13 @@ public class InputValidationService {
     private final InputDataValidator inputDataValidator;
 
     /**
-     * A plain mapper, with no modules or features, reads JSON as the original transformer did: integers as
-     * {@code Integer}, {@code Long} or {@code BigInteger}, decimals as {@code Double}, nested objects as
-     * {@code LinkedHashMap} and arrays as {@code ArrayList}.
+     * A plain mapper, with no modules and Jackson's default features, reads JSON as the original transformer did:
+     * integers as {@code Integer}, {@code Long} or {@code BigInteger}, decimals as {@code Double}, nested objects
+     * as {@code LinkedHashMap} and arrays as {@code ArrayList}. Only source inclusion is disabled, so the location
+     * in a parser diagnostic, and in the cause chained to each failure, never quotes the request bytes.
      */
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final ObjectMapper objectMapper =
+            JsonMapper.builder().disable(StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION).build();
 
     /**
      * @param inputDataValidator the ported {@code custom-filter} of line 9
@@ -87,11 +101,16 @@ public class InputValidationService {
     /**
      * Converts the request body to the flow's payload map (line 8).
      *
+     * <p>Every failure carries a fixed message; Jackson's exception, when there is one, is its cause.
+     *
      * @param body the raw request body; {@code null} is read as an empty body
      * @return the parsed object as a {@link HashMap}
-     * @throws UncheckedIOException when the body is empty, malformed, or a JSON value other than an object
-     * @throws ClassCastException   when the body is the JSON literal {@code null}, as the original filter's
-     *                              cast of the null payload to {@code Map} failed
+     * @throws UncheckedIOException when the body is malformed, truncated or not decodable
+     *                              ({@code Payload is not valid JSON}), or empty or a JSON value other than an
+     *                              object ({@code JSON payload is not an object})
+     * @throws ClassCastException   when the body is the JSON literal {@code null}
+     *                              ({@code JSON payload is not an object}), as the original filter's cast of the
+     *                              null payload to {@code Map} failed
      */
     public HashMap<String, Object> toPayload(byte[] body) {
         // Jackson rejects a null array with IllegalArgumentException, which would select the
@@ -100,11 +119,17 @@ public class InputValidationService {
         HashMap<String, Object> payload;
         try {
             payload = objectMapper.readValue(bytes, HASH_MAP_TYPE);
+        } catch (MismatchedInputException e) {
+            // Fixed messages, never Jackson's: these messages reach the 500 body, and Jackson's can quote request
+            // bytes and name internal types such as java.util.HashMap. This one covers an empty body and an
+            // array, string, number or boolean root.
+            throw new UncheckedIOException(NOT_AN_OBJECT_MESSAGE, e);
         } catch (IOException e) {
-            throw new UncheckedIOException(e.getMessage(), e);
+            // Syntax errors, truncated input, undecodable bytes and exceeded parser limits.
+            throw new UncheckedIOException(MALFORMED_JSON_MESSAGE, e);
         }
         if (payload == null) {
-            throw new ClassCastException("payload is not a java.util.Map");
+            throw new ClassCastException(NOT_AN_OBJECT_MESSAGE);
         }
         return payload;
     }

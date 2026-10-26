@@ -135,12 +135,12 @@ public class PathScopedSecurityInterceptor implements SoapEndpointInterceptor {
             return true;
         }
         catch (WSSecurityException ex) {
-            LOG.warn("WS-Security validation failed on {}: {}", path.get(), loggable(ex.getMessage()));
+            logRejection(path.get(), ex.getErrorCode(), ex);
             writeFault(messageContext, ex.getErrorCode());
             return false;
         }
         catch (RuntimeException ex) {
-            LOG.warn("WS-Security validation failed on {}: {}", path.get(), loggable(ex.toString()), ex);
+            logRejection(path.get(), ErrorCode.INVALID_SECURITY, ex);
             writeFault(messageContext, ErrorCode.INVALID_SECURITY);
             return false;
         }
@@ -231,9 +231,15 @@ public class PathScopedSecurityInterceptor implements SoapEndpointInterceptor {
         return Optional.of(StringUtils.cleanPath(UrlPathHelper.defaultInstance.getPathWithinApplication(request)));
     }
 
-    /** WSS4J messages can quote token content; line breaks are flattened so a log entry stays one line. */
-    private static String loggable(String message) {
-        return message == null ? "" : message.replace('\r', ' ').replace('\n', ' ');
+    /**
+     * Logs a rejected request by its policy path, the WSS4J error code its fault is chosen by and the exception type.
+     * WSS4J messages, their causes and the exceptions of callback handlers and validators can quote token content or
+     * passwords, so neither the exception's text nor the exception itself is logged. The path matched a key of the
+     * policy table, so, like the code and the type, it cannot break the entry across lines.
+     */
+    private static void logRejection(String path, ErrorCode errorCode, Exception ex) {
+        LOG.warn("WS-Security validation failed on {}: error code {}, exception {}", path, errorCode,
+                ex.getClass().getName());
     }
 
     /**

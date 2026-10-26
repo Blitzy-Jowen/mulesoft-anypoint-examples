@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -25,6 +26,10 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.ws.InvalidXmlException;
+import org.springframework.ws.soap.SoapMessage;
+import org.springframework.ws.soap.SoapMessageCreationException;
+import org.springframework.ws.soap.SoapMessageFactory;
 import org.springframework.ws.soap.SoapVersion;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.springframework.ws.transport.WebServiceMessageReceiver;
@@ -40,8 +45,9 @@ import org.xml.sax.SAXParseException;
  * POST-only listener does not accept, the {@code soap:Client} fault for a body that is not a SOAP 1.1 envelope, and
  * the CXF envelope style of every response a receiver leaves. The 405 body and the fault code are the listener
  * contract and are compared exactly; the fault string is the parser's message, so its origin is asserted rather than
- * a fixed parser text. Every SC-11 consumer carries this class unchanged apart from its package line, which is why it
- * uses its own POST-only pattern and fixtures that name no project type, path or namespace.
+ * a fixed parser text, and CXF's default text only for a failure that carries no message. Every SC-11 consumer
+ * carries this class unchanged apart from its package line, which is why it uses its own POST-only pattern and
+ * fixtures that name no project type, path or namespace.
  */
 class SoapListenerBoundaryAdapterTest {
 
@@ -74,7 +80,10 @@ class SoapListenerBoundaryAdapterTest {
 
     private static final String CLIENT_FAULT_SUFFIX = "</faultstring></soap:Fault></soap:Body></soap:Envelope>";
 
-    /** The fault string CXF wrote when it had no more specific message; the boundary must never fall back to it. */
+    /**
+     * The fault string CXF wrote when it had no more specific message. The boundary uses it only for a failure that
+     * carries no message, so no fault whose failure has a message may carry it.
+     */
     private static final String GENERIC_CXF_FAULT_STRING = "Fault occurred while processing.";
 
     private SoapListenerBoundaryAdapter adapter;
@@ -172,6 +181,41 @@ class SoapListenerBoundaryAdapterTest {
         assertThat(receiverCalls).hasValue(0);
     }
 
+    /** A message-less failure for each path by which request message creation reaches the boundary fault. */
+    static Stream<Arguments> messageLessFailuresOfRequestMessageCreation() {
+        return Stream.of(
+                Arguments.of("SoapMessageCreationException", new SoapMessageCreationException(null,
+                        new IllegalStateException())),
+                Arguments.of("InvalidXmlException", new InvalidXmlException(null, null)));
+    }
+
+    /**
+     * A failure without a message is answered with CXF's default fault text, never with the exception's type, so the
+     * fault discloses nothing about the implementation.
+     */
+    @ParameterizedTest(name = "{0} without a message")
+    @MethodSource("messageLessFailuresOfRequestMessageCreation")
+    void messageLessFailureWhileRequestMessageIsCreatedIsAnsweredWithDefaultFaultString(String description,
+            RuntimeException failure) throws Exception {
+        SaajSoapMessageFactory saaj = new SaajSoapMessageFactory();
+        SoapMessageFactory factory = new RequestRejectingMessageFactory(saaj, failure);
+        factory.setSoapVersion(SoapVersion.SOAP_11);
+        saaj.afterPropertiesSet();
+        SoapListenerBoundaryAdapter rejecting = new SoapListenerBoundaryAdapter(factory, List.of(POST_ONLY_PATTERN),
+                new SoapEnvelopeStyleInterceptor());
+        rejecting.afterPropertiesSet();
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        rejecting.handle(request("POST", ALL_METHODS_PATH, VALID_ENVELOPE), response, echo);
+
+        assertClientFaultEnvelope(response);
+        assertThat(fault(response, "faultstring")).isEqualTo(SoapFaultConfig.DEFAULT_FAULT_STRING)
+                .isEqualTo(GENERIC_CXF_FAULT_STRING);
+        assertThat(response.getContentAsString(StandardCharsets.UTF_8)).doesNotContain("Exception")
+                .doesNotContain(failure.getClass().getName());
+        assertThat(receiverCalls).hasValue(0);
+    }
+
     @ParameterizedTest(name = "POST {0}")
     @ValueSource(strings = { ALL_METHODS_PATH, POST_ONLY_PATH })
     void envelopeIsDispatchedToReceiverAndItsResponseRestyled(String path) throws Exception {
@@ -208,6 +252,12 @@ class SoapListenerBoundaryAdapterTest {
     }
 
     private static void assertClientFault(MockHttpServletResponse response) throws Exception {
+        assertClientFaultEnvelope(response);
+        assertThat(fault(response, "faultstring")).isNotBlank().isNotEqualTo(GENERIC_CXF_FAULT_STRING);
+    }
+
+    /** HTTP 500 and a {@code soap:Client} fault in CXF's envelope form, whatever its fault string. */
+    private static void assertClientFaultEnvelope(MockHttpServletResponse response) throws Exception {
         String body = response.getContentAsString(StandardCharsets.UTF_8);
         assertThat(response.getStatus()).isEqualTo(500);
         assertThat(response.getContentType()).startsWith("text/xml");
@@ -215,7 +265,6 @@ class SoapListenerBoundaryAdapterTest {
                 .doesNotContain("SOAP-ENV").doesNotContain("<?xml").doesNotContain("Header")
                 .doesNotContain("xml:lang");
         assertThat(fault(response, "faultcode")).isEqualTo("soap:Client");
-        assertThat(fault(response, "faultstring")).isNotBlank().isNotEqualTo(GENERIC_CXF_FAULT_STRING);
     }
 
     /** The text of the one unqualified {@code localName} child of the response's {@code soap:Body/soap:Fault}. */
@@ -276,5 +325,35 @@ class SoapListenerBoundaryAdapterTest {
             }
         });
         return parser;
+    }
+
+    /**
+     * A SOAP message factory that creates outgoing messages through SAAJ but rejects every request message with the
+     * given failure, as a factory that cannot say why it rejects a request would.
+     */
+    private static final class RequestRejectingMessageFactory implements SoapMessageFactory {
+
+        private final SaajSoapMessageFactory delegate;
+        private final RuntimeException failure;
+
+        RequestRejectingMessageFactory(SaajSoapMessageFactory delegate, RuntimeException failure) {
+            this.delegate = delegate;
+            this.failure = failure;
+        }
+
+        @Override
+        public void setSoapVersion(SoapVersion version) {
+            delegate.setSoapVersion(version);
+        }
+
+        @Override
+        public SoapMessage createWebServiceMessage() {
+            return delegate.createWebServiceMessage();
+        }
+
+        @Override
+        public SoapMessage createWebServiceMessage(InputStream inputStream) {
+            throw failure;
+        }
     }
 }

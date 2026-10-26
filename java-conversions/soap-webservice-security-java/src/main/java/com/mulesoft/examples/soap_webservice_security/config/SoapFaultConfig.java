@@ -94,6 +94,9 @@ public class SoapFaultConfig {
 
         private static final Logger log = LoggerFactory.getLogger(CxfStyleSoapFaultResolver.class);
 
+        /** The throw site logged for an exception whose stack trace is empty. */
+        private static final String UNKNOWN_THROW_SITE = "an unknown location";
+
         public CxfStyleSoapFaultResolver() {
             setOrder(Ordered.LOWEST_PRECEDENCE - 1);
             // Backs a subclass whose definition lookup yields nothing; the fault string then falls back to the
@@ -119,14 +122,33 @@ public class SoapFaultConfig {
             return definition;
         }
 
+        /**
+         * Logs one WARN line naming the fault kind, the exception's type and its throw site only. The exception's
+         * message, its causes and its stack trace stay out of the log, as does everything in the message context: an
+         * unknown operation's message carries the caller's body root name and namespace, and an endpoint exception's
+         * message can carry request or upstream data. The fault answering the request still carries the message.
+         */
         @Override
         protected void logException(Exception ex, MessageContext messageContext) {
-            log.warn("Answering an endpoint exception with a SOAP {} fault", isClientFault(ex) ? "Client" : "Server",
-                    ex);
+            log.warn("Answering an endpoint exception with a SOAP {} fault: {} thrown at {}",
+                    isClientFault(ex) ? "Client" : "Server", ex.getClass().getName(), throwSite(ex));
         }
 
         private static boolean isClientFault(Exception ex) {
             return ex instanceof UnknownOperationException;
+        }
+
+        /**
+         * The exception's first stack frame as {@code className.methodName:lineNumber}, or {@link #UNKNOWN_THROW_SITE}
+         * when its stack trace is empty.
+         */
+        private static String throwSite(Throwable ex) {
+            StackTraceElement[] frames = ex.getStackTrace();
+            if (frames.length == 0) {
+                return UNKNOWN_THROW_SITE;
+            }
+            StackTraceElement frame = frames[0];
+            return frame.getClassName() + "." + frame.getMethodName() + ":" + frame.getLineNumber();
         }
     }
 

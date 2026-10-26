@@ -25,7 +25,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * <p>The original hard-coded its demo account in the flow. Here the credentials have no default:
  * {@code application.yml} externalizes them as {@code ${CMIS_USERNAME:}} and {@code ${CMIS_PASSWORD:}},
  * and the test configuration supplies the demo values. Nothing is validated at bind time, so the
- * application starts with the credentials unset; the client then sends no {@code Authorization} header.
+ * application starts with the credentials unset; the client then rejects each repository operation,
+ * naming the missing key, before it makes any request.
  *
  * <p>The connect and read timeouts default to 10 seconds, the Mule default response timeout.
  *
@@ -43,7 +44,7 @@ public class CmisProperties {
     /** Repository whose workspace is used ({@code cmis:config repositoryId}). */
     private String repositoryId = "default";
 
-    /** Service-account user name; null or blank sends the requests unauthenticated. */
+    /** Service-account user name; null or blank fails every repository operation before any request. */
     private String username;
 
     /** Service-account password. */

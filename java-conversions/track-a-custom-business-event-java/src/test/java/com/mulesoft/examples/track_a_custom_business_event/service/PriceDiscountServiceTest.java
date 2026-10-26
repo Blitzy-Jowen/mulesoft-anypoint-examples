@@ -1,6 +1,8 @@
 package com.mulesoft.examples.track_a_custom_business_event.service;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -33,6 +35,8 @@ import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.io.JsonEOFException;
 import com.fasterxml.jackson.databind.exc.MismatchedInputException;
 
@@ -49,6 +53,10 @@ import com.fasterxml.jackson.databind.exc.MismatchedInputException;
  * {@code message.json} (shoes, 2 units, price 10) read unchanged, variants of it made by replacing one value, or
  * small JSON literals. Expected texts are literals, so the tests pin the rendering rather than whatever the
  * service computes.
+ *
+ * <p>The platform-default 500 returns the exception's message, so an unreadable body fails with a fixed text:
+ * bodies carrying a marker show that no request bytes and no Java or Jackson type name reach it, and that the
+ * parser location chained as its cause quotes none of the body.
  */
 @ExtendWith(MockitoExtension.class)
 class PriceDiscountServiceTest {
@@ -58,6 +66,13 @@ class PriceDiscountServiceTest {
     private static final String SHOES = "\"shoes\"";
 
     private static final String PRICE_10 = "\"item price per unit\": 10";
+
+    private static final String NOT_AN_OBJECT = "JSON payload is not an object";
+
+    private static final String NOT_VALID_JSON = "Payload is not valid JSON";
+
+    /** Text placed in request bodies to show whether any of their bytes reach a message. */
+    private static final String MARKER = "BLITZY-MARKER-91c4";
 
     @Mock
     private BusinessEventTracker tracker;
@@ -179,12 +194,13 @@ class PriceDiscountServiceTest {
                 assertThrows(IllegalArgumentException.class, () -> service.processPriceRequest(body));
 
         assertEquals(expectedMessage, failure.getMessage());
+        assertMessageDisclosesNothing(failure.getMessage());
         if (expectedCause == null) {
             assertNull(failure.getCause());
         } else {
             assertNotNull(failure.getCause());
             assertEquals(expectedCause, failure.getCause().getClass());
-            assertEquals(failure.getCause().getMessage(), failure.getMessage(), "the parser's message is kept");
+            assertLocationQuotesNoRequestBytes(failure.getCause());
         }
         InOrder order = inOrder(tracker);
         order.verify(tracker).startTransaction();
@@ -197,21 +213,20 @@ class PriceDiscountServiceTest {
 
     static Stream<Arguments> unreadableBodies() {
         return Stream.of(
-                Arguments.of("malformed JSON", json("{\"item name\": "), JsonEOFException.class,
-                        "Unexpected end-of-input within/between Object entries\n"
-                                + " at [Source: (byte[])\"{\"item name\": \"; line: 1, column: 15]"),
-                Arguments.of("empty body", new byte[0], MismatchedInputException.class,
-                        "No content to map due to end-of-input\n at [Source: (byte[])\"\"; line: 1, column: 0]"),
-                Arguments.of("JSON array", json("[1,2]"), MismatchedInputException.class,
-                        "Cannot deserialize value of type `java.util.HashMap<java.lang.Object,java.lang.Object>`"
-                                + " from Array value (token `JsonToken.START_ARRAY`)\n"
-                                + " at [Source: (byte[])\"[1,2]\"; line: 1, column: 1]"),
-                Arguments.of("JSON number", json("42"), MismatchedInputException.class,
-                        "Cannot deserialize value of type `java.util.HashMap<java.lang.Object,java.lang.Object>`"
-                                + " from Integer value (token `JsonToken.VALUE_NUMBER_INT`)\n"
-                                + " at [Source: (byte[])\"42\"; line: 1, column: 1]"),
-                Arguments.of("JSON null", json("null"), null, "JSON payload is not an object"),
-                Arguments.of("no body", null, null, "argument \"src\" is null"));
+                Arguments.of("malformed JSON", json("{\"item name\": "), JsonEOFException.class, NOT_VALID_JSON),
+                Arguments.of("malformed JSON with a marker",
+                        json("{\"item name\": \"" + MARKER + "\", \"item units\": "), JsonEOFException.class,
+                        NOT_VALID_JSON),
+                Arguments.of("unquoted field name", json("{bad"), JsonParseException.class, NOT_VALID_JSON),
+                Arguments.of("empty body", new byte[0], MismatchedInputException.class, NOT_AN_OBJECT),
+                Arguments.of("JSON array", json("[1,2]"), MismatchedInputException.class, NOT_AN_OBJECT),
+                Arguments.of("JSON array with a marker", json("[\"" + MARKER + "\"]"),
+                        MismatchedInputException.class, NOT_AN_OBJECT),
+                Arguments.of("JSON string with a marker", json("\"" + MARKER + "\""),
+                        MismatchedInputException.class, NOT_AN_OBJECT),
+                Arguments.of("JSON number", json("42"), MismatchedInputException.class, NOT_AN_OBJECT),
+                Arguments.of("JSON null", json("null"), null, NOT_AN_OBJECT),
+                Arguments.of("no body", null, MismatchedInputException.class, NOT_AN_OBJECT));
     }
 
     @Test
@@ -229,6 +244,26 @@ class PriceDiscountServiceTest {
         verify(tracker, times(2)).setTransactionId("custom-business-event-example-transaction");
         verify(tracker, times(3)).endTransaction();
         verifyNoMoreInteractions(tracker);
+    }
+
+    /** Asserts that a message the 500 body returns quotes no request bytes and names no Java or Jackson type. */
+    private static void assertMessageDisclosesNothing(String message) {
+        for (String disclosure : List.of(MARKER, "java.", "HashMap", "Source")) {
+            assertFalse(message.contains(disclosure), () -> "message reveals " + disclosure + ": " + message);
+        }
+    }
+
+    /**
+     * Asserts that the location Jackson appends to the chained cause's message quotes none of the body, which holds
+     * only with source inclusion disabled. The location alone is checked: for a string root Jackson's own text
+     * quotes the string value, whatever the source setting.
+     */
+    private static void assertLocationQuotesNoRequestBytes(Throwable cause) {
+        JsonProcessingException parserFailure = assertInstanceOf(JsonProcessingException.class, cause);
+        String location = parserFailure.getMessage().substring(parserFailure.getOriginalMessage().length());
+        assertTrue(location.contains("[Source: "), () -> "cause carries a location: " + location);
+        assertFalse(location.contains(MARKER), () -> "location quotes the body: " + location);
+        assertFalse(location.contains("(byte[])"), () -> "location quotes the body: " + location);
     }
 
     /** Asserts the {@code Price} metadata keys in the flow's declaration order and their values. */

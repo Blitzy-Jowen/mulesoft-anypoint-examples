@@ -59,10 +59,14 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.confi
  * <p>OpenCMIS is not used: its client bindings declare a compile dependency on
  * {@code org.apache.cxf:cxf-rt-frontend-jaxws}, which the project's JAX-WS/CXF dependency ban rejects.
  *
- * <p>Repository URL, repository ID, service account and timeouts come only from {@link CmisProperties}. HTTP
- * failures propagate unchanged as Spring's {@code RestClientResponseException} subtypes (4xx/5xx) or
- * {@code ResourceAccessException} (transport); missing protocol elements and unreadable XML raise
- * {@link IllegalStateException}. No call is retried. The class holds no mutable state and is safe to share.
+ * <p>Repository URL, repository ID, service account and timeouts come only from {@link CmisProperties}. Every
+ * request authenticates with HTTP Basic as that service account, so both {@code cmis.username} and
+ * {@code cmis.password} are required: when either is blank, {@link #createDocumentByPath} fails with an
+ * {@link IllegalStateException} naming the key before any request is made. Construction accepts blank values, so
+ * the application starts with the credentials unset. HTTP failures propagate unchanged as Spring's
+ * {@code RestClientResponseException} subtypes (4xx/5xx) or {@code ResourceAccessException} (transport); missing
+ * protocol elements and unreadable XML raise {@link IllegalStateException}. No call is retried. The class holds no
+ * mutable state and is safe to share.
  */
 @Component
 public class CmisAtomPubClient {
@@ -104,12 +108,22 @@ public class CmisAtomPubClient {
         }
     };
 
+    /** Configuration key of the service-account user name. */
+    private static final String USERNAME_KEY = "cmis.username";
+
+    /** Configuration key of the service-account password. */
+    private static final String PASSWORD_KEY = "cmis.password";
+
     private final CmisProperties properties;
 
     private final RestClient restClient;
 
+    /** First unset service-account key, {@code cmis.username} before {@code cmis.password}; null if both are set. */
+    private final String missingCredentialKey;
+
     /**
-     * Builds the HTTP client from the connection settings; makes no request.
+     * Builds the HTTP client from the connection settings; makes no request. An unset service account is accepted
+     * here, so the application starts without it, and is rejected by {@link #createDocumentByPath} instead.
      *
      * @param properties repository URL, repository ID, service account and timeouts
      */
@@ -120,8 +134,13 @@ public class CmisAtomPubClient {
         requestFactory.setReadTimeout(orDefault(properties.getReadTimeout()));
         RestClient.Builder builder = RestClient.builder().requestFactory(requestFactory);
         String username = properties.getUsername();
-        if (StringUtils.hasText(username)) {
-            String password = properties.getPassword() == null ? "" : properties.getPassword();
+        String password = properties.getPassword();
+        if (!StringUtils.hasText(username)) {
+            this.missingCredentialKey = USERNAME_KEY;
+        } else if (!StringUtils.hasText(password)) {
+            this.missingCredentialKey = PASSWORD_KEY;
+        } else {
+            this.missingCredentialKey = null;
             builder.defaultHeaders(headers -> headers.setBasicAuth(username, password));
         }
         this.restClient = builder.build();
@@ -138,6 +157,8 @@ public class CmisAtomPubClient {
      * @param versioningState CMIS versioning state ({@code NONE}, {@code MAJOR}, ...), or null to send none
      * @param content         document bytes
      * @return the {@code cmis:objectId} the repository assigned to the new document
+     * @throws IllegalStateException when {@code cmis.username} or {@code cmis.password} is not configured, before
+     *                               any request is made
      */
     public String createDocumentByPath(String folderPath, String name, String mimeType, String objectTypeId,
             String versioningState, byte[] content) {
@@ -146,6 +167,7 @@ public class CmisAtomPubClient {
         Objects.requireNonNull(mimeType, "mimeType");
         Objects.requireNonNull(objectTypeId, "objectTypeId");
         Objects.requireNonNull(content, "content");
+        requireServiceAccount();
 
         String repositoryId = properties.getRepositoryId();
         Document serviceDocument = get(serviceDocumentUri(), SERVICE_DOCUMENT_TYPE, "service document");
@@ -167,6 +189,16 @@ public class CmisAtomPubClient {
 
     private static Duration orDefault(Duration timeout) {
         return timeout == null ? DEFAULT_TIMEOUT : timeout;
+    }
+
+    /** Fails the operation, naming the first unset service-account key, before any repository request. */
+    private void requireServiceAccount() {
+        if (USERNAME_KEY.equals(missingCredentialKey)) {
+            throw new IllegalStateException("CMIS service-account user name (cmis.username) is not configured");
+        }
+        if (PASSWORD_KEY.equals(missingCredentialKey)) {
+            throw new IllegalStateException("CMIS service-account password (cmis.password) is not configured");
+        }
     }
 
     private URI serviceDocumentUri() {

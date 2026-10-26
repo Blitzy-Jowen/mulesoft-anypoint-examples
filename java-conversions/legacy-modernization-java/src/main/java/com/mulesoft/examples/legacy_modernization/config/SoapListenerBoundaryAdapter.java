@@ -151,8 +151,8 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
     /**
      * Answers the {@link InvalidXmlException} of message creation with the {@code soap:Client} fault. Its
      * {@code faultstring} is the parser's message, the exception's most specific cause, falling back to the
-     * exception's own message: the listener boundary reports what the parser said, and Spring's own message
-     * ("Could not parse XML") would hide it.
+     * exception's own message and then to {@link SoapFaultConfig#DEFAULT_FAULT_STRING}: the listener boundary reports
+     * what the parser said, and Spring's own message ("Could not parse XML") would hide it.
      */
     @Override
     protected void handleInvalidXmlException(HttpServletRequest request, HttpServletResponse response, Object handler,
@@ -281,12 +281,18 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
         return StringUtils.hasLength(namespace) ? "{" + namespace + "}" + localName : localName;
     }
 
-    /** The exception's message, or its {@code toString()} when it carries none, so a fault string is never empty. */
+    /**
+     * The exception's message, or {@link SoapFaultConfig#DEFAULT_FAULT_STRING}, CXF's text for a fault without one,
+     * when it carries none: a fault string is never empty and never names an exception type or carries a stack trace.
+     */
     private static String describe(Throwable ex) {
-        return StringUtils.hasText(ex.getMessage()) ? ex.getMessage() : ex.toString();
+        return StringUtils.hasText(ex.getMessage()) ? ex.getMessage() : SoapFaultConfig.DEFAULT_FAULT_STRING;
     }
 
-    /** The message of the most specific cause, falling back to the exception's own message. */
+    /**
+     * The message of the most specific cause, falling back to the exception's own message and then to
+     * {@link SoapFaultConfig#DEFAULT_FAULT_STRING}; no exception type or stack trace reaches the fault.
+     */
     private static String mostSpecificMessage(Throwable ex) {
         Throwable cause = NestedExceptionUtils.getMostSpecificCause(ex);
         return StringUtils.hasText(cause.getMessage()) ? cause.getMessage() : describe(ex);

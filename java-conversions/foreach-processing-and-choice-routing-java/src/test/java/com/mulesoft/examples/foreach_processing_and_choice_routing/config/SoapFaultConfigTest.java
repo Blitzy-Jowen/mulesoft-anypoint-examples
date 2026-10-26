@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.io.ByteArrayInputStream;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.stream.Stream;
 
 import javax.xml.namespace.QName;
@@ -16,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -38,12 +40,18 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
 /**
  * Asserts the CXF fault contract SC-11 promises for failures inside Spring WS endpoint dispatch: an endpoint exception
  * becomes a SOAP 1.1 {@code soap:Server} fault carrying the exception message (or CXF's default text when it has
  * none), and an unknown operation, thrown by an endpoint or reached through an unmapped body root, becomes a
  * {@code soap:Client} fault with CXF's unknown-part text, each over HTTP 500 in CXF's envelope form. Codes and strings
- * are that contract verbatim, so they are compared exactly.
+ * are that contract verbatim, so they are compared exactly. The WARN line logged for each fault names its kind and the
+ * exception's type, never the message the fault carries.
  * <p>
  * The context holds only the SC-11 beans and the Spring WS dispatch infrastructure the servlet would use, around an
  * inline echo endpoint, and requests travel through the real servlet handler adapter. Every SC-11 consumer carries
@@ -57,6 +65,12 @@ class SoapFaultConfigTest {
     private static final String REQUEST_PATH = "/svc/Echo";
 
     private static final String TEXT_XML_UTF8 = "text/xml; charset=UTF-8";
+
+    /** Caller-supplied text that the fault carries and no log line may repeat. */
+    private static final String SENTINEL = "sentinel-c41f9e";
+
+    /** Request text that makes the echo endpoint throw with the rest of the text as the exception message. */
+    private static final String FAIL_WITH_PREFIX = "fail-with:";
 
     private static final String CXF_SERVER_FAULT_BOOM =
             "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><soap:Fault>"
@@ -105,6 +119,69 @@ class SoapFaultConfigTest {
         assertThat(text(response, "faultcode")).isEqualTo(faultCode);
         assertThat(text(response, "faultstring")).isEqualTo(faultString);
         assertThat(body(response)).startsWith("<soap:Envelope").doesNotContain("SOAP-ENV").doesNotContain("xml:lang");
+    }
+
+    /**
+     * Faults whose message carries caller data: description, body child, fault code, fault string, fault kind in the
+     * WARN line, exception type and the start of its throw site.
+     */
+    static Stream<Arguments> faultsWhoseMessageCarriesCallerData() {
+        String unmappedRootNamespace = "urn:example:" + SENTINEL;
+        String endpointMessage = "Rejected request " + SENTINEL;
+        return Stream.of(
+                Arguments.of("unmapped payload root in a caller-chosen namespace",
+                        "<x:other xmlns:x=\"" + unmappedRootNamespace + "\"/>",
+                        "soap:Client",
+                        "Message part {" + unmappedRootNamespace
+                                + "}other was not recognized.  (Does it exist in service WSDL?)",
+                        "Client", SoapFaultConfig.UnknownOperationException.class,
+                        SoapFaultConfig.UnknownOperationEndpointMapping.class.getName()
+                                + "$UnknownOperationEndpoint.invoke:"),
+                Arguments.of("endpoint exception whose message carries request data",
+                        "<e:echo xmlns:e=\"urn:example:echo\">" + FAIL_WITH_PREFIX + endpointMessage + "</e:echo>",
+                        "soap:Server", endpointMessage,
+                        "Server", IllegalStateException.class, ThrowingEchoEndpoint.class.getName() + ".echo:"));
+    }
+
+    /**
+     * The fault carries the message with the caller data, while the one WARN line names the fault kind, the exception
+     * type and its throw site only, without the message and without the throwable.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("faultsWhoseMessageCarriesCallerData")
+    void warnLineNamesFaultKindTypeAndThrowSiteButNotTheMessage(String description, String bodyChildXml,
+            String faultCode, String faultString, String faultKind, Class<? extends Exception> exceptionType,
+            String throwingMethod) throws Exception {
+        Logger logger = (Logger) LoggerFactory.getLogger(SoapFaultConfig.CxfStyleSoapFaultResolver.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        MockHttpServletResponse response;
+        try {
+            response = post(bodyChildXml);
+        }
+        finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
+
+        // The fault still carries the message, caller data included.
+        assertThat(response.getStatus()).isEqualTo(500);
+        assertThat(text(response, "faultcode")).isEqualTo(faultCode);
+        assertThat(text(response, "faultstring")).isEqualTo(faultString).contains(SENTINEL);
+        // The resolver's DEBUG trace belongs to the framework; the WARN line is this resolver's own.
+        List<ILoggingEvent> warnings = appender.list.stream()
+                .filter(event -> event.getLevel().isGreaterOrEqual(Level.WARN))
+                .toList();
+        assertThat(warnings).hasSize(1);
+        ILoggingEvent warning = warnings.get(0);
+        assertThat(warning.getLevel()).isEqualTo(Level.WARN);
+        assertThat(warning.getFormattedMessage())
+                .contains("SOAP " + faultKind + " fault")
+                .contains(exceptionType.getName())
+                .contains(" thrown at " + throwingMethod)
+                .doesNotContain(SENTINEL);
+        assertThat(warning.getThrowableProxy()).isNull();
     }
 
     @Test
@@ -194,7 +271,10 @@ class SoapFaultConfigTest {
         }
     }
 
-    /** Fails as the request's text names: {@code fail}, {@code null} or {@code unknown}; echoes otherwise. */
+    /**
+     * Fails as the request's text names: {@code fail}, {@code null} or {@code unknown}, or {@code fail-with:} followed
+     * by the message to throw with; echoes otherwise.
+     */
     @Endpoint
     static class ThrowingEchoEndpoint {
 
@@ -202,6 +282,9 @@ class SoapFaultConfigTest {
         @ResponsePayload
         public Source echo(@RequestPayload Element request) {
             String mode = request.getTextContent().trim();
+            if (mode.startsWith(FAIL_WITH_PREFIX)) {
+                throw new IllegalStateException(mode.substring(FAIL_WITH_PREFIX.length()));
+            }
             switch (mode) {
                 case "fail":
                     throw new IllegalStateException("boom");
