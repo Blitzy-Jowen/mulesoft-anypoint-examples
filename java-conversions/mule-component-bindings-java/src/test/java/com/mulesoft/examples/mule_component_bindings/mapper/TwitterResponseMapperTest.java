@@ -11,6 +11,8 @@ package com.mulesoft.examples.mule_component_bindings.mapper;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayInputStream;
@@ -19,6 +21,7 @@ import java.io.IOException;
 import java.io.NotSerializableException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedList;
@@ -27,6 +30,7 @@ import java.util.stream.Stream;
 
 import org.apache.commons.lang3.SerializationException;
 import org.junit.jupiter.api.Named;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -52,23 +56,21 @@ class TwitterResponseMapperTest {
                 Arguments.of(Named.of("one tweet", new long[] {529013410513453056L}),
                         new String[] {"$AAPL closes higher"}),
                 Arguments.of(Named.of("several tweets, a null text and a negative id included",
-                        new long[] {3L, -7L, 1L}), new String[] {"third \u00e9t\u00e9", null, "first"}));
+                        new long[] {3L, -7L, 1L}), new String[] {"third \u00e9t\u00e9", null, "first"}),
+                Arguments.of(Named.of("snowflake-sized ids up to Long.MAX_VALUE and an empty text",
+                        new long[] {529784356710236160L, 1L, Long.MAX_VALUE}),
+                        new String[] {"$AAPL up", "second", ""}));
     }
 
     @ParameterizedTest
     @MethodSource("searchResults")
     void mapsEveryStatusInResultOrderToAnArrayListOfTweets(long[] ids, String[] texts) {
-        List<Status> statuses = new ArrayList<>();
+        Status[] statuses = new Status[ids.length];
         for (int i = 0; i < ids.length; i++) {
-            Status status = mock(Status.class);
-            when(status.getId()).thenReturn(ids[i]);
-            when(status.getText()).thenReturn(texts[i]);
-            statuses.add(status);
+            statuses[i] = status(ids[i], texts[i]);
         }
-        QueryResult queryResult = mock(QueryResult.class);
-        when(queryResult.getTweets()).thenReturn(statuses);
 
-        List<Tweet> tweets = mapper.toTweets(queryResult);
+        List<Tweet> tweets = mapper.toTweets(result(statuses));
 
         // The original payload was a java.util.ArrayList; the listener's serialized body names that class.
         assertThat(tweets).isExactlyInstanceOf(ArrayList.class).hasSize(ids.length);
@@ -79,6 +81,19 @@ class TwitterResponseMapperTest {
             assertThat(tweet.getText()).isEqualTo(texts[i]);
             assertThat(tweet.getSentiment()).isNull();
         }
+    }
+
+    @Test
+    void readsOnlyTheTweetsOfTheResultAndTheIdAndTextOfEachStatus() {
+        Status status = status(529784356710236160L, "$AAPL up");
+        QueryResult queryResult = result(status);
+
+        mapper.toTweets(queryResult);
+
+        verify(queryResult).getTweets();
+        verify(status).getId();
+        verify(status).getText();
+        verifyNoMoreInteractions(queryResult, status);
     }
 
     static Stream<Named<List<Tweet>>> emptyTweetLists() {
@@ -119,7 +134,45 @@ class TwitterResponseMapperTest {
         assertThatThrownBy(() -> mapper.toListenerPayload(tweets))
                 .isInstanceOf(SerializationException.class)
                 .hasCauseInstanceOf(NotSerializableException.class)
-                .hasMessageContaining(Tweet.class.getName());
+                .hasMessageContaining(Tweet.class.getName())
+                .hasRootCauseMessage(Tweet.class.getName());
+    }
+
+    // The "/" flow end to end: Twitter search result -> mapped tweets -> listener body.
+    @Test
+    void serializesTheTweetsOfASearchWithoutHitsAsAnEmptyArrayList() throws IOException {
+        byte[] body = mapper.toListenerPayload(mapper.toTweets(result()));
+
+        assertThat(body).isEqualTo(javaSerialized(new ArrayList<Tweet>()));
+    }
+
+    @Test
+    void failsToSerializeTheTweetsOfASearchWithHits() {
+        List<Tweet> tweets = mapper.toTweets(result(status(7L, "x")));
+
+        assertThatThrownBy(() -> mapper.toListenerPayload(tweets))
+                .isInstanceOf(SerializationException.class)
+                .hasCauseInstanceOf(NotSerializableException.class)
+                .hasRootCauseMessage(Tweet.class.getName());
+    }
+
+    // Guards the failure above: making Tweet Serializable would change the "/" listener's observable result.
+    @Test
+    void tweetIsNotSerializable() {
+        assertThat(Serializable.class.isAssignableFrom(Tweet.class)).isFalse();
+    }
+
+    private static Status status(long id, String text) {
+        Status status = mock(Status.class);
+        when(status.getId()).thenReturn(id);
+        when(status.getText()).thenReturn(text);
+        return status;
+    }
+
+    private static QueryResult result(Status... statuses) {
+        QueryResult queryResult = mock(QueryResult.class);
+        when(queryResult.getTweets()).thenReturn(List.of(statuses));
+        return queryResult;
     }
 
     private static byte[] javaSerialized(Object value) throws IOException {
