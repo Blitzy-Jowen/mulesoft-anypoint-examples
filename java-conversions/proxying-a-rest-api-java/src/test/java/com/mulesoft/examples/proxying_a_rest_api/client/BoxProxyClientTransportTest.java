@@ -50,6 +50,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 import java.util.zip.GZIPOutputStream;
 
@@ -74,6 +75,7 @@ import com.github.tomakehurst.wiremock.http.RequestMethod;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder;
 import com.mulesoft.examples.proxying_a_rest_api.mapper.ProxyHeaderMapper;
+import com.mulesoft.examples.proxying_a_rest_api.service.RestProxyService;
 import com.sun.net.httpserver.HttpsConfigurator;
 import com.sun.net.httpserver.HttpsServer;
 
@@ -81,9 +83,11 @@ import com.sun.net.httpserver.HttpsServer;
  * The transport under {@link BoxProxyClient}, against loopback upstreams: a stalled exchange fails within the
  * timeout, once, and gives its connection up; no failure is retried; responses come back unparsed and cookies are
  * never replayed; the headers the header mapping keeps, {@code Expect} and {@code Upgrade} included, reach the
- * upstream; a request without body bytes is framed by its method; a redirect carries the caller's headers only on
- * the original origin, and one from https to http is returned unfollowed, so nothing reaches the cleartext target;
- * and {@link BoxProxyClient#close()} releases pooled connections.
+ * upstream; a request without body bytes is framed by its method; a TRACE with body bytes is refused before
+ * anything is sent, and through {@link RestProxyService} the bytes of TRACE and PRI, which the Mule requester sent
+ * without payload, never reach the upstream; a redirect carries the caller's headers only on the original origin,
+ * and one from https to http is returned unfollowed, so nothing reaches the cleartext target; and
+ * {@link BoxProxyClient#close()} releases pooled connections.
  */
 class BoxProxyClientTransportTest {
 
@@ -294,6 +298,51 @@ class BoxProxyClientTransportTest {
         assertThat(head.requestLine()).isEqualTo(method.name() + " /empty HTTP/1.1");
         assertThat(head.headers().get(HttpHeaders.CONTENT_LENGTH)).isEqualTo(contentLength);
         assertThat(head.headers()).doesNotContainKey(HttpHeaders.TRANSFER_ENCODING);
+    }
+
+    // RFC 7231 forbids a client to send a TRACE body, so httpclient5 refuses one before it opens a connection; it
+    // matches the method token in any letter case.
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"TRACE", "trace"})
+    void traceWithBodyBytesIsRefusedBeforeAnythingReachesTheUpstream(String methodName) throws Exception {
+        raw = new RawUpstream(RawUpstream::answerEmpty);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+
+        Throwable failure = catchThrowable(() -> client.exchange(HttpMethod.valueOf(methodName), "/trace/x", null,
+                new HttpHeaders(), "trace-body".getBytes(US_ASCII)));
+
+        assertThat(failure).isExactlyInstanceOf(IllegalStateException.class).hasMessageContaining("TRACE");
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3))
+                .untilAsserted(() -> assertThat(raw.accepted()).as("connections accepted").isZero());
+    }
+
+    // The Mule requester's Grizzly client wrote no payload for TRACE or PRI, so RestProxyService drops their bytes
+    // and the request otherwise reaches the upstream as the caller sent it.
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"TRACE", "PRI"})
+    void bodyOfAMethodTheMuleRequesterSentWithoutPayloadNeverReachesTheUpstream(String methodName)
+            throws Exception {
+        raw = new RawUpstream(RawUpstream::answerEmpty);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+        byte[] body = "trace-body".getBytes(US_ASCII);
+        HttpHeaders inbound = new HttpHeaders();
+        inbound.add(HttpHeaders.CONTENT_TYPE, "text/plain");
+        inbound.add(HttpHeaders.CONTENT_LENGTH, String.valueOf(body.length));
+
+        ResponseEntity<byte[]> response = new RestProxyService(new ProxyHeaderMapper(), client)
+                .forward(HttpMethod.valueOf(methodName), "/trace/x", null, inbound, body);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        RequestHead head = raw.nextRequestHead();
+        assertThat(head.requestLine()).isEqualTo(methodName + " /trace/x HTTP/1.1");
+        assertThat(head.headers())
+                .containsEntry(HttpHeaders.CONTENT_TYPE, "text/plain")
+                .doesNotContainKey(HttpHeaders.TRANSFER_ENCODING);
+        // Either framing sends no body.
+        assertThat(head.headers().get(HttpHeaders.CONTENT_LENGTH)).isIn(null, "0");
+        client.close();
+        assertThat(raw.awaitClientClose(Duration.ofSeconds(5))).as("connection closed by the client").isTrue();
+        assertThat(raw.unreadBytes()).as("bytes received after the request head").isZero();
     }
 
     static Stream<Arguments> redirects() {
@@ -509,7 +558,7 @@ class BoxProxyClientTransportTest {
     /**
      * An HTTP/1.1 upstream on a raw loopback socket, for exchanges WireMock cannot stage. It counts the connections
      * it accepts, records each request head exactly as received, lets its {@link Responder} answer, and then reads
-     * until the client closes the connection, which it reports.
+     * until the client closes the connection, which it reports, counting the bytes it read there.
      */
     static final class RawUpstream implements AutoCloseable {
 
@@ -524,6 +573,8 @@ class BoxProxyClientTransportTest {
         private final BlockingQueue<byte[]> bodies = new LinkedBlockingQueue<>();
 
         private final AtomicInteger bytesBeforeContinue = new AtomicInteger(-1);
+
+        private final AtomicLong unreadBytes = new AtomicLong();
 
         private final CountDownLatch clientClosed = new CountDownLatch(1);
 
@@ -586,6 +637,14 @@ class BoxProxyClientTransportTest {
             return bytesBeforeContinue.get();
         }
 
+        /**
+         * Bytes the client sent after a request head that its responder did not read, final once
+         * {@link #awaitClientClose} has returned {@code true}.
+         */
+        long unreadBytes() {
+            return unreadBytes.get();
+        }
+
         byte[] nextBody() throws InterruptedException {
             byte[] body = bodies.poll(5, TimeUnit.SECONDS);
             assertThat(body).as("request body received").isNotNull();
@@ -643,7 +702,7 @@ class BoxProxyClientTransportTest {
                 OutputStream out = socket.getOutputStream();
                 responder.respond(this, head, in, out);
                 out.flush();
-                in.transferTo(OutputStream.nullOutputStream());
+                unreadBytes.addAndGet(in.transferTo(OutputStream.nullOutputStream()));
                 clientClosed.countDown();
             } catch (IOException e) {
                 // An end of stream inside the head, or a reset, is the client closing the connection.

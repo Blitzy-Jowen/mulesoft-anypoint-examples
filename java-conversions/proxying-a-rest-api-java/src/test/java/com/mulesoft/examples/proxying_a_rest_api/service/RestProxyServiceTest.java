@@ -43,8 +43,8 @@ import com.mulesoft.examples.proxying_a_rest_api.mapper.ProxyHeaderMapper;
 
 /**
  * Unit test of {@link RestProxyService}, the original flow {@code rest-api-proxy}: SC-13 header copying on the
- * caller's headers, one upstream call with the caller's method, raw path, raw query and the body Mule's
- * {@code sendBodyMode} AUTO sends, the requester's default success-status validator, and SC-13 header copying on
+ * caller's headers, one upstream call with the caller's method, raw path, raw query and the body the Mule
+ * requester sent for that method, the requester's default success-status validator, and SC-13 header copying on
  * the upstream response. The client is a Mockito mock and the header mapper the real SC-13 component, so the
  * headers each leg carries are the ones the running proxy produces.
  */
@@ -65,23 +65,27 @@ class RestProxyServiceTest {
 
     /**
      * Caller method, the body the caller sent, and the body the client must receive: none for GET, HEAD and
-     * OPTIONS whatever was sent; for every other method the bytes as sent, an empty or absent body as empty bytes.
+     * OPTIONS ({@code sendBodyMode} AUTO) and for TRACE, CONNECT and PRI (no payload from the requester's Grizzly
+     * client) whatever was sent; for every other method, an extension method or a lower-case {@code trace} token
+     * included, the bytes as sent, an empty or absent body as empty bytes.
      */
     static Stream<Arguments> requestBodies() {
-        Stream<Arguments> bodiless = Stream.of("GET", "HEAD", "OPTIONS").flatMap(method -> Stream.of(
-                Arguments.of(method, Named.of("request bytes", REQUEST_BODY), null),
-                Arguments.of(method, Named.of("empty bytes", new byte[0]), null),
-                Arguments.of(method, Named.of("no body", null), null)));
-        Stream<Arguments> bodied = Stream.of("POST", "PUT", "PATCH", "DELETE").flatMap(method -> Stream.of(
-                Arguments.of(method, Named.of("request bytes", REQUEST_BODY), REQUEST_BODY),
-                Arguments.of(method, Named.of("empty bytes", new byte[0]), new byte[0]),
-                Arguments.of(method, Named.of("no body", null), new byte[0])));
+        Stream<Arguments> bodiless = Stream.of("GET", "HEAD", "OPTIONS", "TRACE", "CONNECT", "PRI")
+                .flatMap(method -> Stream.of(
+                        Arguments.of(method, Named.of("request bytes", REQUEST_BODY), null),
+                        Arguments.of(method, Named.of("empty bytes", new byte[0]), null),
+                        Arguments.of(method, Named.of("no body", null), null)));
+        Stream<Arguments> bodied = Stream.of("POST", "PUT", "PATCH", "DELETE", "PROPFIND", "trace")
+                .flatMap(method -> Stream.of(
+                        Arguments.of(method, Named.of("request bytes", REQUEST_BODY), REQUEST_BODY),
+                        Arguments.of(method, Named.of("empty bytes", new byte[0]), new byte[0]),
+                        Arguments.of(method, Named.of("no body", null), new byte[0])));
         return Stream.concat(bodiless, bodied);
     }
 
     @ParameterizedTest(name = "{0} with {1}")
     @MethodSource("requestBodies")
-    void requestBodyReachesTheClientAsSendBodyModeAutoSendsIt(String methodName, byte[] sent, byte[] expected) {
+    void requestBodyReachesTheClientAsTheMuleRequesterSentIt(String methodName, byte[] sent, byte[] expected) {
         HttpMethod method = HttpMethod.valueOf(methodName);
         stubUpstream(ResponseEntity.ok(UPSTREAM_BODY));
 

@@ -43,12 +43,12 @@ import com.mulesoft.examples.proxying_a_rest_api.service.RestProxyService;
  * anything is written and is answered by the generic 500 advice.
  *
  * <p>Every method is forwarded: {@code PATCH}, {@code PROPFIND} and the other methods the Servlet API does not
- * name, {@code OPTIONS} through its own mapping, and {@code TRACE}, which {@code spring.mvc.dispatch-trace-request}
- * dispatches here. Known differences from the Mule listener, for the README:
+ * name, {@code OPTIONS} through its own mapping, a CORS pre-flight ({@code OPTIONS} with {@code Origin} and
+ * {@code Access-Control-Request-Method}) like every other {@code OPTIONS}, because
+ * {@link com.mulesoft.examples.proxying_a_rest_api.config.PreflightForwardingConfig} keeps Spring MVC's CORS
+ * processing from answering it, and {@code TRACE}, which {@code spring.mvc.dispatch-trace-request} dispatches here.
+ * Known differences from the Mule listener, for the README:
  * <ul>
- *   <li>a CORS pre-flight ({@code OPTIONS} with {@code Origin} and {@code Access-Control-Request-Method}) is
- *       answered by Spring MVC's CORS processing before any handler runs, with 403 {@code Invalid CORS request},
- *       and is not forwarded;</li>
  *   <li>the response is written with a fixed {@code Content-Length}, never chunked;</li>
  *   <li>multipart forwarding is a Tier 2A verification point;</li>
  *   <li>{@code DEBUG} logging of {@code org.springframework.web.servlet.DispatcherServlet} reads the request
@@ -68,8 +68,10 @@ public class RestProxyController {
     }
 
     /**
-     * Forwards a request of any method except {@code OPTIONS}: a mapping without methods matches every other
-     * method, and Spring MVC deliberately keeps {@code OPTIONS} out of it.
+     * Forwards a request of any method. A mapping without methods matches every method except a plain
+     * {@code OPTIONS}, which Spring MVC deliberately keeps out of it and {@link #options} receives. A CORS
+     * pre-flight is matched by its {@code Access-Control-Request-Method} instead, so it arrives here unless that
+     * header names {@code OPTIONS}, and it is forwarded as the {@code OPTIONS} request it is.
      *
      * @param request  the caller's request, read raw
      * @param response written with the status, headers and body bytes {@link RestProxyService#forward} returns
@@ -106,7 +108,8 @@ public class RestProxyController {
 
     /**
      * Forwards an {@code OPTIONS} request. Without this mapping Spring MVC would answer {@code OPTIONS} itself
-     * with an {@code Allow} header listing the methods mapped here.
+     * with an {@code Allow} header listing the methods mapped here. A CORS pre-flight arrives here only when its
+     * {@code Access-Control-Request-Method} names {@code OPTIONS}; every other pre-flight reaches {@link #proxy}.
      *
      * @param request  the caller's request, read raw
      * @param response written as by {@link #proxy}

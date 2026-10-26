@@ -11,16 +11,28 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -28,7 +40,13 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.mock.env.MockEnvironment;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 
 /**
  * Unit tests of {@link AjaxChannelBroker} on neutral channels: {@code /test/in} (inbound, with a handler),
@@ -37,12 +55,18 @@ import org.springframework.mock.env.MockEnvironment;
  * <p>No Spring context and no network: each broker is built from a {@link MockEnvironment} and shut down after the
  * test. Asynchronous outcomes are awaited through {@link AjaxChannelBroker#awaitMessages(String, long)}, latches or
  * Awaitility; a check that nothing arrives listens for {@link #QUIET_MS}.
+ *
+ * <p>The broker's log is captured at DEBUG with a Logback {@link ListAppender}, and the logger's level is restored
+ * after each test. Every check of the captured events also asserts that none breaks a line or carries a throwable.
  */
 class AjaxChannelBrokerTest {
 
     private static final String INBOUND = "/test/in";
     private static final String OUTBOUND = "/test/out";
     private static final String CACHED = "/test/cached";
+
+    /** A channel nobody subscribes to, whose publications only run the idle-client sweep. */
+    private static final String TICK = "/test/tick";
 
     /** Upper bound for anything the broker completes asynchronously, generous for a loaded build host. */
     private static final long WAIT_MS = 10_000;
@@ -53,11 +77,49 @@ class AjaxChannelBrokerTest {
     /** {@code ajax.response-timeout-ms} for brokers whose handlers are expected to answer. */
     private static final String HANDLER_TIMEOUT_MS = "2000";
 
+    /** The characters a log viewer may break a line at; no formatted message may contain one. */
+    private static final char[] LINE_BREAKS = {'\r', '\n', '\u0085', '\u2028', '\u2029'};
+
+    /** Stands for payload content a handler's exception text may repeat; no logged event may contain it. */
+    private static final String SECRET = "payload-secret-sentinel";
+
+    /** A channel name a client could publish on to forge a log line. */
+    private static final String FORGED_CHANNEL = "/x\nFORGED";
+
+    private static final String FORGED_CHANNEL_RENDERING = "/x\\u000aFORGED";
+
+    /** A client ID a client could send to forge a log line. */
+    private static final String FORGED_CLIENT = "client\r\nFORGED";
+
+    private static final String FORGED_CLIENT_RENDERING = "client\\u000d\\u000aFORGED";
+
     private final List<AjaxChannelBroker> brokers = new ArrayList<>();
+
+    private Logger brokerLogger;
+
+    private Level previousLevel;
+
+    private ListAppender<ILoggingEvent> appender;
+
+    @BeforeEach
+    void captureBrokerLog() {
+        brokerLogger = (Logger) LoggerFactory.getLogger(AjaxChannelBroker.class);
+        previousLevel = brokerLogger.getLevel();
+        brokerLogger.setLevel(Level.DEBUG);
+        appender = new ListAppender<>();
+        appender.start();
+        brokerLogger.addAppender(appender);
+    }
 
     @AfterEach
     void shutDownBrokers() {
-        brokers.forEach(AjaxChannelBroker::shutdown);
+        try {
+            brokers.forEach(AjaxChannelBroker::shutdown);
+        } finally {
+            brokerLogger.detachAppender(appender);
+            appender.stop();
+            brokerLogger.setLevel(previousLevel);
+        }
     }
 
     @ParameterizedTest(name = "{0}")
@@ -239,7 +301,8 @@ class AjaxChannelBrokerTest {
         broker.registerInbound(INBOUND, data -> {
             started.countDown();
             try {
-                release.await(WAIT_MS, TimeUnit.MILLISECONDS);
+                // Ignoring the timeout's interrupt, the handler returns a result long after the timeout.
+                awaitIgnoringInterrupts(release);
                 return "late:" + data;
             } finally {
                 finished.countDown();
@@ -261,6 +324,313 @@ class AjaxChannelBrokerTest {
 
         assertThat(finished.await(WAIT_MS, TimeUnit.MILLISECONDS)).isTrue();
         assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
+    }
+
+    @Test
+    void handlerBlockedPastTheResponseTimeoutIsInterruptedAndSendsNoReply() throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment().withProperty("ajax.response-timeout-ms", "100"));
+        CountDownLatch interrupted = new CountDownLatch(1);
+        CountDownLatch never = new CountDownLatch(1);
+        broker.registerInbound(INBOUND, data -> {
+            try {
+                never.await(WAIT_MS, TimeUnit.MILLISECONDS);
+                return "late:" + data;
+            } catch (InterruptedException expected) {
+                interrupted.countDown();
+                throw expected;
+            }
+        });
+        String client = broker.handshake();
+        String replyTo = replyChannel(client);
+        broker.subscribe(client, replyTo);
+
+        try {
+            broker.onPublication(client, INBOUND, rpc("hello", replyTo));
+
+            assertThat(interrupted.await(WAIT_MS, TimeUnit.MILLISECONDS)).isTrue();
+            assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
+        } finally {
+            never.countDown();
+        }
+        // The timeout is logged once; the exception the interrupted handler threw afterwards is discarded.
+        String timeoutLine = "Ajax handler for channel " + INBOUND + " did not respond within 100 ms";
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> loggedMessages(Level.INFO).contains(timeoutLine));
+        assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
+        assertThat(loggedMessages(Level.INFO)).containsExactly(timeoutLine);
+    }
+
+    @Test
+    void atMostMaxRunningHandlersRunAndCallsStillWaitingAtTheirTimeoutNeverStart() throws Exception {
+        int maxRunning = AjaxChannelBroker.MAX_RUNNING_HANDLERS;
+        int waiting = 4;
+        // A response timeout the later probe call can meet even on a loaded host.
+        AjaxChannelBroker broker = broker(handlerEnvironment());
+        AtomicInteger running = new AtomicInteger();
+        AtomicInteger peak = new AtomicInteger();
+        AtomicInteger invocations = new AtomicInteger();
+        Set<String> threadNames = ConcurrentHashMap.newKeySet();
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch probed = new CountDownLatch(1);
+        broker.registerInbound(INBOUND, data -> {
+            if ("probe".equals(data)) {
+                probed.countDown();
+                return null;
+            }
+            invocations.incrementAndGet();
+            threadNames.add(Thread.currentThread().getName());
+            peak.accumulateAndGet(running.incrementAndGet(), Math::max);
+            try {
+                awaitIgnoringInterrupts(release);
+                return "late:" + data;
+            } finally {
+                running.decrementAndGet();
+            }
+        });
+        String client = broker.handshake();
+        String replyTo = replyChannel(client);
+        broker.subscribe(client, replyTo);
+        String timeoutLine = "Ajax handler for channel " + INBOUND + " did not respond within " + HANDLER_TIMEOUT_MS
+                + " ms";
+
+        try {
+            IntStream.range(0, maxRunning + waiting)
+                    .forEach(i -> broker.onPublication(client, INBOUND, rpc(i, replyTo)));
+
+            // Every call times out: the running ones are interrupted, the waiting ones cancelled before they start.
+            await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(20)).until(() ->
+                    loggedMessages(Level.INFO).stream().filter(timeoutLine::equals).count() == maxRunning + waiting);
+            // Ignoring the interrupt, the running handlers keep their threads until they return.
+            assertThat(running).hasValue(maxRunning);
+        } finally {
+            release.countDown();
+        }
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> running.get() == 0);
+
+        // A later call runs on a freed thread, behind any call still in the queue.
+        broker.onPublication(client, INBOUND, rpc("probe", replyTo));
+
+        assertThat(probed.await(WAIT_MS, TimeUnit.MILLISECONDS)).isTrue();
+        assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
+        assertThat(invocations).hasValue(maxRunning);
+        assertThat(peak).hasValue(maxRunning);
+        assertThat(threadNames).hasSize(maxRunning).allMatch(name -> name.matches("ajax-channel-broker-\\d+"));
+    }
+
+    @Test
+    void publicationFindingEveryHandlerThreadBusyAndTheQueueFullIsRefusedAndNeverRetried() throws Exception {
+        int admitted = AjaxChannelBroker.MAX_RUNNING_HANDLERS + AjaxChannelBroker.MAX_QUEUED_HANDLER_CALLS;
+        AjaxChannelBroker broker = broker(new MockEnvironment().withProperty("ajax.response-timeout-ms", "60000"));
+        AtomicInteger invocations = new AtomicInteger();
+        CountDownLatch release = new CountDownLatch(1);
+        broker.registerInbound(INBOUND, data -> {
+            invocations.incrementAndGet();
+            release.await(WAIT_MS, TimeUnit.MILLISECONDS);
+            return null;
+        });
+        String client = broker.handshake();
+
+        try {
+            IntStream.range(0, admitted + 1).forEach(i -> broker.onPublication(client, INBOUND, "call-" + i));
+
+            assertThat(loggedMessages(Level.INFO)).containsExactly("Ajax handler for channel " + INBOUND
+                    + " failed: all handler threads are busy and the waiting queue is full");
+        } finally {
+            release.countDown();
+        }
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> invocations.get() == admitted);
+        assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
+        assertThat(invocations).hasValue(admitted);
+    }
+
+    @Test
+    void handlerFailureIsLoggedByTypeAndThrowSiteOnly() throws Exception {
+        AjaxChannelBroker broker = broker(handlerEnvironment());
+        broker.registerInbound(INBOUND, data -> {
+            throw sensitiveFailure();
+        });
+        String client = broker.handshake();
+        String replyTo = replyChannel(client);
+        broker.subscribe(client, replyTo);
+
+        broker.onPublication(client, INBOUND, rpc(SECRET, replyTo));
+
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> loggedMessages(Level.DEBUG).stream()
+                .anyMatch(message -> message.startsWith("Ajax handler failure on channel ")));
+        assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
+        String throwSite = Pattern.quote(AjaxChannelBrokerTest.class.getName()
+                + ".sensitiveFailure(AjaxChannelBrokerTest.java:") + "\\d+\\)";
+        assertThat(loggedMessages(Level.INFO)).singleElement().asString().matches(
+                Pattern.quote("Ajax handler for channel " + INBOUND + " failed: java.lang.IllegalStateException at ")
+                        + throwSite + Pattern.quote(" <- java.io.IOException"));
+        assertThat(loggedMessages(Level.DEBUG)).filteredOn(message -> message.startsWith("Ajax handler failure"))
+                .singleElement().asString().matches(
+                        Pattern.quote("Ajax handler failure on channel " + INBOUND
+                                + ": java.lang.IllegalStateException at ") + throwSite
+                                + Pattern.quote(" <- java.io.IOException at ") + throwSite);
+        assertThat(loggedEvents()).allSatisfy(event -> assertThat(event.getFormattedMessage())
+                .doesNotContain(SECRET, "forged-by-", "IllegalArgumentException"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("handlerFailureDescriptions")
+    void handlerFailureIsDescribedByTypeIdentifiersOnly(String description, Exception failure, String infoDescription,
+            String debugDescription) {
+        AjaxChannelBroker broker = broker(handlerEnvironment());
+        broker.registerInbound(INBOUND, data -> {
+            throw failure;
+        });
+
+        broker.onPublication(null, INBOUND, "payload");
+
+        String debugLine = "Ajax handler failure on channel " + INBOUND + ": " + debugDescription;
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> loggedMessages(Level.DEBUG).contains(debugLine));
+        assertThat(loggedMessages(Level.INFO))
+                .containsExactly("Ajax handler for channel " + INBOUND + " failed: " + infoDescription);
+        assertThat(loggedEvents()).allSatisfy(event -> assertThat(event.getFormattedMessage()).doesNotContain(SECRET));
+    }
+
+    static Stream<Arguments> handlerFailureDescriptions() {
+        IllegalStateException circularOuter = withStackTrace(new IllegalStateException(SECRET));
+        IOException circularInner = withStackTrace(new IOException(SECRET));
+        circularOuter.initCause(circularInner);
+        circularInner.initCause(circularOuter);
+        IllegalStateException withCauseSites = withStackTrace(
+                new IllegalStateException(SECRET, withStackTrace(new IOException(SECRET),
+                        new StackTraceElement("a.b.Reader", "read", "Reader.java", 7))),
+                new StackTraceElement("a.b.Parser", "next", "Parser.java", 42));
+        String evilFrame =
+                "java.lang.IllegalStateException at a.b.Evil\\u000aINFO forged.next\\u000d(Evil\\u2028.java:7)";
+        String type = "java.lang.RuntimeException";
+        String cause = " <- java.lang.RuntimeException";
+        return Stream.of(
+                Arguments.of("checked exception without stack trace", withStackTrace(new IOException(SECRET)),
+                        "java.io.IOException", "java.io.IOException"),
+                Arguments.of("source frame with line", withStackTrace(new IllegalStateException(SECRET),
+                                new StackTraceElement("a.b.Parser", "next", "Parser.java", 42)),
+                        "java.lang.IllegalStateException at a.b.Parser.next(Parser.java:42)",
+                        "java.lang.IllegalStateException at a.b.Parser.next(Parser.java:42)"),
+                Arguments.of("source frame without line", withStackTrace(new IllegalStateException(SECRET),
+                                new StackTraceElement("a.b.Parser", "next", "Parser.java", -1)),
+                        "java.lang.IllegalStateException at a.b.Parser.next(Parser.java)",
+                        "java.lang.IllegalStateException at a.b.Parser.next(Parser.java)"),
+                Arguments.of("frame without source file", withStackTrace(new IllegalStateException(SECRET),
+                                new StackTraceElement("a.b.Parser", "next", null, 42)),
+                        "java.lang.IllegalStateException at a.b.Parser.next(Unknown Source)",
+                        "java.lang.IllegalStateException at a.b.Parser.next(Unknown Source)"),
+                Arguments.of("native frame", withStackTrace(new IllegalStateException(SECRET),
+                                new StackTraceElement("a.b.Parser", "read", "Parser.java", -2)),
+                        "java.lang.IllegalStateException at a.b.Parser.read(Native Method)",
+                        "java.lang.IllegalStateException at a.b.Parser.read(Native Method)"),
+                Arguments.of("frame names with line breaks", withStackTrace(new IllegalStateException(SECRET),
+                                new StackTraceElement("a.b.Evil\nINFO forged", "next\r", "Evil\u2028.java", 7)),
+                        evilFrame, evilFrame),
+                Arguments.of("cause throw sites only at DEBUG", withCauseSites,
+                        "java.lang.IllegalStateException at a.b.Parser.next(Parser.java:42) <- java.io.IOException",
+                        "java.lang.IllegalStateException at a.b.Parser.next(Parser.java:42)"
+                                + " <- java.io.IOException at a.b.Reader.read(Reader.java:7)"),
+                Arguments.of("circular cause chain", circularOuter,
+                        "java.lang.IllegalStateException <- java.io.IOException <- [circular]",
+                        "java.lang.IllegalStateException <- java.io.IOException <- [circular]"),
+                Arguments.of("ten causes, all named", causeChain(11), type + cause.repeat(10),
+                        type + cause.repeat(10)),
+                Arguments.of("eleven causes, cut after ten", causeChain(12), type + cause.repeat(10) + " <- ...",
+                        type + cause.repeat(10) + " <- ..."),
+                Arguments.of("stack trace and cause that throw when read", new UnreadableException(),
+                        UnreadableException.class.getName() + " at [unavailable] <- [unavailable]",
+                        UnreadableException.class.getName() + " at [unavailable] <- [unavailable]"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("forgedIdentifierDiagnostics")
+    void identifiersAreEscapedAndBoundedOnEveryDiagnostic(String description, Map<String, String> properties,
+            BrokerScenario scenario, Level level, String expected) throws Exception {
+        AjaxChannelBroker broker = broker(environment(properties));
+
+        scenario.run(broker);
+
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> loggedMessages(level).contains(expected));
+        assertThat(loggedEvents()).allSatisfy(event -> assertThat(event.getFormattedMessage())
+                .doesNotContain(SECRET)
+                .doesNotContain(FORGED_CHANNEL)
+                .doesNotContain(FORGED_CLIENT));
+    }
+
+    static Stream<Arguments> forgedIdentifierDiagnostics() {
+        String timeout = "ajax.response-timeout-ms";
+        AjaxChannelBroker.InboundHandler failing = data -> {
+            throw withStackTrace(new IllegalStateException(SECRET + "\nINFO forged-by-message"));
+        };
+        String controls = "/c\t\\\u0000\u007f\u0085\u2028\u2029\u202e\uD83D\uDE00\uD800";
+        String controlsRendering = "/c\\u0009\\u005c\\u0000\\u007f\\u0085\\u2028\\u2029\\u202e\uD83D\uDE00\\ud800";
+        return Stream.of(
+                Arguments.of("dispatch", Map.of(), (BrokerScenario) broker -> {
+                    broker.registerInbound(FORGED_CHANNEL, data -> null);
+                    broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);
+                }, Level.DEBUG, "Ajax publication from client " + FORGED_CLIENT_RENDERING
+                        + " dispatched to the handler of channel " + FORGED_CHANNEL_RENDERING),
+                Arguments.of("drop on an unknown channel", Map.of(),
+                        (BrokerScenario) broker -> broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET),
+                        Level.DEBUG, "No subscriber on Ajax channel " + FORGED_CHANNEL_RENDERING + "; message dropped"),
+                Arguments.of("timeout", Map.of(timeout, "100"), (BrokerScenario) broker -> {
+                    broker.registerInbound(FORGED_CHANNEL, data -> {
+                        Thread.sleep(WAIT_MS);
+                        return null;
+                    });
+                    broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);
+                }, Level.INFO, "Ajax handler for channel " + FORGED_CHANNEL_RENDERING
+                        + " did not respond within 100 ms"),
+                Arguments.of("failure", Map.of(timeout, HANDLER_TIMEOUT_MS), (BrokerScenario) broker -> {
+                    broker.registerInbound(FORGED_CHANNEL, failing);
+                    broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);
+                }, Level.INFO, "Ajax handler for channel " + FORGED_CHANNEL_RENDERING
+                        + " failed: java.lang.IllegalStateException"),
+                Arguments.of("failure detail", Map.of(timeout, HANDLER_TIMEOUT_MS), (BrokerScenario) broker -> {
+                    broker.registerInbound(FORGED_CHANNEL, failing);
+                    broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);
+                }, Level.DEBUG, "Ajax handler failure on channel " + FORGED_CHANNEL_RENDERING
+                        + ": java.lang.IllegalStateException"),
+                Arguments.of("refusal after shutdown", Map.of(), (BrokerScenario) broker -> {
+                    broker.registerInbound(FORGED_CHANNEL, data -> null);
+                    broker.shutdown();
+                    broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);
+                }, Level.INFO, "Ajax handler for channel " + FORGED_CHANNEL_RENDERING
+                        + " failed: the broker has been shut down"),
+                Arguments.of("full hold", Map.of("ajax.cache-messages-channels[0]", FORGED_CHANNEL),
+                        (BrokerScenario) broker -> IntStream.rangeClosed(0, AjaxChannelBroker.MAX_HELD_MESSAGES)
+                                .forEach(i -> broker.publish(FORGED_CHANNEL, SECRET)),
+                        Level.WARN, "Ajax channel " + FORGED_CHANNEL_RENDERING + " already holds "
+                                + AjaxChannelBroker.MAX_HELD_MESSAGES
+                                + " messages for its first subscriber; message dropped"),
+                Arguments.of("control, separator, format and unpaired surrogate characters", Map.of(),
+                        (BrokerScenario) broker -> broker.publish(controls, SECRET),
+                        Level.DEBUG, "No subscriber on Ajax channel " + controlsRendering + "; message dropped"),
+                Arguments.of("over-long channel", Map.of(),
+                        (BrokerScenario) broker -> broker.publish("/" + "a".repeat(300), SECRET),
+                        Level.DEBUG, "No subscriber on Ajax channel /" + "a".repeat(255)
+                                + "...[truncated]; message dropped"),
+                Arguments.of("over-long channel cut before an escape", Map.of(),
+                        (BrokerScenario) broker -> broker.publish("/" + "\n".repeat(100), SECRET),
+                        Level.DEBUG, "No subscriber on Ajax channel /" + "\\u000a".repeat(42)
+                                + "...[truncated]; message dropped"));
+    }
+
+    @Test
+    void escapingLeavesChannelsAndReplyChannelsUnchangedAsRoutingKeys() throws Exception {
+        AjaxChannelBroker broker = broker(handlerEnvironment());
+        broker.registerInbound(FORGED_CHANNEL, data -> "echo:" + data);
+        String client = broker.handshake();
+        String replyTo = FORGED_CHANNEL + "#" + client;
+        broker.subscribe(client, FORGED_CHANNEL + "/out");
+        broker.subscribe(client, replyTo);
+
+        broker.publish(FORGED_CHANNEL + "/out", "m1");
+
+        assertThat(broker.drain(client)).containsExactly(new AjaxChannelBroker.Delivery(FORGED_CHANNEL + "/out", "m1"));
+
+        broker.onPublication(client, FORGED_CHANNEL, rpc("hello", replyTo));
+
+        assertThat(broker.awaitMessages(client, WAIT_MS))
+                .containsExactly(new AjaxChannelBroker.Delivery(replyTo, "echo:hello"));
     }
 
     @Test
@@ -516,6 +886,255 @@ class AjaxChannelBrokerTest {
         assertThat(waiter.result()).isEmpty();
     }
 
+    @ParameterizedTest(name = "removed by {0}")
+    @MethodSource("clientRemovals")
+    void removedClientCannotTakeTheHoldWhichReachesTheNextSubscriberInOrder(String description,
+            Map<String, String> properties, ClientAction removal) {
+        AjaxChannelBroker broker = broker(environment(properties));
+        String removed = broker.handshake();
+        broker.subscribe(removed, OUTBOUND);
+        broker.publish(CACHED, "m1");
+
+        removal.apply(broker, removed);
+
+        assertThat(broker.isKnownClient(removed)).isFalse();
+        broker.publish(CACHED, "m2");
+        assertThatThrownBy(() -> broker.subscribe(removed, CACHED)).isInstanceOf(IllegalArgumentException.class);
+        broker.publish(CACHED, "m3");
+        String live = broker.handshake();
+        broker.subscribe(live, CACHED);
+
+        assertThat(broker.drain(live)).containsExactly(
+                new AjaxChannelBroker.Delivery(CACHED, "m1"),
+                new AjaxChannelBroker.Delivery(CACHED, "m2"),
+                new AjaxChannelBroker.Delivery(CACHED, "m3"));
+        assertThat(broker.drain(removed)).isEmpty();
+    }
+
+    static Stream<Arguments> clientRemovals() {
+        return Stream.of(
+                Arguments.of("disconnect", Map.of("ajax.cache-messages-channels", CACHED),
+                        (ClientAction) AjaxChannelBroker::disconnect),
+                Arguments.of("idle expiry",
+                        Map.of("ajax.cache-messages-channels", CACHED, "ajax.max-interval-ms", "50"),
+                        (ClientAction) (broker, clientId) -> await().atMost(Duration.ofMillis(WAIT_MS))
+                                .pollInterval(Duration.ofMillis(20))
+                                .until(() -> {
+                                    broker.publish(TICK, "tick");
+                                    return !broker.isKnownClient(clientId);
+                                })));
+    }
+
+    @ParameterizedTest(name = "kept active by {0}")
+    @MethodSource("clientActivities")
+    void activeClientSurvivesTheSweepsThatExpireASilentOne(String description, ClientAction activity) {
+        // Wide enough that a stalled test thread on a loaded host cannot let the active client's activity lapse.
+        AjaxChannelBroker broker = broker(new MockEnvironment().withProperty("ajax.max-interval-ms", "500"));
+        String silent = broker.handshake();
+        String active = broker.handshake();
+
+        // Each sweep runs in the publication right after the active client's latest activity.
+        await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(20)).until(() -> {
+            activity.apply(broker, active);
+            broker.publish(TICK, "tick");
+            return !broker.isKnownClient(silent);
+        });
+
+        assertThat(broker.isKnownClient(active)).isTrue();
+    }
+
+    static Stream<Arguments> clientActivities() {
+        return Stream.of(
+                Arguments.of("drain", (ClientAction) AjaxChannelBroker::drain),
+                Arguments.of("subscribe", (ClientAction) (broker, clientId) -> broker.subscribe(clientId, OUTBOUND)),
+                Arguments.of("unsubscribe",
+                        (ClientAction) (broker, clientId) -> broker.unsubscribe(clientId, OUTBOUND)),
+                Arguments.of("publication",
+                        (ClientAction) (broker, clientId) -> broker.onPublication(clientId, TICK, "ping")));
+    }
+
+    @Test
+    void racingSubscribeDisconnectAndCachedPublishLeaveNoSubscriptionForARemovedClient() throws Exception {
+        AjaxChannelBroker broker = broker(environment(Map.of("ajax.cache-messages-channels", CACHED)));
+        int clientsPerThread = 200;
+        int messagesPerPublisher = 100;
+        BlockingQueue<String> toDisconnect = new LinkedBlockingQueue<>();
+        Queue<String> issued = new ConcurrentLinkedQueue<>();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService racers = Executors.newFixedThreadPool(6);
+        List<Future<?>> tasks = new ArrayList<>();
+        try {
+            for (int thread = 0; thread < 2; thread++) {
+                tasks.add(racers.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < clientsPerThread; i++) {
+                        String clientId = broker.handshake();
+                        issued.add(clientId);
+                        toDisconnect.add(clientId);
+                        try {
+                            broker.subscribe(clientId, CACHED);
+                        } catch (IllegalArgumentException disconnectedFirst) {
+                            // The disconnect won the race; the client must then be gone for good.
+                            assertThat(broker.isKnownClient(clientId)).isFalse();
+                        }
+                    }
+                    return null;
+                }));
+                tasks.add(racers.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < clientsPerThread; i++) {
+                        broker.disconnect(toDisconnect.poll(WAIT_MS, TimeUnit.MILLISECONDS));
+                    }
+                    return null;
+                }));
+                int publisher = thread;
+                tasks.add(racers.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < messagesPerPublisher; i++) {
+                        broker.publish(CACHED, "race-" + publisher + "-" + i);
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (Future<?> task : tasks) {
+                // A publication meeting a subscription of a removed client would fail here.
+                task.get(WAIT_MS, TimeUnit.MILLISECONDS);
+            }
+        } finally {
+            racers.shutdownNow();
+        }
+
+        assertThat(issued).hasSize(2 * clientsPerThread).noneMatch(broker::isKnownClient);
+        broker.publish(CACHED, "after-1");
+        broker.publish(CACHED, "after-2");
+        String live = broker.handshake();
+        broker.subscribe(live, CACHED);
+
+        List<AjaxChannelBroker.Delivery> received = broker.drain(live);
+        // Whatever the race left held comes first, each publisher's messages in publish order, then the later ones.
+        assertThat(received).endsWith(
+                new AjaxChannelBroker.Delivery(CACHED, "after-1"),
+                new AjaxChannelBroker.Delivery(CACHED, "after-2"));
+        List<AjaxChannelBroker.Delivery> leftByRace = received.subList(0, received.size() - 2);
+        for (int publisher = 0; publisher < 2; publisher++) {
+            String prefix = "race-" + publisher + "-";
+            assertThat(leftByRace.stream()
+                    .map(delivery -> (String) delivery.data())
+                    .filter(data -> data.startsWith(prefix))
+                    .map(data -> Integer.valueOf(data.substring(prefix.length())))
+                    .toList()).isSorted();
+        }
+        assertThat(leftByRace).allSatisfy(delivery -> assertThat((String) delivery.data()).startsWith("race-"));
+    }
+
+    @Test
+    void subscriberThatNeverDrainsIsRemovedByTheDeliveryBeyondItsQueueBound() throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        int max = AjaxChannelBroker.MAX_QUEUED_DELIVERIES;
+        String hoarder = broker.handshake();
+        String reader = broker.handshake();
+        broker.subscribe(hoarder, OUTBOUND);
+        broker.subscribe(reader, OUTBOUND);
+        List<AjaxChannelBroker.Delivery> read = new ArrayList<>();
+
+        for (int i = 1; i <= max; i++) {
+            broker.publish(OUTBOUND, i);
+            // The hoarder keeps publishing, so inactivity alone would never remove it; it never connects or drains.
+            broker.onPublication(hoarder, TICK, "ping");
+            read.addAll(broker.drain(reader));
+        }
+
+        assertThat(broker.isKnownClient(hoarder)).isTrue();
+        assertThat(loggedMessages(Level.WARN)).isEmpty();
+
+        broker.publish(OUTBOUND, max + 1);
+
+        assertThat(broker.isKnownClient(hoarder)).isFalse();
+        assertThat(broker.drain(hoarder)).isEmpty();
+        assertThat(assertTimeoutPreemptively(Duration.ofMillis(WAIT_MS / 2),
+                () -> broker.awaitMessages(hoarder, WAIT_MS))).isEmpty();
+        assertThat(loggedMessages(Level.WARN)).containsExactly(overflowWarning(hoarder));
+        read.addAll(broker.drain(reader));
+        assertThat(read).containsExactlyElementsOf(IntStream.rangeClosed(1, max + 1)
+                .mapToObj(i -> new AjaxChannelBroker.Delivery(OUTBOUND, i))
+                .toList());
+
+        // The removed client's subscription went with it.
+        broker.publish(OUTBOUND, "later");
+
+        assertThat(broker.drain(reader)).containsExactly(new AjaxChannelBroker.Delivery(OUTBOUND, "later"));
+        assertThat(broker.isKnownClient(reader)).isTrue();
+    }
+
+    @Test
+    void cachedChannelWhoseOnlySubscriberOverflowedHoldsAgain() {
+        AjaxChannelBroker broker = broker(environment(Map.of("ajax.cache-messages-channels", CACHED)));
+        int max = AjaxChannelBroker.MAX_QUEUED_DELIVERIES;
+        String hoarder = broker.handshake();
+        broker.subscribe(hoarder, CACHED);
+        IntStream.rangeClosed(1, max).forEach(i -> broker.publish(CACHED, i));
+
+        broker.publish(CACHED, "overflowing");
+        broker.publish(CACHED, "next");
+
+        assertThat(broker.isKnownClient(hoarder)).isFalse();
+        String subscriber = broker.handshake();
+        broker.subscribe(subscriber, CACHED);
+        assertThat(broker.drain(subscriber)).containsExactly(
+                new AjaxChannelBroker.Delivery(CACHED, "overflowing"),
+                new AjaxChannelBroker.Delivery(CACHED, "next"));
+    }
+
+    @Test
+    void heldTransferFillingTheQueueExactlyIsAccepted() {
+        AjaxChannelBroker broker = broker(environment(Map.of("ajax.cache-messages-channels", CACHED)));
+        int alreadyQueued = AjaxChannelBroker.MAX_QUEUED_DELIVERIES - 2;
+        broker.publish(CACHED, "h1");
+        broker.publish(CACHED, "h2");
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        IntStream.range(0, alreadyQueued).forEach(i -> broker.publish(OUTBOUND, i));
+
+        broker.subscribe(client, CACHED);
+
+        List<AjaxChannelBroker.Delivery> deliveries = broker.drain(client);
+        assertThat(deliveries).hasSize(AjaxChannelBroker.MAX_QUEUED_DELIVERIES).endsWith(
+                new AjaxChannelBroker.Delivery(CACHED, "h1"),
+                new AjaxChannelBroker.Delivery(CACHED, "h2"));
+        assertThat(broker.isKnownClient(client)).isTrue();
+    }
+
+    @Test
+    void heldTransferBeyondTheQueueBoundRemovesTheClientAndKeepsTheHold() {
+        AjaxChannelBroker broker = broker(environment(Map.of("ajax.cache-messages-channels", CACHED)));
+        int alreadyQueued = AjaxChannelBroker.MAX_QUEUED_DELIVERIES - 1;
+        broker.publish(CACHED, "h1");
+        broker.publish(CACHED, "h2");
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        IntStream.range(0, alreadyQueued).forEach(i -> broker.publish(OUTBOUND, i));
+
+        assertThatThrownBy(() -> broker.subscribe(client, CACHED))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(String.valueOf(AjaxChannelBroker.MAX_QUEUED_DELIVERIES));
+
+        assertThat(broker.isKnownClient(client)).isFalse();
+        assertThat(broker.drain(client)).isEmpty();
+        assertThat(loggedMessages(Level.WARN)).containsExactly(overflowWarning(client));
+        String next = broker.handshake();
+        broker.subscribe(next, CACHED);
+        broker.subscribe(next, OUTBOUND);
+        assertThat(broker.drain(next)).containsExactly(
+                new AjaxChannelBroker.Delivery(CACHED, "h1"),
+                new AjaxChannelBroker.Delivery(CACHED, "h2"));
+
+        // The removed client's earlier subscription went with it.
+        broker.publish(OUTBOUND, "later");
+
+        assertThat(broker.drain(next)).containsExactly(new AjaxChannelBroker.Delivery(OUTBOUND, "later"));
+    }
+
     @Test
     void shutdownReleasesConnectsInterruptsHandlersAndRefusesLaterPublications() throws Exception {
         AjaxChannelBroker broker = broker(handlerEnvironment());
@@ -615,5 +1234,118 @@ class AjaxChannelBrokerTest {
         List<AjaxChannelBroker.Delivery> result() throws Exception {
             return task.get(WAIT_MS, TimeUnit.MILLISECONDS);
         }
+    }
+
+    /**
+     * Waits up to {@link #WAIT_MS} for a latch the way a handler that does not honour interruption blocks: an
+     * interrupt is swallowed and the wait goes on.
+     */
+    private static void awaitIgnoringInterrupts(CountDownLatch latch) {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WAIT_MS);
+        while (latch.getCount() > 0 && deadline - System.nanoTime() > 0) {
+            try {
+                latch.await(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
+            } catch (InterruptedException ignored) {
+                // Deliberately swallowed: this handler keeps its thread whatever the broker does.
+            }
+        }
+    }
+
+    /** Something done to or by one client of a broker. */
+    @FunctionalInterface
+    interface ClientAction {
+
+        void apply(AjaxChannelBroker broker, String clientId);
+    }
+
+    /** Steps that make a broker log one diagnostic. */
+    @FunctionalInterface
+    interface BrokerScenario {
+
+        void run(AjaxChannelBroker broker) throws Exception;
+    }
+
+    /**
+     * A handler failure whose message, cause message and suppressed message carry payload content and line breaks.
+     */
+    private static IllegalStateException sensitiveFailure() {
+        IllegalStateException failure = new IllegalStateException(
+                "Rejected " + SECRET + "\r\nINFO forged-by-message",
+                new IOException("Upstream answered " + SECRET + "\nERROR forged-by-cause"));
+        failure.addSuppressed(new IllegalArgumentException("Suppressed " + SECRET + "\nINFO forged-by-suppressed"));
+        return failure;
+    }
+
+    /** Builds {@code length} runtime exceptions, each the cause of the one before, with empty stack traces. */
+    private static Exception causeChain(int length) {
+        RuntimeException outermost = withStackTrace(new RuntimeException(SECRET));
+        RuntimeException current = outermost;
+        for (int i = 1; i < length; i++) {
+            RuntimeException cause = withStackTrace(new RuntimeException(SECRET));
+            current.initCause(cause);
+            current = cause;
+        }
+        return outermost;
+    }
+
+    private static <T extends Throwable> T withStackTrace(T failure, StackTraceElement... frames) {
+        failure.setStackTrace(frames);
+        return failure;
+    }
+
+    /** An exception whose stack trace and cause cannot be read, as a hostile or broken subclass may behave. */
+    static final class UnreadableException extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        UnreadableException() {
+            super(SECRET);
+        }
+
+        @Override
+        public StackTraceElement[] getStackTrace() {
+            throw new IllegalStateException(SECRET);
+        }
+
+        @Override
+        public synchronized Throwable getCause() {
+            throw new IllegalStateException(SECRET);
+        }
+    }
+
+    /** The WARN the broker logs when it removes a client whose queue overflowed. */
+    private static String overflowWarning(String clientId) {
+        return "Ajax client " + clientId + " exceeded " + AjaxChannelBroker.MAX_QUEUED_DELIVERIES
+                + " queued deliveries without a connect; client removed with its subscriptions";
+    }
+
+    /**
+     * Returns every broker event captured so far, after checking that none breaks a line or carries a throwable,
+     * which Logback would print with its message, causes and suppressed exceptions.
+     */
+    private List<ILoggingEvent> loggedEvents() {
+        List<ILoggingEvent> events;
+        // Handler threads log concurrently; ListAppender appends while holding its own monitor.
+        synchronized (appender) {
+            events = new ArrayList<>(appender.list);
+        }
+        for (ILoggingEvent event : events) {
+            String message = event.getFormattedMessage();
+            for (char lineBreak : LINE_BREAKS) {
+                assertThat(message.indexOf(lineBreak))
+                        .as("line break U+%04X in %s", (int) lineBreak, message)
+                        .isEqualTo(-1);
+            }
+            assertThat(event.getThrowableProxy()).as("throwable attached to %s", message).isNull();
+        }
+        return events;
+    }
+
+    /** The formatted messages of the captured broker events at one level, in logging order. */
+    private List<String> loggedMessages(Level level) {
+        return loggedEvents().stream()
+                .filter(event -> event.getLevel() == level)
+                .map(ILoggingEvent::getFormattedMessage)
+                .toList();
     }
 }

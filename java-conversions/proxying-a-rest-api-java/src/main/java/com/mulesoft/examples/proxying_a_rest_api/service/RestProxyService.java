@@ -37,8 +37,10 @@ import com.mulesoft.examples.proxying_a_rest_api.mapper.ProxyHeaderMapper;
  * <p>Mule 3.8 platform semantics the flow relied on, each a Tier 2A verification point that a captured fixture
  * overrides:
  * <ul>
- *   <li>{@code sendBodyMode} AUTO: GET, HEAD and OPTIONS are sent without an entity; every other method sends the
- *       request bytes, an empty body included.</li>
+ *   <li>{@code sendBodyMode} AUTO: GET, HEAD and OPTIONS are sent without an entity. TRACE, CONNECT and PRI are
+ *       sent without one too: the requester's Grizzly client writes no payload for a method whose payload
+ *       expectation is {@code NOT_ALLOWED}, so their bytes never left Mule. Every other method sends the request
+ *       bytes, an empty body included.</li>
  *   <li>The second {@code copy-headers} removes {@code http.status} with the other {@code http.*} properties, so the
  *       listener answers 200 for every upstream status below 400: 201, a 3xx the requester did not follow and 304
  *       alike.</li>
@@ -60,9 +62,13 @@ public class RestProxyService {
     public static final String VALIDATOR_FAILURE_MESSAGE =
             "Response code %d mapped as failure. Message payload is of type: BufferInputStream";
 
-    /** Methods Mule's {@code sendBodyMode} AUTO sends without an entity. */
-    private static final Set<HttpMethod> BODILESS_METHODS =
-            Set.of(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.OPTIONS);
+    /**
+     * Methods the Mule requester sent without an entity: those {@code sendBodyMode} AUTO leaves empty (GET, HEAD,
+     * OPTIONS), and those its Grizzly client sends without a payload (TRACE, CONNECT, PRI). Method tokens match
+     * case-sensitively, as both did.
+     */
+    private static final Set<HttpMethod> BODILESS_METHODS = Set.of(HttpMethod.GET, HttpMethod.HEAD,
+            HttpMethod.OPTIONS, HttpMethod.TRACE, HttpMethod.valueOf("CONNECT"), HttpMethod.valueOf("PRI"));
 
     private final ProxyHeaderMapper proxyHeaderMapper;
 
@@ -85,8 +91,8 @@ public class RestProxyService {
      * @param rawQuery the caller's query string without {@code ?}, still percent-encoded, or {@code null};
      *                 passed through untouched
      * @param inbound  the caller's request headers, filtered by {@link ProxyHeaderMapper#toUpstream}
-     * @param body     the caller's request bytes, or {@code null}; dropped for GET, HEAD and OPTIONS, otherwise
-     *                 forwarded as given, {@code null} as an empty body
+     * @param body     the caller's request bytes, or {@code null}; dropped for GET, HEAD, OPTIONS, TRACE, CONNECT
+     *                 and PRI, otherwise forwarded as given, {@code null} as an empty body
      * @return 200 with the upstream response headers filtered by {@link ProxyHeaderMapper#toCaller} and the upstream
      *         body bytes unparsed, an empty array when the upstream sent none
      * @throws IllegalStateException when the upstream status is 400 or above, with {@link #VALIDATOR_FAILURE_MESSAGE}

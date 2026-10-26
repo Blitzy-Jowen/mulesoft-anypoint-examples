@@ -237,8 +237,10 @@ public class BoxProxyClient implements AutoCloseable {
      * <p>A body is sent only when {@code bodyOrNull} holds at least one byte, with its exact length and no
      * {@code Content-Type} beyond the one the caller supplied. Without one, GET, HEAD, OPTIONS and TRACE requests
      * carry no {@code Content-Length} and every other method carries {@code Content-Length: 0}. A TRACE request
-     * with body bytes cannot be sent, because RFC 7231 forbids a client to send one, and fails with
-     * {@link org.springframework.web.client.ResourceAccessException} before anything reaches the upstream.
+     * with body bytes cannot be sent, because RFC 7231 forbids a client to send one: httpclient5 refuses the entity
+     * with an {@link IllegalStateException} before anything reaches the upstream, and it matches the method token
+     * in any letter case, so an extension token such as {@code trace} fails the same way. Dropping TRACE bytes, as
+     * the Mule requester did, is the caller's decision.
      *
      * <p>A followed redirect carries every header of the original request while it stays on the original
      * origin, and none of {@code Authorization}, {@code Cookie}, {@code Origin}, {@code Referer} or {@code Host}
@@ -255,6 +257,8 @@ public class BoxProxyClient implements AutoCloseable {
      * @param bodyOrNull the request body; {@code null} or empty sends none
      * @return the upstream status, headers and body bytes
      * @throws IllegalArgumentException when the path or query does not form a valid URI
+     * @throws IllegalStateException    when {@code method} is TRACE, in any letter case, and {@code bodyOrNull}
+     *                                  holds at least one byte; nothing is sent
      * @throws org.springframework.web.client.ResourceAccessException on a timeout, an I/O failure, or a request
      *                                                                the HTTP protocol does not allow
      */
