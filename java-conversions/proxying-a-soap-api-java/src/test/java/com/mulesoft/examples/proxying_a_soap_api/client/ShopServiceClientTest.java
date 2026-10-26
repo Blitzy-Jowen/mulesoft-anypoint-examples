@@ -905,7 +905,7 @@ class ShopServiceClientTest {
         return response;
     }
 
-    // AI2-F03: JAX-WS WSDLs import their schemas by absolute URL, which WsdlQueryPublisher never follows on its own.
+    // JAX-WS WSDLs import their schemas by absolute URL, which WsdlQueryPublisher never follows on its own.
     // The adapted resources must get the whole closure served by the proxy, the relative include nested in it too.
     @Test
     void absoluteImportsAndEverySchemaTheyReachArePublishedThroughTheProxy() throws Exception {
@@ -936,7 +936,7 @@ class ShopServiceClientTest {
         stubXml("/shop/ShopService?xsd=1", shopSchema.getBytes(UTF_8));
         stubXml("/shop/ShopTypes.xsd", shopTypes.getBytes(UTF_8));
         stubXml("/common/Common.xsd", commonSchema.getBytes(UTF_8));
-        // The relative include of an absolutely imported schema is keyed by the URL it denotes (FV-F01).
+        // The relative include of an absolutely imported schema is keyed by the URL it denotes.
         String shopTypesUrl = wm.baseUrl() + "/shop/ShopTypes.xsd";
         Map<String, String> upstreamByQuery = Map.of(
                 "wsdl", wsdl,
@@ -976,7 +976,7 @@ class ShopServiceClientTest {
         assertThat(address.getAttribute("location")).isEqualTo(PROXY_URL);
     }
 
-    // AI2-F03: the four reference kinds are matched by namespace and local name; nothing else in the document changes.
+    // The four reference kinds are matched by namespace and local name; nothing else in the document changes.
     @Test
     void everyAbsoluteReferenceLocationIsReplacedByItsKeyAndNothingElseChanges() throws Exception {
         String wsdlImport = wm.baseUrl() + "/shop/Other.wsdl";
@@ -1034,7 +1034,7 @@ class ShopServiceClientTest {
                         "{base}/shop/file:/etc/hosts"));
     }
 
-    // AI2-F03: a key resolves back to exactly the URL it was made from, whichever document holds it; "./" followed by
+    // A key resolves back to exactly the URL it was made from, whichever document holds it; "./" followed by
     // anything but an http or https URL stays an ordinary relative location.
     @ParameterizedTest(name = "{0}")
     @MethodSource("keyResolutions")
@@ -1065,7 +1065,7 @@ class ShopServiceClientTest {
                                 + "</xs:schema>\n"));
     }
 
-    // AI2-F03: only a replaced location changes a document, and one the publisher must reject reaches it as sent.
+    // Only a replaced location changes a document, and one the publisher must reject reaches it as sent.
     @ParameterizedTest(name = "{0}")
     @MethodSource("documentsLeftUnchanged")
     void documentsWithNothingToReplaceAreReadWithTheirExactBytes(String description, String document)
@@ -1119,7 +1119,7 @@ class ShopServiceClientTest {
         return queries;
     }
 
-    // FV-F01: two absolutely imported branches each include their own "Types.xsd". Spelled as written, the two
+    // Two absolutely imported branches each include their own "Types.xsd". Spelled as written, the two
     // includes would be one key for two documents, which WsdlQueryPublisher refuses at start-up; keyed by the URL each
     // denotes, every document of both branches is published under its own key.
     @Test
@@ -1180,7 +1180,7 @@ class ShopServiceClientTest {
                         List.of("{base}/b/B.xsd", "B.xsd"), true));
     }
 
-    // FV-F01: a document reached through relative locations only keeps its relative references as written, CXF's
+    // A document reached through relative locations only keeps its relative references as written, CXF's
     // ?xsd=<location> form; one reached through an absolute location or a key, and every document it reaches, has each
     // scheme-less reference replaced by the key of the URL it denotes. Blank and non-http locations stay as written in
     // both, as the publisher follows neither.
@@ -1223,7 +1223,7 @@ class ShopServiceClientTest {
         assertThat(resource.contentLength()).isEqualTo(adapted.length);
     }
 
-    // FV-F01: a schema the WSDL reaches both through a relative and through an absolute location is one document to
+    // A schema the WSDL reaches both through a relative and through an absolute location is one document to
     // the publisher, read once in the mode of the reference followed first; the closure registers in either order and
     // every key serves that one reading.
     @ParameterizedTest(name = "relative location first: {0}")
