@@ -23,6 +23,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -178,22 +179,27 @@ class FimProxyClientTest {
     }
 
     @Test
-    void bodyStalledAfterHeadersTimesOutOnceWithinTheTimeout() throws IOException {
+    void bodyStalledAfterHeadersTimesOutOnceWithinTheTimeout() throws IOException, InterruptedException {
         // A raw socket rather than WireMock, whose dribble delay also holds back the headers: the response head
         // arrives at once and the body stalls after 10 of its 1000 bytes, so only a deadline on the body read,
         // not the request factory's header timeout, can end the call.
         AtomicInteger requests = new AtomicInteger();
         List<Socket> connections = Collections.synchronizedList(new ArrayList<>());
-        try (ServerSocket upstream = new ServerSocket(0)) {
-            Thread server = new Thread(() -> sendHeadersThenStall(upstream, requests, connections),
-                    "stalled-fim-upstream");
-            server.setDaemon(true);
+        List<IOException> closeFailures = new ArrayList<>();
+        ServerSocket upstream = new ServerSocket(0);
+        Thread server = new Thread(() -> sendHeadersThenStall(upstream, requests, connections),
+                "stalled-fim-upstream");
+        server.setDaemon(true);
+        try {
             server.start();
             FimProxyClient shortTimeoutClient =
                     new FimProxyClient("http://127.0.0.1:" + upstream.getLocalPort(), Duration.ofMillis(300));
 
             long start = System.nanoTime();
-            Throwable thrown = catchThrowable(() -> shortTimeoutClient.send("GET", "/FIM/stalled", null, null));
+            // The watchdog is independent of the client's own timeout, so a body read that never ends fails
+            // the test here instead of hanging the build.
+            Throwable thrown = assertTimeoutPreemptively(Duration.ofSeconds(10),
+                    () -> catchThrowable(() -> shortTimeoutClient.send("GET", "/FIM/stalled", null, null)));
             Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
 
             assertThat(thrown).isInstanceOf(ResourceAccessException.class);
@@ -202,18 +208,40 @@ class FimProxyClientTest {
             // Exactly one attempt: a timed-out request is never retried.
             assertThat(requests).hasValue(1);
         } finally {
+            // The one owner of the sockets: runs whether the call returned, the watchdog gave up on it or the
+            // server thread failed to start. Closing the listening socket ends the accept loop, and closing each
+            // accepted connection ends any client read still blocked on it. Every close is attempted whatever the
+            // others do; failures are reported only after the cleanup, so none of them replaces the failure that
+            // brought the test here.
+            try {
+                upstream.close();
+            } catch (IOException ex) {
+                closeFailures.add(ex);
+            }
             synchronized (connections) {
                 for (Socket connection : connections) {
-                    connection.close();
+                    try {
+                        connection.close();
+                    } catch (IOException ex) {
+                        closeFailures.add(ex);
+                    }
                 }
             }
+            // A thread that never started is not alive, so this returns at once if start() failed.
+            server.join(Duration.ofSeconds(5).toMillis());
         }
+        assertThat(closeFailures).as("failures closing the stalled upstream's sockets").isEmpty();
+        assertThat(server.isAlive()).as("stalled upstream thread still running").isFalse();
     }
 
     /**
      * Accepts connections until {@code upstream} is closed. On each it reads the request head, counts it, sends a
      * complete response head announcing 1000 body bytes and then only the first 10, and leaves the connection
      * open, so the body never completes.
+     *
+     * <p>Each accepted connection is added to {@code connections}, a synchronized list the caller closes after
+     * closing {@code upstream}. A connection accepted while {@code upstream} was being closed may join the list
+     * after the caller has closed its contents, so this loop closes that one itself and stops.
      */
     private static void sendHeadersThenStall(ServerSocket upstream, AtomicInteger requests,
                                              List<Socket> connections) {
@@ -221,6 +249,10 @@ class FimProxyClientTest {
             while (!upstream.isClosed()) {
                 Socket connection = upstream.accept();
                 connections.add(connection);
+                if (upstream.isClosed()) {
+                    connection.close();
+                    return;
+                }
                 BufferedReader reader =
                         new BufferedReader(new InputStreamReader(connection.getInputStream(), US_ASCII));
                 String line;
