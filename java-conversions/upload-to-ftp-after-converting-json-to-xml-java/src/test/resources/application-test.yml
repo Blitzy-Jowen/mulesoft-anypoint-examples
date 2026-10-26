@@ -1,0 +1,8 @@
+# Spring profile "test": original demo FTP login of the Mule example (hard-coded at upload-to-ftp.xml:28);
+# unit tier only. The host is the in-process MockFtpServer FakeFtpServer, whose port each test registers
+# as ftp.port through @DynamicPropertySource, so no port is set here.
+ftp:
+  host: localhost
+  user: demo
+  password: demo
+  path: /Upload/
