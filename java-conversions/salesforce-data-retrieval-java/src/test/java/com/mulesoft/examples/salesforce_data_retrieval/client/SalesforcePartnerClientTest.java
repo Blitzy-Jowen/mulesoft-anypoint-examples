@@ -36,6 +36,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 
 import javax.xml.namespace.QName;
@@ -46,6 +47,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
@@ -72,6 +74,7 @@ import com.sforce.soap.partner.fault.ApiFault;
 import com.sforce.soap.partner.fault.ExceptionCode;
 import com.sforce.soap.partner.fault.LoginFault;
 import com.sforce.soap.partner.fault.UnexpectedErrorFault;
+import com.sforce.ws.ConnectorConfig;
 import com.sforce.ws.bind.TypeMapper;
 import com.sforce.ws.bind.XMLizable;
 import com.sforce.ws.parser.XmlOutputStream;
@@ -131,6 +134,12 @@ class SalesforcePartnerClientTest {
     private static final String QUERY_LOCATOR = "01gxx0000000001-2000";
 
     private static final String CONTACT_ID = "003xx000004TmiQAAS";
+
+    /** The {@code application.yml} key of the connect timeout. */
+    private static final String CONNECT_TIMEOUT_KEY = "sfdc.connect-timeout";
+
+    /** The {@code application.yml} key of the read timeout. */
+    private static final String READ_TIMEOUT_KEY = "sfdc.read-timeout";
 
     /** The query of the original flow's POST {@code /} for {@code object=user}, {@code field=email}. */
     private static final String SOQL = "SELECT id, name, email from user where name like '%mule%'";
@@ -529,6 +538,67 @@ class SalesforcePartnerClientTest {
         assertThat(requestsCarrying(queryAll, SESSION_2)).hasSize(1);
         assertThat(records).hasSize(1);
         assertUserRecord(records.get(0), USER_A);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // Timeout configuration
+    // ---------------------------------------------------------------------------------------------------------
+
+    @ParameterizedTest(name = "{0} = {2}")
+    @MethodSource("timeoutsShorterThanOneMillisecond")
+    void timeoutShorterThanOneMillisecondIsRejectedAtConstructionNamingItsKey(String key,
+            BiConsumer<SalesforceProperties, Duration> setter, Duration timeout) {
+        stubLogin();
+        setter.accept(props, timeout);
+
+        Throwable thrown = catchThrowable(this::loginModeClient);
+
+        assertThat(thrown).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining(key)
+                .hasMessageContaining(timeout.toString());
+        assertThat(wm.getAllServeEvents()).isEmpty();
+    }
+
+    @ParameterizedTest(name = "connect {0}, read {1}")
+    @MethodSource("acceptedTimeouts")
+    void acceptedTimeoutsReachTheConnectorConfigInMilliseconds(Duration connectTimeout, Duration readTimeout,
+            int expectedConnectMillis, int expectedReadMillis) throws Exception {
+        props.setConnectTimeout(connectTimeout);
+        props.setReadTimeout(readTimeout);
+        SalesforcePartnerClient client = sessionModeClient(new TestSessionSource(apiUrl()));
+
+        ConnectorConfig config = client.connection().getConfig();
+
+        assertThat(config.getConnectionTimeout()).isEqualTo(expectedConnectMillis);
+        assertThat(config.getReadTimeout()).isEqualTo(expectedReadMillis);
+        assertThat(wm.getAllServeEvents()).isEmpty();
+    }
+
+    /**
+     * Each timeout key with the setter that binds it, crossed with every duration WSC would turn into no timeout
+     * (zero, or a positive fraction of a millisecond) or an invalid one (negative, down to a value whose milliseconds
+     * overflow a {@code long}).
+     */
+    static Stream<Arguments> timeoutsShorterThanOneMillisecond() {
+        Map<String, BiConsumer<SalesforceProperties, Duration>> setters = new LinkedHashMap<>();
+        setters.put(CONNECT_TIMEOUT_KEY, SalesforceProperties::setConnectTimeout);
+        setters.put(READ_TIMEOUT_KEY, SalesforceProperties::setReadTimeout);
+        return setters.entrySet().stream().flatMap(setter -> Stream.of(Duration.ZERO, Duration.ofMillis(-1),
+                        Duration.ofNanos(999_999), Duration.ofSeconds(Long.MIN_VALUE))
+                .map(timeout -> Arguments.of(setter.getKey(), setter.getValue(), timeout)));
+    }
+
+    /**
+     * Connect and read timeouts the client accepts, with the milliseconds WSC receives: unset falls back to the 10 s
+     * default, 1 ms is the shortest accepted (a sub-millisecond remainder is dropped), and a duration beyond
+     * {@link Integer#MAX_VALUE} milliseconds, up to the longest {@link Duration}, is capped there.
+     */
+    static Stream<Arguments> acceptedTimeouts() {
+        return Stream.of(
+                Arguments.of(null, null, 10_000, 10_000),
+                Arguments.of(Duration.ofMillis(1), Duration.ofNanos(1_999_999), 1, 1),
+                Arguments.of(Duration.ofDays(365), Duration.ofSeconds(Long.MAX_VALUE, 999_999_999),
+                        Integer.MAX_VALUE, Integer.MAX_VALUE));
     }
 
     // ---------------------------------------------------------------------------------------------------------

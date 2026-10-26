@@ -19,6 +19,9 @@ import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * Tests shared component SC-8, {@link WatermarkStore}: the Mule 3.8 poll watermark it reproduces (a default that is
@@ -120,6 +123,44 @@ class WatermarkStoreTest {
         assertThat(readProperties(storeFile())).containsEntry(KEY, JULY_5);
     }
 
+    static Stream<Arguments> chronologicalMaxima() {
+        return Stream.of(
+                Arguments.of(List.of("2025-01-01T00:00:00Z", "2025-01-01T00:00:00.999Z"), "2025-01-01T00:00:00.999Z"),
+                Arguments.of(List.of("2025-01-01T00:00:00.5Z", "2025-01-01T00:00:00.123456789Z"),
+                        "2025-01-01T00:00:00.5Z"),
+                Arguments.of(List.of("2025-01-01T01:00:00+01:00", "2025-01-01T00:00:00.001Z"),
+                        "2025-01-01T00:00:00.001Z"),
+                Arguments.of(List.of("2025-01-01T00:00:00Z", "2025-01-01T01:00:00+01:00", "2025-01-01T00:00:00.000Z"),
+                        "2025-01-01T00:00:00Z"));
+    }
+
+    @ParameterizedTest(name = "MAX of {0} is {1}")
+    @MethodSource("chronologicalMaxima")
+    void updateMaxStoresTheChronologicallyLatestCandidateWithItsOriginalText(List<String> candidates, String latest)
+            throws IOException {
+        WatermarkStore store = new WatermarkStore(storeFile());
+
+        assertThat(store.updateMax(KEY, candidates)).isTrue();
+
+        assertThat(store.current(KEY)).contains(latest);
+        assertThat(readProperties(storeFile())).containsEntry(KEY, latest).hasSize(1);
+    }
+
+    @Test
+    void updateMaxWithANonTimestampCandidateThrowsAndLeavesTheStoreFileUntouched() throws IOException {
+        WatermarkStore store = new WatermarkStore(storeFile());
+        store.store(KEY, JULY_4);
+        byte[] before = Files.readAllBytes(storeFile());
+
+        assertThatThrownBy(() -> store.updateMax(KEY, List.of(JULY_5, DEFAULT_WATERMARK)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("'" + KEY + "'")
+                .hasMessageContaining("'" + DEFAULT_WATERMARK + "'");
+
+        assertThat(store.current(KEY)).contains(JULY_4);
+        assertThat(Files.readAllBytes(storeFile())).isEqualTo(before);
+    }
+
     @Test
     void updateMaxWithoutCandidatesStoresNothingAndCreatesNoFile() {
         WatermarkStore store = new WatermarkStore(storeFile());
@@ -157,13 +198,13 @@ class WatermarkStoreTest {
         WatermarkStore store = new WatermarkStore(storeFile());
         store.store("a", JULY_4);
 
-        assertThat(store.updateMax("b", List.of("3"))).isTrue();
+        assertThat(store.updateMax("b", List.of(JULY_5))).isTrue();
 
         assertThat(store.current("a")).contains(JULY_4);
-        assertThat(store.current("b")).contains("3");
+        assertThat(store.current("b")).contains(JULY_5);
         assertThat(readProperties(storeFile()))
                 .containsEntry("a", JULY_4)
-                .containsEntry("b", "3")
+                .containsEntry("b", JULY_5)
                 .hasSize(2);
     }
 

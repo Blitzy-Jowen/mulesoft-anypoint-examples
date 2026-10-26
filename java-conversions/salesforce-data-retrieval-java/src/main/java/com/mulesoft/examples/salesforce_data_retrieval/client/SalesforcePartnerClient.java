@@ -74,6 +74,21 @@ public class SalesforcePartnerClient {
     /** Connect and read timeout applied when none is configured: the Mule default response timeout. */
     private static final int DEFAULT_TIMEOUT_MILLIS = 10_000;
 
+    /**
+     * Shortest timeout accepted. WSC takes whole milliseconds and treats {@code 0} as no timeout at all, so a shorter
+     * duration would leave the call unbounded.
+     */
+    private static final Duration MIN_TIMEOUT = Duration.ofMillis(1);
+
+    /** Longest timeout WSC can take; a longer one is capped to it. */
+    private static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+
+    /** Configuration key of the connect timeout, named when its value is rejected. */
+    private static final String CONNECT_TIMEOUT_KEY = "sfdc.connect-timeout";
+
+    /** Configuration key of the read timeout, named when its value is rejected. */
+    private static final String READ_TIMEOUT_KEY = "sfdc.read-timeout";
+
     /** Map key of the sObject type, and local name of the Partner API element that carries it. */
     private static final String TYPE_KEY = "type";
 
@@ -94,19 +109,24 @@ public class SalesforcePartnerClient {
     private final Object lock = new Object();
 
     /**
-     * Creates the client; no connection is made until the first call.
+     * Creates the client; no connection is made until the first call. The timeouts are checked here, so an
+     * application configured with one that would leave Salesforce calls unbounded refuses to start.
      *
      * @param properties    the {@code sfdc.*} settings: credentials, login endpoint and timeouts
      * @param executor      the SC-9 executor every vendor call runs through
      * @param sessionSource the provider of an optional {@link SessionSource} bean, resolved at each connection; a
      *                      {@code null} provider, or one without a bean, selects login mode
-     * @throws NullPointerException if {@code properties} or {@code executor} is {@code null}
+     * @throws NullPointerException     if {@code properties} or {@code executor} is {@code null}
+     * @throws IllegalArgumentException if {@code sfdc.connect-timeout} or {@code sfdc.read-timeout} is shorter than
+     *                                  1 ms, zero and negative durations included
      */
     public SalesforcePartnerClient(SalesforceProperties properties, UpstreamCallExecutor executor,
             ObjectProvider<SalesforcePartnerClient.SessionSource> sessionSource) {
         this.properties = Objects.requireNonNull(properties, "properties");
         this.executor = Objects.requireNonNull(executor, "executor");
         this.sessionSourceProvider = sessionSource;
+        millis(properties.getConnectTimeout(), CONNECT_TIMEOUT_KEY);
+        millis(properties.getReadTimeout(), READ_TIMEOUT_KEY);
     }
 
     /**
@@ -288,8 +308,8 @@ public class SalesforcePartnerClient {
         // Always set explicitly: when it is unset, Connector.newConnection falls back to Connector.END_POINT, which
         // in force-partner-api 65.0.0 is an internal Salesforce test host rather than login.salesforce.com.
         config.setAuthEndpoint(properties.getAuthEndpoint());
-        config.setConnectionTimeout(millis(properties.getConnectTimeout()));
-        config.setReadTimeout(millis(properties.getReadTimeout()));
+        config.setConnectionTimeout(millis(properties.getConnectTimeout(), CONNECT_TIMEOUT_KEY));
+        config.setReadTimeout(millis(properties.getReadTimeout(), READ_TIMEOUT_KEY));
         // Departs from WSC's default (buffered POST): a buffered HttpURLConnection POST is silently re-sent once by
         // the JDK when the connection drops before the response (sun.net.http.retryPost), which could submit a
         // create twice. A streamed (chunked) request body is never re-sent, so connectivity failures reach the
@@ -319,15 +339,26 @@ public class SalesforcePartnerClient {
     }
 
     /**
-     * Converts a timeout to the {@code int} milliseconds WSC takes, capped at {@link Integer#MAX_VALUE}.
+     * Converts a timeout to the {@code int} milliseconds WSC takes, capped at {@link Integer#MAX_VALUE}; a
+     * sub-millisecond remainder is dropped.
      *
      * @param timeout the configured timeout; {@code null} gives the 10 s default
+     * @param key     the configuration key the timeout is bound from, named in the rejection message
+     * @return the timeout in milliseconds, at least 1
+     * @throws IllegalArgumentException if {@code timeout} is shorter than 1 ms, zero and negative durations included,
+     *                                  because WSC would then set no timeout or an invalid one
      */
-    private static int millis(Duration timeout) {
+    private static int millis(Duration timeout, String key) {
         if (timeout == null) {
             return DEFAULT_TIMEOUT_MILLIS;
         }
-        return (int) Math.min(Integer.MAX_VALUE, timeout.toMillis());
+        if (timeout.compareTo(MIN_TIMEOUT) < 0) {
+            throw new IllegalArgumentException(key + " must be at least 1 ms: " + timeout);
+        }
+        if (timeout.compareTo(MAX_TIMEOUT) >= 0) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) timeout.toMillis();
     }
 
     /**

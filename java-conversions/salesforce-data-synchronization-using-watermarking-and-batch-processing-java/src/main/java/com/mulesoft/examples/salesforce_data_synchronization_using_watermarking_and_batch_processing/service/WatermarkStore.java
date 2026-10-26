@@ -10,8 +10,11 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
@@ -31,9 +34,10 @@ import org.springframework.stereotype.Component;
  *       object store did;</li>
  *   <li>while no value is stored, the watermark resolves to its {@code default-expression}, evaluated again on every
  *       poll and never persisted ({@link #retrieve});</li>
- *   <li>selector {@code MAX}: once the poll's processing completes, the store takes the greatest value the poll
- *       selected, compared only among that poll's values; a poll that selected nothing leaves the stored value
- *       untouched ({@link #updateMax}). Calling it only after processing is the caller's responsibility.</li>
+ *   <li>selector {@code MAX}: once the poll's processing completes, the store takes the chronologically latest
+ *       timestamp the poll selected, compared as instants only among that poll's values; a poll that selected nothing
+ *       leaves the stored value untouched ({@link #updateMax}). Calling it only after processing is the caller's
+ *       responsibility.</li>
  * </ul>
  *
  * <p>The store is a UTF-8 {@link Properties} file. It is read afresh on every access, so a value written by another
@@ -115,32 +119,63 @@ public class WatermarkStore {
     }
 
     /**
-     * Applies the {@code MAX} selector: stores the greatest of this poll's selected values under {@code key}.
+     * Applies the {@code MAX} selector: stores the latest of this poll's selected timestamps under {@code key}.
      *
      * <p>{@code null} and blank candidates are ignored, as Mule ignores a selector expression that yields nothing. The
-     * remaining candidates are compared in natural {@link String} order, which is chronological for the ISO-8601 UTC
-     * timestamps the selector reads. The previously stored value takes no part in the comparison, because Mule's
-     * selector only sees the values of the current poll.
+     * remaining candidates are ISO-8601 date-times with offset, such as Salesforce's {@code 2014-07-04T06:16:54.000Z},
+     * and are compared chronologically by the instant each denotes, so differing fraction precision and offsets order
+     * correctly; text order would not ({@code ...00Z} sorts after {@code ...00.999Z}). The latest candidate is stored
+     * with its original text unchanged; among candidates denoting the same instant the first in iteration order wins.
+     * The previously stored value takes no part in the comparison, because Mule's selector only sees the values of the
+     * current poll.
      *
      * @param key        the watermark variable name
      * @param candidates the selector values of this poll's records; elements may be {@code null}
      * @return {@code true} if a value was stored, {@code false} if no candidate remained and the store was left
      *         untouched
-     * @throws NullPointerException if {@code key} or {@code candidates} is {@code null}
-     * @throws UncheckedIOException if the store cannot be read or written
+     * @throws NullPointerException     if {@code key} or {@code candidates} is {@code null}
+     * @throws IllegalArgumentException if a non-blank candidate is not an ISO-8601 date-time with offset; the message
+     *                                  names {@code key} and the candidate, and the store is left untouched
+     * @throws UncheckedIOException     if the store cannot be read or written
      */
     public synchronized boolean updateMax(String key, Collection<String> candidates) {
         Objects.requireNonNull(key, "key must not be null");
         Objects.requireNonNull(candidates, "candidates must not be null");
-        Optional<String> max = candidates.stream()
-                .filter(Objects::nonNull)
-                .filter(candidate -> !candidate.isBlank())
-                .max(Comparator.naturalOrder());
-        if (max.isEmpty()) {
+        String max = null;
+        Instant maxInstant = null;
+        for (String candidate : candidates) {
+            if (candidate == null || candidate.isBlank()) {
+                continue;
+            }
+            Instant instant = toInstant(key, candidate);
+            if (maxInstant == null || instant.isAfter(maxInstant)) {
+                max = candidate;
+                maxInstant = instant;
+            }
+        }
+        if (max == null) {
             return false;
         }
-        store(key, max.get());
+        store(key, max);
         return true;
+    }
+
+    /**
+     * Parses a selector value as an ISO-8601 date-time with offset ({@code Z}, {@code +hh:mm} or {@code -hh:mm}; zero
+     * to nine fraction digits), the form Salesforce gives {@code LastModifiedDate}.
+     *
+     * @param key       the watermark variable name, named in the failure message
+     * @param candidate the non-blank selector value to parse
+     * @return the instant {@code candidate} denotes
+     * @throws IllegalArgumentException naming {@code key} and {@code candidate} when the value has another form
+     */
+    private static Instant toInstant(String key, String candidate) {
+        try {
+            return OffsetDateTime.parse(candidate, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant();
+        } catch (DateTimeParseException e) {
+            throw new IllegalArgumentException("Watermark candidate for key '" + key
+                    + "' is not an ISO-8601 date-time with offset: '" + candidate + "'", e);
+        }
     }
 
     /**

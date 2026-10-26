@@ -13,9 +13,21 @@
 # configured), the application completes the OAuth 2.0 authorization-code flow and runs its contact query,
 # and the test checks the "Salesforce query returned N contacts." text.
 #
-# The connected app identified by sfdc.key must have exactly http://localhost:8081/oauth2callback as its
-# callback URL. The test runs the application on port 8081, and the redirect URI is built from
-# sfdc.oauth.callback.* (defaults localhost, 8081, oauth2callback, as in the original oauth-callback-config).
+# Ports and callback URL. The production default is http.port 8081: server.port and
+# sfdc.oauth.callback.local-port both resolve ${http.port:8081}, and with sfdc.oauth.callback.domain localhost
+# and path oauth2callback the redirect URI is http://localhost:8081/oauth2callback, as in the original
+# oauth-callback-config. Setting http.port therefore moves the listener and the redirect URI together; set it
+# rather than sfdc.oauth.callback.local-port alone, which would point the redirect URI at a port the
+# application does not listen on.
+#
+# The live test must not bind 8081 or any other default port. A random port (0) cannot be used either, because
+# Salesforce redirects only to a callback URL registered on the connected app, matched exactly. Before running,
+# choose a free port <P> allocated to this checkout or CI host and supply it as http.port: HTTP_PORT=<P> in the
+# environment, or the two lines below in application-it.yml with their leading "# " removed. The redirect URI
+# is then http://localhost:<P>/oauth2callback; register that exact URL as a callback URL of the connected app
+# identified by sfdc.key (a connected app may list several) before running the test.
+# http:
+#   port: <P>
 #
 # The existing Salesforce org and credentials are reused; no new sandbox is needed. These keys replace the
 # sfdc.key, sfdc.secret, sfdc.user and sfdc.password that the original authenticating-salesforce-using-oauth2

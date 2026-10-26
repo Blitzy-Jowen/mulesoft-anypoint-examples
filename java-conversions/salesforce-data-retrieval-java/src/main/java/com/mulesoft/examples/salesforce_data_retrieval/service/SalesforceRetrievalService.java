@@ -8,8 +8,14 @@
 
 package com.mulesoft.examples.salesforce_data_retrieval.service;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
@@ -37,10 +43,13 @@ import com.sforce.soap.partner.Field;
  *
  * <p>Query hardening: the original concatenated the caller's form values into SOQL. Before any query runs, the
  * object name must be one {@code describeGlobal} lists, and {@code searchKey} and every {@code field} entry must be
- * a field (or a relationship path) {@code describeSObject} lists for that object; {@code searchValue} is escaped
- * inside its string literal. Legitimate input yields the same SOQL and rows as the original; hostile input fails
- * with an {@link IllegalArgumentException} before Salesforce is queried. Describe results are read on every
- * request, never cached.
+ * a field {@code describeSObject} lists for that object, or a relationship path ({@code Owner.Name},
+ * {@code Account.Owner.Name}) of at most five relationships whose every segment Salesforce describes: each
+ * relationship is followed to the {@code describeSObject} fields of the types its reference field refers to, and the
+ * last segment must be a field of one of them. {@code searchValue} is escaped inside its string literal. Legitimate
+ * input yields the same SOQL and rows as the original; hostile input fails with an
+ * {@link IllegalArgumentException} before Salesforce is queried. Describe results are read on every request and
+ * never cached across requests; within one request each type is described at most once.
  *
  * <p>Nothing here catches or wraps an exception. SC-9 upstream exceptions raised inside the client reach
  * {@code UpstreamExceptionHandler}; every other failure of {@link #query(Map)} reaches the project handler that
@@ -62,6 +71,9 @@ public class SalesforceRetrievalService {
 
     /** A segment after the relationship name of a dotted path such as {@code Owner.Name}. */
     private static final Pattern PATH_SEGMENT = Pattern.compile("[A-Za-z][A-Za-z0-9_]*");
+
+    /** SOQL's limit on child-to-parent relationships in one path, such as the two of {@code Account.Owner.Name}. */
+    private static final int MAX_RELATIONSHIP_HOPS = 5;
 
     private static final Field[] NO_FIELDS = new Field[0];
 
@@ -135,7 +147,11 @@ public class SalesforceRetrievalService {
         }
         DescribeSObjectResult describe = client.describeSObject(object);
         Field[] fields = describe == null || describe.getFields() == null ? NO_FIELDS : describe.getFields();
-        if (!isValidIdentifier(searchKey, fields)) {
+        // This request's describe results by lower-cased type name, so each type a relationship path reaches is
+        // described at most once per request; a later request describes afresh.
+        Map<String, DescribeSObjectResult> describes = new HashMap<>();
+        describes.put(object.toLowerCase(Locale.ROOT), describe);
+        if (!isValidIdentifier(searchKey, fields, describes)) {
             throw new IllegalArgumentException("Unknown field: " + searchKey);
         }
         if (!field.isEmpty()) {
@@ -143,7 +159,7 @@ public class SalesforceRetrievalService {
             // "email, phone" was legitimate; each entry is checked, and the raw text still reaches the SOQL.
             for (String segment : field.split(",", -1)) {
                 String name = segment.trim();
-                if (name.isEmpty() || !isValidIdentifier(name, fields)) {
+                if (name.isEmpty() || !isValidIdentifier(name, fields, describes)) {
                     throw new IllegalArgumentException("Invalid field list: " + field);
                 }
             }
@@ -172,30 +188,130 @@ public class SalesforceRetrievalService {
     }
 
     /**
-     * Whether {@code name} is a field of the described object, or a relationship path whose first segment is one of
-     * its relationship names and whose later segments are plain identifiers ({@code Owner.Name}).
+     * Whether {@code name} is a field of the described object, or a relationship path every segment of which
+     * Salesforce describes ({@code Owner.Name}, {@code Account.Owner.Name}).
+     *
+     * <p>A path is resolved hop by hop, starting at the queried object's fields. Each segment before the last must be
+     * the relationship name of a reference field at the current level, and the next level is the union of the
+     * {@code describeSObject} fields of every type that field refers to; the last segment must be a field name at the
+     * final level. Names are compared case-insensitively, as SOQL compares them. A polymorphic relationship, one
+     * referring to several types (such as {@code Owner} referring to {@code Group} and {@code User}), is resolved
+     * deliberately as that union: the path is accepted when at least one target type resolves it, so no legitimate
+     * path is rejected, and a name no target type describes is rejected. A type whose describe or field list is
+     * absent resolves nothing, and a reference field without targets leads nowhere.
+     *
+     * <p>A path of more than {@value #MAX_RELATIONSHIP_HOPS} relationships, or one whose later segments are not plain
+     * identifiers, is rejected before any {@code describeSObject} call.
+     *
+     * @param name      the caller's identifier, a {@code searchKey} or one {@code field} entry
+     * @param fields    the queried object's fields
+     * @param describes this request's describe results by lower-cased type name, the queried object's included; each
+     *                  type described here is added
+     * @return whether {@code name} resolves to a field Salesforce describes
+     * @throws Exception an SC-9 upstream exception, or the vendor's exception, of a {@code describeSObject} call,
+     *                   unchanged
      */
-    private static boolean isValidIdentifier(String name, Field[] fields) {
+    private boolean isValidIdentifier(String name, Field[] fields, Map<String, DescribeSObjectResult> describes)
+            throws Exception {
         if (name.indexOf('.') < 0) {
-            for (Field candidate : fields) {
-                if (candidate != null && name.equalsIgnoreCase(candidate.getName())) {
-                    return true;
-                }
-            }
-            return false;
+            return isFieldName(name, fields);
         }
         String[] segments = name.split("\\.", -1);
+        if (segments.length - 1 > MAX_RELATIONSHIP_HOPS) {
+            return false;
+        }
         for (int i = 1; i < segments.length; i++) {
             if (!PATH_SEGMENT.matcher(segments[i]).matches()) {
                 return false;
             }
         }
-        for (Field candidate : fields) {
-            if (candidate != null && segments[0].equalsIgnoreCase(candidate.getRelationshipName())) {
+        List<Field[]> level = Collections.singletonList(fields);
+        for (int i = 0; i < segments.length - 1; i++) {
+            level = referencedFields(segments[i], level, describes);
+            if (level.isEmpty()) {
+                return false;
+            }
+        }
+        String terminal = segments[segments.length - 1];
+        for (Field[] typeFields : level) {
+            if (isFieldName(terminal, typeFields)) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Whether one of {@code fields} is named {@code name}, compared case-insensitively as SOQL does.
+     *
+     * @param name   the identifier or path segment
+     * @param fields the fields of one described type
+     * @return whether a field of that name exists
+     */
+    private static boolean isFieldName(String name, Field[] fields) {
+        for (Field candidate : fields) {
+            if (candidate != null && name.equalsIgnoreCase(candidate.getName())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The next level of a relationship path: the fields of every type that a reference field of {@code level} whose
+     * relationship name is {@code relationship} refers to, one array per type that could be described.
+     *
+     * @param relationship the path segment read as a relationship name
+     * @param level        the fields of each type the path has reached so far
+     * @param describes    this request's describe results by lower-cased type name
+     * @return the referenced types' fields; empty when no reference field of {@code level} carries that relationship
+     *         name, it refers to no type, or no type it refers to has a describe with fields
+     * @throws Exception an SC-9 upstream exception, or the vendor's exception, of a {@code describeSObject} call,
+     *                   unchanged
+     */
+    private List<Field[]> referencedFields(String relationship, List<Field[]> level,
+            Map<String, DescribeSObjectResult> describes) throws Exception {
+        Set<String> types = new LinkedHashSet<>();
+        for (Field[] typeFields : level) {
+            for (Field candidate : typeFields) {
+                if (candidate != null && relationship.equalsIgnoreCase(candidate.getRelationshipName())
+                        && candidate.getReferenceTo() != null) {
+                    for (String type : candidate.getReferenceTo()) {
+                        if (type != null && !type.isEmpty()) {
+                            types.add(type);
+                        }
+                    }
+                }
+            }
+        }
+        List<Field[]> next = new ArrayList<>(types.size());
+        for (String type : types) {
+            DescribeSObjectResult describe = describe(type, describes);
+            if (describe != null && describe.getFields() != null) {
+                next.add(describe.getFields());
+            }
+        }
+        return next;
+    }
+
+    /**
+     * Describes {@code type} once per request: a type already in {@code describes} (an absent result included) is
+     * not described again.
+     *
+     * @param type      the sObject type name, as a reference field's {@code referenceTo} lists it
+     * @param describes this request's describe results by lower-cased type name
+     * @return the {@code describeSObject} result, possibly {@code null}
+     * @throws Exception an SC-9 upstream exception, or the vendor's exception, unchanged
+     */
+    private DescribeSObjectResult describe(String type, Map<String, DescribeSObjectResult> describes)
+            throws Exception {
+        String key = type.toLowerCase(Locale.ROOT);
+        if (describes.containsKey(key)) {
+            return describes.get(key);
+        }
+        DescribeSObjectResult result = client.describeSObject(type);
+        describes.put(key, result);
+        return result;
     }
 
     /**
