@@ -1,0 +1,32 @@
+# sending-json-data-to-a-amqp-queue-java runtime configuration
+# Replaces sending-json-data-to-a-amqp-queue/src/main/app/mule-app.properties (empty) and the values of
+# json-to-rabbitmq.xml. The original placeholder and test-property names are kept (http.port, amqp.host).
+# No broker credentials, port or virtual host are written: the original amqp:connector (xml:3) set none, and
+# Spring Boot's defaults (5672, guest/guest, vhost /) equal the Mule AMQP connector defaults it relied on.
+spring:
+  application:
+    name: sending-json-data-to-a-amqp-queue-java
+  rabbitmq:
+    host: ${amqp.host:localhost}   # original test property amqp.host (SendingJsonDataToAmqpQueueIT.java:131)
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  # The listener accepts POST only (xml:6), so every other method, TRACE included, gets SC-1's 405:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the dispatcher instead of the servlet's default 200 TRACE echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (xml:4)
+
+http:
+  port: 8081            # original placeholder name ${http.port} (xml:4); the port of the original README
+
+amqp:
+  host: localhost                 # original test property amqp.host; feeds spring.rabbitmq.host
+  exchange-name: sales_exchange   # amqp:outbound-endpoint exchangeName (xml:9)
+  queue-name: sales_queue         # amqp:outbound-endpoint queueName (xml:9)
+  response-timeout: 10000         # ms; amqp:outbound-endpoint responseTimeout (xml:9), the RabbitTemplate reply timeout set by config/AmqpConfig

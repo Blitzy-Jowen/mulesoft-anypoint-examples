@@ -1,0 +1,38 @@
+# processing-orders-with-dataweave-and-APIkit-java runtime configuration
+# Replaces processing-orders-with-dataweave-and-APIkit/src/main/app/mule-app.properties (empty) and the values
+# currency.xml and books.xml fix; mule-deploy.properties loads both flows (config.resources=currency.xml,books.xml).
+spring:
+  application:
+    name: processing-orders-with-dataweave-and-APIkit-java
+  # No static resource handler: unknown paths raise NoHandlerFoundException / NoResourceFoundException,
+  # answered by ApiKitExceptionHandler under /api and GlobalExceptionHandler elsewhere (AAP 0.4.7)
+  web:
+    resources:
+      add-mappings: false
+  # The /api/* listener (currency.xml:33) declares no allowedMethods and serves no other path. Both settings keep
+  # the error behaviour identical to the first SC-1/SC-3 consumer, rest-api-with-apikit-java.
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the APIkit 405 mapping instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404
+
+# http:listener-config host="0.0.0.0" port="${http.port}" (currency.xml:3), also the port of the
+# books.xml:3 http:request-config the order flow calls back on. The original fixes no http.port, so 8081 is the
+# default and no separate http.port key is defined; pass --http.port (or HTTP_PORT) to change it.
+server:
+  port: ${http.port:8081}
+
+# apikit:config raml="currency.raml" consoleEnabled="true" consolePath="console" (currency.xml:4); listener path /api/*
+apikit:
+  base-path: /api
+  raml: api/currency.raml
+  console-path: console
+
+# OrderFlow file endpoints of books.xml, paths relative to the working directory as Mule resolved them:
+# file:inbound-endpoint path (l.8), which declares no pollingFrequency, so Mule's 1000 ms default applies;
+# file:outbound-endpoint path of orders.json and report.csv (l.39, l.42)
+orders:
+  input-dir: src/main/resources/input
+  output-dir: src/main/resources/output
+  polling-frequency: 1000
