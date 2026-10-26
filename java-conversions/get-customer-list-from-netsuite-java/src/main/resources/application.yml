@@ -27,6 +27,7 @@ netsuite:
   account: ${NETSUITE_ACCOUNT:}
   # Empty: the clients derive https://<account>.suitetalk.api.netsuite.com from netsuite.account
   # (lower-cased, '_' -> '-'); tests point it at WireMock.
+  # TODO: supply the NetSuite base URL (scheme and host, no path) only when overriding the account-derived URL
   base-url: ${NETSUITE_BASE_URL:}
   # Connect and read timeouts of every NetSuite call: the Mule default response timeout
   connect-timeout: 10s
