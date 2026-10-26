@@ -1,0 +1,14 @@
+# implementing-a-choice-exception-strategy-java runtime configuration
+# Replaces implementing-a-choice-exception-strategy/src/main/app/mule-app.properties (empty)
+# and the http:listener-config of choice-error-handling.xml:3 (host 0.0.0.0, port ${http.port}).
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (choice-error-handling.xml:3)
+spring:
+  application:
+    name: implementing-a-choice-exception-strategy-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
