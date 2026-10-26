@@ -34,6 +34,15 @@ spring:
       "[mail.smtp.connectiontimeout]": 10000
       "[mail.smtp.timeout]": 10000
       "[mail.smtp.writetimeout]": 10000
+  # Bounds the applicationTaskExecutor the scatter-gather routes run on, like the original's ScatterGatherWorkManager
+  task:
+    execution:
+      pool:
+        core-size: 1                       # Mule 3.8 default threading profile maxThreadsIdle 1
+        max-size: 16                       # maxThreadsActive 16
+        queue-capacity: 0                  # maxBufferSize 0 -> no queue, a route is handed straight to a thread
+        keep-alive: 60s                    # threadTTL 60000 ms
+        allow-core-thread-timeout: false   # the core thread is kept, as Mule's pool never timed it out
 # smtp:outbound-endpoint attributes (scatter-gather.xml:64) under their original placeholder names
 smtp:
   # TODO: supply the SMTP server host (the original README suggests smtp.gmail.com)

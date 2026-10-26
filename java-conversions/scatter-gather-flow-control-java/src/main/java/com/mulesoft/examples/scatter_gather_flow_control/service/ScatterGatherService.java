@@ -17,6 +17,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
@@ -41,7 +42,11 @@ import com.mulesoft.examples.scatter_gather_flow_control.model.BranchResult;
  * routes are awaited without a time limit and every failure propagates to the caller unchanged.
  *
  * <p>The routes run on Spring Boot's auto-configured {@code applicationTaskExecutor}. That bean backs off when any
- * other {@link Executor} bean exists, so the project must declare none, or this qualifier finds no target.
+ * other {@link Executor} bean exists, so the project must declare none, or this qualifier finds no target. Its
+ * {@code spring.task.execution.pool} keys in {@code application.yml} give it the bounds Mule 3.8's default threading
+ * profile gave the original's scatter-gather pool: at most 16 threads and no queue. A route the saturated executor
+ * rejects runs on the calling thread instead, as a route did when the original's pool was exhausted, so both routes
+ * always run and {@link #scatter()} always returns.
  */
 @Service
 public class ScatterGatherService {
@@ -135,8 +140,8 @@ public class ScatterGatherService {
     public List<BranchResult> scatter() {
         // The routes are invoked through method references on this, so that when the bean is a Mockito or Spring
         // @SpyBean, this is the spied instance and stubs of sourceA() and sourceB() apply.
-        CompletableFuture<List<Map<String, String>>> a = CompletableFuture.supplyAsync(this::sourceA, executor);
-        CompletableFuture<List<Map<String, String>>> b = CompletableFuture.supplyAsync(this::sourceB, executor);
+        CompletableFuture<List<Map<String, String>>> a = CompletableFuture.supplyAsync(this::sourceA, this::runRoute);
+        CompletableFuture<List<Map<String, String>>> b = CompletableFuture.supplyAsync(this::sourceB, this::runRoute);
 
         // No time limit: the original scatter-gather declares no timeout. A route's failure is read per route below.
         CompletableFuture.allOf(a, b).exceptionally(t -> null).join();
@@ -157,6 +162,24 @@ public class ScatterGatherService {
         List<Map<String, String>> merged = strategy.aggregate(scatter());
         String csv = contactsCsvMapper.toCsv(merged);
         return aggregationReportMailer.send(csv);
+    }
+
+    /**
+     * Hands one route to the route executor, or runs it on the calling thread when the executor rejects it.
+     *
+     * <p>The original's pool ran a route on the thread that submitted it once all its threads were busy (Mule's
+     * {@code WHEN_EXHAUSTED_RUN}), so a rejected route is never lost and the caller's wait for both routes always
+     * ends. The route records its own outcome in its future, so running it here throws nothing.
+     *
+     * @param route the task {@link CompletableFuture#supplyAsync} built for one route
+     */
+    private void runRoute(Runnable route) {
+        try {
+            executor.execute(route);
+        } catch (RejectedExecutionException e) {
+            // Spring's TaskRejectedException, raised by the saturated or shut-down applicationTaskExecutor, is one.
+            route.run();
+        }
     }
 
     private static BranchResult toResult(CompletableFuture<?> future) {
