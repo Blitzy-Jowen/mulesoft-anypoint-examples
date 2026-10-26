@@ -1,0 +1,21 @@
+# http-multipart-request-java runtime configuration
+# Replaces http-multipart-request/src/main/app/mule-app.properties (empty) and the values
+# http-multipart-request.xml reads or fixes: the http:listener-config and the file:outbound-endpoint path.
+http:
+  port: 8081            # original placeholder name ${http.port} (http-multipart-request.xml:4); port the flow comment and README name
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (http-multipart-request.xml:4)
+spring:
+  application:
+    name: http-multipart-request-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: -1     # the Mule listener imposed no upload limit; a negative size means unlimited
+      max-request-size: -1
+upload:
+  directory: /tmp       # directory the uploaded file is written to; original file:outbound-endpoint path (http-multipart-request.xml:27)

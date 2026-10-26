@@ -1,0 +1,22 @@
+# querying-a-mysql-database-java runtime configuration
+# Replaces querying-a-mysql-database/src/main/app/mule-app.properties (empty) and the
+# db:generic-config / http:listener-config of database-to-json.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); port used by the original README
+jdbc:
+  # TODO: supply the MySQL JDBC URL, e.g. jdbc:mysql://<host>:3306/company?user=<user>&password=<password> (env JDBC_URL)
+  url: ${JDBC_URL:}
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (database-to-json.xml:4)
+spring:
+  application:
+    name: querying-a-mysql-database-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  datasource:
+    url: ${jdbc.url}    # original db:generic-config url key bound to Boot's DataSource (AAP 0.6.6); credentials stay inside the URL
+  sql:
+    init:
+      mode: never       # never auto-run import.sql or any schema/data script

@@ -1,0 +1,20 @@
+# munit-short-tutorial-java runtime configuration
+# Replaces munit-short-tutorial/src/main/app/mule-app.properties (empty) and the http:listener-config of production-code.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); the original fixes no port, 8081 is the default (AAP 0.4.9)
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (production-code.xml:4)
+spring:
+  application:
+    name: munit-short-tutorial-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  # The listener serves path / with allowedMethods GET only (production-code.xml:7). Beyond the General template,
+  # two Boot defaults are switched off because they answer requests the Mule listener rejected:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the dispatcher and gets SC-1's 405 instead of the servlet's 200 TRACE echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

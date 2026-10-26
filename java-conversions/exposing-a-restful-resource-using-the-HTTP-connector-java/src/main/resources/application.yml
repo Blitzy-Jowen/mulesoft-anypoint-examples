@@ -1,0 +1,14 @@
+# exposing-a-restful-resource-using-the-HTTP-connector-java runtime configuration
+# Replaces exposing-a-restful-resource-using-the-HTTP-connector/src/main/app/mule-app.properties (empty) and the
+# http:listener-config of http-restful-resource.xml; its unused http:request-config (xml:5) has no key
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (http-restful-resource.xml:4)
+spring:
+  application:
+    name: exposing-a-restful-resource-using-the-HTTP-connector-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
