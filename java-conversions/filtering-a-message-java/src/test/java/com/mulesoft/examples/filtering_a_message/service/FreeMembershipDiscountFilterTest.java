@@ -29,7 +29,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
  * (lines 18-30) with the filter interface removed and the body unchanged.
  *
  * <p>The boundary table and the failure cases are derived from the original rule, not from the port, so a drift in
- * the port fails here. The two example payloads are the inputs of {@code FilteringMessageIT.java} (lines 62-67):
+ * the port fails here. The table also holds accepting rows past each purchase threshold and rows on both sides of
+ * each month boundary. The two example payloads are the inputs of {@code FilteringMessageIT.java} (lines 62-67):
  * {@code message.json} is granted the discount and {@code message1.json} is rejected. Plain JUnit 5 with no Spring
  * context: the filter is stateless and has no collaborators.
  */
@@ -46,14 +47,19 @@ class FreeMembershipDiscountFilterTest {
                  5,      1000,    premium,    false
                  6,       999,    premium,    false
                  6,      1000,    premium,    true
+                 7,      1001,    premium,    true
+                 5,      2499,       free,    false
+                 5,      2501,       free,    true
                  6,      2499,       free,    false
                  6,      2500,       free,    true
                  7,      1999,       free,    false
                  7,      2000,       free,    true
+                 7,      2001,       free,    true
                 11,      1999,       free,    false
                 11,      2000,       free,    true
                 12,      1499,       free,    false
                 12,      1500,       free,    true
+                13,      1501,       free,    true
                  6,      1000,    PREMIUM,    false
             """)
     void discountBoundaries(int months, int purchases, String membership, boolean expected) {
