@@ -1,0 +1,119 @@
+# service-orchestration-and-choice-routing-java runtime configuration
+# Original: service-orchestration-and-choice-routing/src/main/app/fulfillment.xml and mule-config.xml
+# (mule-app.properties holds no keys), so every value is a fixed default taken from the flows' literals.
+# The original holds no credentials. The Ajax connector's resourceBase docroot is served from classpath static/orders.
+spring:
+  application:
+    name: service-orchestration-and-choice-routing-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404; AjaxResourceConfig registers its own resource handlers
+  mvc:
+    dispatch-trace-request: true   # every original listener declares allowedMethods: TRACE reaches the MVC mappings and gets the 405 instead of the servlet's message/http echo
+  # spring.webservices.path stays at Boot's default /services: messageDispatcherServlet is reached only through the
+  # SC-10 named-servlet forwards below, so a request on /services/** matches no listener route and gets SC-10's 404.
+  webservices:
+    servlet:
+      init:                        # bracketed so the case-sensitive servlet init parameter names keep their camelCase
+        "[dispatchOptionsRequest]": "true"   # OPTIONS and TRACE on the POST-only SOAP listeners reach SoapListenerBoundaryAdapter's 405
+        "[dispatchTraceRequest]": "true"     # instead of HttpServlet's default Allow and echo answers
+  artemis:
+    mode: embedded                 # replaces the ActiveMQ XA connector's in-VM broker vm://localhost (fulfillment.xml:4)
+    embedded:
+      queues: inhouseOrder         # fulfillment.xml:39,99
+      persistent: false
+  datasource:
+    xa:
+      data-source-class-name: org.apache.derby.jdbc.EmbeddedXADataSource   # replaces enhydra StandardXADataSource over EmbeddedDriver (fulfillment.xml:7-10); shipped in derbytools 10.16
+      properties:
+        databaseName: muleEmbeddedDB   # jdbc:derby:muleEmbeddedDB;create=true (fulfillment.xml:9), under derby.system.home
+        createDatabase: create
+        # Boot fills a missing XA user from the embedded-database default "sa", which would put the tables in schema SA.
+        # The original connected without a user, so Derby used its default schema APP; Derby runs without authentication.
+        user: APP
+  cache:
+    type: caffeine                 # Caching_Strategy with an in-memory store (fulfillment.xml:16-18)
+    cache-names: prices            # no caffeine spec: the original in-memory store never expires
+
+server:
+  port: 1080                       # HTTP_Listener_Configuration3 (fulfillment.xml:27): main listener, SOAP /orders
+  address: 0.0.0.0                 # every original listener binds 0.0.0.0 (fulfillment.xml:24-27)
+
+# Additional listener ports, kept outside the listeners list: Spring Boot binds a list from one property source only,
+# so overriding a single listeners.additional[i].port fails binding, while these keys can be overridden one by one.
+ports:
+  populate: 8091                   # HTTP_Listener_Configuration (fulfillment.xml:24)
+  samsung: 9090                    # HTTP_Listener_Configuration1 (fulfillment.xml:25)
+  prices: 9999                     # HTTP_Listener_Configuration2 (fulfillment.xml:26)
+
+# SC-10: one Undertow process serves 1080 and the four additional original ports, each answering only for its routes.
+# disallowed-methods is unset: method enforcement belongs to the MVC mappings and SoapListenerBoundaryAdapter.
+listeners:
+  host: 0.0.0.0
+  main:
+    routes:
+      - servlet: messageDispatcherServlet
+        patterns: ["/orders"]      # POST-only SOAP IProcessOrder listener path orders (fulfillment.xml:29)
+  additional:
+    - name: ajax
+      port: ${ajax.port}
+      routes:
+        - servlet: dispatcherServlet
+          patterns: ["/orders", "/orders/**", "/ajax/**"]   # docroot, Mule Ajax JS and the Bayeux endpoint /ajax/cometd (mule-config.xml:3)
+    - name: populate
+      port: ${ports.populate}
+      routes:
+        - servlet: dispatcherServlet
+          patterns: ["/populate"]  # GET-only listener path populate (fulfillment.xml:160)
+    - name: samsung
+      port: ${ports.samsung}
+      routes:
+        - servlet: messageDispatcherServlet
+          patterns: ["/samsung/orders"]   # POST-only SOAP SamsungService listener path samsung/orders (fulfillment.xml:151)
+    - name: prices
+      port: ${ports.prices}
+      routes:
+        - servlet: dispatcherServlet
+          patterns: ["/api/**"]    # POST-only listener path api over the Jersey ProductPrice resource (fulfillment.xml:145)
+
+# SC-12: Mule Ajax transport, read by AjaxResourceConfig, BayeuxLongPollingController and AjaxChannelBroker.
+ajax:
+  port: 8090                       # ajax:connector serverUrl http://0.0.0.0:8090/orders (mule-config.xml:3)
+  server-path: /orders             # same serverUrl; the docroot is served at <server-path>/
+  disable-reply-to: false          # the connector keeps replies enabled, so mule.rpc callbacks receive them on replyTo
+  cache-messages-channels: []      # no outbound channel sets cacheMessages
+  response-timeout-ms: 10000       # responseTimeout of /orders/request, /orders/soap, /orders/manufacturers (mule-config.xml:6,39,44)
+  # Bayeux server-side poll timeout: "The server side poll timeout in milliseconds (default 250000)", Mule tag mule-3.8.0
+  # transports/ajax/src/main/java/org/mule/transport/ajax/embedded/AjaxConnector.java:97-100; the connector sets none.
+  connect-timeout-ms: 250000
+
+orders:
+  samsung:
+    # samsungWebServiceClient: POST port 9090 path samsung/orders (fulfillment.xml:96), this application's own samsung
+    # listener, so the port follows ports.samsung; the request-config host 0.0.0.0 (mule-config.xml:4) is that loopback target.
+    url: http://localhost:${ports.samsung}/samsung/orders
+    timeout-ms: 10000              # Mule default response timeout; connect and read timeout of client/SamsungServiceClient
+  price:
+    # GET api/prices/#[payload.productId] on port 9999 (fulfillment.xml:105), this application's own price listener, so the
+    # port follows ports.prices; {productId} is a URI-template variable, not a placeholder.
+    url: "http://localhost:${ports.prices}/api/prices/{productId}"
+    timeout-ms: 10000              # Mule default response timeout; client/ProductPriceClient
+  soap:
+    url: http://localhost:1080/orders   # POST port 1080 path orders (mule-config.xml:21,40); client/OrderProcessingSoapClient
+    request-timeout-ms: 10000000   # responseTimeout of the /orders/request call (mule-config.xml:21)
+    proxy-timeout-ms: 10000        # /orders/soap proxy call without responseTimeout: Mule default (mule-config.xml:40)
+  inhouse:
+    queue: inhouseOrder            # fulfillment.xml:39,99
+    reply-timeout-ms: 10000        # Mule default response timeout of the request-response JMS outbound endpoint
+    max-redelivery-attempts: 3     # rollback-exception-strategy maxRedeliveryAttempts (fulfillment.xml:123)
+  audit:
+    rollback-threshold: 5000       # rollback when #[sessionVars.totalValue] > 5000 (fulfillment.xml:138)
+
+derby:
+  system-home: target/derby        # config/XaTransactionConfig sets derby.system.home to it before Derby boots, unless already set
+
+narayana:
+  log-dir: target/narayana         # Narayana object store
+  # Seconds; JBossTS com.arjuna.ats.arjuna.coordinator.defaultTimeout (fulfillment.xml:13). Its txReaperTimeout
+  # 1000000 (fulfillment.xml:14) has no Narayana starter key.
+  default-timeout: 600

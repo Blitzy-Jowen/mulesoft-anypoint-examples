@@ -1,0 +1,4 @@
+# Spring profile "test": the public OpenKM demo login the original cmis:config hard-coded (cmis-document-integration.xml:3), committed deliberately for unit tests only, never in src/main/resources.
+cmis:
+  username: user3
+  password: pass3

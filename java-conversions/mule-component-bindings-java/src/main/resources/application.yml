@@ -1,0 +1,48 @@
+# mule-component-bindings-java runtime configuration
+# Original: mule-component-bindings/src/main/app/mule-component-bindings.xml (mule-app.properties holds no keys),
+# so ports and hosts are fixed defaults from the flow's literals and the six secrets keep the flow's placeholder names.
+spring:
+  application:
+    name: mule-component-bindings-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404
+  mvc:
+    dispatch-trace-request: true   # TRACE on 8081 / reaches TwitterSearchController (original listener accepts every method)
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # SC-1 owns every platform-default error
+
+server:
+  port: ${ports.twitter-search}    # HTTP_Listener_Configuration, mule-component-bindings.xml:31
+  address: localhost               # :31 host="localhost"
+
+ports:
+  twitter-search: 8081             # mule-component-bindings.xml:31
+  stock-stats: 8180                # :40
+
+twitter:
+  accessKey: ${TWITTER_ACCESSKEY:}         # TODO: supply the Twitter access token (twitter:config accessKey, :10)
+  accessSecret: ${TWITTER_ACCESSSECRET:}   # TODO: supply the Twitter access token secret (accessSecret, :10)
+  apiKey: ${TWITTER_APIKEY:}               # TODO: supply the Twitter API (consumer) key (consumerKey, :10)
+  apiSecret: ${TWITTER_APISECRET:}         # TODO: supply the Twitter API (consumer) secret (consumerSecret, :10)
+  rest-base-url: https://api.twitter.com/1.1/   # twitter4j 4.0.7 default restBaseURL
+
+stockstats:
+  stocklyticsApiKey: ${STOCKSTATS_STOCKLYTICSAPIKEY:}       # TODO: supply the Stocklytics API key (:20)
+  sentiment140ApiKey: ${STOCKSTATS_SENTIMENT140APIKEY:}     # TODO: supply the Sentiment140 app id (the registration email) (:25)
+  stocklytics-base-url: http://api.stocklytics.com/         # StocklyticsStockService.java:36 BASE_URL
+  sentiment140-base-url: http://www.sentiment140.com/api/   # Sentiment140SentimentService.java:38 BASE_URL
+
+listeners:
+  host: localhost                  # both listener configs bind localhost, :31, :40
+  disallowed-methods: []           # every original listener accepts every method, TRACE included
+  main:
+    routes:
+      - patterns: ["/"]            # listener path="/" exactly, :33; any other path on 8081 gets the no-listener 404
+  additional:
+    - name: stock-stats
+      port: ${ports.stock-stats}
+      host: localhost              # HTTP_Listener_Configuration2, :40
+      routes:
+        - patterns: ["/api", "/api/**"]   # listener path="/api/*", :42; StockStatsController maps /api/stockStats

@@ -123,7 +123,7 @@ public class PortRoutingFilter extends OncePerRequestFilter {
         }
         log.debug("Port {} forwards {} from {} to {}, by route {}", port, path, mappedServlet, targetServlet,
                 route.patterns());
-        dispatcher.forward(new DefaultServletRequest(request, targetServlet, path), response);
+        dispatcher.forward(new DefaultMappingRequest(request, targetServlet, path), response);
     }
 
     /** The first route with a pattern matching {@code path}, or {@code null} when none matches. */
@@ -180,12 +180,12 @@ public class PortRoutingFilter extends OncePerRequestFilter {
      * The request as the target servlet of a forward sees it: mapped as the default servlet, so the servlet path is
      * the whole path within the application and there is no path info.
      */
-    private static final class DefaultServletRequest extends HttpServletRequestWrapper {
+    private static final class DefaultMappingRequest extends HttpServletRequestWrapper {
 
         private final HttpServletMapping mapping;
         private final String servletPath;
 
-        DefaultServletRequest(HttpServletRequest request, String servletName, String servletPath) {
+        DefaultMappingRequest(HttpServletRequest request, String servletName, String servletPath) {
             super(request);
             this.mapping = new DefaultServletMapping(servletName);
             this.servletPath = servletPath;
