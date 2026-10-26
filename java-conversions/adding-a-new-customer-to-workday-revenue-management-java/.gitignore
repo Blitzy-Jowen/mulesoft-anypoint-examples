@@ -1,0 +1,4 @@
+# Maven build output (incl. XJC-generated Workday JAXB sources)
+target/
+# Live Workday sandbox credentials; never committed (see application-it.yml.example)
+src/test/resources/application-it.yml
