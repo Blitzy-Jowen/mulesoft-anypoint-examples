@@ -51,6 +51,15 @@ public class TransactionConfig {
 
     private static final Logger log = LoggerFactory.getLogger(TransactionConfig.class);
 
+    /** Longest text {@link #logSafe} emits before appending {@link #TRUNCATION_MARKER}. */
+    private static final int MAX_LOGGED_LENGTH = 256;
+
+    /** Appended by {@link #logSafe} where it cuts a value at {@link #MAX_LOGGED_LENGTH}. */
+    private static final String TRUNCATION_MARKER = "...";
+
+    /** Throw site logged for a failure that carries no stack frame. */
+    private static final String UNKNOWN_THROW_SITE = "unknown";
+
     /**
      * Local transaction manager for the database work of the transactional scope. Its bean type makes Boot's
      * {@code DataSourceTransactionManagerAutoConfiguration} back off, so it is the only
@@ -67,7 +76,8 @@ public class TransactionConfig {
     /**
      * Container factory for the listener on queue {@code in}: one consumer receiving in a locally transacted
      * session. When the listener throws, the container rolls the session back before the error handler runs,
-     * so the error handler only logs the failure.
+     * so the error handler only logs the failure, and logs only the type and throw site of its most specific
+     * cause, never a message or stack trace: those can carry rejected order values and SQL or connection detail.
      *
      * @param connectionFactory Boot's Artemis {@code ConnectionFactory}, shared with {@link #jmsTemplate}
      * @return the session-transacted listener container factory
@@ -79,7 +89,7 @@ public class TransactionConfig {
         factory.setSessionTransacted(true);
         factory.setErrorHandler(t -> {
             Throwable cause = NestedExceptionUtils.getMostSpecificCause(t);
-            log.error("JMS listener failed: " + cause.getClass().getSimpleName() + ": " + cause.getMessage(), t);
+            log.error("JMS listener failed: {} at {}", logSafe(typeName(cause)), logSafe(throwSite(cause)));
         });
         return factory;
     }
@@ -98,5 +108,60 @@ public class TransactionConfig {
         template.setSessionTransacted(true);
         template.setPubSubDomain(false);
         return template;
+    }
+
+    /**
+     * The failure's simple class name, or its binary name when the class has none (anonymous classes).
+     *
+     * @param failure the failure the listener raised
+     * @return the name identifying the failure's type
+     */
+    private static String typeName(Throwable failure) {
+        String simpleName = failure.getClass().getSimpleName();
+        return simpleName.isEmpty() ? failure.getClass().getName() : simpleName;
+    }
+
+    /**
+     * Where the failure was thrown, from its top stack frame: {@code declaringClass.method:line}, without the line
+     * when the frame records none (native or debug-less code).
+     *
+     * @param failure the failure the listener raised
+     * @return the throw site, or {@link #UNKNOWN_THROW_SITE} when the stack trace is empty or suppressed
+     */
+    private static String throwSite(Throwable failure) {
+        StackTraceElement[] frames = failure.getStackTrace();
+        if (frames.length == 0) {
+            return UNKNOWN_THROW_SITE;
+        }
+        StackTraceElement top = frames[0];
+        String site = top.getClassName() + '.' + top.getMethodName();
+        return top.getLineNumber() >= 0 ? site + ':' + top.getLineNumber() : site;
+    }
+
+    /**
+     * Makes a value safe for a single log line: every ISO control character (CR, LF, TAB and the rest) and the
+     * Unicode line and paragraph separators become Java-style Unicode escapes (a backslash, {@code u} and four
+     * hex digits), so the value cannot start a forged line, and the result is cut at {@link #MAX_LOGGED_LENGTH}
+     * characters, marked by {@link #TRUNCATION_MARKER}.
+     *
+     * @param value the text to log
+     * @return the escaped, bounded text
+     */
+    private static String logSafe(String value) {
+        StringBuilder safe = new StringBuilder(Math.min(value.length(), MAX_LOGGED_LENGTH));
+        int index = 0;
+        while (index < value.length()) {
+            int codePoint = value.codePointAt(index);
+            boolean escaped = Character.isISOControl(codePoint)
+                    || Character.getType(codePoint) == Character.LINE_SEPARATOR
+                    || Character.getType(codePoint) == Character.PARAGRAPH_SEPARATOR;
+            String text = escaped ? String.format("\\u%04X", codePoint) : new String(Character.toChars(codePoint));
+            if (safe.length() + text.length() > MAX_LOGGED_LENGTH) {
+                return safe.append(TRUNCATION_MARKER).toString();
+            }
+            safe.append(text);
+            index += Character.charCount(codePoint);
+        }
+        return safe.toString();
     }
 }
