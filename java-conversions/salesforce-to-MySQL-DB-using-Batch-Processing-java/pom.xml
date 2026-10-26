@@ -88,6 +88,15 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Test scope only; the application stays non-web. Spring Boot 3.2 registers a TestRestTemplate for every
+             @SpringBootTest(webEnvironment = RANDOM_PORT), including the shared FixtureParityTest, and that test
+             context cannot load without spring-web. No server or servlet API comes with it, so test contexts start
+             non-web as well. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <scope>test</scope>
+        </dependency>
         <!-- H2 in MySQL mode replaces the live MySQL server and the MySQLDbCreator of the original integration test, in both the unit tier and the failsafe IT. -->
         <dependency>
             <groupId>com.h2database</groupId>

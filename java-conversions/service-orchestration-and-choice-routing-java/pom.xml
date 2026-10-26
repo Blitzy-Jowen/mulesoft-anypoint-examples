@@ -36,6 +36,24 @@
         <spring-ws.version>4.1.4</spring-ws.version>
     </properties>
 
+    <!-- Artemis 2.31.2 brings commons-beanutils 1.9.4 and commons-logging 1.2, neither managed by the Boot BOM.
+         These entries align them with the 1.11.0 and 1.3.2 used across the converted projects (the versions
+         Salesforce WSC 65.0.0 declares), leaving Artemis at the BOM's 2.31.2. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>commons-beanutils</groupId>
+                <artifactId>commons-beanutils</artifactId>
+                <version>1.11.0</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-logging</groupId>
+                <artifactId>commons-logging</artifactId>
+                <version>1.3.2</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <!-- HTTP serving on Undertow: Tomcat 10.1 drops custom reason phrases. Undertow also carries the
              extra listeners on 8090, 8091, 9090 and 9999 beside the primary 1080 listener. The Undertow

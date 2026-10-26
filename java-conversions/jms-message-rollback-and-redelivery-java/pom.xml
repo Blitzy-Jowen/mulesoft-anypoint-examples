@@ -37,6 +37,26 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
+    <!--
+        Artemis 2.31.2 brings commons-beanutils 1.9.4 and commons-logging 1.2, neither managed by the Boot
+        BOM. These entries align them with the 1.11.0 and 1.3.2 used across the converted projects (the
+        versions Salesforce WSC 65.0.0 declares), leaving Artemis at the BOM's 2.31.2.
+    -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>commons-beanutils</groupId>
+                <artifactId>commons-beanutils</artifactId>
+                <version>1.11.0</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-logging</groupId>
+                <artifactId>commons-logging</artifactId>
+                <version>1.3.2</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -46,6 +66,17 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!--
+            Test scope only; the application stays non-web. Spring Boot 3.2 registers a TestRestTemplate for
+            every @SpringBootTest(webEnvironment = RANDOM_PORT), including the shared FixtureParityTest, and
+            that test context cannot load without spring-web. No server or servlet API comes with it, so test
+            contexts start non-web as well.
+        -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
             <scope>test</scope>
         </dependency>
         <!--

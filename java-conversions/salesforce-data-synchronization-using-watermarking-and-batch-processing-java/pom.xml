@@ -71,6 +71,15 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Test scope only; the application stays non-web. Spring Boot 3.2 registers a TestRestTemplate for every
+             @SpringBootTest(webEnvironment = RANDOM_PORT), including the shared FixtureParityTest, and that test
+             context cannot load without spring-web. No server or servlet API comes with it, so test contexts start
+             non-web as well. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <scope>test</scope>
+        </dependency>
         <!-- Shaded standalone artefact: SOAP stubs for the Partner client tests and upstream replay for the fixture test, without clashing with Boot's Jackson. -->
         <dependency>
             <groupId>org.wiremock</groupId>

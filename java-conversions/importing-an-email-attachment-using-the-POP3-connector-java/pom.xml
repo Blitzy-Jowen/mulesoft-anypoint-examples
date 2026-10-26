@@ -50,6 +50,15 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Test scope only; the application stays non-web. Spring Boot 3.2 registers a TestRestTemplate for every
+             @SpringBootTest(webEnvironment = RANDOM_PORT), including the shared FixtureParityTest, and that test
+             context cannot load without spring-web. No server or servlet API comes with it, so test contexts start
+             non-web as well. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <scope>test</scope>
+        </dependency>
         <!-- In-process POP3S/SMTP server that stands in for the Gmail account the original test used. The starter's
              org.eclipse.angus:jakarta.mail already bundles the jakarta.mail API with Angus, so GreenMail's separate
              API jar is excluded to keep a single copy of every jakarta.mail class on the test classpath. -->

@@ -38,6 +38,24 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
+    <!-- Artemis 2.31.2 brings commons-beanutils 1.9.4 and commons-logging 1.2, neither managed by the Boot BOM.
+         These entries align them with the 1.11.0 and 1.3.2 used across the converted projects (the versions
+         Salesforce WSC 65.0.0 declares), leaving Artemis at the BOM's 2.31.2. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>commons-beanutils</groupId>
+                <artifactId>commons-beanutils</artifactId>
+                <version>1.11.0</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-logging</groupId>
+                <artifactId>commons-logging</artifactId>
+                <version>1.3.2</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <!-- Tomcat 10.1 never sends a custom reason phrase; every HTTP-serving conversion runs on Undertow instead.
              Port 8086 serves the page, the Mule Ajax JavaScript and the Bayeux endpoint /ajax/cometd. -->
