@@ -39,17 +39,20 @@ import org.springframework.stereotype.Component;
  * original keys are dotted and mixed-case ({@code Sharepoint.SiteUrl}) and must be read under exactly those
  * names.
  *
- * <p>Startup fails fast, as the original application failed to deploy on an unresolved placeholder: when any of
- * the four keys above is blank, or {@code Sharepoint.SiteUrl} is set but, with its trailing {@code /} removed, is
- * not an absolute {@code http} or {@code https} URL with a host and without user info, query or fragment, the
- * constructor throws one {@link IllegalStateException} naming every blank key and the invalid site URL key with
- * its environment variable. Plain {@code http} is accepted for any host, so tests can address a local stub. The
+ * <p>Binding never fails: the constructor stores each value as supplied, so the application starts with the blank
+ * placeholders {@code application.yml} ships. {@link #requireValid()} checks the values, and
+ * {@code client/SharepointRestClient} calls it before its first SharePoint request: when any of the four keys above
+ * is blank, or {@code Sharepoint.SiteUrl} is set but, with its trailing {@code /} removed, is not an absolute
+ * {@code http} or {@code https} URL with a host and without user info, query or fragment, it throws one
+ * {@link IllegalStateException} naming every blank key and the invalid site URL key with its environment variable,
+ * and no request is sent. Plain {@code http} is accepted for any host, so tests can address a local stub. The
  * message never carries a configured value.
  *
  * <p>Consumers:
  * <ul>
- *   <li>{@code client/SharepointRestClient} reads {@link #username()}, {@link #password()},
- *       {@link #siteUrl()} and {@link #stsUrl()} to sign in and to address the site's REST API.</li>
+ *   <li>{@code client/SharepointRestClient} calls {@link #requireValid()} first in each operation, then reads
+ *       {@link #username()}, {@link #password()}, {@link #siteUrl()} and {@link #stsUrl()} to sign in and to
+ *       address the site's REST API.</li>
  *   <li>{@code service/SharepointImportService} reads {@link #csvImportFolder()} to build
  *       {@code /Shared Documents/<csvImportFolder>} and {@code /Shared Documents/<csvImportFolder>/contacts.csv}.</li>
  * </ul>
@@ -64,23 +67,22 @@ public final class SharepointProperties {
 
     private final String username;
     private final String password;
+    /** {@code Sharepoint.SiteUrl} as bound, so {@link #requireValid()} tells a blank key from an invalid URL. */
+    private final String configuredSiteUrl;
     private final String siteUrl;
     private final String csvImportFolder;
     private final String stsUrl;
 
     /**
-     * Validates and stores the settings.
+     * Stores the settings as bound and never throws, so a context whose placeholders are still blank starts;
+     * {@link #requireValid()} checks them before the first SharePoint request.
      *
-     * @param username        {@code Sharepoint.Username}, the SharePoint Online account
+     * @param username        {@code Sharepoint.Username}, the SharePoint Online account, stored as supplied
      * @param password        {@code Sharepoint.Password}, stored exactly as supplied
-     * @param siteUrl         {@code Sharepoint.SiteUrl}, stored with every trailing {@code /} removed; the stored
-     *                        value must be an absolute {@code http} or {@code https} URL with a host and without
-     *                        user info, query or fragment
-     * @param csvImportFolder {@code csvImportFolder}, the folder under {@code Shared Documents}
+     * @param siteUrl         {@code Sharepoint.SiteUrl}, stored with every trailing {@code /} removed; {@code null}
+     *                        stays {@code null}
+     * @param csvImportFolder {@code csvImportFolder}, the folder under {@code Shared Documents}, stored as supplied
      * @param stsUrl          {@code sharepoint-online.sts-url}, stored as given and not validated
-     * @throws IllegalStateException when any of the first four values is {@code null} or blank, or when
-     *                               {@code siteUrl} is set but its stored value is not such a URL; one exception
-     *                               names every such key and none of the configured values
      */
     public SharepointProperties(
             @Value("${Sharepoint.Username:}") String username,
@@ -88,6 +90,26 @@ public final class SharepointProperties {
             @Value("${Sharepoint.SiteUrl:}") String siteUrl,
             @Value("${csvImportFolder:}") String csvImportFolder,
             @Value("${sharepoint-online.sts-url:https://login.microsoftonline.com/extSTS.srf}") String stsUrl) {
+        this.username = username;
+        this.password = password;
+        this.configuredSiteUrl = siteUrl;
+        this.siteUrl = siteUrl == null ? null : stripTrailingSlashes(siteUrl);
+        this.csvImportFolder = csvImportFolder;
+        this.stsUrl = stsUrl;
+    }
+
+    /**
+     * Checks the settings before SharePoint is called. {@code client/SharepointRestClient} runs it first in each
+     * operation, so blank placeholders or an unusable site URL fail there, naming their keys, before any request.
+     *
+     * @throws IllegalStateException when {@code Sharepoint.Username}, {@code Sharepoint.Password},
+     *                               {@code Sharepoint.SiteUrl} or {@code csvImportFolder} is {@code null} or blank,
+     *                               or when {@code Sharepoint.SiteUrl} is set but, with its trailing {@code /}
+     *                               removed, is not an absolute {@code http} or {@code https} URL with a host and
+     *                               without user info, query or fragment; one exception names every such key with
+     *                               its environment variable and none of the configured values
+     */
+    public void requireValid() {
         List<String> missing = new ArrayList<>();
         if (isBlank(username)) {
             missing.add(USERNAME_KEY);
@@ -95,14 +117,13 @@ public final class SharepointProperties {
         if (isBlank(password)) {
             missing.add(PASSWORD_KEY);
         }
-        if (isBlank(siteUrl)) {
+        if (isBlank(configuredSiteUrl)) {
             missing.add(SITE_URL_KEY);
         }
         if (isBlank(csvImportFolder)) {
             missing.add(CSV_IMPORT_FOLDER_KEY);
         }
-        String normalizedSiteUrl = isBlank(siteUrl) ? null : stripTrailingSlashes(siteUrl);
-        boolean invalidSiteUrl = normalizedSiteUrl != null && !isAbsoluteHttpUrl(normalizedSiteUrl);
+        boolean invalidSiteUrl = !isBlank(configuredSiteUrl) && !isAbsoluteHttpUrl(siteUrl);
         if (!missing.isEmpty() || invalidSiteUrl) {
             List<String> problems = new ArrayList<>();
             if (!missing.isEmpty()) {
@@ -115,11 +136,6 @@ public final class SharepointProperties {
             throw new IllegalStateException(String.join(" ", problems)
                     + " # TODO: supply them in application.yml or as environment variables.");
         }
-        this.username = username;
-        this.password = password;
-        this.siteUrl = normalizedSiteUrl;
-        this.csvImportFolder = csvImportFolder;
-        this.stsUrl = stsUrl;
     }
 
     /** The SharePoint Online account used for the claims sign-in. */

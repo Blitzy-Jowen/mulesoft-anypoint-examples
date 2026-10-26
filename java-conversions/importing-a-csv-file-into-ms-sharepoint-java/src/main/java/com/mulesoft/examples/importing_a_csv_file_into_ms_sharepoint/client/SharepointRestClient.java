@@ -9,15 +9,21 @@
 package com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.client;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -27,11 +33,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpRequest;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.ClientHttpRequestExecution;
+import org.springframework.http.client.ClientHttpRequestInterceptor;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.util.UriUtils;
 import org.w3c.dom.Document;
@@ -41,6 +53,7 @@ import org.xml.sax.ErrorHandler;
 import org.xml.sax.SAXException;
 import org.xml.sax.SAXParseException;
 
+import com.fasterxml.jackson.core.JsonLocation;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -68,15 +81,29 @@ import com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.config.Shar
  * {@link org.springframework.web.client.RestClientResponseException} subtypes and timeouts or connectivity failures
  * as {@link org.springframework.web.client.ResourceAccessException}; neither is caught, wrapped or retried.
  * The password, the security token, the cookie values and the form digest are never logged and never placed in an
- * exception message.
+ * exception message. A security token service error status surfaces with its status and headers but without its
+ * body. Of a security token service response with a 2xx status, only the SOAP fault reason can reach an exception
+ * message; neither its body nor the XML parser's messages about it are logged or placed in one. Nor are the JSON
+ * parser's messages about a {@code /_api/contextinfo} response, which can quote its form digest.
  */
 @Component
 public class SharepointRestClient {
 
     private static final Logger log = LoggerFactory.getLogger(SharepointRestClient.class);
 
-    /** The Mule default response timeout, applied to connecting and to awaiting each response. */
+    /**
+     * The Mule default response timeout, applied to connecting and to each whole response: its headers and the last
+     * byte of its body must arrive within this time of the request being sent.
+     */
     static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+
+    /**
+     * The most bytes of one response body held in memory, 1 MiB. SharePoint's security token service and contextinfo
+     * responses, its folder and file metadata and its error bodies are a few kilobytes. A longer body is read no
+     * further and its connection is closed rather than drained: its status and headers still decide a call that needs
+     * no body, and reading the body fails with an {@link IOException} that names this limit.
+     */
+    static final int MAX_BUFFERED_BODY_BYTES = 1 << 20;
 
     static final String SOAP12_NS = "http://www.w3.org/2003/05/soap-envelope";
     static final String WSA_NS = "http://www.w3.org/2005/08/addressing";
@@ -93,11 +120,14 @@ public class SharepointRestClient {
     private static final String FEDAUTH_COOKIE = "FedAuth";
     private static final String REQUEST_DIGEST_HEADER = "X-RequestDigest";
 
-    /** Rethrows parse errors instead of the parser's default of printing them to standard error. */
+    /**
+     * Rethrows parse errors instead of the parser's default of printing them to standard error, and logs a warning
+     * by its {@linkplain #parserDiagnostic type and position} only, since the parser's message can quote the response.
+     */
     private static final ErrorHandler XML_ERROR_HANDLER = new ErrorHandler() {
         @Override
         public void warning(SAXParseException e) {
-            log.debug("XML warning in a security token service response: {}", e.getMessage());
+            log.debug("XML warning in a security token service response: {}", parserDiagnostic(e));
         }
 
         @Override
@@ -129,7 +159,8 @@ public class SharepointRestClient {
      * Creates the client with the given connect and response timeout; the test seam for short timeouts.
      *
      * @param props   the SharePoint Online account, site and security token service
-     * @param timeout the connect timeout and the time allowed for each response
+     * @param timeout the connect timeout and the time allowed for each whole response, headers and body, from the
+     *                moment its request is sent
      */
     SharepointRestClient(SharepointProperties props, Duration timeout) {
         this.props = Objects.requireNonNull(props, "props");
@@ -142,9 +173,16 @@ public class SharepointRestClient {
                 .followRedirects(HttpClient.Redirect.NEVER)
                 .connectTimeout(timeout)
                 .build();
+        // The factory's read timeout bounds only the wait for the response headers. The interceptor reads every
+        // response body, up to MAX_BUFFERED_BODY_BYTES, within what is left of the same timeout, so a server that
+        // stalls after its headers fails the call as a timeout instead of blocking the file poll, an oversized body
+        // cannot exhaust the heap, and nothing after it reads or drains the connection.
         JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory(httpClient);
         factory.setReadTimeout(timeout);
-        this.restClient = RestClient.builder().requestFactory(factory).build();
+        this.restClient = RestClient.builder()
+                .requestFactory(factory)
+                .requestInterceptor(new BoundedExchangeInterceptor(timeout))
+                .build();
     }
 
     /**
@@ -166,11 +204,15 @@ public class SharepointRestClient {
      * Signs in to SharePoint Online with the configured username and password.
      *
      * @return the session holding the federation cookies and the form digest
-     * @throws IllegalStateException when the security token service returns no token (its SOAP fault reason, or the
-     *                               body, is the message), when the sign-in response lacks the {@code rtFa} or
-     *                               {@code FedAuth} cookie, or when {@code /_api/contextinfo} carries no form digest
+     * @throws IllegalStateException when the security token service returns no token (the message is its SOAP fault
+     *                               reason, or else a fixed reason for an empty, unparseable or token-less response,
+     *                               never other response text), when the sign-in response lacks the {@code rtFa} or
+     *                               {@code FedAuth} cookie, or when {@code /_api/contextinfo} carries no form digest;
+     *                               and first, before any request is sent, when
+     *                               {@link SharepointProperties#requireValid()} rejects the configuration
      */
     public SharepointSession signIn() {
+        props.requireValid();
         log.debug("Signing in to SharePoint Online site {}", props.siteUrl());
         String token = requestSecurityToken();
         String cookieHeader = requestFederationCookies(token);
@@ -183,8 +225,11 @@ public class SharepointRestClient {
      *
      * @param session                 the session from {@link #signIn()}
      * @param folderServerRelativeUrl the server-relative folder URL, for example {@code /Shared Documents/my_folder}
+     * @throws IllegalStateException when {@link SharepointProperties#requireValid()} rejects the configuration; no
+     *                               request is sent
      */
     public void createFolder(SharepointSession session, String folderServerRelativeUrl) {
+        props.requireValid();
         Objects.requireNonNull(session, "session");
         Objects.requireNonNull(folderServerRelativeUrl, "folderServerRelativeUrl");
         log.debug("Creating SharePoint folder {}", folderServerRelativeUrl);
@@ -218,9 +263,12 @@ public class SharepointRestClient {
      *                              {@code /Shared Documents/my_folder/contacts.csv}
      * @param content               the file bytes, sent unchanged
      * @param overwrite             whether an existing file of that name is replaced
+     * @throws IllegalStateException    when {@link SharepointProperties#requireValid()} rejects the configuration; no
+     *                                  request is sent
      * @throws IllegalArgumentException when {@code fileServerRelativeUrl} is not {@code <folder>/<name>}
      */
     public void addFile(SharepointSession session, String fileServerRelativeUrl, byte[] content, boolean overwrite) {
+        props.requireValid();
         Objects.requireNonNull(session, "session");
         Objects.requireNonNull(fileServerRelativeUrl, "fileServerRelativeUrl");
         Objects.requireNonNull(content, "content");
@@ -278,6 +326,18 @@ public class SharepointRestClient {
                 .contentType(SOAP12_UTF8)
                 .body(envelope.getBytes(StandardCharsets.UTF_8))
                 .retrieve()
+                // Spring's default handler quotes an error body in the exception message and keeps it on the exception.
+                // This one raises the exception type Spring would, with the status and headers only, because a
+                // security token service body can hold an issued token.
+                .onStatus(HttpStatusCode::isError, (request, error) -> {
+                    HttpStatusCode status = error.getStatusCode();
+                    String statusText = error.getStatusText();
+                    HttpHeaders headers = error.getHeaders();
+                    if (status.is4xxClientError()) {
+                        throw HttpClientErrorException.create(status, statusText, headers, null, null);
+                    }
+                    throw HttpServerErrorException.create(status, statusText, headers, null, null);
+                })
                 .body(byte[].class);
 
         if (response == null || response.length == 0) {
@@ -287,10 +347,11 @@ public class SharepointRestClient {
         NodeList tokens = document.getElementsByTagNameNS(WSSE_NS, "BinarySecurityToken");
         String token = tokens.getLength() > 0 ? tokens.item(0).getTextContent().trim() : "";
         if (token.isEmpty()) {
-            // The service answers rejected credentials with HTTP 200 and a SOAP 1.2 fault; a body without a token
-            // carries no secret, so it may stand in for a missing fault reason.
-            throw new IllegalStateException(SIGN_IN_FAILED
-                    + faultReason(document).orElseGet(() -> new String(response, StandardCharsets.UTF_8)));
+            // The service answers rejected credentials with HTTP 200 and a SOAP 1.2 fault, whose reason is the message.
+            // Without one, only the body's length is reported: a token in an unexpected namespace is still a token.
+            throw new IllegalStateException(SIGN_IN_FAILED + faultReason(document).orElseGet(() ->
+                    "the security token service response carries no BinarySecurityToken and no SOAP fault reason ("
+                            + response.length + " bytes)"));
         }
         return token;
     }
@@ -357,10 +418,12 @@ public class SharepointRestClient {
         try {
             root = objectMapper.readTree(response);
         } catch (IOException e) {
-            throw new IllegalStateException(NO_FORM_DIGEST, e);
+            // The parser exception is not chained: its message quotes the response, which can hold the form digest.
+            throw new IllegalStateException(NO_FORM_DIGEST + " (" + parserDiagnostic(e) + ")");
         }
         JsonNode digest = root.path("d").path("GetContextWebInformation").path("FormDigestValue");
-        String formDigest = digest.isValueNode() ? digest.asText() : "";
+        // Only a JSON string is a digest: null, number and boolean values would otherwise render as bogus text.
+        String formDigest = digest.isTextual() ? digest.textValue() : "";
         if (formDigest.isBlank()) {
             throw new IllegalStateException(NO_FORM_DIGEST);
         }
@@ -381,7 +444,14 @@ public class SharepointRestClient {
         return reason.isEmpty() ? Optional.empty() : Optional.of(reason);
     }
 
-    /** Parses a namespace-aware DOM with DTDs, external entities and XInclude disabled. */
+    /**
+     * Parses a namespace-aware DOM with DTDs, external entities and XInclude disabled.
+     *
+     * <p>A rejected response fails with a fixed reason and the parser exception's
+     * {@linkplain #parserDiagnostic type and position}. The body and the parser exception are left out of the
+     * {@link IllegalStateException}, because a truncated response can hold an issued token and the parser's message
+     * can quote the input.
+     */
     private static Document parseXml(byte[] xml) {
         DocumentBuilder builder;
         try {
@@ -400,8 +470,27 @@ public class SharepointRestClient {
         try {
             return builder.parse(new ByteArrayInputStream(xml));
         } catch (SAXException | IOException e) {
-            throw new IllegalStateException(SIGN_IN_FAILED + new String(xml, StandardCharsets.UTF_8), e);
+            throw new IllegalStateException(SIGN_IN_FAILED
+                    + "the security token service response is not well-formed XML or declares a DOCTYPE ("
+                    + parserDiagnostic(e) + ")");
         }
+    }
+
+    /**
+     * Describes a parser exception by its type and, for a {@link SAXParseException} or a
+     * {@link JsonProcessingException} with a known position, its line and column. The exception's message is never
+     * used: it can quote the parsed response.
+     */
+    private static String parserDiagnostic(Exception e) {
+        String type = e.getClass().getSimpleName().isEmpty() ? e.getClass().getName() : e.getClass().getSimpleName();
+        if (e instanceof SAXParseException parse && parse.getLineNumber() > 0) {
+            return type + " at line " + parse.getLineNumber() + ", column " + parse.getColumnNumber();
+        }
+        JsonLocation location = e instanceof JsonProcessingException json ? json.getLocation() : null;
+        if (location != null && location.getLineNr() > 0) {
+            return type + " at line " + location.getLineNr() + ", column " + location.getColumnNr();
+        }
+        return type;
     }
 
     /** Escapes a value for XML text and attribute content. */
@@ -416,5 +505,170 @@ public class SharepointRestClient {
     /** Quotes a value inside an OData string literal by doubling every single quote. */
     private static String odataLiteral(String value) {
         return value.replace("'", "''");
+    }
+
+    /**
+     * Bounds each whole exchange by the client's timeout, counted from the moment the request is handed to the
+     * request factory. The request is sent once, unchanged. The response body is then read to its end within what
+     * remains of the timeout and passed on as a {@link BufferedClientHttpResponse}, so no later step reads from or
+     * drains the connection. When the time runs out, a watchdog closes the body stream, which ends a blocked read,
+     * and the exchange fails with an {@link HttpTimeoutException}; any other I/O failure propagates unchanged.
+     * RestClient reports either as a {@link org.springframework.web.client.ResourceAccessException}.
+     *
+     * <p>A body is read in {@value #READ_BUFFER_BYTES}-byte steps and at most {@link #MAX_BUFFERED_BODY_BYTES} of it
+     * is kept. A body that grows past that limit is read no further and its stream is closed, abandoning the
+     * connection instead of draining it; the response is passed on with its status and headers and a body that cannot
+     * be read, never with the part that arrived.
+     */
+    private static final class BoundedExchangeInterceptor implements ClientHttpRequestInterceptor {
+
+        private static final int READ_BUFFER_BYTES = 8 * 1024;
+
+        private final Duration timeout;
+        private final long timeoutNanos;
+
+        BoundedExchangeInterceptor(Duration timeout) {
+            this.timeout = timeout;
+            this.timeoutNanos = timeout.toNanos();
+        }
+
+        @Override
+        public ClientHttpResponse intercept(HttpRequest request, byte[] body, ClientHttpRequestExecution execution)
+                throws IOException {
+            long deadline = System.nanoTime() + timeoutNanos;
+            ClientHttpResponse response = execution.execute(request, body);
+            InputStream stream = null;
+            boolean readInFull = false;
+            try {
+                stream = response.getBody();
+                byte[] content = readWithin(stream, deadline - System.nanoTime());
+                readInFull = content != null;
+                return new BufferedClientHttpResponse(response.getStatusCode(), response.getStatusText(),
+                        response.getHeaders(), content);
+            } finally {
+                if (!readInFull) {
+                    // Closed first, so that closing the response does not drain a body that has stopped arriving or
+                    // that exceeds MAX_BUFFERED_BODY_BYTES.
+                    closeQuietly(stream);
+                }
+                response.close();
+            }
+        }
+
+        /**
+         * Reads the stream to its end, closing it when {@code remainingNanos} pass first.
+         *
+         * @return the whole body, or {@code null} once it exceeds {@link #MAX_BUFFERED_BODY_BYTES}, at which point
+         *         reading stops and the bytes read so far are discarded
+         */
+        private byte[] readWithin(InputStream stream, long remainingNanos) throws IOException {
+            if (remainingNanos <= 0) {
+                throw timedOut(null);
+            }
+            AtomicBoolean expired = new AtomicBoolean();
+            CompletableFuture<Void> watchdog = new CompletableFuture<>();
+            watchdog.orTimeout(remainingNanos, TimeUnit.NANOSECONDS).whenComplete((done, failure) -> {
+                if (failure != null) {
+                    expired.set(true);
+                    closeQuietly(stream);
+                }
+            });
+            try {
+                ByteArrayOutputStream content = new ByteArrayOutputStream();
+                byte[] buffer = new byte[READ_BUFFER_BYTES];
+                for (int read = stream.read(buffer); read != -1; read = stream.read(buffer)) {
+                    if (read > MAX_BUFFERED_BODY_BYTES - content.size()) {
+                        return null;
+                    }
+                    content.write(buffer, 0, read);
+                }
+                return content.toByteArray();
+            } catch (IOException e) {
+                if (expired.get()) {
+                    throw timedOut(e);
+                }
+                throw e;
+            } finally {
+                // Completing the watchdog cancels its pending timeout.
+                watchdog.complete(null);
+            }
+        }
+
+        /** The timeout failure; its message names the bound and nothing of the exchange. */
+        private HttpTimeoutException timedOut(IOException cause) {
+            HttpTimeoutException timeoutException = new HttpTimeoutException(
+                    "SharePoint response not received in full within " + timeout.toMillis() + " ms");
+            if (cause != null) {
+                timeoutException.initCause(cause);
+            }
+            return timeoutException;
+        }
+
+        /** Closes a body stream whose exchange has already ended; a failure to close leaves nothing to report to. */
+        private static void closeQuietly(InputStream stream) {
+            if (stream == null) {
+                return;
+            }
+            try {
+                stream.close();
+            } catch (IOException e) {
+                log.debug("Closing a SharePoint response body failed: {}", e.getClass().getName());
+            }
+        }
+    }
+
+    /**
+     * A response whose exchange has ended: the status, reason phrase and headers as received, and the body served
+     * from memory. A body over {@link #MAX_BUFFERED_BODY_BYTES} was not kept and is passed as {@code null}, so
+     * {@link #getBody()} fails with an {@link IOException} naming the limit and nothing of the content. RestClient
+     * then reports a call that reads the body as a {@link org.springframework.web.client.RestClientException} with
+     * that cause, builds an error-status exception with an empty body, and completes a call that needs only the
+     * status and headers.
+     */
+    private static final class BufferedClientHttpResponse implements ClientHttpResponse {
+
+        private static final String BODY_TOO_LARGE =
+                "SharePoint response body exceeds " + MAX_BUFFERED_BODY_BYTES + " bytes";
+
+        private final HttpStatusCode statusCode;
+        private final String statusText;
+        private final HttpHeaders headers;
+        private final InputStream body;
+
+        BufferedClientHttpResponse(HttpStatusCode statusCode, String statusText, HttpHeaders headers, byte[] body) {
+            this.statusCode = statusCode;
+            this.statusText = statusText;
+            this.headers = headers;
+            this.body = body == null ? null : new ByteArrayInputStream(body);
+        }
+
+        @Override
+        public HttpStatusCode getStatusCode() {
+            return statusCode;
+        }
+
+        @Override
+        public String getStatusText() {
+            return statusText;
+        }
+
+        @Override
+        public HttpHeaders getHeaders() {
+            return headers;
+        }
+
+        @Override
+        public InputStream getBody() throws IOException {
+            if (body == null) {
+                throw new IOException(BODY_TOO_LARGE);
+            }
+            return body;
+        }
+
+        @Override
+        public void close() {
+            // Nothing to release: the body is held in memory, and the connection was released once it had been read,
+            // or closed once the body had exceeded MAX_BUFFERED_BODY_BYTES.
+        }
     }
 }
