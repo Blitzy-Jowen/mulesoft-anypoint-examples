@@ -86,6 +86,11 @@ ajax:
   # Bayeux server-side poll timeout: "The server side poll timeout in milliseconds (default 250000)", Mule tag mule-3.8.0
   # transports/ajax/src/main/java/org/mule/transport/ajax/embedded/AjaxConnector.java:97-100; the connector sets none.
   connect-timeout-ms: 250000
+  # Bayeux maxInterval: "The max client side poll timeout in milliseconds (default 30000). A client will be removed if a
+  # connection is not received in this time.", same AjaxConnector.java:80-83; the connector sets none. AjaxChannelBroker
+  # removes a client without a held connect that has not been heard from for this long; independent of
+  # connect-timeout-ms, which bounds a held /meta/connect.
+  max-interval-ms: 30000
 
 orders:
   samsung:

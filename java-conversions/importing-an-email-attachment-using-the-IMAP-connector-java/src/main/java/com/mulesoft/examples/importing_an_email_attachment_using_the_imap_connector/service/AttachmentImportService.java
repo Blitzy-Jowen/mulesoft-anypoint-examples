@@ -89,7 +89,7 @@ public class AttachmentImportService {
 
         List<Map<String, String>> rows = readCsv(first.getContent());
         String xml = ordersXmlMapper.toXml(rows);
-        log.info("Received: " + xml);
+        log.info("Received: {}", xml);
         return fileOutboundWriter.write(outputDir, outputFileName, xml);
     }
 
