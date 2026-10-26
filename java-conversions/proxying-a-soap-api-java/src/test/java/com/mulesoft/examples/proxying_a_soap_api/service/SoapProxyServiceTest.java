@@ -154,6 +154,7 @@ class SoapProxyServiceTest {
                 Arguments.of(Named.of("unparseable xml", "xml"), UPSTREAM_SOAP11_CONTENT_TYPE),
                 Arguments.of("text/plain", UPSTREAM_SOAP11_CONTENT_TYPE),
                 Arguments.of("application/xml", UPSTREAM_SOAP11_CONTENT_TYPE),
+                Arguments.of("application/json", UPSTREAM_SOAP11_CONTENT_TYPE),
                 Arguments.of("text/xml", "text/xml"),
                 Arguments.of("text/xml; charset=ISO-8859-1", "text/xml; charset=ISO-8859-1"),
                 Arguments.of("application/soap+xml", "application/soap+xml"),
@@ -179,13 +180,16 @@ class SoapProxyServiceTest {
     }
 
     /**
-     * SOAP 1.1 requests, by caller Content-Type ({@code null}: absent, so replaced by the SOAP 1.1 type), caller
-     * action header name and value ({@code null}: none sent), and the single action the upstream must receive.
+     * SOAP 1.1 requests, by caller Content-Type ({@code null}: none sent; an absent, non-SOAP or unparseable type is
+     * replaced by the SOAP 1.1 type), caller action header name and value ({@code null}: none sent), and the single
+     * action the upstream must receive.
      */
     static Stream<Arguments> soap11Actions() {
         return Stream.of(
                 Arguments.of(SOAP11_CONTENT_TYPE, null, null, EMPTY_SOAP_ACTION),
                 Arguments.of(null, null, null, EMPTY_SOAP_ACTION),
+                Arguments.of("application/json", null, null, EMPTY_SOAP_ACTION),
+                Arguments.of("not a type", null, null, EMPTY_SOAP_ACTION),
                 Arguments.of(SOAP11_CONTENT_TYPE, SOAP_ACTION, CALLER_SOAP_ACTION, CALLER_SOAP_ACTION),
                 Arguments.of(SOAP11_CONTENT_TYPE, "soapaction", CALLER_SOAP_ACTION, CALLER_SOAP_ACTION));
     }
@@ -273,7 +277,7 @@ class SoapProxyServiceTest {
         assertThat(returned).isEqualTo(new ProxyHeaderMapper().toCaller(upstreamHeaders));
         assertThat(returned.get(HttpHeaders.CONTENT_TYPE)).containsExactly(SOAP11_CONTENT_TYPE);
         assertThat(returned.get("X-Upstream")).containsExactly("predic8");
-        for (String removed : List.of(HttpHeaders.CONNECTION, HttpHeaders.TRANSFER_ENCODING,
+        for (String removed : List.of(HttpHeaders.HOST, HttpHeaders.CONNECTION, HttpHeaders.TRANSFER_ENCODING,
                 HttpHeaders.CONTENT_LENGTH, "MULE_ENCODING", "MULE_CORRELATION_ID")) {
             assertThat(returned.containsKey(removed)).as(removed).isFalse();
         }
@@ -365,6 +369,7 @@ class SoapProxyServiceTest {
         HttpHeaders headers = new HttpHeaders();
         headers.add(HttpHeaders.CONTENT_TYPE, SOAP11_CONTENT_TYPE);
         headers.add("X-Upstream", "predic8");
+        headers.add(HttpHeaders.HOST, "www.predic8.com:8080");
         headers.add(HttpHeaders.CONNECTION, "close");
         headers.add(HttpHeaders.TRANSFER_ENCODING, "chunked");
         headers.add(HttpHeaders.CONTENT_LENGTH, String.valueOf(RESPONSE_ENVELOPE.length));

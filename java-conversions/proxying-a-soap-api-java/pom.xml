@@ -48,10 +48,16 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-undertow</artifactId>
         </dependency>
-        <!-- The envelope is forwarded as raw bytes through RestClient (spring-web), and no Spring WS endpoint exists,
-             so spring-boot-starter-web-services is absent: it would mount MessageDispatcherServlet at /services/*.
-             The copied WsdlQueryPublisher parses and rewrites the upstream WSDL with JDK DOM only, so neither
-             spring-xml nor wsdl4j is needed and spring-ws.version is not set. -->
+        <!-- The envelope is forwarded as raw bytes through RestClient (spring-web) over httpclient5, and no Spring WS
+             endpoint exists, so spring-boot-starter-web-services is absent: it would mount MessageDispatcherServlet at
+             /services/*. The copied WsdlQueryPublisher parses and rewrites the upstream WSDL with JDK DOM only, so
+             neither spring-xml nor wsdl4j is needed and spring-ws.version is not set. -->
+        <!-- ShopServiceClient transport: it forwards the caller's Expect and Upgrade, which the JDK client drops, and
+             its socket timeout bounds every response body read. Version from the Boot BOM. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
