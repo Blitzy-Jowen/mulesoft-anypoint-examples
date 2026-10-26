@@ -10,6 +10,7 @@ package com.mulesoft.examples.scatter_gather_flow_control.mapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -86,14 +87,16 @@ class ContactsCsvMapperTest {
         assertThat(mapper.toCsv(List.of(reversed))).isEqualTo("Id,Name,Email\n1,vlado,vlado@email.com\n");
     }
 
-    // Route A of the original scatter-gather: 1 vlado, 2 michal.
+    // Route A of the original scatter-gather: 1 vlado, 2 michal, in an ArrayList as its expression component builds it.
     private static List<Map<String, String>> sourceA() {
-        return List.of(contact("1", "vlado", "vlado@email.com"), contact("2", "michal", "michal@email.com"));
+        return new ArrayList<>(List.of(contact("1", "vlado", "vlado@email.com"),
+                contact("2", "michal", "michal@email.com")));
     }
 
-    // Route B of the original scatter-gather: 1 peter, 2 vlado.
+    // Route B of the original scatter-gather: 1 peter, 2 vlado, in an ArrayList as its expression component builds it.
     private static List<Map<String, String>> sourceB() {
-        return List.of(contact("1", "peter", "peter@email.com"), contact("2", "vlado", "vlado@email.com"));
+        return new ArrayList<>(List.of(contact("1", "peter", "peter@email.com"),
+                contact("2", "vlado", "vlado@email.com")));
     }
 
     private static Map<String, String> contact(String id, String name, String email) {
