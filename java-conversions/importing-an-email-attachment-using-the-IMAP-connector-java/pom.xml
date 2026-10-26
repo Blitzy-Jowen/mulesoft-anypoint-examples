@@ -151,7 +151,8 @@
                     </excludes>
                     <systemPropertyVariables>
                         <!-- Every test context, FixtureParityTest included, loads application-test.yml: GreenMail
-                             host, ports and users, the held-back scheduled poll and a target/ output directory. -->
+                             host and users (ports are the dynamically allocated ones each test registers through
+                             @DynamicPropertySource), the held-back scheduled poll and a target/ output directory. -->
                         <spring.profiles.active>test</spring.profiles.active>
                     </systemPropertyVariables>
                 </configuration>

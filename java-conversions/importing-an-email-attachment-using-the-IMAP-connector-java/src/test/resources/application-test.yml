@@ -1,15 +1,21 @@
 # Spring profile "test", activated for every test by surefire (spring.profiles.active=test in pom.xml); tests only.
 # Points the original imap.* placeholders of imap-to-xml.xml:10, and the smtp.* sender keys the original
 # integration test read from its uncommitted mule.test.properties, at the in-process GreenMail server the tests
-# start (ServerSetupTest.SMTP on 3025 plus ServerSetupTest.IMAPS on 3993) instead of a public mail provider. These
-# are GreenMail test values, not credentials, and this file must never hold a real host, account or password: real
-# values come from the environment variables behind the placeholders of src/main/resources/application.yml. The
-# original test's imap.user_enc (the %40-encoded address Mule needed in its endpoint URI) has no counterpart,
-# because Jakarta Mail takes the plain address. A test that binds GreenMail elsewhere overrides the ports with
-# @DynamicPropertySource.
+# start instead of a public mail provider. These are GreenMail test values, not credentials, and this file must
+# never hold a real host, account or password: real values come from the environment variables behind the
+# placeholders of src/main/resources/application.yml. The original test's imap.user_enc (the %40-encoded address
+# Mule needed in its endpoint URI) has no counterpart, because Jakarta Mail takes the plain address.
+# Ports: GreenMail always runs on dynamically allocated ports, ServerSetup.dynamicPort(new ServerSetup[] {
+# ServerSetupTest.SMTP, ServerSetupTest.IMAPS }) (GreenMail 2.1.14 has no SMTP_IMAPS constant), so this file sets
+# neither imap.port nor smtp.port. Every test that talks to GreenMail must register the ports the server actually
+# bound as imap.port and smtp.port through @DynamicPropertySource, or pass them to the poller or sender it constructs
+# directly. @DynamicPropertySource is read when the context is created, so GreenMail must already be running then
+# and keep its ports for the cached context (for example GreenMailExtension.withPerMethodLifecycle(false)). Fixed
+# ports are never used, because concurrent builds share this host. Without the registration imap.port falls back to
+# the 993 of application.yml and smtp.port is undefined, so such a test fails instead of reaching another build's
+# mailbox.
 imap:
   host: 127.0.0.1
-  port: 3993                         # GreenMail ServerSetupTest.IMAPS (the original fixes 993)
   user: receiver@localhost
   password: receiver-test-pw         # test-only literal; tests create the GreenMail user with exactly this value
   initial-delay: 86400000            # holds back the @Scheduled poll(); tests call pollOnce() or override this to 0
@@ -21,7 +27,6 @@ imap:
 
 smtp:
   host: 127.0.0.1
-  port: 3025                         # GreenMail ServerSetupTest.SMTP
   user: sender@localhost
   password: sender-test-pw           # test-only literal
 

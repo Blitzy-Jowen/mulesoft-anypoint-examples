@@ -1,12 +1,19 @@
 # Spring profile "test", activated with @ActiveProfiles("test"); tests only.
 # Points the original smtp.* and mail.* placeholders of scatter-gather.xml:64 at the in-process GreenMail SMTP
-# server the tests start (ServerSetupTest.SMTP, port 3025, user scatter@localhost / secret) instead of Gmail.
+# server the tests start (user scatter@localhost / secret) instead of Gmail.
 # These are GreenMail test values, not credentials. Real values come from the environment variables behind the
 # placeholders of src/main/resources/application.yml (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, MAIL_FROM,
-# MAIL_TO). A test that binds GreenMail elsewhere overrides smtp.port with @DynamicPropertySource.
+# MAIL_TO).
+# Port: GreenMail SMTP always runs on a dynamically allocated port, ServerSetupTest.SMTP.dynamicPort(), so
+# this file does not set smtp.port. Every Spring test that sends mail must register the port the server
+# actually bound as smtp.port through @DynamicPropertySource; it is read when the context is created, so
+# GreenMail must already be running then and keep its port for the cached context (for example
+# GreenMailExtension.withPerMethodLifecycle(false)). A test that builds JavaMailSenderImpl or
+# AggregationReportMailer directly passes that port itself. Fixed ports are never used, because concurrent
+# builds share this host. Without the registration smtp.port falls back to the ${SMTP_PORT:587} of
+# application.yml, where no GreenMail listens.
 smtp:
   host: localhost
-  port: 3025
   user: scatter@localhost
   password: secret
 mail:
