@@ -1,0 +1,46 @@
+# get-customer-list-from-netsuite-java runtime configuration
+# Replaces get-customer-list-from-netsuite/src/main/app/mule-app.properties and the ${...} placeholders of the
+# netsuite:config and http:listener-config of get-customer-list-from-netsuite.xml (lines 4-5).
+# Live credentials belong only in environment variables or the git-ignored src/test/resources/application-it.yml.
+spring:
+  application:
+    name: get-customer-list-from-netsuite-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: no static resources, so an unknown path reaches GlobalExceptionHandler -> 404 text/plain "No listener for endpoint: <path>"
+  # The /customers listener declares no allowedMethods, so it serves every method and no other path:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the /customers mapping instead of the servlet's default TRACE echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+
+http:
+  port: 8081            # original placeholder name ${http.port}; the port of the original README
+
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (get-customer-list-from-netsuite.xml:5)
+
+netsuite:
+  # TODO: supply the NetSuite account ID (Setup > Company > Company Information), e.g. 1234567 or 1234567_SB1
+  account: ${NETSUITE_ACCOUNT:}
+  # Empty: the clients derive https://<account>.suitetalk.api.netsuite.com from netsuite.account
+  # (lower-cased, '_' -> '-'); tests point it at WireMock.
+  base-url: ${NETSUITE_BASE_URL:}
+  # Connect and read timeouts of every NetSuite call: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s
+  # Account time zone used to render NetSuite dates; SC-16 NetsuiteProperties carries it for both NetSuite projects
+  time-zone: America/Los_Angeles
+  # Original SuiteTalk login keys -> OAuth 2.0 M2M keys (client credentials grant, PS256 JWT client assertion):
+  #   netsuite.email, netsuite.password -> netsuite.oauth.client-id + netsuite.oauth.certificate-id + netsuite.oauth.private-key-path
+  #   netsuite.roleId                   -> the role is bound to the M2M certificate mapping in NetSuite; there is no key
+  #   netsuite.account                  -> unchanged
+  oauth:
+    # TODO: supply the client ID of the NetSuite integration record (OAuth 2.0 client credentials / M2M)
+    client-id: ${NETSUITE_OAUTH_CLIENT_ID:}
+    # TODO: supply the certificate ID from Setup > Integration > OAuth 2.0 Client Credentials (M2M) Setup (JWT header kid)
+    certificate-id: ${NETSUITE_OAUTH_CERTIFICATE_ID:}
+    # TODO: supply the path to the PKCS#8 PEM private key of that certificate (file path or classpath: location)
+    private-key-path: ${NETSUITE_OAUTH_PRIVATE_KEY_PATH:}
