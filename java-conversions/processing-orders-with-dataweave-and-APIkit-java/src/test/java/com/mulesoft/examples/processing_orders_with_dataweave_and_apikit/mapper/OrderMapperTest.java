@@ -32,6 +32,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.w3c.dom.Document;
 import org.xml.sax.SAXException;
 
@@ -64,6 +65,10 @@ class OrderMapperTest {
     private static final ObjectMapper EXACT_DECIMALS = new ObjectMapper()
             .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
             .configure(JsonNodeFeature.STRIP_TRAILING_BIGDECIMAL_ZEROES, false);
+
+    /** A dated item with no {@code price} element. */
+    private static final String ITEM_WITHOUT_PRICE = "<item><type>book</type><properties><title>No Price</title>"
+            + "<authors><author>Author</author></authors><year>2005</year></properties></item>";
 
     private OrderMapper mapper;
 
@@ -186,14 +191,49 @@ class OrderMapperTest {
     @Test
     @DisplayName("USD with no entries -> an empty prices list, the item's price never read")
     void mapsEmptyUsdToEmptyPricesWithoutReadingPrice() throws Exception {
-        Document orders = parseXml("<orders><item><type>book</type><properties><title>No Price</title>"
-                + "<authors><author>Author</author></authors><year>2005</year></properties></item></orders>");
+        Document orders = parseXml(ordersXml(ITEM_WITHOUT_PRICE));
         JsonNode noRatios = EXACT_DECIMALS.readTree("{\"USD\": []}");
 
         List<Map<String, Object>> kept = keptOrders(mapper.map(orders, noRatios));
 
         assertThat(kept).hasSize(1);
         assertThat(prices(kept.get(0))).isEmpty();
+    }
+
+    // Absent year, price and USD: asserted because OrderMapper documents each outcome, like absent authors above.
+
+    @Test
+    @DisplayName("a kept item without price while USD has entries -> IllegalArgumentException")
+    void rejectsKeptItemWithoutPrice() throws Exception {
+        Document orders = parseXml(ordersXml(ITEM_WITHOUT_PRICE));
+
+        assertThatThrownBy(() -> mapper.map(orders, currencies)).isExactlyInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @DisplayName("an item without properties/year is dropped; dated items around it are kept in order")
+    void dropsItemWithoutYear() throws Exception {
+        Document orders = parseXml(ordersXml(
+                item("First", "30", "2005", "Author"),
+                "<item><type>book</type><price>30</price><properties><title>No Year</title>"
+                        + "<authors><author>Author</author></authors></properties></item>",
+                item("Last", "30", "2006", "Author")));
+
+        List<Map<String, Object>> kept = keptOrders(mapper.map(orders, currencies));
+
+        assertThat(kept).extracting(order -> order.get("title")).containsExactly("First", "Last");
+    }
+
+    @ParameterizedTest(name = "currencies {0}")
+    @ValueSource(strings = {"{}", "{\"USD\": null}"})
+    @DisplayName("currencies without USD, or with a JSON-null USD -> \"prices\": null (plan default)")
+    void mapsAbsentUsdToNullPrices(String currenciesJson) throws Exception {
+        Document orders = parseXml(ordersXml(item("Priced", "30", "2005", "Author")));
+
+        List<Map<String, Object>> kept = keptOrders(mapper.map(orders, EXACT_DECIMALS.readTree(currenciesJson)));
+
+        assertThat(kept).hasSize(1);
+        assertThat(kept.get(0)).containsEntry("prices", null);
     }
 
     /** One {@code item} in the layout of the bundled {@code orders.xml}: price beside properties. */
