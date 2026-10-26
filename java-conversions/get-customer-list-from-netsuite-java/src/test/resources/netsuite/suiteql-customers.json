@@ -1,0 +1,38 @@
+{
+  "links": [
+    {
+      "rel": "self",
+      "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/query/v1/suiteql?limit=1000&offset=0"
+    }
+  ],
+  "count": 4,
+  "hasMore": false,
+  "items": [
+    {
+      "links": [],
+      "email": "ab@example.com",
+      "firstname": "Byron",
+      "lastname": "Abbott"
+    },
+    {
+      "links": [],
+      "email": "gustaff@example.com",
+      "firstname": "Gustaffson",
+      "lastname": "Norman"
+    },
+    {
+      "links": [],
+      "email": "aa@example.com",
+      "firstname": "Angels",
+      "lastname": "Analytics"
+    },
+    {
+      "links": [],
+      "email": "mcgill@example.com",
+      "firstname": "Stuart",
+      "lastname": "McGill"
+    }
+  ],
+  "offset": 0,
+  "totalResults": 4
+}

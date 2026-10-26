@@ -80,7 +80,7 @@ import com.mulesoft.examples.salesforce_data_retrieval.exception.UpstreamUnavail
  * in the {@code package} line and in the imports of the project's own SC-9 types, so it depends on the JDK, JUnit,
  * Logback, Byte Buddy (on every project's test classpath through {@code spring-boot-starter-test}) and the SC-9 types
  * alone. Netty's {@code ReadTimeoutException} is defined under its real name by Byte Buddy in a throwaway class
- * loader, so no project needs Netty to run it.
+ * loader, so no project needs Netty to run it; where Netty is on the classpath, its real class is checked as well.
  */
 class UpstreamCallExecutorTest {
 
@@ -508,6 +508,37 @@ class UpstreamCallExecutorTest {
                 new UnknownHostException("vendor.invalid"),
                 new NoRouteToHostException("No route to host"),
                 new SocketException("Connection reset"));
+    }
+
+    /**
+     * Pins {@link UpstreamFailureClassifier#NETTY_READ_TIMEOUT_EXCEPTION} to the class Reactor Netty really throws
+     * in the projects that call through {@code WebClient}; a project without Netty checks the stand-in of that name
+     * instead, so the case runs, and passes, in every copy.
+     */
+    @Test
+    void isUnavailableRecognisesNettysReadTimeoutWhereverNettyIsPresent() {
+        RuntimeException readTimeout = nettyReadTimeout();
+
+        assertEquals(UpstreamFailureClassifier.NETTY_READ_TIMEOUT_EXCEPTION, readTimeout.getClass().getName());
+        assertTrue(UpstreamFailureClassifier.isUnavailable(readTimeout));
+        assertTrue(UpstreamFailureClassifier.isUnavailable(new RuntimeException("wrap", readTimeout)));
+        assertTrue(UpstreamFailureClassifier.isUnavailable(new IOException("wrap", readTimeout)));
+    }
+
+    /** Netty's shared {@code ReadTimeoutException.INSTANCE} when Netty is loadable, otherwise the stand-in. */
+    private static RuntimeException nettyReadTimeout() {
+        Class<?> netty;
+        try {
+            netty = Class.forName(UpstreamFailureClassifier.NETTY_READ_TIMEOUT_EXCEPTION, true,
+                    UpstreamCallExecutorTest.class.getClassLoader());
+        } catch (ClassNotFoundException absent) {
+            return instantiate(NettyStandIns.READ_TIMEOUT, "read timed out");
+        }
+        try {
+            return (RuntimeException) netty.getField("INSTANCE").get(null);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot read " + netty.getName() + ".INSTANCE", e);
+        }
     }
 
     @ParameterizedTest
