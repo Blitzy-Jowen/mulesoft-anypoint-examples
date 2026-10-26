@@ -33,6 +33,7 @@
         <!-- Artefacts outside the Spring Boot 3.2.12 BOM -->
         <force-partner-api.version>65.0.0</force-partner-api.version>
         <wiremock.version>3.13.2</wiremock.version>
+        <commons-net.version>3.13.0</commons-net.version>
 
         <!-- Build plugins. The compiler, surefire, failsafe and enforcer properties reuse Boot's names with Boot's own values, so the parent's pluginManagement resolves the same versions. -->
         <maven-compiler-plugin.version>3.11.0</maven-compiler-plugin.version>
@@ -42,6 +43,18 @@
         <jacoco.version>0.8.15</jacoco.version>
         <spring-boot-maven-plugin.version>3.2.12</spring-boot-maven-plugin.version>
     </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- Aligns HtmlUnit's transitive commons-net (3.9.0) with the version the conversions use (3.13.0).
+                 HtmlUnit is its only consumer here, so it is managed rather than declared. -->
+            <dependency>
+                <groupId>commons-net</groupId>
+                <artifactId>commons-net</artifactId>
+                <version>${commons-net.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <!-- Undertow instead of Tomcat: Tomcat 10.1 drops custom HTTP reason phrases, Undertow writes them to the status line.
@@ -64,7 +77,8 @@
 
         <!--
             Salesforce SOAP Partner API (WSC 65.0.0; brings force-wsc, ST4 4.3, commons-beanutils 1.11.0).
-            This block is shared verbatim by every Salesforce project.
+            Every Salesforce project pins the same WSC/Partner API 65.0.0; the commons-logging exclusion below is
+              this project's own choice (some other Salesforce projects keep WSC's commons-logging).
             - force-wsc declares Jackson 2.18.4; the Spring Boot BOM resolves Jackson 2.15.4 instead (recorded in the
               root DECISIONS.md). The Partner API calls use WSC's own XML stack, not Jackson.
             - commons-logging is excluded because spring-jcl already provides the org.apache.commons.logging API;

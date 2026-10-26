@@ -64,7 +64,8 @@
 
         <!--
             Salesforce SOAP Partner API (WSC 65.0.0; brings force-wsc, ST4 4.3, commons-beanutils 1.11.0).
-            This block is shared verbatim by every Salesforce project.
+            Every Salesforce project pins the same WSC/Partner API 65.0.0; the commons-logging exclusion below is
+              this project's own choice (some other Salesforce projects keep WSC's commons-logging).
             - force-wsc declares Jackson 2.18.4; the Spring Boot BOM resolves Jackson 2.15.4 instead (recorded in the
               root DECISIONS.md). The Partner API calls use WSC's own XML stack, not Jackson.
             - commons-logging is excluded because spring-jcl already provides the org.apache.commons.logging API;
