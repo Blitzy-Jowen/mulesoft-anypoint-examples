@@ -11,3 +11,10 @@ spring:
   web:
     resources:
       add-mappings: false   # no static resource handler competes with EchoController's /** echo; SC-1's no-listener 404 relies on it too
+  # The /* listener has no allowedMethods (echo.xml:5), so every path and method is echoed. Two Boot defaults would
+  # otherwise answer requests the Mule listener echoed:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches EchoController and is echoed instead of getting the servlet's message/http TRACE echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error is echoed like any other path
