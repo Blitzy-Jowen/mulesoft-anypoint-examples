@@ -189,6 +189,25 @@
                             </rules>
                         </configuration>
                     </execution>
+                    <!-- Once earlier XJC output exists, XJC's staleness check skips generation even after the WSDL is gone, so
+                         this check, which runs ahead of XJC in the same phase, fails generate-sources whenever the WSDL is missing. -->
+                    <execution>
+                        <id>require-workday-wsdl</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireFilesExist>
+                                    <files>
+                                        <file>${project.basedir}/src/main/resources/wsdl/Revenue_Management_v25.0.wsdl</file>
+                                    </files>
+                                    <message>The Workday Revenue_Management v25.0 WSDL is the mandatory contract the JAXB classes are generated from.</message>
+                                </requireFilesExist>
+                            </rules>
+                        </configuration>
+                    </execution>
                 </executions>
             </plugin>
 
@@ -216,8 +235,8 @@
                     <outputDirectory>${project.build.directory}/generated-sources/jaxb</outputDirectory>
                     <clearOutputDir>true</clearOutputDir>
                     <noGeneratedHeaderComments>true</noGeneratedHeaderComments>
-                    <!-- Generation is skipped rather than failing while the vendor WSDL is absent; sources that use the generated types still fail to compile without it. -->
-                    <failOnNoSchemas>false</failOnNoSchemas>
+                    <!-- The Revenue_Management v25.0 WSDL is the mandatory contract: without it XJC fails the build at generate-sources. -->
+                    <failOnNoSchemas>true</failOnNoSchemas>
                 </configuration>
             </plugin>
 
