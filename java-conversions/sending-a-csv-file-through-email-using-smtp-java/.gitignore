@@ -1,0 +1,2 @@
+# Maven build output (classes, surefire/JaCoCo reports, target/test-csv-email/, target/fixture-parity/)
+target/
