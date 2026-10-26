@@ -1,0 +1,5 @@
+# dataweave-with-flowreflookup-java
+# Maven build output
+target/
+# Live Salesforce sandbox credentials (sfdc.username, sfdc.password, sfdc.securityToken) - local only, never commit (see application-it.yml.example)
+src/test/resources/application-it.yml
