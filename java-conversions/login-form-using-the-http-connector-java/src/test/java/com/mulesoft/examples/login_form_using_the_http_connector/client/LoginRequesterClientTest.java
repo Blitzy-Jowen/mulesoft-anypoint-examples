@@ -26,6 +26,10 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.net.ConnectException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -33,6 +37,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
@@ -46,6 +51,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.web.context.WebServerApplicationContext;
 import org.springframework.boot.web.context.WebServerInitializedEvent;
 import org.springframework.boot.web.server.WebServer;
+import org.springframework.http.client.ClientHttpRequestInterceptor;
 import org.springframework.web.client.RestClient;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -197,21 +203,32 @@ class LoginRequesterClientTest {
     }
 
     @Test
-    void connectionRefusedPropagatesWithoutRetry() {
-        int port = wireMock.port();
-        wireMock.stop();
+    void connectionRefusedPropagatesWithoutRetry() throws Exception {
+        AtomicInteger attempts = new AtomicInteger();
+        // Interceptors on the builder wrap whatever request factory the client installs, so the counter sees
+        // every execution of the real transport, including any repeat made after the refusal.
+        ClientHttpRequestInterceptor countingInterceptor = (request, body, execution) -> {
+            attempts.incrementAndGet();
+            return execution.execute(request, body);
+        };
+        // A bound socket that never listens holds its loopback port for the duration of the call, so no other
+        // process can listen there and the kernel refuses every connection to it.
+        try (Socket unaccepted = new Socket()) {
+            unaccepted.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            String baseUrl = new URI("http", null, unaccepted.getLocalAddress().getHostAddress(),
+                    unaccepted.getLocalPort(), null, null, null).toString();
+            LoginRequesterClient refused = new LoginRequesterClient(
+                    RestClient.builder().requestInterceptor(countingInterceptor), baseUrl);
 
-        Exception failure = assertThrows(Exception.class, () -> client.postLogin(form()));
+            Exception failure = assertThrows(Exception.class, () -> refused.postLogin(form()));
 
-        assertTrue(hasCause(failure, ConnectException.class),
-                () -> "expected a ConnectException in the cause chain of " + failure);
-        assertFalse(failure instanceof IllegalStateException
-                && String.valueOf(failure.getMessage()).endsWith("mapped as failure."),
-                "a refused connection is not a status failure");
-        // A listener opened on the same port only after the call must never see a late second attempt.
-        wireMock = new WireMockServer(WireMockConfiguration.options().port(port));
-        wireMock.start();
-        assertTrue(wireMock.getAllServeEvents().isEmpty(), "no retry may follow a refused connection");
+            assertTrue(hasCause(failure, ConnectException.class),
+                    () -> "expected a ConnectException in the cause chain of " + failure);
+            assertFalse(failure instanceof IllegalStateException
+                    && String.valueOf(failure.getMessage()).endsWith("mapped as failure."),
+                    "a refused connection is not a status failure");
+            assertEquals(1, attempts.get(), "no retry may follow a refused connection");
+        }
     }
 
     @Test
