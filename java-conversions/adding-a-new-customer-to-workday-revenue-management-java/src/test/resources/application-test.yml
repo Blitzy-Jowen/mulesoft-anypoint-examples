@@ -1,0 +1,25 @@
+# Spring profile "test" for the credential-free unit tier (surefire), activated by @ActiveProfiles("test") in
+# controller/WorkdayCustomerControllerTest and AddingANewCustomerToWorkdayTest.
+#
+# Every value below is fake and safe to commit: it fills a TODO placeholder left empty in
+# src/main/resources/application.yml (wday.hostname, wday.tenant, wday.user, wday.password) or stands in for the
+# original MUnit test-data keys wday.status.id and wday.reason.id. None is a Workday host, tenant, user, password
+# or WID, and none authenticates anywhere; the UsernameToken the client sends with them is testuser@test_pt1.
+#
+# Deliberately absent, because each test sets them itself:
+#   wday.endpoint   registered by @DynamicPropertySource to the test's in-process WireMock Workday stub; without
+#                   that override it derives to https://localhost/ccx/service/test_pt1/Revenue_Management/v25.0,
+#                   so a test that forgets it reaches no live host
+#   server.port     webEnvironment = RANDOM_PORT
+#
+# Live Workday values belong only in the git-ignored src/test/resources/application-it.yml
+# (template: application-it.yml.example).
+wday:
+  hostname: localhost
+  tenant: test_pt1
+  user: testuser
+  password: test-password
+  status:
+    id: TEST-STATUS-WID
+  reason:
+    id: TEST-REASON-WID

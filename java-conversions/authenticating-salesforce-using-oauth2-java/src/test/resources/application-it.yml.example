@@ -1,0 +1,28 @@
+# Live-sandbox credentials template for SalesforceOauthIT.
+#
+# Copy this file to src/test/resources/application-it.yml and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it.
+#
+# SalesforceOauthIT runs under failsafe (mvn -B verify) with Spring profile "it", which loads
+# application-it.yml. It is skipped by assumption, never failed, while application-it.yml is missing or
+# while any key below is missing, blank or still TODO.
+#
+# The test is read-only: it creates and deletes no Salesforce records. HtmlUnit logs in to
+# https://login.salesforce.com/ as sfdc.username (HtmlUnit replaces PhantomJS, so no browser binary is
+# configured), the application completes the OAuth 2.0 authorization-code flow and runs its contact query,
+# and the test checks the "Salesforce query returned N contacts." text.
+#
+# The connected app identified by sfdc.key must have exactly http://localhost:8081/oauth2callback as its
+# callback URL. The test runs the application on port 8081, and the redirect URI is built from
+# sfdc.oauth.callback.* (defaults localhost, 8081, oauth2callback, as in the original oauth-callback-config).
+#
+# The existing Salesforce org and credentials are reused; no new sandbox is needed. These keys replace the
+# sfdc.key, sfdc.secret, sfdc.user and sfdc.password that the original authenticating-salesforce-using-oauth2
+# test read from src/test/resources/mule.test.properties; sfdc.username is the new name of sfdc.user.
+# The authorization-code flow needs no security token.
+sfdc:
+  key:        # TODO: supply the connected-app consumer key
+  secret:     # TODO: supply the connected-app consumer secret
+  username:   # TODO: supply the Salesforce user for the browser login (replaces the original sfdc.user)
+  password:   # TODO: supply that user's password

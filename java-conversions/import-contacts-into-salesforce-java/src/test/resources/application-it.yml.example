@@ -1,0 +1,24 @@
+# Live-sandbox (Tier 2B) credentials template for import-contacts-into-salesforce-java.
+#
+# Copy this file to application-it.yml in this same directory (src/test/resources/) and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it.
+#
+# ImportContactsToSfdcIT runs under failsafe (mvn -B verify) and loads application-it.yml as Spring profile
+# "it". It is skipped by assumption while application-it.yml is missing, or while any of the three keys below
+# is missing, blank or still TODO, so mvn -B verify and mvn -B clean install pass without credentials.
+#
+# The live test writes data. It drops contacts.csv into the input directory, which creates two Salesforce
+# Contacts: John Doe (john.doe@texasComp.com) and Jane Doe (jane.doe@texasComp.com). It deletes both in
+# @AfterEach. Use a sandbox org, never production.
+#
+# Reuse the existing Salesforce sandbox credentials of the original import-contacts-into-salesforce example;
+# no new sandbox is procured. sfdc.username replaces the sfdc.user key that the original test read from
+# src/test/resources/mule.test.properties; sfdc.password and sfdc.securityToken keep their names.
+sfdc:
+  username:        # TODO: supply the Salesforce sandbox username (replaces the original sfdc.user)
+  password:        # TODO: supply the Salesforce sandbox user's password, without the security token
+  securityToken:   # TODO: supply the security token of that Salesforce user
+  # Optional, for sandbox orgs, whose users log in at test.salesforce.com
+  # (default https://login.salesforce.com/services/Soap/u/65.0 from src/main/resources/application.yml):
+  # auth-endpoint: https://test.salesforce.com/services/Soap/u/65.0
