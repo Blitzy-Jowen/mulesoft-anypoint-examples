@@ -1,0 +1,68 @@
+# netsuite-data-retrieval-java runtime configuration
+# Spring Boot conversion of netsuite-data-retrieval. Replaces the http:listener-config, apikit:config and
+# netsuite:config-login-authentication of netsuite-data-retrieval/src/main/app/netsuite-api.xml (lines 12-18);
+# netsuite-data-retrieval/src/main/app/mule-app.properties is empty, and mule-deploy.properties loads only netsuite-api.xml.
+# Live credentials belong only in environment variables or the git-ignored src/test/resources/application-it.yml.
+spring:
+  application:
+    name: netsuite-data-retrieval-java
+  # No static resource handler: unknown paths raise NoHandlerFoundException / NoResourceFoundException,
+  # answered by ApiKitExceptionHandler under /api and GlobalExceptionHandler elsewhere (AAP 0.4.7)
+  web:
+    resources:
+      add-mappings: false
+  # The /api/* listener (netsuite-api.xml:21) declares no allowedMethods and serves no other path:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the APIkit 405 mapping instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404
+
+# http:listener-config host="0.0.0.0" port="8081" connectionIdleTimeout="3000000" (netsuite-api.xml:12).
+# The original fixes the port rather than reading ${http.port}, so it is a literal here; --server.port overrides it.
+server:
+  port: 8081
+  address: 0.0.0.0
+  undertow:
+    no-request-timeout: 3000000ms   # connectionIdleTimeout: an idle keep-alive connection is closed after 3000 s
+
+# apikit:config raml="netsuite-api.raml" consoleEnabled="true" consolePath="console" (netsuite-api.xml:13); listener path /api/*
+apikit:
+  base-path: /api
+  raml: api/netsuite-api.raml
+  console-path: console
+
+# Original SuiteTalk login keys (netsuite-api.xml:18) -> OAuth 2.0 M2M keys (REST web services and SuiteQL,
+# client credentials grant with a PS256 JWT client assertion):
+#   nets.account                                    -> netsuite.account
+#   nets.email, nets.password, nets.roleId,
+#   nets.applicationId                              -> netsuite.oauth.client-id + netsuite.oauth.certificate-id
+#                                                      + netsuite.oauth.private-key-path (the role is bound to the
+#                                                      M2M certificate mapping of the integration record)
+# The live-test data keys nets.customer.*, nets.opportunity.title and nets.item.quantity keep their names and live
+# in src/test/resources/application-it.yml.
+netsuite:
+  # TODO: supply the NetSuite account ID (Setup > Company > Company Information), e.g. 1234567 or 1234567_SB1
+  account: ${NETSUITE_ACCOUNT:}
+  # Empty: the clients derive https://<account>.suitetalk.api.netsuite.com from netsuite.account
+  # (lower-cased, '_' -> '-'); tests point it at WireMock.
+  # TODO: supply the NetSuite base URL (scheme and host, no path) only when overriding the account-derived URL
+  base-url: ${NETSUITE_BASE_URL:}
+  # Connect and read timeouts of every NetSuite call: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s
+  # Account time zone of the record-shape dates and date-times; gives the -07:00 / -08:00 offsets of the
+  # committed api/*-response.json examples
+  time-zone: America/Los_Angeles
+  # Optional custom select field script ID -> select source (custom list or record type) internal ID, e.g.
+  #   custentity8: "16"
+  # A non-empty entry wins over the SuiteQL customfield lookup that otherwise supplies the select typeId. A script
+  # ID containing '_' must be bracketed: "[custentity_fmt_cur_sales_order]": "-30". Empty by default.
+  custom-field-type-ids: {}
+  oauth:
+    # TODO: supply the client ID of the NetSuite OAuth 2.0 M2M integration record
+    client-id: ${NETSUITE_OAUTH_CLIENT_ID:}
+    # TODO: supply the certificate ID of the uploaded M2M certificate (JWT kid)
+    certificate-id: ${NETSUITE_OAUTH_CERTIFICATE_ID:}
+    # TODO: supply the path of the PKCS#8 PEM private key matching that certificate (PS256; file path or classpath: location)
+    private-key-path: ${NETSUITE_OAUTH_PRIVATE_KEY_PATH:}
