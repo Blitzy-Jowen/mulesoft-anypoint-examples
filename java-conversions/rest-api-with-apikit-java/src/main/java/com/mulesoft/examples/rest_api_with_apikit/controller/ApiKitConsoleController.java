@@ -42,7 +42,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StreamUtils;
-import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -61,7 +60,7 @@ import org.springframework.web.util.UriUtils;
  * <ul>
  *   <li>{@code GET <base>/console}: 301 to {@code <base>/console/};</li>
  *   <li>{@code GET <base>/console/} and {@code <base>/console/index.html}: the console page, its RAML source
- *       pointed at {@code ./?} and its attribute placeholder replaced by the handler's options;</li>
+ *       pointed at {@code ./?raml} and its attribute placeholder replaced by the handler's options;</li>
  *   <li>{@code GET <base>/console/<file>}: the console's scripts, styles, fonts and images from the classpath
  *       tree {@code apikit-console/};</li>
  *   <li>{@code GET <base>/console?raml}, {@code GET <base>/console/?raml}, the same paths and {@code GET <base>/}
@@ -81,7 +80,12 @@ import org.springframework.web.util.UriUtils;
  *   <li>the RAML is the raw file with only its {@code baseUri} line rewritten, while APIkit re-dumps the parsed
  *       RAML with every include inlined;</li>
  *   <li>the content types of the include files, which follow the console's extension table, so {@code .json}
- *       files are {@code application/octet-stream}.</li>
+ *       files are {@code application/octet-stream};</li>
+ *   <li>the page's RAML source is {@code ./?raml}, while {@code ConsoleHandler} with its RAML 0.8 parser wrote
+ *       {@code ./?};</li>
+ *   <li>the redirect's {@code Location} is the relative path {@code <base>/console/}, while
+ *       {@code ConsoleHandler} wrote an absolute URL built from the scheme, the {@code Host} header and the
+ *       request path.</li>
  * </ul>
  *
  * <p>Every RAML-backed project carries a copy that differs from this one in the {@code package} line and the
@@ -120,7 +124,7 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
 
     private static final String RAML_CONSOLE_SRC = "<raml-console src=\"[^\"]+\"";
 
-    private static final String RAML_CONSOLE_SRC_RENDERED = "<raml-console src=\"./?\"";
+    private static final String RAML_CONSOLE_SRC_RENDERED = "<raml-console src=\"./?raml\"";
 
     private static final String ATTRIBUTES_PLACEHOLDER = "console-attributes-placeholder";
 
@@ -208,21 +212,19 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     }
 
     /**
-     * The console path without its trailing slash: the RAML when asked for, otherwise a 301 to the same path
-     * with {@code /} appended, the query string kept, as {@code ConsoleHandler} redirected.
+     * The console path without its trailing slash: the RAML when asked for, otherwise a 301 whose
+     * {@code Location} is the relative path {@code <base>/console/}, preceded by the servlet context path and
+     * followed by the query string when there is one. The path is built from the configured console path
+     * alone, so neither the {@code Host} header nor the raw request path reaches the header.
      */
     @GetMapping("${apikit.base-path:/api}/${apikit.console-path:console}")
     public ResponseEntity<byte[]> consoleNoSlash(HttpServletRequest request) {
         if (hasRamlQuery(request) || wantsRaml(request)) {
             return raml(request);
         }
-        String host = request.getHeader(HttpHeaders.HOST);
-        if (!StringUtils.hasText(host)) {
-            host = hostLiteral(request.getServerName()) + ":" + request.getServerPort();
-        }
-        StringBuilder location = new StringBuilder(request.getScheme())
-                .append("://").append(host.trim())
-                .append(request.getRequestURI()).append('/');
+        String contextPath = request.getContextPath();
+        StringBuilder location = new StringBuilder(contextPath == null ? "" : contextPath)
+                .append(UriUtils.encodePath(consolePrefix, StandardCharsets.UTF_8)).append('/');
         String query = request.getQueryString();
         if (query != null && !query.isEmpty()) {
             location.append('?').append(query);
