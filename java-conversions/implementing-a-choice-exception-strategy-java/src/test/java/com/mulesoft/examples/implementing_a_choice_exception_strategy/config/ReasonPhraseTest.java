@@ -11,13 +11,7 @@ package com.mulesoft.examples.implementing_a_choice_exception_strategy.config;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
-import java.io.ByteArrayOutputStream;
-import java.io.EOFException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.Socket;
+import java.lang.reflect.InvocationTargetException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 
@@ -41,13 +35,14 @@ import org.springframework.web.bind.annotation.RestController;
  * HTTP/1.1 status line Undertow writes, and must not outlive the exchange it was set on.
  *
  * <p>Every project that carries {@code ReasonPhrase} carries this test with only the {@code package} line
- * changed, so it depends on {@code ReasonPhrase.set(String)}, Spring Boot, JUnit 5, AssertJ and the JDK alone.
- * The context holds the probe controller and auto-configuration only: no project advice can reshape the probe
- * responses. {@link ProbeConfig} is deliberately not a {@code @SpringBootConfiguration}, so the project's other
- * {@code @SpringBootTest} classes still find exactly one when they search for the application class.
+ * changed, so it depends on {@code ReasonPhrase.set(String)}, the project's ST-1 client, Spring Boot, JUnit 5,
+ * AssertJ and the JDK alone. The context holds the probe controller and auto-configuration only: no project advice
+ * can reshape the probe responses. {@link ProbeConfig} is deliberately not a {@code @SpringBootConfiguration}, so
+ * the project's other {@code @SpringBootTest} classes still find exactly one when they search for the application
+ * class.
  *
- * <p>The status line is read from a plain socket because the JDK and Spring HTTP clients do not expose the reason
- * phrase as sent.
+ * <p>The status line is read through the project's ST-1 client {@code support.HttpTestClient}, located from this
+ * class's package, because the JDK and Spring HTTP clients do not expose the reason phrase as sent.
  */
 @SpringBootTest(
         classes = ReasonPhraseTest.ProbeConfig.class,
@@ -59,14 +54,12 @@ class ReasonPhraseTest {
     private static final String INVALID_INPUT_DATA = "Invalid input data";
     private static final String MISSING_INPUT_DATA = "Missing input data";
 
-    private static final int TIMEOUT_MILLIS = 10_000;
-
     @LocalServerPort
     int port;
 
     @Test
     @DisplayName("custom phrase on 400 -> 'HTTP/1.1 400 Invalid input data' and 'HTTP/1.1 400 Missing input data'")
-    void customReasonPhraseIsSentOnStatusLine() throws IOException {
+    void customReasonPhraseIsSentOnStatusLine() {
         assertThat(statusLine(withPhrase("/reason-phrase-probe/status/400", INVALID_INPUT_DATA)))
                 .isEqualTo("HTTP/1.1 400 Invalid input data");
         assertThat(statusLine(withPhrase("/reason-phrase-probe/status/400", MISSING_INPUT_DATA)))
@@ -75,7 +68,7 @@ class ReasonPhraseTest {
 
     @Test
     @DisplayName("phrase is per exchange: 'HTTP/1.1 400 Invalid input data' then 'HTTP/1.1 400 Bad Request', five times")
-    void reasonPhraseDoesNotLeakIntoNextExchange() throws IOException {
+    void reasonPhraseDoesNotLeakIntoNextExchange() {
         for (int round = 1; round <= 5; round++) {
             assertThat(statusLine(withPhrase("/reason-phrase-probe/status/400", INVALID_INPUT_DATA)))
                     .as("custom phrase, round %d", round)
@@ -88,7 +81,7 @@ class ReasonPhraseTest {
 
     @Test
     @DisplayName("custom phrase on 200 with a body -> 'HTTP/1.1 200 Custom Phrase'; without one -> 'HTTP/1.1 200 OK'")
-    void customReasonPhraseWithSuccessStatusAndBody() throws IOException {
+    void customReasonPhraseWithSuccessStatusAndBody() {
         assertThat(statusLine(withPhrase("/reason-phrase-probe/body/200", "Custom Phrase")))
                 .isEqualTo("HTTP/1.1 200 Custom Phrase");
         assertThat(statusLine("/reason-phrase-probe/status/200"))
@@ -97,7 +90,7 @@ class ReasonPhraseTest {
 
     @Test
     @DisplayName("set(phrase) then set(null) -> 'HTTP/1.1 400 Bad Request'")
-    void nullRestoresStandardReasonPhrase() throws IOException {
+    void nullRestoresStandardReasonPhrase() {
         assertThat(statusLine(withPhrase("/reason-phrase-probe/reset/400", "Temp")))
                 .isEqualTo("HTTP/1.1 400 Bad Request");
     }
@@ -114,36 +107,49 @@ class ReasonPhraseTest {
     }
 
     /**
-     * Sends {@code GET pathAndQuery} on a fresh connection and returns the response's status line without its
-     * line terminator, for example {@code HTTP/1.1 400 Invalid input data}.
+     * Sends {@code GET pathAndQuery} through the project's ST-1 client on a fresh connection and returns the
+     * response's raw status line without its line terminator, for example {@code HTTP/1.1 400 Invalid input data}.
      */
-    private String statusLine(String pathAndQuery) throws IOException {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress("127.0.0.1", port), TIMEOUT_MILLIS);
-            socket.setSoTimeout(TIMEOUT_MILLIS);
+    private String statusLine(String pathAndQuery) {
+        return St1Client.getStatusLine("127.0.0.1", port, pathAndQuery);
+    }
 
-            OutputStream out = socket.getOutputStream();
-            out.write(("GET " + pathAndQuery + " HTTP/1.1\r\n"
-                    + "Host: localhost:" + port + "\r\n"
-                    + "Connection: close\r\n"
-                    + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
-            out.flush();
+    /**
+     * Package-neutral bridge to the project's ST-1 client {@code <project package>.support.HttpTestClient}.
+     *
+     * <p>Every project carrying this test differs from the others only in its {@code package} line, while ST-1
+     * lives in each project's own package, so the client cannot be imported by name. It is located from this
+     * class's package, one level up, and called reflectively through its public API: {@code new
+     * HttpTestClient(String, int)}, {@code get(String)} and {@code Response.statusLine()}. Failures the client
+     * reports pass through unchanged; a missing client or method fails the test naming what is missing.
+     */
+    private static final class St1Client {
 
-            InputStream in = socket.getInputStream();
-            ByteArrayOutputStream line = new ByteArrayOutputStream();
-            int b;
-            while ((b = in.read()) != -1 && b != '\n') {
-                line.write(b);
+        private static final String CLIENT_CLASS = ReasonPhraseTest.class.getPackageName()
+                .substring(0, ReasonPhraseTest.class.getPackageName().lastIndexOf('.')) + ".support.HttpTestClient";
+
+        private St1Client() {
+        }
+
+        static String getStatusLine(String host, int port, String path) {
+            try {
+                Object client = Class.forName(CLIENT_CLASS).getConstructor(String.class, int.class)
+                        .newInstance(host, port);
+                Object response = client.getClass().getMethod("get", String.class).invoke(client, path);
+                return (String) response.getClass().getMethod("statusLine").invoke(response);
+            } catch (InvocationTargetException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException runtimeException) {
+                    throw runtimeException;
+                }
+                if (cause instanceof Error error) {
+                    throw error;
+                }
+                throw new IllegalStateException("ST-1 " + CLIENT_CLASS + " failed on GET " + path, cause);
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("ST-1 client " + CLIENT_CLASS + " with public HttpTestClient(String,"
+                        + " int), get(String) and Response.statusLine() is required: " + e, e);
             }
-            if (b == -1) {
-                throw new EOFException("Connection closed before a complete status line was received for GET "
-                        + pathAndQuery + "; bytes read: '" + line.toString(StandardCharsets.ISO_8859_1) + "'");
-            }
-            // Drain the rest so the server finishes the exchange before the next request opens a connection.
-            in.transferTo(OutputStream.nullOutputStream());
-
-            String statusLine = line.toString(StandardCharsets.ISO_8859_1);
-            return statusLine.endsWith("\r") ? statusLine.substring(0, statusLine.length() - 1) : statusLine;
         }
     }
 
