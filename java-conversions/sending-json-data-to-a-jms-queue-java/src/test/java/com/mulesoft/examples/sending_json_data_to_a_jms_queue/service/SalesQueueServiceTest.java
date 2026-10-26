@@ -21,6 +21,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.stream.Stream;
@@ -46,8 +47,10 @@ import org.springframework.jms.core.JmsTemplate;
  * Spring context and no broker.
  *
  * <p>The byte path, {@link SalesQueueService#send(byte[], String)}, is the transformer: its tests cover the charset
- * a {@code Content-Type} names and every header from which UTF-8 is taken instead, assert the text queued and the
- * bytes returned, and assert that a failed send or an absent body logs nothing.
+ * a {@code Content-Type} names, the JVM's default charset taken when it names none, and every header from which
+ * UTF-8 is taken instead, assert the text queued and the bytes returned, and assert that a failed send or an
+ * absent body logs nothing. {@link SalesQueueService#responseContentType(String)} is checked against the
+ * {@code Content-Type} the original listener derived from each of those headers.
  *
  * <p>The original logger declares no message, so it logged Mule's description of the message, which names the
  * payload's class and never the body. The log tests therefore assert that description and the body's absence
@@ -184,24 +187,31 @@ class SalesQueueServiceTest {
 
     /**
      * A request's {@code Content-Type}, its raw body and the text the transformer must queue. The UTF-8 bodies
-     * carry a multi-byte character, so decoding them with any other charset would queue different text.
+     * carry a multi-byte character, so decoding them with any other charset would queue different text. A
+     * header that names no charset takes the JVM's default charset, so those bodies are encoded with it and the
+     * expected text is what that charset holds of the original.
      */
     static Stream<Arguments> bytePathBodies() {
         String json = "{\n\t\"ITEM_ID\"= 008, \n\t\"ITEM_NAME\" = \"Shirt\u2122\", \n\t\"QTY\" = 1, "
                 + "\n\t\"PRICE\" = 20\n}";
+        String noCharset = "no-charset-payload-14 \u20ac";
         return Stream.of(
-                // No charset parameter on a JSON type: the application encoding, UTF-8.
-                Arguments.of("application/json", utf8(json), json),
+                // No charset parameter on a JSON type: the JVM's default charset, as the original listener set it.
+                Arguments.of("application/json", jvmDefault(json), inJvmDefault(json)),
                 // The named charset: four ISO-8859-1 bytes, the last 0xE9 for the e acute.
                 Arguments.of("text/plain; charset=ISO-8859-1", new byte[] {'C', 'a', 'f', (byte) 0xE9}, "Caf\u00e9"),
+                // The same, with the parameter name in another letter case.
+                Arguments.of("Text/Plain; Charset=ISO-8859-1", new byte[] {'C', 'a', 'f', (byte) 0xE9}, "Caf\u00e9"),
                 Arguments.of(null, utf8("null-type-payload-9 \u20ac"), "null-type-payload-9 \u20ac"),
                 Arguments.of("   ", utf8("blank-type-payload-10 \u20ac"), "blank-type-payload-10 \u20ac"),
                 Arguments.of(";;;", utf8("unparseable-type-payload-11 \u20ac"), "unparseable-type-payload-11 \u20ac"),
                 Arguments.of("text/plain; charset=bogus", utf8("unsupported-charset-payload-12 \u20ac"),
                         "unsupported-charset-payload-12 \u20ac"),
+                Arguments.of("text/plain; CHARSET=bogus", utf8("unsupported-charset-payload-16 \u20ac"),
+                        "unsupported-charset-payload-16 \u20ac"),
                 Arguments.of("text/plain; charset=x*y", utf8("illegal-charset-payload-13 \u20ac"),
                         "illegal-charset-payload-13 \u20ac"),
-                Arguments.of("text/plain", utf8("no-charset-payload-14 \u20ac"), "no-charset-payload-14 \u20ac"),
+                Arguments.of("text/plain", jvmDefault(noCharset), inJvmDefault(noCharset)),
                 Arguments.of("application/json", new byte[0], ""));
     }
 
@@ -213,6 +223,47 @@ class SalesQueueServiceTest {
         verify(jmsTemplate).convertAndSend(eq(SALES), eq(expectedText));
         verifyNoMoreInteractions(jmsTemplate);
         assertThat(result).containsExactly(body);
+    }
+
+    /**
+     * A request's {@code Content-Type} and the response {@code Content-Type} the original listener derived from
+     * it: the lower-cased {@code type/subtype}, {@code "; charset="} and the charset's canonical name, or none
+     * ({@code null}) when the request has none or it is <code>&#42;/&#42;</code>. The {@code charset} parameter
+     * name is read ignoring case, as the original read it. Unparseable headers send none, and an unusable charset
+     * is replaced by UTF-8, the plan defaults the byte path decodes with.
+     */
+    static Stream<Arguments> responseContentTypes() {
+        String jvmDefault = "; charset=" + Charset.defaultCharset().name();
+        return Stream.of(
+                Arguments.of("application/json", "application/json" + jvmDefault),
+                Arguments.of("APPLICATION/JSON", "application/json" + jvmDefault),
+                Arguments.of("application/json; foo=bar", "application/json" + jvmDefault),
+                Arguments.of("application/xml", "application/xml" + jvmDefault),
+                Arguments.of("text/*", "text/*" + jvmDefault),
+                Arguments.of("application/json; charset=UTF-8", "application/json; charset=UTF-8"),
+                Arguments.of("Text/Plain;Charset=ISO-8859-1", "text/plain; charset=ISO-8859-1"),
+                Arguments.of("text/plain; charset=ISO-8859-1", "text/plain; charset=ISO-8859-1"),
+                Arguments.of("text/plain; charset=utf-8", "text/plain; charset=UTF-8"),
+                Arguments.of("text/plain; charset=\"latin1\"", "text/plain; charset=ISO-8859-1"),
+                Arguments.of("text/plain; CHARSET=\"latin1\"", "text/plain; charset=ISO-8859-1"),
+                Arguments.of("text/plain; charset=bogus", "text/plain; charset=UTF-8"),
+                Arguments.of("text/plain; Charset=bogus", "text/plain; charset=UTF-8"),
+                Arguments.of("text/plain; charset=x*y", "text/plain; charset=UTF-8"),
+                Arguments.of("*/*", null),
+                Arguments.of("*/*; charset=ISO-8859-1", null),
+                Arguments.of(null, null),
+                Arguments.of("   ", null),
+                Arguments.of(";;;", null),
+                Arguments.of("text", null));
+    }
+
+    @ParameterizedTest(name = "{index}: Content-Type [{0}]")
+    @MethodSource("responseContentTypes")
+    void responseContentTypeIsTheOneTheOriginalListenerWrote(String requestContentType, String expected) {
+        String actual = new SalesQueueService(jmsTemplate, SALES).responseContentType(requestContentType);
+
+        assertThat(actual).isEqualTo(expected);
+        verifyNoInteractions(jmsTemplate);
     }
 
     @Test
@@ -244,6 +295,15 @@ class SalesQueueServiceTest {
 
     private static byte[] utf8(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static byte[] jvmDefault(String text) {
+        return text.getBytes(Charset.defaultCharset());
+    }
+
+    /** {@code text} as the JVM's default charset holds it: the same text whenever that charset can encode it. */
+    private static String inJvmDefault(String text) {
+        return new String(jvmDefault(text), Charset.defaultCharset());
     }
 
     private static long descriptionCount(CapturedOutput output) {

@@ -18,9 +18,12 @@ import com.mulesoft.examples.dataweave_with_flowreflookup.client.UpstreamSystem;
  * <p>{@code client/UpstreamCallExecutor} throws it when the project's {@code UpstreamFailureClassifier} returns
  * {@code UNAVAILABLE}, that is when the cause chain of the failure holds a timeout
  * ({@link java.net.SocketTimeoutException}, {@link java.net.http.HttpTimeoutException} or Netty's
- * {@code ReadTimeoutException}) or a connectivity failure ({@link java.net.ConnectException},
+ * {@code ReadTimeoutException}), a connectivity failure ({@link java.net.ConnectException},
  * {@link java.net.UnknownHostException}, {@link java.net.NoRouteToHostException} or any other
- * {@link java.net.SocketException}, such as a connection reset). The original failure is kept as the cause.
+ * {@link java.net.SocketException}, such as a connection reset) or a connection the transport found closed or reset
+ * ({@link java.nio.channels.ClosedChannelException}, Reactor Netty's {@code PrematureCloseException} and
+ * {@code AbortedException}, Netty's {@code PrematureChannelClosureException} and {@code NativeIoException}). The
+ * original failure is kept as the cause.
  *
  * <p>The call is never retried: a timed-out or interrupted request may already have been processed by the
  * vendor, so repeating it could submit a write twice, for example a Salesforce {@code sfdc:create}, a Workday

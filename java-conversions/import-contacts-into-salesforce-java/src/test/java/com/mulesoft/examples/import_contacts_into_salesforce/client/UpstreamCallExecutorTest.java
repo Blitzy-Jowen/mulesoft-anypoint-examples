@@ -26,6 +26,8 @@ import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpTimeoutException;
+import java.nio.channels.AsynchronousCloseException;
+import java.nio.channels.ClosedChannelException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -67,9 +69,11 @@ import com.mulesoft.examples.import_contacts_into_salesforce.exception.UpstreamU
  *
  * <p>Covered: the single re-authentication and retry after an authentication rejection, and how a failure of either
  * step ends the attempt; no retry at all for a rate limit, a timeout or a connectivity failure, and the unchanged
- * rethrow of every other failure; the mechanics (interrupt flag, {@link Error}s, upstream exceptions of nested
- * executors, the classifier registry and null arguments); every timeout and connectivity type, Netty's read timeout
- * included; and the default upstream message.
+ * rethrow of every other failure; the mechanics (interrupt flag, the classification of {@link Error}s and of the
+ * upstream exceptions of nested executors, which leave as the same instance unless classified into another
+ * category, the classifier registry and null arguments); every timeout, connectivity and closed-connection type,
+ * Netty's read timeout and the connection closures of Netty and Reactor Netty included; and the default upstream
+ * message.
  *
  * <p>The executor's ERROR line is asserted rather than left unchecked: a Logback {@link ListAppender} on the
  * executor's logger proves that the line names the upstream, the category and the failure's types while no vendor
@@ -79,8 +83,10 @@ import com.mulesoft.examples.import_contacts_into_salesforce.exception.UpstreamU
  * <p>This is the SC-9 reference test. It is copied to every connector project with only the package root changed,
  * in the {@code package} line and in the imports of the project's own SC-9 types, so it depends on the JDK, JUnit,
  * Logback, Byte Buddy (on every project's test classpath through {@code spring-boot-starter-test}) and the SC-9 types
- * alone. Netty's {@code ReadTimeoutException} is defined under its real name by Byte Buddy in a throwaway class
- * loader, so no project needs Netty to run it; where Netty is on the classpath, its real class is checked as well.
+ * alone. The Netty and Reactor Netty types the classifier recognises by name ({@code ReadTimeoutException},
+ * {@code PrematureCloseException}, {@code AbortedException}, {@code PrematureChannelClosureException} and
+ * {@code NativeIoException}) are defined under their real names by Byte Buddy in throwaway class loaders, so no
+ * project needs Netty to run it; where they are on the classpath, the real classes are checked as well.
  */
 class UpstreamCallExecutorTest {
 
@@ -108,6 +114,22 @@ class UpstreamCallExecutorTest {
 
     /** Upper bound on a walk over a cyclic cause chain; a walk that never ends fails here instead of hanging. */
     private static final Duration CYCLE_TIMEOUT = Duration.ofSeconds(5);
+
+    /** What Reactor Netty's {@code PrematureCloseException} says when the server closes before responding. */
+    private static final String PREMATURE_CLOSE_MESSAGE = "Connection prematurely closed BEFORE response";
+
+    /** What Reactor Netty's {@code AbortedException} says when the connection closed before the request was sent. */
+    private static final String ABORTED_MESSAGE = "Connection has been closed BEFORE send operation";
+
+    /** What Netty's {@code PrematureChannelClosureException} says when the connection closes inside the headers. */
+    private static final String PREMATURE_CHANNEL_CLOSURE_MESSAGE = "Connection closed before received headers";
+
+    /** What Netty's native {@code NativeIoException} says for a connection the peer reset. */
+    private static final String NATIVE_IO_MESSAGE = "recvAddress(..) failed: Connection reset by peer";
+
+    /** Netty's native transports, whose {@code isAvailable()} loads the transport's library or reports it absent. */
+    private static final List<String> NATIVE_TRANSPORTS =
+            List.of("io.netty.channel.epoll.Epoll", "io.netty.channel.kqueue.KQueue");
 
     /** Every vendor call and re-authentication in the order the executor made them. */
     private final List<String> journal = new ArrayList<>();
@@ -333,24 +355,129 @@ class UpstreamCallExecutorTest {
     // Mechanics
     // ---------------------------------------------------------------------------------------------------------------
 
-    /** The upstream exception a nested executor raised reaches the caller as the same instance, unclassified. */
-    @ParameterizedTest(name = "{1} at {0}")
-    @MethodSource("nestedUpstreamExceptions")
-    void upstreamExceptionFromACallbackPassesThroughUnclassified(Stage stage, RuntimeException nested) {
-        Attempt attempt = failAt(stage, nested);
+    /**
+     * An {@link Error} or an upstream exception a nested executor raised is classified like any other failure, and
+     * leaves as the same instance, with no ERROR line and no further attempt, when classified {@code OTHER}, as its
+     * own category, as {@code AUTHENTICATION} for a rate-limit or unavailable exception, or as
+     * {@code AUTHENTICATION} for an authentication exception at a stage where that ends the attempt.
+     */
+    @ParameterizedTest(name = "{2} classified {1} at {0}")
+    @MethodSource("failuresRethrownUnchanged")
+    void classifiedFailureCarryingItsOutcomeIsRethrownAsTheSameInstance(Stage stage, Category category,
+            Throwable failure) {
+        classifier.returns(kindOf(category), failure);
 
-        assertSame(nested, attempt.thrown());
+        Attempt attempt = failAt(stage, failure);
+
+        assertSame(failure, attempt.thrown());
         assertEquals(stage.journal, journal);
-        assertEquals(stage == Stage.FIRST_ATTEMPT ? List.of() : List.of(attempt.firstFailure()),
+        assertEquals(stage == Stage.FIRST_ATTEMPT ? List.of(failure) : List.of(attempt.firstFailure(), failure),
                 classifier.classified);
+        assertEquals(stage == Stage.FIRST_ATTEMPT ? 1 : 2, classifier.classifyCalls.get());
         assertEquals(List.of(), lines(Level.ERROR));
     }
 
-    private static Stream<Arguments> nestedUpstreamExceptions() {
+    private static Stream<Arguments> failuresRethrownUnchanged() {
+        return Stream.of(Stage.values()).flatMap(stage -> {
+            List<Arguments> cases = new ArrayList<>(List.of(
+                    Arguments.of(stage, Category.OTHER, new Error("fatal at " + stage)),
+                    Arguments.of(stage, Category.OTHER, nestedAuthentication()),
+                    Arguments.of(stage, Category.OTHER, nestedRateLimit()),
+                    Arguments.of(stage, Category.OTHER, nestedUnavailable()),
+                    Arguments.of(stage, Category.RATE_LIMIT, nestedRateLimit()),
+                    Arguments.of(stage, Category.UNAVAILABLE, nestedUnavailable()),
+                    Arguments.of(stage, Category.AUTHENTICATION, nestedRateLimit()),
+                    Arguments.of(stage, Category.AUTHENTICATION, nestedUnavailable())));
+            if (stage != Stage.FIRST_ATTEMPT) {
+                // At the first attempt an authentication exception is re-authenticated and retried instead.
+                cases.add(Arguments.of(stage, Category.AUTHENTICATION, nestedAuthentication()));
+            }
+            return cases.stream();
+        });
+    }
+
+    /**
+     * An upstream exception a nested executor raised, classified into another category, is translated like a
+     * vendor failure: the category's upstream exception with the nested one as its cause, after one ERROR line.
+     */
+    @ParameterizedTest(name = "{2} classified {1} at {0}")
+    @MethodSource("relabelledUpstreamExceptions")
+    void upstreamExceptionClassifiedIntoAnotherCategoryIsTranslated(Stage stage, Category category,
+            RuntimeException nested) {
+        classifier.returns(kindOf(category), nested);
+
+        Attempt attempt = failAt(stage, nested);
+
+        assertTranslated(category, SYSTEM, nested, attempt.thrown());
+        assertEquals(stage.journal, journal);
+        assertEquals(1, lines(Level.ERROR).size());
+    }
+
+    private static Stream<Arguments> relabelledUpstreamExceptions() {
         return Stream.of(Stage.values()).flatMap(stage -> Stream.of(
-                Arguments.of(stage, new UpstreamAuthenticationException(SYSTEM, "nested rejection", null)),
-                Arguments.of(stage, new UpstreamRateLimitException(SYSTEM, "nested throttle", "5", null)),
-                Arguments.of(stage, new UpstreamUnavailableException(SYSTEM, "nested timeout", null))));
+                Arguments.of(stage, Category.RATE_LIMIT, nestedAuthentication()),
+                Arguments.of(stage, Category.UNAVAILABLE, nestedAuthentication()),
+                Arguments.of(stage, Category.UNAVAILABLE, nestedRateLimit()),
+                Arguments.of(stage, Category.RATE_LIMIT, nestedUnavailable())));
+    }
+
+    /**
+     * An {@link Error} or a nested executor's authentication exception classified {@code AUTHENTICATION} at the
+     * first attempt earns the single re-authentication and retry, as a vendor rejection does.
+     */
+    @ParameterizedTest
+    @MethodSource("authenticationRejectionsOfOtherTypes")
+    void authenticationRejectionOfAnyThrowableTypeIsReauthenticatedAndRetriedOnce(Throwable expired)
+            throws Exception {
+        classifier.returns(UpstreamFailureKind.AUTHENTICATION, expired);
+
+        String result = executor.call(SYSTEM, new ScriptedCall(expired, "records"), reauthenticate());
+
+        assertEquals("records", result);
+        assertEquals(Stage.RETRY.journal, journal);
+        assertEquals(List.of(expired), classifier.classified);
+        assertEquals(1, classifier.classifyCalls.get());
+        assertEquals(List.of(), lines(Level.ERROR));
+    }
+
+    private static Stream<Throwable> authenticationRejectionsOfOtherTypes() {
+        return Stream.of(new Error("session expired"), nestedAuthentication());
+    }
+
+    @Test
+    void nestedAuthenticationExceptionWithoutReauthenticationStepIsRethrownAsTheSameInstance() {
+        UpstreamAuthenticationException nested = classifier.returns(UpstreamFailureKind.AUTHENTICATION,
+                nestedAuthentication());
+
+        Exception thrown = assertThrows(Exception.class, () -> executor.call(SYSTEM, new ScriptedCall(nested), null));
+
+        assertSame(nested, thrown);
+        assertEquals(Stage.FIRST_ATTEMPT.journal, journal);
+        assertEquals(List.of(nested), classifier.classified);
+        assertEquals(List.of(), appender.list);
+    }
+
+    /**
+     * The classifier sees an {@link Error} too: an {@link AssertionError} caused by a read timeout, classified by a
+     * classifier that delegates to {@link UpstreamFailureClassifier#isUnavailable} as the vendor classifiers do,
+     * becomes the unavailable exception at every stage, with its ERROR line and no further attempt.
+     */
+    @ParameterizedTest
+    @EnumSource(Stage.class)
+    void errorWithAnUnavailableCauseIsTranslatedAndNeverRetried(Stage stage) {
+        classifier = ScriptedClassifier.delegatingToIsUnavailable(SYSTEM);
+        executor = new UpstreamCallExecutor(List.of(classifier));
+        AssertionError fatal = new AssertionError("failed at " + stage, new SocketTimeoutException("Read timed out"));
+
+        Attempt attempt = failAt(stage, fatal);
+
+        assertTranslated(Category.UNAVAILABLE, SYSTEM, fatal, attempt.thrown());
+        assertEquals(stage.journal, journal);
+        assertEquals(stage == Stage.FIRST_ATTEMPT ? List.of(fatal) : List.of(attempt.firstFailure(), fatal),
+                classifier.classified);
+        assertEquals(List.of("Upstream " + SYSTEM.displayName() + " call failed [UNAVAILABLE]: "
+                + AssertionError.class.getName() + throwSite(fatal) + " <- " + SocketTimeoutException.class.getName()),
+                lines(Level.ERROR));
     }
 
     @ParameterizedTest
@@ -369,20 +496,6 @@ class UpstreamCallExecutorTest {
         } finally {
             Thread.interrupted();
         }
-    }
-
-    @ParameterizedTest
-    @EnumSource(Stage.class)
-    void errorsAreNeverCaughtOrClassified(Stage stage) {
-        Error fatal = new Error("fatal at " + stage);
-
-        Attempt attempt = failAt(stage, fatal);
-
-        assertSame(fatal, attempt.thrown());
-        assertEquals(stage.journal, journal);
-        assertEquals(stage == Stage.FIRST_ATTEMPT ? List.of() : List.of(attempt.firstFailure()),
-                classifier.classified);
-        assertEquals(List.of(), lines(Level.ERROR));
     }
 
     @Test
@@ -496,7 +609,11 @@ class UpstreamCallExecutorTest {
                 new IllegalStateException("outermost", new VendorException("middle", cause))));
     }
 
-    /** Every timeout and connectivity type, Netty's read timeout and a subtype of it included. */
+    /**
+     * Every timeout, connectivity and closed-connection type: the JDK's, a JDK subtype of
+     * {@link ClosedChannelException}, and the stand-ins of the Netty and Reactor Netty types recognised by name, with
+     * a subtype of each whose real class is not final.
+     */
     private static Stream<Throwable> unavailableCauses() {
         return Stream.of(
                 new SocketTimeoutException("Read timed out"),
@@ -507,7 +624,15 @@ class UpstreamCallExecutorTest {
                 new ConnectException("Connection refused"),
                 new UnknownHostException("vendor.invalid"),
                 new NoRouteToHostException("No route to host"),
-                new SocketException("Connection reset"));
+                new SocketException("Connection reset"),
+                new ClosedChannelException(),
+                new AsynchronousCloseException(),
+                instantiate(NettyStandIns.PREMATURE_CLOSE, PREMATURE_CLOSE_MESSAGE),
+                instantiate(NettyStandIns.ABORTED, ABORTED_MESSAGE),
+                instantiate(NettyStandIns.ABORTED_SUBTYPE, ABORTED_MESSAGE),
+                instantiate(NettyStandIns.PREMATURE_CHANNEL_CLOSURE, PREMATURE_CHANNEL_CLOSURE_MESSAGE),
+                instantiate(NettyStandIns.PREMATURE_CHANNEL_CLOSURE_SUBTYPE, PREMATURE_CHANNEL_CLOSURE_MESSAGE),
+                instantiate(NettyStandIns.NATIVE_IO, NATIVE_IO_MESSAGE));
     }
 
     /**
@@ -541,6 +666,88 @@ class UpstreamCallExecutorTest {
         }
     }
 
+    /**
+     * Pins {@link UpstreamFailureClassifier#REACTOR_PREMATURE_CLOSE_EXCEPTION},
+     * {@link UpstreamFailureClassifier#REACTOR_ABORTED_EXCEPTION},
+     * {@link UpstreamFailureClassifier#NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION} and
+     * {@link UpstreamFailureClassifier#NETTY_NATIVE_IO_EXCEPTION} to the classes Reactor Netty and Netty really throw
+     * in the projects that call through {@code WebClient}; a project without them checks the stand-in of each name
+     * instead, so the case runs, and passes, in every copy.
+     *
+     * @param name the fully qualified name the classifier matches
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {
+            UpstreamFailureClassifier.REACTOR_PREMATURE_CLOSE_EXCEPTION,
+            UpstreamFailureClassifier.REACTOR_ABORTED_EXCEPTION,
+            UpstreamFailureClassifier.NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION,
+            UpstreamFailureClassifier.NETTY_NATIVE_IO_EXCEPTION})
+    void isUnavailableRecognisesEachConnectionClosureWhereverNettyIsPresent(String name) {
+        Throwable closure = connectionClosure(name);
+
+        assertEquals(name, closure.getClass().getName());
+        assertTrue(UpstreamFailureClassifier.isUnavailable(closure));
+        assertTrue(UpstreamFailureClassifier.isUnavailable(new RuntimeException("wrap", closure)));
+        assertTrue(UpstreamFailureClassifier.isUnavailable(new IOException("wrap", closure)));
+    }
+
+    /**
+     * The real throwable named {@code name} when its class is loadable, otherwise its stand-in. The real ones are
+     * Reactor Netty's shared {@code PrematureCloseException.TEST_EXCEPTION}, which is only ever wrapped and never
+     * given a cause, and new instances of {@code AbortedException}, {@code PrematureChannelClosureException} and a
+     * connection-reset {@code NativeIoException}, with the messages the transport writes. {@code NativeIoException}
+     * is real only once a native transport has loaded its library, because its constructor reads the error text from
+     * that library and a failed attempt would leave Netty's {@code Errors} class unusable for every later test in the
+     * JVM; without the library the transport cannot raise it either.
+     */
+    private static Throwable connectionClosure(String name) {
+        Class<?> real;
+        try {
+            real = Class.forName(name, false, UpstreamCallExecutorTest.class.getClassLoader());
+        } catch (ClassNotFoundException absent) {
+            real = null;
+        }
+        try {
+            return switch (name) {
+                case UpstreamFailureClassifier.REACTOR_PREMATURE_CLOSE_EXCEPTION -> real != null
+                        ? (Throwable) real.getField("TEST_EXCEPTION").get(null)
+                        : instantiate(NettyStandIns.PREMATURE_CLOSE, PREMATURE_CLOSE_MESSAGE);
+                case UpstreamFailureClassifier.REACTOR_ABORTED_EXCEPTION -> real != null
+                        ? (Throwable) real.getConstructor(String.class).newInstance(ABORTED_MESSAGE)
+                        : instantiate(NettyStandIns.ABORTED, ABORTED_MESSAGE);
+                case UpstreamFailureClassifier.NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION -> real != null
+                        ? (Throwable) real.getConstructor(String.class).newInstance(PREMATURE_CHANNEL_CLOSURE_MESSAGE)
+                        : instantiate(NettyStandIns.PREMATURE_CHANNEL_CLOSURE, PREMATURE_CHANNEL_CLOSURE_MESSAGE);
+                case UpstreamFailureClassifier.NETTY_NATIVE_IO_EXCEPTION -> real != null && isNativeTransportLoaded()
+                        ? (Throwable) real.getConstructor(String.class, int.class).newInstance("recvAddress",
+                                real.getDeclaringClass().getField("ERRNO_ECONNRESET_NEGATIVE").getInt(null))
+                        : instantiate(NettyStandIns.NATIVE_IO, NATIVE_IO_MESSAGE);
+                default -> throw new IllegalArgumentException("not a connection closure type: " + name);
+            };
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot create " + name, e);
+        }
+    }
+
+    /**
+     * Tells whether one of Netty's native transports ({@link #NATIVE_TRANSPORTS}) is on the classpath and has
+     * loaded its library; asking loads it where the platform supports it, as Reactor Netty itself does.
+     */
+    private static boolean isNativeTransportLoaded() throws ReflectiveOperationException {
+        for (String transport : NATIVE_TRANSPORTS) {
+            Class<?> type;
+            try {
+                type = Class.forName(transport, true, UpstreamCallExecutorTest.class.getClassLoader());
+            } catch (ClassNotFoundException absent) {
+                continue;
+            }
+            if (Boolean.TRUE.equals(type.getMethod("isAvailable").invoke(null))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @ParameterizedTest
     @MethodSource("availableFailures")
     void isUnavailableRejectsEveryOtherFailure(Throwable failure) {
@@ -558,7 +765,15 @@ class UpstreamCallExecutorTest {
                 new TimeoutException("future timed out"),
                 new IllegalStateException("Connection reset"),
                 new VendorException("connection refused"),
-                instantiate(NettyStandIns.SAME_SIMPLE_NAME, "read timed out"));
+                instantiate(NettyStandIns.SAME_SIMPLE_NAME, "read timed out"),
+                new IOException(PREMATURE_CLOSE_MESSAGE),
+                new IllegalStateException(ABORTED_MESSAGE),
+                new IOException(NATIVE_IO_MESSAGE),
+                instantiate(NettyStandIns.PREMATURE_CLOSE_SAME_SIMPLE_NAME, PREMATURE_CLOSE_MESSAGE),
+                instantiate(NettyStandIns.ABORTED_SAME_SIMPLE_NAME, ABORTED_MESSAGE),
+                instantiate(NettyStandIns.PREMATURE_CHANNEL_CLOSURE_SAME_SIMPLE_NAME,
+                        PREMATURE_CHANNEL_CLOSURE_MESSAGE),
+                instantiate(NettyStandIns.NATIVE_IO_SAME_SIMPLE_NAME, NATIVE_IO_MESSAGE));
     }
 
     @Test
@@ -800,6 +1015,21 @@ class UpstreamCallExecutorTest {
         };
     }
 
+    /** An authentication exception as a nested executor raises it. */
+    private static UpstreamAuthenticationException nestedAuthentication() {
+        return new UpstreamAuthenticationException(SYSTEM, "nested rejection", null);
+    }
+
+    /** A rate-limit exception as a nested executor raises it, with a {@code Retry-After} of its own. */
+    private static UpstreamRateLimitException nestedRateLimit() {
+        return new UpstreamRateLimitException(SYSTEM, "nested throttle", "5", null);
+    }
+
+    /** An unavailable exception as a nested executor raises it. */
+    private static UpstreamUnavailableException nestedUnavailable() {
+        return new UpstreamUnavailableException(SYSTEM, "nested timeout", null);
+    }
+
     /**
      * Asserts that {@code thrown} is what the executor raises for {@code failure} classified as {@code category}:
      * the category's upstream exception for {@code system}, with {@code failure} as its cause and the upstream's
@@ -903,7 +1133,7 @@ class UpstreamCallExecutorTest {
         }
     }
 
-    private static RuntimeException instantiate(Class<? extends RuntimeException> type, String message) {
+    private static <T extends Throwable> T instantiate(Class<T> type, String message) {
         try {
             return type.getConstructor(String.class).newInstance(message);
         } catch (ReflectiveOperationException e) {
@@ -1024,9 +1254,12 @@ class UpstreamCallExecutorTest {
     }
 
     /**
-     * Netty stand-ins defined by Byte Buddy, each in its own child-first class loader so a Netty jar on the
-     * classpath cannot shadow them: {@code ReadTimeoutException} under its real name, a subtype of it, and an
-     * unrelated class sharing its simple name.
+     * Netty and Reactor Netty stand-ins defined by Byte Buddy, each in its own child-first class loader so a Netty or
+     * Reactor Netty jar on the classpath cannot shadow them: every type {@link UpstreamFailureClassifier#isUnavailable}
+     * recognises by name, under its real name and with its real class's superclass kind ({@code RuntimeException}
+     * for {@code ReadTimeoutException}, {@code AbortedException} and {@code PrematureChannelClosureException},
+     * {@code IOException} for {@code PrematureCloseException} and {@code NativeIoException}); a subtype of each whose
+     * real class is not final; and an unrelated class sharing each simple name.
      */
     private static final class NettyStandIns {
 
@@ -1039,8 +1272,37 @@ class UpstreamCallExecutorTest {
         static final Class<? extends RuntimeException> SAME_SIMPLE_NAME =
                 define("example.transport.ReadTimeoutException", RuntimeException.class);
 
-        private static Class<? extends RuntimeException> define(String name,
-                Class<? extends RuntimeException> superclass) {
+        static final Class<? extends IOException> PREMATURE_CLOSE =
+                define(UpstreamFailureClassifier.REACTOR_PREMATURE_CLOSE_EXCEPTION, IOException.class);
+
+        static final Class<? extends IOException> PREMATURE_CLOSE_SAME_SIMPLE_NAME =
+                define("example.transport.PrematureCloseException", IOException.class);
+
+        static final Class<? extends RuntimeException> ABORTED =
+                define(UpstreamFailureClassifier.REACTOR_ABORTED_EXCEPTION, RuntimeException.class);
+
+        static final Class<? extends RuntimeException> ABORTED_SUBTYPE =
+                define("example.transport.SendAbortedException", ABORTED);
+
+        static final Class<? extends RuntimeException> ABORTED_SAME_SIMPLE_NAME =
+                define("example.transport.AbortedException", RuntimeException.class);
+
+        static final Class<? extends RuntimeException> PREMATURE_CHANNEL_CLOSURE =
+                define(UpstreamFailureClassifier.NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION, RuntimeException.class);
+
+        static final Class<? extends RuntimeException> PREMATURE_CHANNEL_CLOSURE_SUBTYPE =
+                define("example.transport.HeaderChannelClosureException", PREMATURE_CHANNEL_CLOSURE);
+
+        static final Class<? extends RuntimeException> PREMATURE_CHANNEL_CLOSURE_SAME_SIMPLE_NAME =
+                define("example.transport.PrematureChannelClosureException", RuntimeException.class);
+
+        static final Class<? extends IOException> NATIVE_IO =
+                define(UpstreamFailureClassifier.NETTY_NATIVE_IO_EXCEPTION, IOException.class);
+
+        static final Class<? extends IOException> NATIVE_IO_SAME_SIMPLE_NAME =
+                define("example.transport.Errors$NativeIoException", IOException.class);
+
+        private static <T extends Throwable> Class<? extends T> define(String name, Class<T> superclass) {
             ClassLoader parent = superclass.getClassLoader() != null
                     ? superclass.getClassLoader()
                     : UpstreamCallExecutorTest.class.getClassLoader();

@@ -23,6 +23,7 @@ import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.net.http.HttpTimeoutException;
+import java.nio.channels.ClosedChannelException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -42,7 +43,12 @@ import org.springframework.http.HttpStatus;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
+import io.netty.channel.epoll.Epoll;
+import io.netty.channel.unix.Errors;
+import io.netty.handler.codec.PrematureChannelClosureException;
 import io.netty.handler.timeout.ReadTimeoutException;
+import reactor.netty.channel.AbortedException;
+import reactor.netty.http.client.PrematureCloseException;
 
 import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamAuthenticationException;
 import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamRateLimitException;
@@ -61,7 +67,7 @@ import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamU
  *
  * <p>This is the reference copy of an SC-16 test: {@code netsuite-data-retrieval-java} carries it with only the
  * {@code package} line and the project prefix of the {@code exception} imports changed, so it uses nothing beyond
- * the SC-9 and SC-16 types, Spring's web types, Netty, the JDK, JUnit 5 and AssertJ.
+ * the SC-9 and SC-16 types, Spring's web types, Netty, Reactor Netty, the JDK, JUnit 5 and AssertJ.
  */
 class NetsuiteFailureClassifierTest {
 
@@ -187,15 +193,33 @@ class NetsuiteFailureClassifierTest {
     // Timeouts and connectivity failures → unavailable, never retried
     // ---------------------------------------------------------------------------------------------------------------
 
+    /**
+     * Every timeout and connectivity cause, the closed-connection failures Reactor Netty and Netty raise beneath
+     * {@code WebClient} included. Reactor Netty's {@code PrematureCloseException} is its shared
+     * {@code TEST_EXCEPTION}, which the cases only wrap and never give a cause. The native transport's
+     * connection-reset {@code NativeIoException} is present where the epoll transport loads, because its constructor
+     * needs that transport's library, without which the transport cannot raise it either.
+     */
     static Stream<Named<Throwable>> unavailableCauses() {
-        return Stream.of(
+        Stream<Named<Throwable>> causes = Stream.of(
                 named("SocketTimeoutException", new SocketTimeoutException("Read timed out")),
                 named("HttpTimeoutException", new HttpTimeoutException("request timed out")),
                 named("Netty ReadTimeoutException", ReadTimeoutException.INSTANCE),
                 named("ConnectException", new ConnectException("Connection refused")),
                 named("UnknownHostException", new UnknownHostException("tstdrv.suitetalk.api.netsuite.com")),
                 named("NoRouteToHostException", new NoRouteToHostException("No route to host")),
-                named("SocketException (connection reset)", new SocketException("Connection reset")));
+                named("SocketException (connection reset)", new SocketException("Connection reset")),
+                named("Reactor Netty PrematureCloseException", PrematureCloseException.TEST_EXCEPTION),
+                named("Reactor Netty AbortedException",
+                        new AbortedException("Connection has been closed BEFORE send operation")),
+                named("Netty PrematureChannelClosureException",
+                        new PrematureChannelClosureException("Connection closed before received headers")),
+                named("ClosedChannelException", new ClosedChannelException()));
+        if (!Epoll.isAvailable()) {
+            return causes;
+        }
+        return Stream.concat(causes, Stream.of(named("Netty NativeIoException (connection reset by peer)",
+                new Errors.NativeIoException("recvAddress", Errors.ERRNO_ECONNRESET_NEGATIVE))));
     }
 
     @ParameterizedTest

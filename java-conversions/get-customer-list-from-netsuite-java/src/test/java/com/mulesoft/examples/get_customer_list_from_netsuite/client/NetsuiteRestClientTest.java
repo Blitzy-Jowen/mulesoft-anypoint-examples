@@ -28,6 +28,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.get_customer_list_from_netsuite.config.NetsuiteProperties;
 import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamAuthenticationException;
@@ -638,6 +639,33 @@ class NetsuiteRestClientTest {
     @FunctionalInterface
     interface TimedOutCall {
         void invoke(NetsuiteRestClient client);
+    }
+
+    /**
+     * NetSuite's side closing or resetting the connection, before or during the response, is unavailable after
+     * exactly one request, with no token eviction: the failure reaches the classifier as the real {@code WebClient}
+     * chain (for example Reactor Netty's {@code PrematureCloseException}, or a connection reset reported by the
+     * native or the JDK transport), not as a hand-built cause.
+     */
+    @ParameterizedTest(name = "{0}: {2}")
+    @MethodSource("droppedConnections")
+    void droppedConnectionIsUnavailableAfterExactlyOneRequest(String name, TimedOutCall call, Fault fault) {
+        netsuite.stubFor(post(anyUrl()).willReturn(aResponse().withFault(fault)));
+
+        assertThatThrownBy(() -> call.invoke(client)).isInstanceOfSatisfying(UpstreamUnavailableException.class,
+                e -> assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE));
+
+        verify(tokenProvider, never()).evict();
+        await().atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> netsuite.verify(1, anyRequestedFor(anyUrl())));
+        netsuite.verify(1, anyRequestedFor(anyUrl()));
+    }
+
+    /** Each call of {@link #timedOutCalls()} against each way WireMock drops the connection. */
+    static Stream<Arguments> droppedConnections() {
+        return timedOutCalls().flatMap(call -> Stream.of(Fault.EMPTY_RESPONSE, Fault.CONNECTION_RESET_BY_PEER,
+                        Fault.RANDOM_DATA_THEN_CLOSE, Fault.MALFORMED_RESPONSE_CHUNK)
+                .map(fault -> Arguments.of(call.get()[0], call.get()[1], fault)));
     }
 
     @ParameterizedTest(name = "{0}")

@@ -9,14 +9,15 @@
 package com.mulesoft.examples.sending_json_data_to_a_jms_queue.controller;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
-import org.springframework.http.MediaType;
+import io.undertow.servlet.handlers.ServletRequestContext;
+import io.undertow.util.Headers;
+
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -32,7 +33,8 @@ import com.mulesoft.examples.sending_json_data_to_a_jms_queue.service.SalesQueue
  * <ul>
  *   <li>line 6, {@code http:listener path="sales" allowedMethods="POST"}: this class, mapped to {@code POST /sales}
  *       with no {@code consumes}, {@code produces}, parameter or header condition, because the Mule listener
- *       accepted any {@code Content-Type} and ignored {@code Accept};</li>
+ *       accepted any {@code Content-Type} and ignored {@code Accept}; the listener matched the method ignoring
+ *       case, which {@code config.ListenerMethodFilter} reproduces ahead of this mapping;</li>
  *   <li>line 8, {@code byte-array-to-string-transformer}: {@link SalesQueueService#send(byte[], String)}, which
  *       this class hands the raw body bytes and the raw {@code Content-Type} header;</li>
  *   <li>lines 9-10, the one-way {@code jms:outbound-endpoint queue="sales"} and the {@code logger}:
@@ -40,12 +42,16 @@ import com.mulesoft.examples.sending_json_data_to_a_jms_queue.service.SalesQueue
  * </ul>
  * The body is never parsed or validated: the example's own sample body is not valid JSON and is forwarded
  * untouched. The response is 200 with the payload the flow ends with, which is the request body, so the response
- * bytes equal the request bytes for every body valid in its charset.
+ * bytes equal the request bytes for every body valid in its charset. Its {@code Content-Type} is the one the
+ * listener derived from the message: the request's lower-cased {@code type/subtype} with
+ * {@code "; charset="} and the charset the body was decoded with, or no header when the request has no
+ * {@code Content-Type}; see {@link SalesQueueService#responseContentType(String)}.
  *
  * <p>Plan defaults, each a verification point for fixtures captured from the original application:
  * <ul>
- *   <li>a request without {@code Content-Type} is decoded as UTF-8 and answered with
- *       {@code text/plain;charset=UTF-8};</li>
+ *   <li>a {@code Content-Type} that cannot be parsed, or that names a charset the JVM cannot use, is decoded as
+ *       UTF-8; the response carries no {@code Content-Type} for the first, and the request's type with
+ *       {@code charset=UTF-8} for the second;</li>
  *   <li>an empty body is sent to the queue as the empty string and answered with an empty body;</li>
  *   <li>an {@code application/x-www-form-urlencoded} body, which curl's {@code -d} sends, is passed through as raw
  *       bytes, whereas the Mule listener turned such a body into a parameter map;</li>
@@ -61,9 +67,6 @@ public class SalesController {
     private static final String PATH = "/sales";
 
     private static final String ALLOWED_METHOD = "POST";
-
-    /** Content-Type of a response to a request that names none; renders as {@code text/plain;charset=UTF-8}. */
-    private static final MediaType DEFAULT_CONTENT_TYPE = new MediaType("text", "plain", StandardCharsets.UTF_8);
 
     private final SalesQueueService salesQueueService;
 
@@ -86,9 +89,10 @@ public class SalesController {
      * <p>The raw body bytes and the raw {@code Content-Type} header go to
      * {@link SalesQueueService#send(byte[], String)}, which decodes, sends and logs, and returns the response body
      * bytes. The response is written to the servlet response directly, so content negotiation can never reject it.
-     * Its {@code Content-Type} is the request's, unchanged, or {@link #DEFAULT_CONTENT_TYPE} when the request has
-     * none. The body is written as the bytes the service returns, because the writer would fail on an echoed
-     * charset name the JVM does not support.
+     * Its {@code Content-Type} is the value {@link SalesQueueService#responseContentType(String)} builds, written
+     * byte for byte, or no header at all when that value is {@code null}. The body is written as the bytes the
+     * service returns, already encoded with the charset that header names; a writer would re-encode the text with
+     * the servlet response's own charset.
      *
      * @param request  the {@code POST /sales} request
      * @param response the response the echoed payload is written to
@@ -103,9 +107,12 @@ public class SalesController {
         byte[] body = request.getInputStream().readAllBytes();
 
         byte[] out = salesQueueService.send(body, rawContentType);
+        String contentType = salesQueueService.responseContentType(rawContentType);
 
         response.setStatus(HttpServletResponse.SC_OK);
-        response.setContentType(isBlank(rawContentType) ? DEFAULT_CONTENT_TYPE.toString() : rawContentType);
+        if (contentType != null) {
+            writeContentType(response, contentType);
+        }
         response.setContentLength(out.length);
         ServletOutputStream stream = response.getOutputStream();
         stream.write(out);
@@ -129,7 +136,21 @@ public class SalesController {
         throw new HttpRequestMethodNotSupportedException(request.getMethod(), Set.of(ALLOWED_METHOD));
     }
 
-    private static boolean isBlank(String value) {
-        return value == null || value.isBlank();
+    /**
+     * Writes {@code contentType} as the response's {@code Content-Type} header, byte for byte.
+     *
+     * <p>Undertow's {@code HttpServletResponse.setContentType}, and {@code setHeader("Content-Type", ...)}, which
+     * delegates to it, rewrite the value as {@code type;charset=X}, dropping the space the original listener wrote
+     * after the {@code ;}. The header is therefore put on the Undertow exchange behind the current request, which
+     * sends it verbatim. Without an Undertow request on the calling thread (another servlet container, MockMvc)
+     * the servlet API is used instead.
+     */
+    private static void writeContentType(HttpServletResponse response, String contentType) {
+        ServletRequestContext context = ServletRequestContext.current();
+        if (context == null) {
+            response.setContentType(contentType);
+        } else {
+            context.getExchange().getResponseHeaders().put(Headers.CONTENT_TYPE, contentType);
+        }
     }
 }

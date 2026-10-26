@@ -19,7 +19,9 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * The default component scan from this package wires the classes that carry the flow:
  * <ul>
  *   <li>{@code controller.SalesController}, the HTTP listener;</li>
+ *   <li>{@code config.ListenerMethodFilter}, the listener's case-insensitive match of its allowed method;</li>
  *   <li>{@code service.SalesQueueService}, the transformer, the queue send and the logger;</li>
+ *   <li>{@code config.ArtemisClientConfig}, the {@code jms.call-timeout} bound on each blocking call of the send;</li>
  *   <li>{@code exception.GlobalExceptionHandler}, the listener's and runtime's default error responses.</li>
  * </ul>
  *

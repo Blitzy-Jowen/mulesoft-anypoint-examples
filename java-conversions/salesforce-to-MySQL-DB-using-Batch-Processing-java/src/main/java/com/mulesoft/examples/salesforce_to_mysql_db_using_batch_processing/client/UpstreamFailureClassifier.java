@@ -12,6 +12,7 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.net.http.HttpTimeoutException;
+import java.nio.channels.ClosedChannelException;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Objects;
@@ -31,8 +32,11 @@ import java.util.Set;
  * so no vendor can retry them and no write is ever submitted twice.
  *
  * <p>The interface depends on the JDK and its SC-9 siblings alone so that every connector project can copy it with
- * only its {@code package} line changed. In particular it has no Netty dependency: Netty's read timeout is
- * recognised by class name ({@link #NETTY_READ_TIMEOUT_EXCEPTION}).
+ * only its {@code package} line changed. In particular it has no Netty or Reactor Netty dependency: the read timeout
+ * and the connection closures those transports raise beneath {@code WebClient} are recognised by class name
+ * ({@link #NETTY_READ_TIMEOUT_EXCEPTION}, {@link #REACTOR_PREMATURE_CLOSE_EXCEPTION},
+ * {@link #REACTOR_ABORTED_EXCEPTION}, {@link #NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION} and
+ * {@link #NETTY_NATIVE_IO_EXCEPTION}).
  */
 public interface UpstreamFailureClassifier {
 
@@ -42,6 +46,36 @@ public interface UpstreamFailureClassifier {
      * the classpath compile and classify the same way.
      */
     String NETTY_READ_TIMEOUT_EXCEPTION = "io.netty.handler.timeout.ReadTimeoutException";
+
+    /**
+     * Fully qualified name of Reactor Netty's {@code PrematureCloseException}, the {@code IOException} (not a
+     * {@code SocketException}, and often without any cause) that {@code WebClient} carries when the connection closes
+     * before or during the response ("Connection prematurely closed BEFORE response", "... DURING response").
+     * Matched by name, as {@link #NETTY_READ_TIMEOUT_EXCEPTION} is.
+     */
+    String REACTOR_PREMATURE_CLOSE_EXCEPTION = "reactor.netty.http.client.PrematureCloseException";
+
+    /**
+     * Fully qualified name of Reactor Netty's {@code AbortedException}, the {@code RuntimeException} raised when the
+     * connection has closed before the request could be written ("Connection has been closed BEFORE send
+     * operation"). Matched by name, as {@link #NETTY_READ_TIMEOUT_EXCEPTION} is.
+     */
+    String REACTOR_ABORTED_EXCEPTION = "reactor.netty.channel.AbortedException";
+
+    /**
+     * Fully qualified name of Netty's {@code PrematureChannelClosureException}, the {@code RuntimeException} its HTTP
+     * client codec raises when the connection closes before the response headers have arrived ("Connection closed
+     * before received headers"). Matched by name, as {@link #NETTY_READ_TIMEOUT_EXCEPTION} is.
+     */
+    String NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION = "io.netty.handler.codec.PrematureChannelClosureException";
+
+    /**
+     * Binary name, as {@link Class#getName()} returns it, of Netty's {@code Errors.NativeIoException}: the
+     * {@code IOException} (not a {@code SocketException}) the native epoll and kqueue transports raise when a socket
+     * operation fails, for example a connection reset by the peer ("recvAddress(..) failed: Connection reset by
+     * peer"). Matched by name, as {@link #NETTY_READ_TIMEOUT_EXCEPTION} is.
+     */
+    String NETTY_NATIVE_IO_EXCEPTION = "io.netty.channel.unix.Errors$NativeIoException";
 
     /**
      * Returns the upstream system this classifier serves.
@@ -104,9 +138,16 @@ public interface UpstreamFailureClassifier {
      *       {@link #NETTY_READ_TIMEOUT_EXCEPTION} on its class or a superclass;</li>
      *   <li>a connectivity failure: {@link UnknownHostException} (DNS failure) or any {@link SocketException},
      *       which covers {@code ConnectException} (connection refused), {@code NoRouteToHostException}, Netty's
-     *       connect timeouts and a connection reset.</li>
+     *       connect timeouts and a connection reset reported by the JDK's sockets;</li>
+     *   <li>a connection the transport found closed or reset: {@link ClosedChannelException} (Netty's stackless
+     *       variant included), Reactor Netty's {@code PrematureCloseException} and {@code AbortedException}, Netty's
+     *       {@code PrematureChannelClosureException} and the native transports' {@code NativeIoException}, the last
+     *       four matched by {@link #REACTOR_PREMATURE_CLOSE_EXCEPTION}, {@link #REACTOR_ABORTED_EXCEPTION},
+     *       {@link #NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION} and {@link #NETTY_NATIVE_IO_EXCEPTION} on its class or
+     *       a superclass.</li>
      * </ul>
-     * No other type qualifies. The walk visits each throwable once, so it terminates on a cyclic cause chain.
+     * No other type qualifies, whatever its message or simple name: a type is recognised by itself or by its fully
+     * qualified name alone. The walk visits each throwable once, so it terminates on a cyclic cause chain.
      *
      * @param failure the throwable to inspect; may be {@code null}
      * @return {@code true} when the cause chain holds a timeout or connectivity failure; {@code false} otherwise,
@@ -132,15 +173,33 @@ public interface UpstreamFailureClassifier {
         if (throwable instanceof SocketTimeoutException
                 || throwable instanceof HttpTimeoutException
                 || throwable instanceof UnknownHostException
-                || throwable instanceof SocketException) {
+                || throwable instanceof SocketException
+                || throwable instanceof ClosedChannelException) {
             return true;
         }
         for (Class<?> type = throwable.getClass(); type != null; type = type.getSuperclass()) {
-            if (NETTY_READ_TIMEOUT_EXCEPTION.equals(type.getName())) {
+            if (isTransportFailureName(type.getName())) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * Tells whether a fully qualified class name is one of the Netty and Reactor Netty failure types that
+     * {@link #isUnavailable} recognises by name.
+     *
+     * @param className the name {@link Class#getName()} returned; never {@code null}
+     * @return {@code true} for {@link #NETTY_READ_TIMEOUT_EXCEPTION}, {@link #REACTOR_PREMATURE_CLOSE_EXCEPTION},
+     *         {@link #REACTOR_ABORTED_EXCEPTION}, {@link #NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION} and
+     *         {@link #NETTY_NATIVE_IO_EXCEPTION}; {@code false} for every other name
+     */
+    private static boolean isTransportFailureName(String className) {
+        return switch (className) {
+            case NETTY_READ_TIMEOUT_EXCEPTION, REACTOR_PREMATURE_CLOSE_EXCEPTION, REACTOR_ABORTED_EXCEPTION,
+                    NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION, NETTY_NATIVE_IO_EXCEPTION -> true;
+            default -> false;
+        };
     }
 
     /**

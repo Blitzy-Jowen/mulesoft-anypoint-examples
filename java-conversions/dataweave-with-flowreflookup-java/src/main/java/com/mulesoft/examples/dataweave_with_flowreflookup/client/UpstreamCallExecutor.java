@@ -58,8 +58,13 @@ import com.mulesoft.examples.dataweave_with_flowreflookup.exception.UpstreamUnav
  * poll-triggered projects, which have no caller to answer, rely on that line. The upstream's message is carried
  * only by the raised exception, for the caller; neither it nor any other exception text, suppressed exception or
  * stack trace is logged, because vendor text can repeat request data, identifiers or tokens and can carry line
- * breaks that forge log lines. An upstream exception thrown by a callback, for example by a nested
- * executor, passes through unclassified. {@link Error}s are never caught. A caught {@link InterruptedException}
+ * breaks that forge log lines. Every throwable either callback raises is classified, {@link Error}s and the
+ * upstream exceptions of a nested executor included. An upstream exception that already carries its outcome
+ * leaves as the same instance, with no second ERROR line, no re-wrapping and no retry: a rate-limit or
+ * unavailable exception classified as its own category or as {@code AUTHENTICATION}, and an authentication
+ * exception classified {@code AUTHENTICATION} where that ends the attempt. At a first attempt that has a
+ * {@code reauthenticate} step, an authentication exception classified {@code AUTHENTICATION} is re-authenticated
+ * and retried once like any other rejection. A caught {@link InterruptedException}
  * restores the thread's interrupt flag before it is classified.
  *
  * <p>The executor is stateless apart from its immutable classifier registry, so one instance serves concurrent
@@ -136,6 +141,8 @@ public class UpstreamCallExecutor {
      * @throws UpstreamUnavailableException    the vendor timed out or could not be reached
      * @throws IllegalStateException           no classifier is registered for {@code system}; nothing is invoked
      * @throws Exception                       the vendor's own exception, unchanged, for any other failure
+     * @throws Error                           an {@link Error} a callback raised and the classifier answered
+     *                                         {@code OTHER} for, rethrown unchanged too
      */
     public <T> T call(UpstreamSystem system, UpstreamCall<T> call, UpstreamAction reauthenticate) throws Exception {
         Objects.requireNonNull(system, "system");
@@ -143,10 +150,11 @@ public class UpstreamCallExecutor {
         UpstreamFailureClassifier classifier = classifierFor(system);
         try {
             return call.call();
-        } catch (UpstreamAuthenticationException | UpstreamRateLimitException | UpstreamUnavailableException e) {
-            throw e;
-        } catch (Exception failure) {
+        } catch (Throwable failure) {
             UpstreamFailureKind kind = classify(classifier, failure);
+            if (rethrownUnchanged(kind, failure, reauthenticate == null)) {
+                throw failure;
+            }
             if (kind.category() != Category.AUTHENTICATION) {
                 throw translate(system, classifier, kind, failure);
             }
@@ -184,7 +192,7 @@ public class UpstreamCallExecutor {
      * attempt whatever either step yields.
      */
     private <T> T reauthenticateAndRetry(UpstreamSystem system, UpstreamFailureClassifier classifier,
-            UpstreamCall<T> call, UpstreamAction reauthenticate, Exception firstFailure) throws Exception {
+            UpstreamCall<T> call, UpstreamAction reauthenticate, Throwable firstFailure) throws Exception {
         if (reauthenticate == null) {
             throw authenticationFailure(system, classifier, firstFailure);
         }
@@ -192,19 +200,46 @@ public class UpstreamCallExecutor {
                 system.displayName(), Category.AUTHENTICATION);
         try {
             reauthenticate.run();
-        } catch (UpstreamAuthenticationException | UpstreamRateLimitException | UpstreamUnavailableException e) {
-            throw e;
-        } catch (Exception reauthenticationFailure) {
-            throw translate(system, classifier, classify(classifier, reauthenticationFailure),
-                    reauthenticationFailure);
+        } catch (Throwable reauthenticationFailure) {
+            UpstreamFailureKind kind = classify(classifier, reauthenticationFailure);
+            if (rethrownUnchanged(kind, reauthenticationFailure, true)) {
+                throw reauthenticationFailure;
+            }
+            throw translate(system, classifier, kind, reauthenticationFailure);
         }
         try {
             return call.call();
-        } catch (UpstreamAuthenticationException | UpstreamRateLimitException | UpstreamUnavailableException e) {
-            throw e;
-        } catch (Exception retryFailure) {
-            throw translate(system, classifier, classify(classifier, retryFailure), retryFailure);
+        } catch (Throwable retryFailure) {
+            UpstreamFailureKind kind = classify(classifier, retryFailure);
+            if (rethrownUnchanged(kind, retryFailure, true)) {
+                throw retryFailure;
+            }
+            throw translate(system, classifier, kind, retryFailure);
         }
+    }
+
+    /**
+     * Tells whether a classified failure leaves the executor as the same instance: always for {@code OTHER}, so
+     * the caller's original exception branch receives the vendor type, and for an upstream exception that
+     * already carries its outcome, because the nested executor that raised it has logged it and applied its own
+     * retry. A rate-limit or unavailable exception keeps its category even when classified
+     * {@code AUTHENTICATION}, so it is never re-authenticated, retried or relabelled. An authentication exception
+     * classified {@code AUTHENTICATION} leaves unchanged only where that classification ends the attempt.
+     *
+     * @param authenticationFinal {@code true} where an authentication rejection ends the attempt: at the
+     *                            re-authentication step, at the retry, and at a first attempt without a
+     *                            {@code reauthenticate} step
+     */
+    private static boolean rethrownUnchanged(UpstreamFailureKind kind, Throwable failure,
+            boolean authenticationFinal) {
+        return switch (kind.category()) {
+            case OTHER -> true;
+            case RATE_LIMIT -> failure instanceof UpstreamRateLimitException;
+            case UNAVAILABLE -> failure instanceof UpstreamUnavailableException;
+            case AUTHENTICATION -> failure instanceof UpstreamRateLimitException
+                    || failure instanceof UpstreamUnavailableException
+                    || (authenticationFinal && failure instanceof UpstreamAuthenticationException);
+        };
     }
 
     /**
@@ -212,7 +247,7 @@ public class UpstreamCallExecutor {
      * A classifier that breaks its contract by returning {@code null} is read as {@code OTHER}, so the vendor
      * failure is rethrown rather than lost.
      */
-    private static UpstreamFailureKind classify(UpstreamFailureClassifier classifier, Exception failure) {
+    private static UpstreamFailureKind classify(UpstreamFailureClassifier classifier, Throwable failure) {
         restoreInterrupt(failure);
         UpstreamFailureKind kind = classifier.classify(failure);
         return kind != null ? kind : UpstreamFailureKind.OTHER;
@@ -225,23 +260,26 @@ public class UpstreamCallExecutor {
     }
 
     /**
-     * Returns the exception to throw for a classified failure: one of the three upstream exceptions, or for
-     * {@code OTHER} the failure itself, unwrapped and unlogged, for the caller's original exception branch.
+     * Returns the upstream exception to throw for a classified failure that does not leave unchanged, with the
+     * failure as its cause, after its ERROR line. {@code OTHER} never reaches here: the callers rethrow such a
+     * failure itself, unwrapped and unlogged, for the caller's original exception branch.
+     *
+     * @throws IllegalArgumentException if {@code kind} is {@code OTHER}
      */
-    private static Exception translate(UpstreamSystem system, UpstreamFailureClassifier classifier,
-            UpstreamFailureKind kind, Exception failure) {
+    private static RuntimeException translate(UpstreamSystem system, UpstreamFailureClassifier classifier,
+            UpstreamFailureKind kind, Throwable failure) {
         return switch (kind.category()) {
             case AUTHENTICATION -> authenticationFailure(system, classifier, failure);
             case RATE_LIMIT -> new UpstreamRateLimitException(system,
                     logFailure(system, classifier, Category.RATE_LIMIT, failure), kind.retryAfter(), failure);
             case UNAVAILABLE -> new UpstreamUnavailableException(system,
                     logFailure(system, classifier, Category.UNAVAILABLE, failure), failure);
-            case OTHER -> failure;
+            case OTHER -> throw new IllegalArgumentException("An OTHER failure is rethrown unchanged, not translated");
         };
     }
 
     private static UpstreamAuthenticationException authenticationFailure(UpstreamSystem system,
-            UpstreamFailureClassifier classifier, Exception failure) {
+            UpstreamFailureClassifier classifier, Throwable failure) {
         return new UpstreamAuthenticationException(system,
                 logFailure(system, classifier, Category.AUTHENTICATION, failure), failure);
     }
@@ -256,7 +294,7 @@ public class UpstreamCallExecutor {
      * exceptions and stack traces can repeat request data, identifiers or tokens, and can carry line breaks.
      */
     private static String logFailure(UpstreamSystem system, UpstreamFailureClassifier classifier, Category category,
-            Exception failure) {
+            Throwable failure) {
         String message = classifier.upstreamMessage(failure);
         LOG.error("Upstream {} call failed [{}]: {}", system.displayName(), category, describe(failure));
         return message;

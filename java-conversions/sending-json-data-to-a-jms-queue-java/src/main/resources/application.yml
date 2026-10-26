@@ -22,14 +22,23 @@ spring:
     # (vm://localhost?broker.persistent=false); an embedded, non-persistent Artemis server takes its place.
     mode: embedded
     embedded:
-      enabled: true
+      enabled: true       # starts the in-VM broker in any mode: set it to false together with mode: native (below)
       persistent: false
       queues: sales
-    # To send to an external Artemis broker instead (the original README points at tcp://localhost:61616):
+    # To send to an external Artemis broker instead (the original README points at tcp://localhost:61616), replace the
+    # mode and embedded entries above (persistent and queues configure only the in-VM broker) with the settings below.
+    # Boot starts the in-VM broker whenever embedded.enabled is true, whatever the mode, so without enabled: false an
+    # unused in-VM broker would also start:
     #   mode: native
-    #   broker-url: tcp://localhost:61616
+    #   embedded:
+    #     enabled: false
+    #   broker-url: tcp://localhost:61616   # an optional ?callTimeout=<ms> overrides jms.call-timeout
     #   user: ${ARTEMIS_USER:}          # TODO: supply broker user
     #   password: ${ARTEMIS_PASSWORD:}  # TODO: supply broker password
+    # The same switch without editing this file, on the command line:
+    #   --spring.artemis.mode=native --spring.artemis.embedded.enabled=false --spring.artemis.broker-url=tcp://localhost:61616
+    # or as environment variables: SPRING_ARTEMIS_MODE=native SPRING_ARTEMIS_EMBEDDED_ENABLED=false
+    # SPRING_ARTEMIS_BROKER_URL=tcp://localhost:61616 (broker credentials as in the user and password lines above).
   jms:
     pub-sub-domain: false   # jms:outbound-endpoint queue= is point-to-point
     template:
@@ -38,3 +47,9 @@ spring:
       delivery-mode: non-persistent
 jms:
   queue: sales          # jms:outbound-endpoint queue="sales" (json-to-jms.xml:9), read by service/SalesQueueService
+  # ms, positive (0 or less is rejected at start-up): how long each blocking Artemis client call waits for the broker,
+  # set by config/ArtemisClientConfig in both modes instead of Artemis' 30000 default. 10 s is the Mule default
+  # response timeout, the bound the converted connector clients use for connect and read and the sibling AMQP project
+  # uses for every broker wait. A call that times out fails the request once; nothing retries it, because a timeout is
+  # never retried silently. A broker-url ?callTimeout=<ms> other than 30000 takes precedence.
+  call-timeout: 10000

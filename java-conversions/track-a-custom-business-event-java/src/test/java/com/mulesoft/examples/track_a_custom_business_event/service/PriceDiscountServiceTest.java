@@ -1,5 +1,7 @@
 package com.mulesoft.examples.track_a_custom_business_event.service;
 
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -13,10 +15,13 @@ import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -54,6 +59,11 @@ import com.fasterxml.jackson.databind.exc.MismatchedInputException;
  * small JSON literals. Expected texts are literals, so the tests pin the rendering rather than whatever the
  * service computes.
  *
+ * <p>Each body is decoded with the charset its row declares, UTF-8 unless the row shows how the declared charset
+ * governs: Latin-1 bytes read as ISO-8859-1, malformed bytes replaced, a byte-order mark kept as a character.
+ * Nesting depth, number length and string length beyond Jackson's default read constraints are accepted, as the
+ * original transformer accepted them.
+ *
  * <p>The platform-default 500 returns the exception's message, so an unreadable body fails with a fixed text:
  * bodies carrying a marker show that no request bytes and no Java or Jackson type name reach it, and that the
  * parser location chained as its cause quotes none of the body.
@@ -70,6 +80,13 @@ class PriceDiscountServiceTest {
     private static final String NOT_AN_OBJECT = "JSON payload is not an object";
 
     private static final String NOT_VALID_JSON = "Payload is not valid JSON";
+
+    /** A shoes request whose email holds {@code é}, which Latin-1 encodes as the single byte 0xE9. */
+    private static final String CAFE_SHOES = "{\"email\":\"caf\u00e9@abc.sk\",\"item name\":\"shoes\","
+            + "\"item units\":2,\"item price per unit\":10}";
+
+    /** {@link #CAFE_SHOES} with the item name {@code shoés}, outside the discount table once decoded. */
+    private static final String CAFE_SHOES_ACCENTED = CAFE_SHOES.replace("\"shoes\"", "\"sho\u00e9s\"");
 
     /** Text placed in request bodies to show whether any of their bytes reach a message. */
     private static final String MARKER = "BLITZY-MARKER-91c4";
@@ -99,11 +116,11 @@ class PriceDiscountServiceTest {
         assertEquals("item price per unit", PriceDiscountService.ITEM_PRICE_PER_UNIT);
     }
 
-    @ParameterizedTest(name = "{0} -> \"{2}\"")
+    @ParameterizedTest(name = "{0} -> \"{3}\"")
     @MethodSource("discountedRequests")
-    void discountedPriceIsReturnedAndTheTransactionCompleted(String description, byte[] body, String expected,
-            List<String> expectedMetadata) {
-        assertEquals(expected, service.processPriceRequest(body));
+    void discountedPriceIsReturnedAndTheTransactionCompleted(String description, byte[] body, Charset encoding,
+            String expected, List<String> expectedMetadata) {
+        assertEquals(expected, service.processPriceRequest(body, encoding));
 
         InOrder order = inOrder(tracker);
         order.verify(tracker).startTransaction();
@@ -117,30 +134,48 @@ class PriceDiscountServiceTest {
 
     static Stream<Arguments> discountedRequests() throws IOException {
         return Stream.of(
-                Arguments.of("message.json (shoes at 10)", message(), "8.5", List.of("shoes", "2", "10")),
-                Arguments.of("jeans at 10", messageWith(SHOES, "\"jeans\""), "8.0", List.of("jeans", "2", "10")),
-                Arguments.of("jackets at 10", messageWith(SHOES, "\"jackets\""), "7.0",
+                Arguments.of("message.json (shoes at 10)", message(), UTF_8, "8.5", List.of("shoes", "2", "10")),
+                Arguments.of("jeans at 10", messageWith(SHOES, "\"jeans\""), UTF_8, "8.0",
+                        List.of("jeans", "2", "10")),
+                Arguments.of("jackets at 10", messageWith(SHOES, "\"jackets\""), UTF_8, "7.0",
                         List.of("jackets", "2", "10")),
                 Arguments.of("jeans at decimal 12.5",
-                        messageWith(SHOES, "\"jeans\"", PRICE_10, "\"item price per unit\": 12.5"), "10.0",
+                        messageWith(SHOES, "\"jeans\"", PRICE_10, "\"item price per unit\": 12.5"), UTF_8, "10.0",
                         List.of("jeans", "2", "12.5")),
                 Arguments.of("shoes at long 3000000000",
-                        messageWith(PRICE_10, "\"item price per unit\": 3000000000"), "2.55E9",
+                        messageWith(PRICE_10, "\"item price per unit\": 3000000000"), UTF_8, "2.55E9",
                         List.of("shoes", "2", "3000000000")),
                 Arguments.of("shoes at big integer 100000000000000000000",
-                        messageWith(PRICE_10, "\"item price per unit\": 100000000000000000000"), "8.5E19",
+                        messageWith(PRICE_10, "\"item price per unit\": 100000000000000000000"), UTF_8, "8.5E19",
                         List.of("shoes", "2", "100000000000000000000")),
                 Arguments.of("shoes at string \"10\", repeated zero times",
-                        messageWith(PRICE_10, "\"item price per unit\": \"10\""), "",
-                        List.of("shoes", "2", "10")));
+                        messageWith(PRICE_10, "\"item price per unit\": \"10\""), UTF_8, "",
+                        List.of("shoes", "2", "10")),
+                // The declared charset decodes the body: Latin-1 bytes are not valid UTF-8.
+                Arguments.of("Latin-1 body declared as ISO-8859-1", CAFE_SHOES.getBytes(ISO_8859_1), ISO_8859_1,
+                        "8.5", List.of("shoes", "2", "10")),
+                // Decoding replaces the malformed byte 0xE9 with U+FFFD instead of rejecting the body.
+                Arguments.of("Latin-1 body read as UTF-8", CAFE_SHOES.getBytes(ISO_8859_1), UTF_8, "8.5",
+                        List.of("shoes", "2", "10")),
+                // No read limit: nesting, number length and string length beyond Jackson's default constraints.
+                Arguments.of("arrays nested 1500 deep under an extra key", shoesWithExtra(nestedArrays(1_500)),
+                        UTF_8, "8.5", List.of("shoes", "null", "10")),
+                Arguments.of("arrays nested 100000 deep under an extra key", shoesWithExtra(nestedArrays(100_000)),
+                        UTF_8, "8.5", List.of("shoes", "null", "10")),
+                Arguments.of("1001-digit integer price",
+                        json("{\"item name\": \"shoes\", \"item price per unit\": " + "9".repeat(1_001) + "}"),
+                        UTF_8, "Infinity", List.of("shoes", "null", "9".repeat(1_001))),
+                Arguments.of("string of 20000001 characters under an extra key",
+                        shoesWithExtra("\"" + "a".repeat(20_000_001) + "\""), UTF_8, "8.5",
+                        List.of("shoes", "null", "10")));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("scriptFailures")
-    void scriptFailureRaisesTheJRubyErrorAfterTheEventIsTracked(String description, byte[] body,
+    void scriptFailureRaisesTheJRubyErrorAfterTheEventIsTracked(String description, byte[] body, Charset encoding,
             String expectedMessage, List<String> expectedMetadata) {
         IllegalStateException failure =
-                assertThrows(IllegalStateException.class, () -> service.processPriceRequest(body));
+                assertThrows(IllegalStateException.class, () -> service.processPriceRequest(body, encoding));
 
         assertEquals(expectedMessage, failure.getMessage());
         assertNull(failure.getCause());
@@ -157,32 +192,39 @@ class PriceDiscountServiceTest {
     static Stream<Arguments> scriptFailures() throws IOException {
         return Stream.of(
                 // No when-branch matches, so $discount stays nil and (1 - nil) fails before any price is read.
-                Arguments.of("unknown item hats", messageWith(SHOES, "\"hats\""), NIL_DISCOUNT,
+                Arguments.of("unknown item hats", messageWith(SHOES, "\"hats\""), UTF_8, NIL_DISCOUNT,
                         List.of("hats", "2", "10")),
-                Arguments.of("item name differing only in case", messageWith(SHOES, "\"Shoes\""), NIL_DISCOUNT,
-                        List.of("Shoes", "2", "10")),
-                Arguments.of("missing item name", json("{\"item units\": 2, \"item price per unit\": 10}"),
+                Arguments.of("item name differing only in case", messageWith(SHOES, "\"Shoes\""), UTF_8,
+                        NIL_DISCOUNT, List.of("Shoes", "2", "10")),
+                Arguments.of("missing item name", json("{\"item units\": 2, \"item price per unit\": 10}"), UTF_8,
                         NIL_DISCOUNT, List.of("null", "2", "10")),
                 Arguments.of("numeric item name",
-                        json("{\"item name\": 5, \"item units\": 2, \"item price per unit\": 10}"), NIL_DISCOUNT,
-                        List.of("5", "2", "10")),
+                        json("{\"item name\": 5, \"item units\": 2, \"item price per unit\": 10}"), UTF_8,
+                        NIL_DISCOUNT, List.of("5", "2", "10")),
                 Arguments.of("unknown item with a string price",
-                        messageWith(SHOES, "\"hats\"", PRICE_10, "\"item price per unit\": \"10\""), NIL_DISCOUNT,
-                        List.of("hats", "2", "10")),
-                Arguments.of("unknown item without units or price", json("{\"item name\": \"hats\"}"),
+                        messageWith(SHOES, "\"hats\"", PRICE_10, "\"item price per unit\": \"10\""), UTF_8,
+                        NIL_DISCOUNT, List.of("hats", "2", "10")),
+                Arguments.of("unknown item without units or price", json("{\"item name\": \"hats\"}"), UTF_8,
                         NIL_DISCOUNT, List.of("hats", "null", "null")),
+                // The metadata shows the item name as the declared charset decoded it.
+                Arguments.of("accented item name in Latin-1 declared as ISO-8859-1",
+                        CAFE_SHOES_ACCENTED.getBytes(ISO_8859_1), ISO_8859_1, NIL_DISCOUNT,
+                        List.of("sho\u00e9s", "2", "10")),
+                Arguments.of("accented item name in UTF-8 declared as ISO-8859-1",
+                        CAFE_SHOES_ACCENTED.getBytes(UTF_8), ISO_8859_1, NIL_DISCOUNT,
+                        List.of("sho\u00c3\u00a9s", "2", "10")),
                 // A known item whose price has no * method.
-                Arguments.of("null price", messageWith(PRICE_10, "\"item price per unit\": null"),
+                Arguments.of("null price", messageWith(PRICE_10, "\"item price per unit\": null"), UTF_8,
                         "undefined method `*' for nil:NilClass", List.of("shoes", "2", "null")),
-                Arguments.of("missing price", json("{\"item name\": \"shoes\", \"item units\": 2}"),
+                Arguments.of("missing price", json("{\"item name\": \"shoes\", \"item units\": 2}"), UTF_8,
                         "undefined method `*' for nil:NilClass", List.of("shoes", "2", "null")),
                 Arguments.of("object price", messageWith(PRICE_10, "\"item price per unit\": {\"amount\": 10}"),
-                        "undefined method `*' for {amount=10}", List.of("shoes", "2", "{amount=10}")),
-                Arguments.of("array price", messageWith(PRICE_10, "\"item price per unit\": [10]"),
+                        UTF_8, "undefined method `*' for {amount=10}", List.of("shoes", "2", "{amount=10}")),
+                Arguments.of("array price", messageWith(PRICE_10, "\"item price per unit\": [10]"), UTF_8,
                         "undefined method `*' for [10]", List.of("shoes", "2", "[10]")),
-                Arguments.of("true price", messageWith(PRICE_10, "\"item price per unit\": true"),
+                Arguments.of("true price", messageWith(PRICE_10, "\"item price per unit\": true"), UTF_8,
                         "undefined method `*' for true", List.of("shoes", "2", "true")),
-                Arguments.of("false price", messageWith(PRICE_10, "\"item price per unit\": false"),
+                Arguments.of("false price", messageWith(PRICE_10, "\"item price per unit\": false"), UTF_8,
                         "undefined method `*' for false", List.of("shoes", "2", "false")));
     }
 
@@ -191,7 +233,7 @@ class PriceDiscountServiceTest {
     void unreadableBodyRaisesIllegalArgumentBeforeTheEvent(String description, byte[] body,
             Class<? extends Throwable> expectedCause, String expectedMessage) {
         IllegalArgumentException failure =
-                assertThrows(IllegalArgumentException.class, () -> service.processPriceRequest(body));
+                assertThrows(IllegalArgumentException.class, () -> service.processPriceRequest(body, UTF_8));
 
         assertEquals(expectedMessage, failure.getMessage());
         assertMessageDisclosesNothing(failure.getMessage());
@@ -211,7 +253,7 @@ class PriceDiscountServiceTest {
         verifyNoMoreInteractions(tracker);
     }
 
-    static Stream<Arguments> unreadableBodies() {
+    static Stream<Arguments> unreadableBodies() throws IOException {
         return Stream.of(
                 Arguments.of("malformed JSON", json("{\"item name\": "), JsonEOFException.class, NOT_VALID_JSON),
                 Arguments.of("malformed JSON with a marker",
@@ -226,18 +268,34 @@ class PriceDiscountServiceTest {
                         MismatchedInputException.class, NOT_AN_OBJECT),
                 Arguments.of("JSON number", json("42"), MismatchedInputException.class, NOT_AN_OBJECT),
                 Arguments.of("JSON null", json("null"), null, NOT_AN_OBJECT),
-                Arguments.of("no body", null, MismatchedInputException.class, NOT_AN_OBJECT));
+                Arguments.of("no body", null, MismatchedInputException.class, NOT_AN_OBJECT),
+                // Decoded through a reader, a UTF-8 byte-order mark is the character U+FEFF ahead of the object.
+                Arguments.of("UTF-8 byte-order mark before message.json",
+                        concat(new byte[] {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF}, message()),
+                        JsonParseException.class, NOT_VALID_JSON));
+    }
+
+    @Test
+    void nullEncodingIsRejectedBeforeAnythingIsTracked() throws IOException {
+        byte[] body = message();
+
+        NullPointerException failure =
+                assertThrows(NullPointerException.class, () -> service.processPriceRequest(body, null));
+
+        assertEquals("encoding", failure.getMessage());
+        verifyNoInteractions(tracker);
     }
 
     @Test
     void eachRequestStartsWithoutADiscountWhateverWasRequestedBefore() throws IOException {
         byte[] hats = messageWith(SHOES, "\"hats\"");
 
-        assertEquals("8.5", service.processPriceRequest(message()));
+        assertEquals("8.5", service.processPriceRequest(message(), UTF_8));
         IllegalStateException afterShoes =
-                assertThrows(IllegalStateException.class, () -> service.processPriceRequest(hats));
+                assertThrows(IllegalStateException.class, () -> service.processPriceRequest(hats, UTF_8));
         assertEquals(NIL_DISCOUNT, afterShoes.getMessage(), "the shoes discount is not carried to the next request");
-        assertEquals("8.5", service.processPriceRequest(message()), "the failed request leaves no state behind");
+        assertEquals("8.5", service.processPriceRequest(message(), UTF_8),
+                "the failed request leaves no state behind");
 
         verify(tracker, times(3)).startTransaction();
         verify(tracker, times(3)).trackCustomEvent(eq("Price"), any());
@@ -254,16 +312,17 @@ class PriceDiscountServiceTest {
     }
 
     /**
-     * Asserts that the location Jackson appends to the chained cause's message quotes none of the body, which holds
-     * only with source inclusion disabled. The location alone is checked: for a string root Jackson's own text
-     * quotes the string value, whatever the source setting.
+     * Asserts that the location Jackson appends to the chained cause's message quotes none of the body and does not
+     * describe the source either, which holds only with source inclusion disabled; with it enabled the location
+     * would name the reader the body is decoded through. The location alone is checked: for a string root Jackson's
+     * own text quotes the string value, whatever the source setting.
      */
     private static void assertLocationQuotesNoRequestBytes(Throwable cause) {
         JsonProcessingException parserFailure = assertInstanceOf(JsonProcessingException.class, cause);
         String location = parserFailure.getMessage().substring(parserFailure.getOriginalMessage().length());
         assertTrue(location.contains("[Source: "), () -> "cause carries a location: " + location);
         assertFalse(location.contains(MARKER), () -> "location quotes the body: " + location);
-        assertFalse(location.contains("(byte[])"), () -> "location quotes the body: " + location);
+        assertFalse(location.contains("Reader"), () -> "location describes the source: " + location);
     }
 
     /** Asserts the {@code Price} metadata keys in the flow's declaration order and their values. */
@@ -296,5 +355,22 @@ class PriceDiscountServiceTest {
 
     private static byte[] json(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** UTF-8 bytes of a shoes request at price 10, without units, carrying {@code value} under the extra key x. */
+    private static byte[] shoesWithExtra(String value) {
+        return json("{\"item name\": \"shoes\", \"item price per unit\": 10, \"x\": " + value + "}");
+    }
+
+    /** {@code depth} empty arrays nested in one another. */
+    private static String nestedArrays(int depth) {
+        return "[".repeat(depth) + "]".repeat(depth);
+    }
+
+    private static byte[] concat(byte[] first, byte[] second) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(first.length + second.length);
+        bytes.writeBytes(first);
+        bytes.writeBytes(second);
+        return bytes.toByteArray();
     }
 }

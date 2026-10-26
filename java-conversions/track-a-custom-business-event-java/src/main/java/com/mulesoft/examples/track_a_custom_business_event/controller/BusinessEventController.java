@@ -8,11 +8,19 @@
 
 package com.mulesoft.examples.track_a_custom_business_event.controller;
 
+import java.io.IOException;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 
+import jakarta.servlet.ServletOutputStream;
+import jakarta.servlet.http.HttpServletResponse;
+
+import io.undertow.servlet.handlers.ServletRequestContext;
+import io.undertow.util.Headers;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -27,8 +35,8 @@ import com.mulesoft.examples.track_a_custom_business_event.service.PriceDiscount
  *
  * <p>The listener declares no {@code allowedMethods}, so every method is accepted and handled alike: a GET or PUT
  * carrying the JSON body is processed exactly as a POST. No handler declares {@code consumes} or {@code produces}:
- * the original JSON transformer ignored the request's {@code Content-Type}, and the response's Content-Type is
- * preset, so Spring writes the body without consulting {@code Accept} and never answers 406 or 415. The match is
+ * the Mule listener accepted any {@code Content-Type}, and the response is written to the servlet response without
+ * a message converter, so {@code Accept} is never consulted and Spring never answers 406 or 415. The match is
  * exact; any other path, {@code /customBusinessEvents/x} included, falls through to the no-listener 404 of
  * {@code GlobalExceptionHandler}.
  *
@@ -41,14 +49,22 @@ import com.mulesoft.examples.track_a_custom_business_event.service.PriceDiscount
  * Mule listener likewise parsed a form body into a parameter map, which the JSON transformer could not read; the
  * exact error bytes are a verification point for captured fixtures.
  *
- * <p>The response Content-Type {@code text/plain;charset=UTF-8} is a plan default for the text the original
- * {@code object-to-string-transformer} produced; a fixture captured from the original application governs it.
+ * <p>The request's {@code Content-Type} decides the encoding and the response's {@code Content-Type}, as the Mule
+ * message carried the inbound media type and encoding through the flow's transformers, none of which declares its
+ * own:
+ * <ul>
+ *   <li>the encoding is the canonical name of the request's {@code charset} ({@code latin1} becomes
+ *       {@code ISO-8859-1}), or UTF-8 when the request declares none or sends no {@code Content-Type}; the body is
+ *       decoded with it and the result encoded with it, sent with its {@code Content-Length};</li>
+ *   <li>the response's {@code Content-Type} is the request's type and subtype in lower case, every other parameter
+ *       dropped, followed by {@code "; charset="} and the encoding, e.g. {@code application/json; charset=UTF-8};</li>
+ *   <li>a request without {@code Content-Type}, or with the wildcard media type (any type, any subtype), is
+ *       answered without one, as the listener sent none for a payload whose media type was the wildcard.</li>
+ * </ul>
  */
 @RestController
 @RequestMapping("/customBusinessEvents")
 public class BusinessEventController {
-
-    private static final MediaType TEXT_PLAIN_UTF8 = new MediaType("text", "plain", StandardCharsets.UTF_8);
 
     private final PriceDiscountService priceDiscountService;
 
@@ -61,15 +77,39 @@ public class BusinessEventController {
 
     /**
      * Answers {@code /customBusinessEvents} for every method except {@code OPTIONS}, which
-     * {@link #handleOptions(byte[])} maps; a {@code HEAD} response carries the headers without the body.
+     * {@link #handleOptions(HttpHeaders, byte[], HttpServletResponse)} maps, with 200 and the service's result,
+     * e.g. {@code 8.5} for shoes at 10; a {@code HEAD} response carries the headers without the body.
      *
-     * @param body the raw request body, whatever its {@code Content-Type}; {@code null} when the request carries
-     *             none
-     * @return 200 {@code text/plain;charset=UTF-8} with the service's result, e.g. {@code 8.5} for shoes at 10
+     * <p>The service runs before the response is touched, so its failure leaves the response uncommitted for the
+     * 500 of {@code GlobalExceptionHandler}. The result is written to the servlet response directly and this method
+     * returns nothing, so no message converter adds a {@code Content-Type} of its own. The {@code Content-Type} is
+     * put on the Undertow exchange, because the servlet response's {@code setContentType} and {@code setHeader}
+     * rewrite it to {@code ;charset=} without the space the listener sent.
+     *
+     * @param headers  the request headers; Spring has already parsed their {@code Content-Type} while binding the
+     *                 body, so one it cannot parse never reaches this method
+     * @param body     the raw request body; {@code null} when the request carries none
+     * @param response the response the result is written to
+     * @throws IOException when writing the response fails
      */
     @RequestMapping
-    public ResponseEntity<String> handle(@RequestBody(required = false) byte[] body) {
-        return ResponseEntity.ok().contentType(TEXT_PLAIN_UTF8).body(priceDiscountService.processPriceRequest(body));
+    public void handle(@RequestHeader HttpHeaders headers, @RequestBody(required = false) byte[] body,
+            HttpServletResponse response) throws IOException {
+        MediaType contentType = headers.getContentType();
+        Charset encoding = contentType != null && contentType.getCharset() != null
+                ? contentType.getCharset()
+                : StandardCharsets.UTF_8;
+        byte[] result = priceDiscountService.processPriceRequest(body, encoding).getBytes(encoding);
+
+        response.setStatus(HttpServletResponse.SC_OK);
+        if (contentType != null && !MediaType.ALL.equalsTypeAndSubtype(contentType)) {
+            ServletRequestContext.requireCurrent().getExchange().getResponseHeaders().put(Headers.CONTENT_TYPE,
+                    contentType.getType() + "/" + contentType.getSubtype() + "; charset=" + encoding.name());
+        }
+        response.setContentLength(result.length);
+        ServletOutputStream stream = response.getOutputStream();
+        stream.write(result);
+        stream.flush();
     }
 
     /**
@@ -78,12 +118,15 @@ public class BusinessEventController {
      * no body; the Mule listener ran the flow for {@code OPTIONS} too. What the original returned for an
      * {@code OPTIONS} request without a body is a verification point for captured fixtures.
      *
-     * @param body the raw request body, whatever its {@code Content-Type}; {@code null} when the request carries
-     *             none
-     * @return the response of {@link #handle(byte[])} for the same body
+     * @param headers  the request headers, as {@link #handle(HttpHeaders, byte[], HttpServletResponse)} reads them
+     * @param body     the raw request body; {@code null} when the request carries none
+     * @param response the response the result is written to, as
+     *                 {@link #handle(HttpHeaders, byte[], HttpServletResponse)} writes it
+     * @throws IOException when writing the response fails
      */
     @RequestMapping(method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> handleOptions(@RequestBody(required = false) byte[] body) {
-        return handle(body);
+    public void handleOptions(@RequestHeader HttpHeaders headers, @RequestBody(required = false) byte[] body,
+            HttpServletResponse response) throws IOException {
+        handle(headers, body, response);
     }
 }

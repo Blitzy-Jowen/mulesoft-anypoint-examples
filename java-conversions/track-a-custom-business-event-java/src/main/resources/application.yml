@@ -6,6 +6,9 @@ http:
 server:
   port: ${http.port:8081}
   address: 0.0.0.0      # http:listener-config host (custom-business-events.xml:3)
+  servlet:
+    encoding:
+      enabled: false    # the listener took the request charset from its Content-Type alone; Boot's forced UTF-8 request encoding would make Spring reject a wildcard Content-Type such as */* before the controller
 spring:
   application:
     name: track-a-custom-business-event-java
@@ -17,3 +20,6 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+logging:
+  pattern:
+    correlation: "[transactionId=%X{transactionId:-} businessEvent=%X{businessEvent:-}] "   # renders the tracking MDC on every console and file line: transaction id of tracking:transaction / the default events, business event name of tracking:custom-event

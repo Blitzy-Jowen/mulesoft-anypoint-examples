@@ -10,6 +10,7 @@ package com.mulesoft.examples.sending_json_data_to_a_jms_queue.service;
 
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -25,9 +26,12 @@ import org.springframework.stereotype.Service;
  * processors of flow {@code json-to-jmsFlow} (sending-json-data-to-a-jms-queue/src/main/app/json-to-jms.xml:8-10).
  *
  * <p>The transformer is {@link #send(byte[], String)}: it decodes the raw body bytes with the charset the request's
- * {@code Content-Type} names, or UTF-8, the application encoding of {@code mule-deploy.properties}, when it names
- * none or names one that cannot be used, and encodes the flow's result back with the same charset for the
- * response. The endpoint and the logger are {@link #send(String)}, which runs in the processors' order.
+ * {@code Content-Type} names, the JVM's default charset when the header names none, or UTF-8, the application
+ * encoding of {@code mule-deploy.properties}, when there is no header, it cannot be parsed, or it names a charset
+ * that cannot be used, and encodes the flow's result back with the same charset for the response. The endpoint
+ * and the logger are {@link #send(String)}, which runs in the processors' order.
+ * {@link #responseContentType(String)} gives the response the {@code Content-Type} the listener derived from that
+ * message, naming the same charset.
  *
  * <p>The endpoint is one-way: the payload is sent to the queue synchronously on the caller's thread, with no
  * reply-to and no receive, so a failed send fails the request before anything is logged.
@@ -56,6 +60,9 @@ public class SalesQueueService {
     /** The application's default encoding, which Mule's message reports when the payload sets none. */
     private static final String DEFAULT_ENCODING = "UTF-8";
 
+    /** The {@code Content-Type} parameter that names the body's charset. */
+    private static final String CHARSET_PARAMETER = "charset";
+
     /**
      * The property scopes Mule's message rendering lists, in its order; Mule skips the application scope there,
      * because a message does not hold that scope.
@@ -80,10 +87,11 @@ public class SalesQueueService {
      * {@code byte-array-to-string-transformer} did, sends and logs the text through {@link #send(String)}, and
      * encodes the payload the flow ends with in the charset it was decoded with.
      *
-     * <p>The charset is the one {@code contentType} names, or UTF-8 when the header is absent or blank, names no
-     * charset, cannot be parsed, or names a charset that is malformed or unsupported. Encoding the result with that
-     * same charset gives back the request bytes for every body valid in its charset, apart from a byte-order mark
-     * the charset's encoder writes its own way, as {@code UTF-16} writes big-endian. The body is never parsed or
+     * <p>The charset is the one {@code contentType} names; the JVM's default charset when the header names none,
+     * as the original listener set the message encoding; or UTF-8 when the header is absent or blank, cannot be
+     * parsed, or names a charset that is malformed or unsupported. Encoding the result with that same charset
+     * gives back the request bytes for every body valid in its charset, apart from a byte-order mark the
+     * charset's encoder writes its own way, as {@code UTF-16} writes big-endian. The body is never parsed or
      * validated, because the original forwards bodies that are not valid JSON.
      *
      * @param body        the raw request body; an empty array is sent as the empty string
@@ -125,6 +133,42 @@ public class SalesQueueService {
     }
 
     /**
+     * Builds the {@code Content-Type} of the success response the way the Mule 3.8 listener built it from the
+     * message's data type, or returns {@code null} when the original sent none.
+     *
+     * <p>The value is the request's lower-cased {@code type/subtype}, then {@code "; charset="} and the canonical
+     * name of the charset {@link #send(byte[], String)} decodes and encodes the body with, for example
+     * {@code application/json; charset=UTF-8} for {@code APPLICATION/JSON; foo=bar}. Other parameters are dropped,
+     * as the original dropped them. The header and the body therefore always agree on the charset.
+     *
+     * <p>{@code null}, meaning no {@code Content-Type} header, when the request has none or a blank one, or when
+     * its {@code type/subtype} is <code>&#42;/&#42;</code>: the original typed a request without
+     * {@code Content-Type} as <code>&#42;/&#42;</code> and wrote no header for that type. It is also {@code null}
+     * when the {@code type/subtype} cannot be parsed, the plan default under which the body is decoded as UTF-8.
+     * The {@code type/subtype} is the text before the first {@code ;}, parsed on its own, so a header whose
+     * charset is unusable still yields its type, with UTF-8, the charset the body is decoded with.
+     *
+     * @param rawContentType the request's raw {@code Content-Type} header, or {@code null} when it has none
+     * @return the response {@code Content-Type}, or {@code null} when the response must carry none
+     */
+    public String responseContentType(String rawContentType) {
+        if (isBlank(rawContentType)) {
+            return null;
+        }
+        int parameters = rawContentType.indexOf(';');
+        MediaType type;
+        try {
+            type = MediaType.parseMediaType(parameters < 0 ? rawContentType : rawContentType.substring(0, parameters));
+        } catch (IllegalArgumentException unparseable) {
+            return null;
+        }
+        if (type.isWildcardType() && type.isWildcardSubtype()) {
+            return null;
+        }
+        return type.getType() + '/' + type.getSubtype() + "; charset=" + resolveCharset(rawContentType).name();
+    }
+
+    /**
      * Renders the message the way Mule's {@code DefaultMuleMessage.toString()} renders it, followed by its
      * {@code Message properties:} section, each line ending with the platform line separator.
      *
@@ -160,17 +204,29 @@ public class SalesQueueService {
     }
 
     /**
-     * Returns the charset {@code rawContentType} names, or UTF-8, the application encoding of the original, when
-     * the header is absent or blank, names no charset, cannot be parsed, or names a charset that is malformed or
-     * unsupported.
+     * Returns the charset {@code rawContentType} names in its {@code charset} parameter, whatever the letter case
+     * of the parameter name; the JVM's default charset, the encoding the original listener gave a request whose
+     * {@code Content-Type} names none; or UTF-8, the application encoding of the original, when the header is
+     * absent or blank, cannot be parsed, or names a charset that is malformed or unsupported.
      */
     private static Charset resolveCharset(String rawContentType) {
         if (isBlank(rawContentType)) {
             return StandardCharsets.UTF_8;
         }
         try {
-            Charset charset = MediaType.parseMediaType(rawContentType).getCharset();
-            return charset != null ? charset : StandardCharsets.UTF_8;
+            MediaType mediaType = MediaType.parseMediaType(rawContentType);
+            if (mediaType.getCharset() != null) {
+                return mediaType.getCharset();
+            }
+            // The original's parser read parameter names ignoring case, while Spring resolves the charset of a
+            // parameter spelled "charset" only; getParameter ignores case, so "Charset" or "CHARSET" is found here
+            // and resolved under the lower-case name.
+            String charsetName = mediaType.getParameter(CHARSET_PARAMETER);
+            if (charsetName == null) {
+                return Charset.defaultCharset();
+            }
+            return new MediaType(mediaType.getType(), mediaType.getSubtype(), Map.of(CHARSET_PARAMETER, charsetName))
+                    .getCharset();
         } catch (IllegalArgumentException unusable) {
             // One catch covers every failure: InvalidMediaTypeException (an unparseable header, or a charset the
             // parser cannot resolve) and Charset.forName's IllegalCharsetNameException and
