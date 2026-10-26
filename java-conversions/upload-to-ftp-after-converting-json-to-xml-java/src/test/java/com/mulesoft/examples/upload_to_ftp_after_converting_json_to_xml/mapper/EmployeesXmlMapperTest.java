@@ -373,6 +373,9 @@ class EmployeesXmlMapperTest {
                 Arguments.of("blank", utf8("   ")),
                 Arguments.of("malformed", utf8("{\"employees\": [")),
                 Arguments.of("trailing content", utf8("{} {}")),
+                // Jackson's encoding detection rejects this UCS-4 byte order with a CharConversionException, an
+                // IOException that is not a JsonProcessingException.
+                Arguments.of("unsupported UCS-4 byte order", new byte[] {0, 0, (byte) 0xFF, (byte) 0xFE, 0, 0, 0, '{'}),
                 Arguments.of("top-level array", utf8("[]")),
                 Arguments.of("top-level string", utf8("\"text\"")),
                 Arguments.of("top-level number", utf8("1")),

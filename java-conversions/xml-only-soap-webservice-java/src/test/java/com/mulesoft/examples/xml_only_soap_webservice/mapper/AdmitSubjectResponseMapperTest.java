@@ -126,7 +126,7 @@ class AdmitSubjectResponseMapperTest {
 
     @Test
     void absentEndDateOmitsElement() {
-        String xml = mapper.toXml(parse(episodeResponse(START_DATE_TIME, null)));
+        String xml = mapper.toXml(parse(episodeResponse("2015-01-22", null)));
 
         assertThat(xml)
                 .isEqualTo(standardDocument("\t\t<startDate>2015-01-22</startDate>"))

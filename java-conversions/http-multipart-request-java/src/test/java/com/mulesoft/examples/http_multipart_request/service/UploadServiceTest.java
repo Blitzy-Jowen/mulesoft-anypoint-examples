@@ -120,6 +120,8 @@ class UploadServiceTest {
     static Stream<Arguments> fileNamesByTheOriginalExpression() {
         return Stream.of(
                 Arguments.of("browser header", TEST_TXT_DISPOSITION, "test.txt"),
+                Arguments.of("httpmime FileBody header of the original test, file name \"file\"",
+                        "form-data; name=\"file\"; filename=\"file\"", "file"),
                 Arguments.of("surrounding whitespace is trimmed",
                         "  form-data; name=\"file\"; filename=\"test.txt\"\t ", "test.txt"),
                 Arguments.of("spaces inside the name are kept",
@@ -135,6 +137,7 @@ class UploadServiceTest {
                 Arguments.of("first filename= wins",
                         "form-data; name=\"file\"; filename=\"a.txt\"; filename=\"b.txt\"",
                         "a.txt\"; filename=\"b.txt"),
+                // The original's quirk, kept on purpose: indexOf answers -1, so the range is [9, length - 1).
                 Arguments.of("without filename= the range starts at index 9",
                         "form-data; name=\"file\"", "; name=\"file"),
                 Arguments.of("filename* is not read",

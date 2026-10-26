@@ -1,0 +1,35 @@
+# Live-sandbox (Tier 2B) credentials template for src/test/resources/application-it.yml of
+# import-contacts-into-ms-dynamics-java.
+#
+# Copy this file to application-it.yml in this same directory (src/test/resources/) and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it, and never put real values in this template.
+#
+# Only ImportContactsIntoMSDynamicsIT reads it: that test runs under failsafe (mvn -B verify) and loads
+# application-it.yml as Spring profile "it". Surefire (mvn -B test) never reads it. The test is skipped by
+# assumption, not failed, while application-it.yml is missing, or while any of the four keys below is missing,
+# blank or starts with TODO, so mvn -B verify and mvn -B clean install pass without credentials.
+#
+# Requester-side prerequisites inside the existing Microsoft Dynamics 365 tenant (no new tenant is procured):
+#   - a Microsoft Entra (Azure AD) app registration with a client secret;
+#   - a Dataverse application user mapped to that app's client ID, holding a security role that allows create,
+#     read and delete on the contact table.
+# The token is requested with the OAuth 2.0 client-credentials grant from
+# https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token with scope <service-url>/.default; both are
+# derived from the keys below by src/main/resources/application.yml, so they are not listed here.
+#
+# The live test writes data. It drops contacts.csv into the input directory, which creates two Dataverse contacts:
+# John Doe (john.doe@texasComp.com) and Jane Doe (jane.doe@texasComp.com). It queries them back by e-mail
+# ($filter=emailaddress1 eq '<e-mail>'), asserts firstname John and lastname Doe, and deletes both
+# (DELETE contacts(<guid>)) in @AfterEach. Use a sandbox or test environment, never production.
+#
+# Original keys, which the original test read from src/test/resources/mule.test.properties (not used here):
+#   crm.username, crm.password, crm.auth-type -> dynamics.oauth.tenant-id, dynamics.oauth.client-id,
+#                                                dynamics.oauth.client-secret
+#   crm.service-url                           -> dynamics.service-url
+dynamics:
+  service-url:            # TODO: supply the Dataverse environment URL, e.g. https://<org>.crm.dynamics.com (no trailing slash)
+  oauth:
+    tenant-id:            # TODO: supply the Entra (Azure AD) tenant ID
+    client-id:            # TODO: supply the Entra app registration (application) client ID
+    client-secret:        # TODO: supply the Entra app registration client secret
