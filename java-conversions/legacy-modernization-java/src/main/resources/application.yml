@@ -1,0 +1,32 @@
+# legacy-modernization-java runtime configuration
+# Original: legacy-modernization/src/main/app/FufillmentWebService.xml (mule-app.properties holds no keys),
+# so every value is a fixed default taken from the flow's literals.
+spring:
+  application:
+    name: legacy-modernization-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404
+  mvc:
+    dispatch-trace-request: true   # TRACE on any path but /OrderFulfillment reaches the no-listener 404, not the servlet's echo
+  webservices:
+    path: /OrderFulfillment        # MessageDispatcherServlet registered as "messageDispatcherServlet"; WebServiceConfig narrows it to exactly /OrderFulfillment; dispatcherServlet stays at /
+    servlet:
+      init:                        # bracketed so the case-sensitive servlet init parameter names keep their camelCase
+        "[dispatchOptionsRequest]": "true"   # OPTIONS and TRACE reach SoapListenerBoundaryAdapter, whose 405 answers every
+        "[dispatchTraceRequest]": "true"     # non-POST request: the original listener is POST-only (FufillmentWebService.xml:5)
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no /error page rewrites SC-1/SC-11 response bytes
+  task:
+    execution:
+      thread-name-prefix: legacy-fulfillment-async-   # applicationTaskExecutor behind @Async ShippingOrderExportService (async scope, :9-36); pool sizes stay at Boot's defaults
+
+server:
+  port: 1080                       # FufillmentWebService.xml:3
+  address: 0.0.0.0                 # :3
+
+fulfillment:
+  # file:outbound-endpoint path (:35), relative to the working directory as in Mule. File names follow
+  # outputPattern (:35) as ShippingOrder-<dd-MM-yy_HH-mm-ss.SSS>.txt; they are produced in code, not configured.
+  output-dir: src/main/resources/Output
