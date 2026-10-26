@@ -22,6 +22,7 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.net.ConnectException;
+import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -49,12 +50,17 @@ import org.springframework.amqp.AmqpTimeoutException;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageBuilder;
 import org.springframework.amqp.core.MessageDeliveryMode;
+import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.rabbit.core.ChannelCallback;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.support.DefaultMessagePropertiesConverter;
 import org.springframework.amqp.rabbit.support.RabbitExceptionTranslator;
 
 import com.mulesoft.examples.sending_json_data_to_a_amqp_queue.config.AmqpConfig;
+import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.ChannelContinuationTimeoutException;
+import com.rabbitmq.client.ShutdownSignalException;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -166,7 +172,8 @@ class SalesPublisherServiceTest {
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("payloads")
-    @DisplayName("publishes the unchanged body as a persistent message to sales_exchange with the empty routing key")
+    @DisplayName("publishes the unchanged body as a persistent message, with no content type or priority, to"
+            + " sales_exchange with the empty routing key")
     void publishSendsUnchangedBodyAsPersistentMessage(String description, byte[] payload) {
         runChannelCallbackOnMockedChannel();
         byte[] sent = payload.clone();
@@ -176,8 +183,16 @@ class SalesPublisherServiceTest {
         ArgumentCaptor<Message> published = ArgumentCaptor.forClass(Message.class);
         verify(rabbitTemplate).sendAndReceive(eq(EXCHANGE), eq(AmqpConfig.DEFAULT_ROUTING_KEY), published.capture());
         assertThat(published.getValue().getBody()).isEqualTo(payload);
-        assertThat(published.getValue().getMessageProperties().getDeliveryMode())
-                .isEqualTo(MessageDeliveryMode.PERSISTENT);
+        MessageProperties properties = published.getValue().getMessageProperties();
+        assertThat(properties.getDeliveryMode()).isEqualTo(MessageDeliveryMode.PERSISTENT);
+        assertThat(properties.getContentType()).as("no content type, as the original set none").isNull();
+        assertThat(properties.getPriority()).as("no priority, as the original set none").isNull();
+        // The properties as RabbitTemplate publishes them, through the same converter.
+        AMQP.BasicProperties wire =
+                new DefaultMessagePropertiesConverter().fromMessageProperties(properties, "UTF-8");
+        assertThat(wire.getContentType()).as("content_type on the wire").isNull();
+        assertThat(wire.getPriority()).as("priority on the wire").isNull();
+        assertThat(wire.getDeliveryMode()).as("delivery_mode on the wire").isEqualTo(2);
         assertThat(sent).as("the caller's array is left as it was").isEqualTo(payload);
     }
 
@@ -248,6 +263,92 @@ class SalesPublisherServiceTest {
     }
 
     @ParameterizedTest(name = "{0}")
+    @MethodSource("passiveCheckFailures")
+    @DisplayName("a failed passive check is logged at ERROR with the broker's reason, then reaches the caller"
+            + " unchanged")
+    void passiveCheckFailureIsLoggedWithBrokerReason(String description, PassiveCheck failing, IOException failure,
+                                                     String expectedReason) throws Exception {
+        runChannelCallbackOnMockedChannel();
+        if (failing == PassiveCheck.EXCHANGE) {
+            doThrow(failure).when(channel).exchangeDeclarePassive(EXCHANGE);
+        } else {
+            doThrow(failure).when(channel).queueDeclarePassive(QUEUE);
+        }
+
+        Throwable thrown = catchThrowable(() -> service.publish(bytes(PAYLOAD)));
+
+        assertThat(thrown).isInstanceOf(AmqpIOException.class).isSameAs(templateFailure.get());
+        assertThat(thrown.getCause()).isSameAs(failure);
+        // execute() was the template's only call, so no sendAndReceive overload published anything.
+        verify(rabbitTemplate).execute(any());
+        verifyNoMoreInteractions(rabbitTemplate);
+        assertThat(appender.list).hasSize(2);
+        assertThat(appender.list.get(0)).as("the INFO logger line stays first").satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.INFO);
+            assertThat(event.getFormattedMessage()).isEqualTo("payload to be sent: test");
+        });
+        assertThat(appender.list.get(1)).satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+            assertThat(event.getLoggerName()).isEqualTo(SalesPublisherService.class.getName());
+            assertThat(event.getFormattedMessage()).isEqualTo(
+                    "Passive check of " + failing.kind + " '" + failing.destination + "' failed: " + expectedReason);
+            assertThat(event.getThrowableProxy()).as("no stack trace is attached").isNull();
+        });
+    }
+
+    /**
+     * What a failed passive declaration throws, for each check, with the reason its ERROR line must give: the
+     * broker's {@code channel.close} and {@code connection.close}, which amqp-client delivers as the cause of an
+     * {@link IOException} without a message, the application's own {@code connection.close}, and failures that
+     * carry no broker reason (a withheld channel RPC, a lost connection, a cause chain that loops back on itself).
+     */
+    static Stream<Arguments> passiveCheckFailures() {
+        return Stream.of(PassiveCheck.values()).flatMap(check -> {
+            String notFound = "NOT_FOUND - no " + check.kind + " '" + check.destination + "' in vhost '/'";
+            // channel.close names the method the broker refused: class 40 is exchange, 50 is queue, 10 is declare.
+            ShutdownSignalException channelClosed = new ShutdownSignalException(false, false,
+                    new AMQP.Channel.Close.Builder().replyCode(404).replyText(notFound)
+                            .classId(check == PassiveCheck.EXCHANGE ? 40 : 50).methodId(10).build(),
+                    null);
+            String forced = "CONNECTION_FORCED - broker forced connection closure with reason 'shutdown'";
+            ShutdownSignalException connectionClosed = new ShutdownSignalException(true, false,
+                    new AMQP.Connection.Close.Builder().replyCode(320).replyText(forced).build(), null);
+            // The application's own connection.close, as when its connection factory is destroyed mid-request.
+            ShutdownSignalException connectionClosedByApplication = new ShutdownSignalException(true, true,
+                    new AMQP.Connection.Close.Builder().replyCode(200).replyText("OK").build(), null);
+            ChannelContinuationTimeoutException rpcTimeout = new ChannelContinuationTimeoutException(
+                    new TimeoutException(), "AMQChannel(amqp://guest@localhost:5672/,1)", 1,
+                    check == PassiveCheck.EXCHANGE
+                            ? new AMQP.Exchange.Declare.Builder().exchange(check.destination).passive(true).build()
+                            : new AMQP.Queue.Declare.Builder().queue(check.destination).passive(true).build());
+            ShutdownSignalException connectionLost = new ShutdownSignalException(true, false, null, null);
+            connectionLost.initCause(new SocketException("Connection reset"));
+            IOException first = new IOException("first");
+            IOException second = new IOException("second", first);
+            first.initCause(second);
+            return Stream.of(
+                    // amqp-client hands the waiting caller a clone of the signal, caused by the original.
+                    Arguments.of(check.kind + ": channel closed by the broker", check,
+                            withoutMessageCausedBy(channelClosed.sensibleClone()),
+                            "the broker closed the channel with reply-code=404, reply-text=" + notFound),
+                    Arguments.of(check.kind + ": connection closed by the broker", check,
+                            withoutMessageCausedBy(connectionClosed),
+                            "the broker closed the connection with reply-code=320, reply-text=" + forced),
+                    Arguments.of(check.kind + ": connection closed by the application", check,
+                            withoutMessageCausedBy(connectionClosedByApplication),
+                            "the application closed the connection with reply-code=200, reply-text=OK"),
+                    Arguments.of(check.kind + ": channel RPC timed out", check, rpcTimeout,
+                            rpcTimeout + " <- java.util.concurrent.TimeoutException"),
+                    Arguments.of(check.kind + ": connection lost without a broker reason", check,
+                            withoutMessageCausedBy(connectionLost),
+                            "java.io.IOException <- com.rabbitmq.client.ShutdownSignalException: connection error"
+                                    + " <- java.net.SocketException: Connection reset"),
+                    Arguments.of(check.kind + ": cause chain that loops back on itself", check, first,
+                            "java.io.IOException: first <- java.io.IOException: second"));
+        });
+    }
+
+    @ParameterizedTest(name = "{0}")
     @MethodSource("sendFailures")
     @DisplayName("a failed publish reaches the caller unchanged after exactly one attempt")
     void sendFailurePropagatesUnchangedAfterOneAttempt(String description, AmqpException failure) {
@@ -310,6 +411,11 @@ class SalesPublisherServiceTest {
 
     private static byte[] bytes(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** An {@link IOException} without a message caused by {@code signal}, as amqp-client's channel RPC throws. */
+    private static IOException withoutMessageCausedBy(ShutdownSignalException signal) {
+        return new IOException((String) null, signal);
     }
 
     /** The two passive checks the service makes before it publishes, with the broker's word for each kind. */

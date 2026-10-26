@@ -13,6 +13,9 @@ spring:
       add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
   mvc:
     dispatch-trace-request: true   # the /helloWorld listener has no allowedMethods: TRACE reaches HelloWorldController like every other method instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false   # the flow reads no form fields: a form body on PUT/PATCH/DELETE reaches HelloWorldController as it does on POST instead of being parsed by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

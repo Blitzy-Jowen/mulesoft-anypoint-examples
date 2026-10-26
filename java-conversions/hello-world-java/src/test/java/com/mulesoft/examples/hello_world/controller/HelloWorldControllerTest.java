@@ -69,6 +69,23 @@ class HelloWorldControllerTest {
         assertHelloWorld(response);
     }
 
+    /**
+     * The flow reads no form fields, so a form body that cannot be parsed never fails the request: Boot's form
+     * filter is disabled in {@code application.yml}, and PUT, PATCH and DELETE get the reply POST gets instead
+     * of a 500 raised before dispatch.
+     *
+     * @param method the request method, sent with the same form body each time
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE", "POST"})
+    void malformedFormBodyIsAnsweredLikeEveryOtherBody(String method) {
+        HttpTestClient.Response response = client().send(method, HELLO_WORLD_PATH,
+                Map.of("Content-Type", MediaType.APPLICATION_FORM_URLENCODED_VALUE),
+                "a=1&b=%ZZ".getBytes(StandardCharsets.UTF_8));
+
+        assertHelloWorld(response);
+    }
+
     @Test
     void optionsIsAnsweredLikeGet() {
         assertHelloWorld(client().send("OPTIONS", HELLO_WORLD_PATH, Map.of(), null));

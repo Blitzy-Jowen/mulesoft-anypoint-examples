@@ -11,8 +11,10 @@ package com.mulesoft.examples.soap_webservice_security.config;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 import java.util.function.Supplier;
 
 import javax.security.auth.callback.Callback;
@@ -58,6 +60,12 @@ public class SAMLCallbackHandler implements CallbackHandler {
     static final String ISSUER_KEY_NAME_PROPERTY = "org.apache.ws.security.saml.issuer.key.name";
 
     private static final Logger LOG = LoggerFactory.getLogger(SAMLCallbackHandler.class);
+
+    /** Most characters one class, method or file name may occupy in a log line once escaped. */
+    private static final int NAME_LOG_LIMIT = 256;
+
+    /** Most causes named in a log line; a longer chain ends with {@code ...}. */
+    private static final int CAUSE_LOG_LIMIT = 10;
 
     private final String subjectName;
     private final String subjectQualifier;
@@ -149,6 +157,10 @@ public class SAMLCallbackHandler implements CallbackHandler {
      * Resolves the issuer crypto for one callback. A crypto that cannot be loaded (typically an unconfigured
      * keystore password) leaves the issuer crypto unset: the unsigned SAML client never uses it, and the signed
      * client then fails inside WSS4J, which the client front reports through its catch branch.
+     *
+     * <p>The failure is logged at DEBUG by type and throw site only, without the issuer, the exception message
+     * or the throwable, because the message and the causes of a keystore failure can carry keystore or
+     * credential diagnostics.
      */
     private Crypto resolveIssuerCrypto() {
         if (issuerCrypto == null) {
@@ -157,10 +169,94 @@ public class SAMLCallbackHandler implements CallbackHandler {
         try {
             return issuerCrypto.get();
         } catch (RuntimeException ex) {
-            LOG.debug("SAML issuer crypto is unavailable; the assertion of issuer {} carries no issuer crypto",
-                    issuer, ex);
+            LOG.debug("SAML issuer crypto is unavailable; the assertion carries no issuer crypto: {}", describe(ex));
             return null;
         }
+    }
+
+    /**
+     * Returns the type identifiers of {@code ex} without any of its text: its class name and throw-site frame,
+     * then the class name of each cause, separated by {@code " <- "}. The walk stops at a cause already named,
+     * marked {@code [circular]}, and after {@link #CAUSE_LOG_LIMIT} causes, marked {@code ...}.
+     */
+    private static String describe(Throwable ex) {
+        StringBuilder out = new StringBuilder(128).append(sanitize(ex.getClass().getName()));
+        appendThrowSite(out, ex);
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(ex);
+        int causes = 0;
+        for (Throwable cause = ex.getCause(); cause != null; cause = cause.getCause()) {
+            out.append(" <- ");
+            if (causes == CAUSE_LOG_LIMIT) {
+                return out.append("...").toString();
+            }
+            if (!named.add(cause)) {
+                return out.append("[circular]").toString();
+            }
+            out.append(sanitize(cause.getClass().getName()));
+            causes++;
+        }
+        return out.toString();
+    }
+
+    /**
+     * Appends {@code " at <class>.<method>(<file>:<line>)"} for the frame that threw {@code ex}, or nothing when
+     * the exception has no stack trace.
+     */
+    private static void appendThrowSite(StringBuilder out, Throwable ex) {
+        StackTraceElement[] trace = ex.getStackTrace();
+        if (trace == null || trace.length == 0 || trace[0] == null) {
+            return;
+        }
+        StackTraceElement frame = trace[0];
+        out.append(" at ").append(sanitize(frame.getClassName()))
+                .append('.').append(sanitize(frame.getMethodName())).append('(');
+        if (frame.isNativeMethod()) {
+            out.append("Native Method");
+        } else if (frame.getFileName() == null) {
+            out.append("Unknown Source");
+        } else {
+            out.append(sanitize(frame.getFileName()));
+            if (frame.getLineNumber() >= 0) {
+                out.append(':').append(frame.getLineNumber());
+            }
+        }
+        out.append(')');
+    }
+
+    /**
+     * Makes a name safe to log on one line: ISO control characters, line and paragraph separators, format
+     * characters, unpaired surrogates and the reverse solidus are each written as {@code \}{@code u} and four
+     * lower-case hex digits; a value longer than {@link #NAME_LOG_LIMIT} characters once escaped is cut before
+     * the character or escape that would exceed it, never inside a surrogate pair, and {@code ...[truncated]} is
+     * appended. {@code null} is written as {@code (null)}.
+     */
+    private static String sanitize(String value) {
+        if (value == null) {
+            return "(null)";
+        }
+        StringBuilder out = new StringBuilder(Math.min(value.length(), NAME_LOG_LIMIT));
+        int i = 0;
+        while (i < value.length()) {
+            int codePoint = value.codePointAt(i);
+            int units = Character.charCount(codePoint);
+            int type = Character.getType(codePoint);
+            boolean escape = codePoint == '\\' || Character.isISOControl(codePoint)
+                    || type == Character.LINE_SEPARATOR || type == Character.PARAGRAPH_SEPARATOR
+                    || type == Character.FORMAT || type == Character.SURROGATE;
+            if (out.length() + (escape ? 6 * units : units) > NAME_LOG_LIMIT) {
+                return out.append("...[truncated]").toString();
+            }
+            for (int unit = i; unit < i + units; unit++) {
+                if (escape) {
+                    out.append(String.format("\\u%04x", (int) value.charAt(unit)));
+                } else {
+                    out.append(value.charAt(unit));
+                }
+            }
+            i += units;
+        }
+        return out.toString();
     }
 
     private static Properties load(Resource samlProperties) {

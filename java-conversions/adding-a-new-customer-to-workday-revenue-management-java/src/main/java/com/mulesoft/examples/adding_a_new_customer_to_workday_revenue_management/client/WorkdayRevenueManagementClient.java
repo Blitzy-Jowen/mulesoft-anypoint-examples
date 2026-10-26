@@ -8,8 +8,12 @@
 
 package com.mulesoft.examples.adding_a_new_customer_to_workday_revenue_management.client;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URLConnection;
 import java.util.Objects;
 
 import javax.xml.transform.Source;
@@ -27,6 +31,7 @@ import org.springframework.ws.client.support.interceptor.ClientInterceptor;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.springframework.ws.soap.security.wss4j2.Wss4jSecurityInterceptor;
 import org.springframework.ws.transport.WebServiceConnection;
+import org.springframework.ws.transport.http.HttpTransportException;
 import org.springframework.ws.transport.http.HttpUrlConnection;
 import org.springframework.ws.transport.http.HttpUrlConnectionMessageSender;
 import org.w3c.dom.Document;
@@ -59,7 +64,10 @@ import jakarta.xml.soap.SOAPException;
  * <p>Payloads are bound by Jakarta JAXB classes that XJC generates from {@code wsdl/Revenue_Management_v25.0.wsdl}.
  * The WSDL's binding declares no {@code soapAction} for any operation, so no action is set and the SOAP 1.1 default
  * {@code SOAPAction: ""} goes on the wire. Both connect and read timeouts come from {@code wday.connect-timeout} and
- * {@code wday.read-timeout} (10 s, the Mule default response timeout).
+ * {@code wday.read-timeout} (10 s, the Mule default response timeout). Each request goes out in fixed-length
+ * streaming mode, with its {@code Content-Length} header, so the JDK never silently re-sends a {@code Put_Customer}
+ * POST after a connection reset or an early end of stream while the response is awaited: Workday receives each
+ * attempt once, and the failure surfaces instead.
  *
  * <p>Every call runs through {@link UpstreamCallExecutor} for {@link UpstreamSystem#WORKDAY}, with
  * {@link #reauthenticate()} as the single re-authentication step before its one retry. This class therefore catches,
@@ -68,7 +76,8 @@ import jakarta.xml.soap.SOAPException;
  * connection failure as {@code WebServiceIOException} with the socket exception as cause, so
  * {@code WorkdayFailureClassifier} sees each one unchanged.
  *
- * <p>The password is never logged, and neither is any request envelope, whose security header carries it.
+ * <p>Neither the password nor the UsernameToken's {@code user@tenant} principal is ever logged, and neither is any
+ * request envelope, whose security header carries both.
  *
  * <p>Thread-safe: the template, its message factory, marshaller and sender are configured once and are safe for
  * concurrent use; {@link #reauthenticate()} replaces the security interceptor under the instance lock.
@@ -153,10 +162,12 @@ public class WorkdayRevenueManagementClient {
      * the previous one: the single re-authentication step {@link UpstreamCallExecutor} runs before its one retry.
      * Workday's UsernameToken is stateless, so there is no session to renew and no network call is made.
      *
+     * <p>The INFO line is fixed text: it names neither the token's {@code user@tenant} principal nor the password.
+     *
      * @throws IllegalStateException if the interceptor cannot be configured
      */
     public synchronized void reauthenticate() {
-        log.info("Re-authenticating Workday UsernameToken for {}", properties.username());
+        log.info("Re-authenticating Workday UsernameToken");
         template.setInterceptors(new ClientInterceptor[] {securityInterceptor()});
     }
 
@@ -201,8 +212,9 @@ public class WorkdayRevenueManagementClient {
 
     /**
      * Configures the SOAP 1.1 template: SAAJ messages, the generated JAXB classes, and an
-     * {@code HttpURLConnection} sender with the configured timeouts. No default URI is set, because every call passes
-     * {@code wday.endpoint} as read at call time.
+     * {@code HttpURLConnection} sender with the configured timeouts that streams every request with a fixed length
+     * ({@link FixedLengthStreamingMessageSender}), so the JDK never re-sends a request on its own. No default URI is
+     * set, because every call passes {@code wday.endpoint} as read at call time.
      */
     private static WebServiceTemplate createTemplate(WorkdayProperties properties) {
         SaajSoapMessageFactory messageFactory;
@@ -223,7 +235,7 @@ public class WorkdayRevenueManagementClient {
             throw new IllegalStateException("Could not configure the Workday JAXB marshaller", e);
         }
 
-        HttpUrlConnectionMessageSender messageSender = new HttpUrlConnectionMessageSender();
+        HttpUrlConnectionMessageSender messageSender = new FixedLengthStreamingMessageSender();
         messageSender.setConnectionTimeout(properties.getConnectTimeout());
         messageSender.setReadTimeout(properties.getReadTimeout());
 
@@ -232,6 +244,67 @@ public class WorkdayRevenueManagementClient {
         template.setUnmarshaller(marshaller);
         template.setMessageSender(messageSender);
         return template;
+    }
+
+    /**
+     * {@code HttpURLConnection} sender whose connections stream each request with a fixed length.
+     *
+     * <p>The JDK re-sends a buffered {@code HttpURLConnection} request once, POST included, when the connection is
+     * reset or the stream ends while the response is awaited, which is after the server may already have processed
+     * it. It never re-sends a streamed request. The connection is prepared exactly as the plain sender prepares it:
+     * POST, no caches, {@code Accept-Encoding: gzip} and the configured connect and read timeouts.
+     */
+    private static final class FixedLengthStreamingMessageSender extends HttpUrlConnectionMessageSender {
+
+        /**
+         * Opens and prepares the connection as the plain sender does, and wraps it in a
+         * {@link FixedLengthStreamingConnection}.
+         *
+         * @throws HttpTransportException if the URI does not open an HTTP connection
+         */
+        @Override
+        public WebServiceConnection createConnection(URI uri) throws IOException {
+            URLConnection connection = uri.toURL().openConnection();
+            if (!(connection instanceof HttpURLConnection httpConnection)) {
+                throw new HttpTransportException("URI [" + uri + "] is not an HTTP URL");
+            }
+            prepareConnection(httpConnection);
+            return new FixedLengthStreamingConnection(httpConnection);
+        }
+    }
+
+    /**
+     * Connection that buffers the serialized envelope, then streams it in fixed-length mode, so the request keeps its
+     * {@code Content-Length} header and is never re-sent by the JDK. Request headers are all added before the
+     * envelope is written, and nothing reaches the socket until the envelope is complete.
+     */
+    private static final class FixedLengthStreamingConnection extends HttpUrlConnection {
+
+        private final ByteArrayOutputStream requestBody = new ByteArrayOutputStream();
+
+        FixedLengthStreamingConnection(HttpURLConnection connection) {
+            super(connection);
+        }
+
+        /** Returns the in-memory buffer the envelope is serialized into. */
+        @Override
+        protected OutputStream getRequestOutputStream() {
+            return requestBody;
+        }
+
+        /**
+         * Fixes the streamed length to the size of the buffered envelope, writes the envelope, and completes the
+         * request. A failure while writing escapes as the socket's own {@link IOException}.
+         */
+        @Override
+        protected void onSendAfterWrite(WebServiceMessage message) throws IOException {
+            HttpURLConnection connection = getConnection();
+            connection.setFixedLengthStreamingMode((long) requestBody.size());
+            try (OutputStream out = connection.getOutputStream()) {
+                requestBody.writeTo(out);
+            }
+            super.onSendAfterWrite(message);
+        }
     }
 
     /**

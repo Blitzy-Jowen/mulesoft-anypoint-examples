@@ -11,6 +11,9 @@ spring:
   # The /oauth and /FIM/* listeners declare no allowedMethods (xml:32,40), so they serve every method and no other path:
   mvc:
     dispatch-trace-request: true   # TRACE reaches the /oauth and /FIM/* mappings instead of the servlet's default TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the /FIM/* flow forwards the request body unchanged: a form body on PUT/PATCH/DELETE reaches FimProxyController as it does on POST instead of being parsed by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

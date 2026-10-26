@@ -15,6 +15,9 @@ spring:
   # otherwise answer requests the Mule listener echoed:
   mvc:
     dispatch-trace-request: true   # TRACE reaches EchoController and is echoed instead of getting the servlet's message/http TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the flow reads no form fields: a form body on PUT/PATCH/DELETE is echoed as on POST instead of being parsed by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error is echoed like any other path

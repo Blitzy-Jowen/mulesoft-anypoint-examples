@@ -66,8 +66,10 @@ import reactor.netty.http.client.HttpClient;
  *
  * <p>{@link #connector(NetsuiteProperties)} builds the Reactor Netty transport of every NetSuite {@code WebClient}, the
  * token request of {@link NetsuiteTokenProvider} included, with the connect timeout {@code netsuite.connect-timeout}
- * and the response timeout {@code netsuite.read-timeout} (10 s each, the Mule default response timeout). The two
- * timeouts surface as follows, each wrapped by {@code WebClient} in a {@code WebClientRequestException}:
+ * and the response timeout {@code netsuite.read-timeout} (10 s each, the Mule default response timeout). A timeout
+ * shorter than 1 ms, which Netty would apply as no timeout at all, fails start-up naming its key, so every call stays
+ * bounded. The two timeouts surface as follows, each wrapped by {@code WebClient} in a
+ * {@code WebClientRequestException}:
  * <ul>
  *   <li>no connection within the connect timeout raises Netty's {@code io.netty.channel.ConnectTimeoutException},
  *       a {@code java.net.ConnectException};</li>
@@ -76,7 +78,9 @@ import reactor.netty.http.client.HttpClient;
  * </ul>
  * Both causes are in the unavailable list of the SC-9 classification, so the cause walk of
  * {@code NetsuiteFailureClassifier} classifies either failure as {@code UNAVAILABLE} and {@code UpstreamCallExecutor}
- * answers it with no retry.
+ * answers it with no retry. The transport adds none either: Reactor Netty's automatic retry of a request whose
+ * connection is reset before the request is sent is disabled, so a connectivity failure, of a token request
+ * included, surfaces from the single attempt.
  *
  * <p>{@link #suiteQlLiteral(String)} escapes a caller-supplied value for use inside a SuiteQL string literal. SuiteQL
  * follows Oracle literal rules, under which a single quote is the only character that can end a literal and is
@@ -86,8 +90,12 @@ import reactor.netty.http.client.HttpClient;
  *
  * <p>Response bodies are parsed into {@link LinkedHashMap}s in the order NetSuite wrote the keys, with integers as
  * {@code Integer}, {@code Long} or {@code BigInteger} and decimals as {@link BigDecimal} keeping their written scale
- * ({@code 50.0} stays {@code 50.0}). The class and its public methods are not final, so tests can mock it; one
- * instance serves concurrent requests, its two caches being concurrent maps that live for the application run.
+ * ({@code 50.0} stays {@code 50.0}). A read whose body is empty, is JSON {@code null} or is not an object fails with
+ * an {@link IllegalStateException}, as does a page without its {@code items} array and boolean {@code hasMore} and a
+ * metadata catalog without its {@code properties} object, so a malformed answer never reads as an empty result or
+ * enters the cache; no such message carries any part of the body. The class and its public methods are not final,
+ * so tests can mock it; one instance serves concurrent requests, its two caches being concurrent maps that live for
+ * the application run.
  */
 @Component
 public class NetsuiteRestClient {
@@ -96,6 +104,12 @@ public class NetsuiteRestClient {
 
     /** Connect and response timeout used when a setting is absent: the Mule default response timeout. */
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+
+    /**
+     * The shortest accepted timeout: Netty and Reactor Netty apply both timeouts in whole milliseconds and read
+     * {@code 0} as no timeout at all.
+     */
+    private static final Duration MIN_TIMEOUT = Duration.ofMillis(1);
 
     /** Netty takes the connect timeout as an {@code int} number of milliseconds. */
     private static final Duration MAX_CONNECT_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
@@ -138,6 +152,8 @@ public class NetsuiteRestClient {
     private static final String COUNT = "count";
 
     private static final String LINKS = "links";
+
+    private static final String PROPERTIES = "properties";
 
     private static final String SCRIPT_ID_COLUMN = "scriptid";
 
@@ -194,8 +210,18 @@ public class NetsuiteRestClient {
     /**
      * Builds the HTTP transport of a NetSuite {@code WebClient}: a Reactor Netty client whose connect timeout is
      * {@code netsuite.connect-timeout} and whose response timeout is {@code netsuite.read-timeout}, each 10 s when
-     * the setting returns {@code null}. A zero duration disables that timeout, as it does in Netty. The settings are
-     * read once, when the transport is built.
+     * the setting returns {@code null}, and which never retries a request on its own. The settings are read once,
+     * when the transport is built.
+     *
+     * <p>Each timeout must be at least 1 ms. Netty applies the connect timeout and Reactor Netty the response
+     * timeout in whole milliseconds, and both read {@code 0} as no timeout, so a zero, negative or sub-millisecond
+     * setting would leave every call unbounded; it is rejected here, at start-up, instead.
+     *
+     * <p>Reactor Netty's automatic retry is disabled. Left enabled, it sends a request a second time, on a new
+     * connection, when the first connection is reset before the request headers are written, and neither
+     * {@link UpstreamCallExecutor} nor the caller would see the first attempt. Disabled, a connectivity failure
+     * surfaces from the single attempt, the token request included, so the executor classifies it and never retries
+     * it.
      *
      * <p>A connect timeout that expires raises {@code io.netty.channel.ConnectTimeoutException} (a
      * {@code java.net.ConnectException}); a response timeout that expires raises
@@ -205,18 +231,31 @@ public class NetsuiteRestClient {
      * @param props the {@code netsuite.*} settings
      * @return a new {@link ReactorClientHttpConnector} for {@code WebClient.Builder#clientConnector}
      * @throws NullPointerException  when {@code props} is {@code null}
-     * @throws IllegalStateException when a timeout is negative, or when the connect timeout exceeds
-     *         {@link Integer#MAX_VALUE} milliseconds or the read timeout {@link Long#MAX_VALUE} milliseconds; the
-     *         message names the key
+     * @throws IllegalStateException when a timeout is shorter than 1 ms (zero and negative included), or when the
+     *         connect timeout exceeds {@link Integer#MAX_VALUE} milliseconds or the read timeout
+     *         {@link Long#MAX_VALUE} milliseconds; the message names the key
      */
     public static ClientHttpConnector connector(NetsuiteProperties props) {
+        return new ReactorClientHttpConnector(httpClient(props));
+    }
+
+    /**
+     * Builds the Reactor Netty client that {@link #connector(NetsuiteProperties)} wraps, configured as that method
+     * describes. It is package-private so that tests can read the configuration the transport runs with.
+     *
+     * @param props the {@code netsuite.*} settings
+     * @return a new Reactor Netty client
+     * @throws NullPointerException  when {@code props} is {@code null}
+     * @throws IllegalStateException when a timeout is invalid, as for {@link #connector(NetsuiteProperties)}
+     */
+    static HttpClient httpClient(NetsuiteProperties props) {
         Objects.requireNonNull(props, "props");
         Duration connect = timeout(props.getConnectTimeout(), CONNECT_TIMEOUT_KEY, MAX_CONNECT_TIMEOUT);
         Duration read = timeout(props.getReadTimeout(), READ_TIMEOUT_KEY, MAX_READ_TIMEOUT);
-        HttpClient httpClient = HttpClient.create()
+        return HttpClient.create()
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, (int) connect.toMillis())
-                .responseTimeout(read);
-        return new ReactorClientHttpConnector(httpClient);
+                .responseTimeout(read)
+                .disableRetry(true);
     }
 
     /**
@@ -239,9 +278,10 @@ public class NetsuiteRestClient {
     /**
      * Runs a SuiteQL query and returns every result row: {@code POST /services/rest/query/v1/suiteql} with
      * {@code Prefer: transient} and the body {@code {"q": query}}, paged by {@code limit=1000&offset=<n>} until
-     * NetSuite reports {@code hasMore} other than {@code true} or a page holds no item. Each page is its own
-     * executor call, and {@code offset} advances by the page's {@code count}, or by its item count when NetSuite
-     * states none.
+     * NetSuite reports {@code hasMore} {@code false} or a page holds no item. Each page is its own executor call,
+     * and {@code offset} advances by the page's {@code count}, or by its item count when NetSuite states none. Only
+     * a page such as {@code {"items": [], "hasMore": false}} is an empty result; a page that is not a JSON object
+     * with an {@code items} array and a boolean {@code hasMore} fails the read.
      *
      * <p>Each row keeps NetSuite's column keys (SuiteQL writes them lower-case, for example {@code email},
      * {@code firstname}, {@code lastname}) in their order and its values as parsed; only the per-row {@code links}
@@ -251,8 +291,8 @@ public class NetsuiteRestClient {
      * @param query the SuiteQL statement
      * @return the rows in arrival order, unmodifiable
      * @throws IllegalArgumentException when {@code query} is {@code null}
-     * @throws IllegalStateException    when a setting is missing (the message names the key) or a page is not the
-     *         expected JSON
+     * @throws IllegalStateException    when a setting is missing (the message names the key), or a page is empty,
+     *         is not a JSON object, or lacks its {@code items} array of objects or its boolean {@code hasMore}
      * @throws RuntimeException         the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged for failures the classifier reports as {@code OTHER} (for example a 400 for an invalid query)
      */
@@ -293,7 +333,8 @@ public class NetsuiteRestClient {
      * @param id   the record's internal ID
      * @return the record exactly as NetSuite wrote it, {@code links} included
      * @throws IllegalArgumentException when {@code type} or {@code id} is {@code null} or blank
-     * @throws IllegalStateException    when a setting is missing or the body is not a JSON object
+     * @throws IllegalStateException    when a setting is missing, or the body is empty, JSON {@code null} or not a
+     *         JSON object
      * @throws RuntimeException         the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged (for example a 404 for an unknown ID)
      */
@@ -310,7 +351,8 @@ public class NetsuiteRestClient {
      * @param type the REST record type, for example {@code itemsupplyplan}
      * @return the {@code id} of each listed item that has one, as text, in arrival order, unmodifiable
      * @throws IllegalArgumentException when {@code type} is {@code null} or blank
-     * @throws IllegalStateException    when a setting is missing or a page is not the expected JSON
+     * @throws IllegalStateException    when a setting is missing, or a page is empty, is not a JSON object, or lacks
+     *         its {@code items} array of objects or its boolean {@code hasMore}
      * @throws RuntimeException         the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged
      */
@@ -333,12 +375,16 @@ public class NetsuiteRestClient {
     /**
      * Returns the metadata catalog (JSON schema) of a record type,
      * {@code GET /services/rest/record/v1/metadata-catalog/{type}} with {@code Accept: application/schema+json}. A
-     * successful read is cached for the application run, so each type is read once; a failure is not cached.
+     * successful read is cached for the application run, so each type is read once; a failure is not cached. A read
+     * succeeds only when the body is a JSON object whose {@code properties}, the field definitions, is a JSON object;
+     * no other schema keyword is required.
      *
      * @param type the REST record type, for example {@code customer}
      * @return the catalog, deeply unmodifiable, because the cached instance is shared by every caller
      * @throws IllegalArgumentException when {@code type} is {@code null} or blank
-     * @throws IllegalStateException    when a setting is missing or the body is not a JSON object
+     * @throws IllegalStateException    when a setting is missing, the body is empty or not a JSON object, or its
+     *         {@code properties} is missing or not a JSON object (the message names the record type); nothing is
+     *         cached then
      * @throws RuntimeException         the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged
      */
@@ -349,7 +395,12 @@ public class NetsuiteRestClient {
             return cached;
         }
         URI uri = expand(endpoint(METADATA_CATALOG_PATH), Map.of("type", recordType));
-        Map<String, Object> catalog = immutableMap(parse(exchange(() -> get(uri, SCHEMA_JSON))));
+        Map<String, Object> parsed = parse(exchange(() -> get(uri, SCHEMA_JSON)));
+        if (!(parsed.get(PROPERTIES) instanceof Map<?, ?>)) {
+            throw new IllegalStateException("Unexpected NetSuite metadata catalog for record type " + recordType
+                    + ": properties is missing or not an object");
+        }
+        Map<String, Object> catalog = immutableMap(parsed);
         Map<String, Object> earlier = metadataCache.putIfAbsent(recordType, catalog);
         return earlier != null ? earlier : catalog;
     }
@@ -445,7 +496,9 @@ public class NetsuiteRestClient {
      *                  ignored
      * @return lower-cased script ID → source ID for every resolved ID, in first-seen input order, unmodifiable;
      *         empty, with no request made, for {@code null} or empty input
-     * @throws IllegalStateException when a setting is missing or the lookup answer is not the expected JSON
+     * @throws IllegalStateException when a setting is missing, or a lookup page is not the SuiteQL page
+     *         {@link #suiteQl(String)} requires (a JSON object with an {@code items} array of objects and a boolean
+     *         {@code hasMore})
      * @throws RuntimeException      the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged
      */
@@ -557,12 +610,16 @@ public class NetsuiteRestClient {
     }
 
     /**
-     * Reads every page of a paged NetSuite resource, starting at offset 0. Paging ends when a page's
-     * {@code hasMore} is not {@code true} or the page holds no item, the latter guarding against a server that
-     * keeps reporting more without delivering it.
+     * Reads every page of a paged NetSuite resource, starting at offset 0. Every page must be a JSON object with an
+     * {@code items} array of objects and a boolean {@code hasMore}; {@code count}, {@code offset},
+     * {@code totalResults} and {@code links} are optional. Paging ends when a page's {@code hasMore} is
+     * {@code false} or the page holds no item, the latter guarding against a server that keeps reporting more
+     * without delivering it.
      *
      * @param pageCall the request of the page at a given offset
      * @return the items of every page, in arrival order
+     * @throws IllegalStateException when a page is empty, is not a JSON object, or lacks the {@code items} array of
+     *         objects or the boolean {@code hasMore}, so a malformed page never reads as the end of the result
      */
     private List<Map<String, Object>> collectPages(LongFunction<UpstreamCall<String>> pageCall) {
         List<Map<String, Object>> collected = new ArrayList<>();
@@ -570,8 +627,9 @@ public class NetsuiteRestClient {
         while (true) {
             Map<String, Object> page = parse(exchange(pageCall.apply(offset)));
             List<Map<String, Object>> items = items(page);
+            boolean hasMore = hasMore(page);
             collected.addAll(items);
-            if (!Boolean.TRUE.equals(page.get(HAS_MORE)) || items.isEmpty()) {
+            if (!hasMore || items.isEmpty()) {
                 return collected;
             }
             Object count = page.get(COUNT);
@@ -584,7 +642,7 @@ public class NetsuiteRestClient {
     private static List<Map<String, Object>> items(Map<String, Object> page) {
         Object items = page.get(ITEMS);
         if (items == null) {
-            return List.of();
+            throw new IllegalStateException("Unexpected NetSuite response: items is missing");
         }
         if (!(items instanceof List<?> list)) {
             throw new IllegalStateException("Unexpected NetSuite response: items is not an array");
@@ -597,6 +655,17 @@ public class NetsuiteRestClient {
             result.add((Map<String, Object>) map);
         }
         return result;
+    }
+
+    private static boolean hasMore(Map<String, Object> page) {
+        Object hasMore = page.get(HAS_MORE);
+        if (hasMore == null) {
+            throw new IllegalStateException("Unexpected NetSuite response: hasMore is missing");
+        }
+        if (!(hasMore instanceof Boolean more)) {
+            throw new IllegalStateException("Unexpected NetSuite response: hasMore is not a boolean");
+        }
+        return more;
     }
 
     /**
@@ -647,16 +716,30 @@ public class NetsuiteRestClient {
         return builder.encode().buildAndExpand(variables).toUri();
     }
 
+    /**
+     * Parses a read's body as a JSON object. An absent or blank body and JSON {@code null} are failures, never an
+     * empty object, so a malformed answer cannot pass for an empty result; the messages raised here carry no part of
+     * the body.
+     *
+     * @param body the response body as NetSuite sent it, possibly {@code null}
+     * @return the body's top-level JSON object, keys in arrival order
+     * @throws IllegalStateException when the body is absent or blank, is JSON {@code null}, or is not valid JSON
+     *         holding an object ({@code Unparsable NetSuite response}, with Jackson's exception as the cause)
+     */
     private Map<String, Object> parse(String body) {
         if (body == null || body.isBlank()) {
-            return new LinkedHashMap<>();
+            throw new IllegalStateException("NetSuite returned an empty response body");
         }
+        Map<String, Object> parsed;
         try {
-            Map<String, Object> parsed = json.readValue(body, JSON_OBJECT);
-            return parsed != null ? parsed : new LinkedHashMap<>();
+            parsed = json.readValue(body, JSON_OBJECT);
         } catch (IOException e) {
             throw new IllegalStateException("Unparsable NetSuite response", e);
         }
+        if (parsed == null) {
+            throw new IllegalStateException("NetSuite response is not a JSON object");
+        }
+        return parsed;
     }
 
     private static Optional<String> lastPathSegment(String location) {
@@ -698,8 +781,11 @@ public class NetsuiteRestClient {
 
     private static Duration timeout(Duration configured, String key, Duration max) {
         Duration timeout = configured != null ? configured : DEFAULT_TIMEOUT;
-        if (timeout.isNegative()) {
-            throw new IllegalStateException(key + " must not be negative");
+        // Below 1 ms a timeout is truncated to 0 ms, which Netty reads as no timeout, or is negative, which no Netty
+        // timeout accepts; compareTo, unlike toMillis(), cannot overflow.
+        if (timeout.compareTo(MIN_TIMEOUT) < 0) {
+            throw new IllegalStateException(
+                    key + " must be a positive duration of at least " + MIN_TIMEOUT.toMillis() + " ms");
         }
         if (timeout.compareTo(max) > 0) {
             throw new IllegalStateException(key + " must not exceed " + max.toMillis() + " ms");

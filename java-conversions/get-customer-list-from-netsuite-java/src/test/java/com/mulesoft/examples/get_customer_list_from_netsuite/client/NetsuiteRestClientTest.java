@@ -18,6 +18,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.mock;
@@ -32,13 +33,21 @@ import com.mulesoft.examples.get_customer_list_from_netsuite.config.NetsuiteProp
 import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamAuthenticationException;
 import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamRateLimitException;
 import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamUnavailableException;
+import io.netty.channel.ChannelOption;
+import java.io.IOException;
 import java.math.BigDecimal;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -55,8 +64,12 @@ import org.springframework.boot.test.context.ConfigDataApplicationContextInitial
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
+import org.springframework.web.reactive.function.client.ClientRequest;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Mono;
+import reactor.netty.http.client.HttpClientConfig;
 
 /**
  * Tests {@link NetsuiteRestClient} (SC-16) against WireMock standing in for the NetSuite REST services, with the token
@@ -170,10 +183,44 @@ class NetsuiteRestClientTest {
     static Stream<String> pagesEndingTheRead() {
         return Stream.of(
                 "{\"count\": 0, \"hasMore\": false, \"items\": []}",
+                // The minimal empty result: count, offset, totalResults and links are optional.
+                "{\"items\": [], \"hasMore\": false}",
                 // A server that reports more but delivers nothing must not keep the client looping.
-                "{\"count\": 0, \"hasMore\": true, \"items\": []}",
-                "{\"hasMore\": true}",
-                "");
+                "{\"count\": 0, \"hasMore\": true, \"items\": []}");
+    }
+
+    @ParameterizedTest
+    @MethodSource("malformedPages")
+    void pagedReadsRejectAMalformedPageAfterExactlyOneRequest(String pageBody, String message) {
+        netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(okJson(pageBody)));
+        netsuite.stubFor(get(urlPathEqualTo(CUSTOMER_RECORDS)).willReturn(okJson(pageBody)));
+
+        // A malformed page is a failure, never an empty result: the caller would otherwise show "No customers found".
+        assertThatThrownBy(() -> client.suiteQl("SELECT id FROM customer"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(message);
+        assertThatThrownBy(() -> client.listRecordIds("customer"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(message);
+        netsuite.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL)));
+        netsuite.verify(1, getRequestedFor(urlPathEqualTo(CUSTOMER_RECORDS)));
+    }
+
+    static Stream<Arguments> malformedPages() {
+        return Stream.of(
+                Arguments.of("", "NetSuite returned an empty response body"),
+                Arguments.of("   ", "NetSuite returned an empty response body"),
+                Arguments.of("null", "NetSuite response is not a JSON object"),
+                Arguments.of("[]", "Unparsable NetSuite response"),
+                Arguments.of("{\"hasMore\": false}", "Unexpected NetSuite response: items is missing"),
+                Arguments.of("{\"items\": []}", "Unexpected NetSuite response: hasMore is missing"),
+                // Rows without hasMore are not taken for the last page.
+                Arguments.of("{\"count\": 1, \"items\": [{\"id\": \"1\"}]}",
+                        "Unexpected NetSuite response: hasMore is missing"),
+                Arguments.of("{\"items\": {}, \"hasMore\": false}",
+                        "Unexpected NetSuite response: items is not an array"),
+                Arguments.of("{\"items\": [], \"hasMore\": \"false\"}",
+                        "Unexpected NetSuite response: hasMore is not a boolean"));
     }
 
     @Test
@@ -267,6 +314,24 @@ class NetsuiteRestClientTest {
                 Arguments.of(" ", "1"),
                 Arguments.of("customer", null),
                 Arguments.of("customer", ""));
+    }
+
+    @ParameterizedTest
+    @MethodSource("bodiesThatAreNotARecord")
+    void getRecordRejectsABodyThatIsNotAJsonObject(String body, String message) {
+        netsuite.stubFor(get(urlPathEqualTo(CUSTOMER_RECORDS + "/107")).willReturn(okJson(body)));
+
+        assertThatThrownBy(() -> client.getRecord("customer", "107"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(message);
+        netsuite.verify(1, getRequestedFor(urlPathEqualTo(CUSTOMER_RECORDS + "/107")));
+    }
+
+    static Stream<Arguments> bodiesThatAreNotARecord() {
+        return Stream.of(
+                Arguments.of("", "NetSuite returned an empty response body"),
+                Arguments.of(" \n ", "NetSuite returned an empty response body"),
+                Arguments.of("null", "NetSuite response is not a JSON object"));
     }
 
     @Test
@@ -372,13 +437,44 @@ class NetsuiteRestClientTest {
         netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG)).inScenario("catalog").whenScenarioStateIs(STARTED)
                 .willReturn(aResponse().withStatus(500)).willSetStateTo("recovered"));
         netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG)).inScenario("catalog").whenScenarioStateIs("recovered")
-                .willReturn(okJson("{\"type\": \"object\"}")));
+                .willReturn(okJson("{\"type\": \"object\", \"properties\": {}}")));
 
         assertThatThrownBy(() -> client.metadataCatalog("customer"))
                 .isInstanceOf(WebClientResponseException.InternalServerError.class);
         assertThat(client.metadataCatalog("customer")).containsEntry("type", "object");
         assertThat(client.metadataCatalog("customer")).containsEntry("type", "object");
         netsuite.verify(2, getRequestedFor(urlEqualTo(CUSTOMER_CATALOG)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("malformedCatalogs")
+    void metadataCatalogRejectsAndDoesNotCacheACatalogWithoutAPropertiesObject(String body, String message) {
+        netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG)).inScenario("catalog").whenScenarioStateIs(STARTED)
+                .willReturn(okJson(body)).willSetStateTo("recovered"));
+        // Only the properties object is required; no other schema keyword.
+        netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG)).inScenario("catalog").whenScenarioStateIs("recovered")
+                .willReturn(okJson("{\"properties\": {\"custentity8\": {\"type\": \"boolean\"}}}")));
+
+        assertThatThrownBy(() -> client.metadataCatalog("customer"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(message);
+        Map<String, Object> recovered = client.metadataCatalog("customer");
+
+        assertThat(recovered).containsOnlyKeys("properties");
+        assertThat(client.metadataCatalog("customer")).isSameAs(recovered);
+        netsuite.verify(2, getRequestedFor(urlEqualTo(CUSTOMER_CATALOG)));
+    }
+
+    static Stream<Arguments> malformedCatalogs() {
+        String noProperties =
+                "Unexpected NetSuite metadata catalog for record type customer: properties is missing or not an object";
+        return Stream.of(
+                Arguments.of("", "NetSuite returned an empty response body"),
+                Arguments.of("null", "NetSuite response is not a JSON object"),
+                Arguments.of("{\"type\": \"object\"}", noProperties),
+                Arguments.of("{\"type\": \"object\", \"properties\": null}", noProperties),
+                Arguments.of("{\"type\": \"object\", \"properties\": []}", noProperties),
+                Arguments.of("{\"type\": \"object\", \"properties\": \"custentity8\"}", noProperties));
     }
 
 
@@ -544,6 +640,78 @@ class NetsuiteRestClientTest {
         void invoke(NetsuiteRestClient client);
     }
 
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("timedOutCalls")
+    void connectionResetBeforeTheRequestIsSentIsNotRetried(String name, TimedOutCall call) throws IOException {
+        // Holding the body back lets the reset arrive before the request headers are sent: the case in which Reactor
+        // Netty would otherwise send the request again on a new connection, unseen by the executor.
+        ExchangeFilterFunction holdBackBody = (request, next) -> next.exchange(ClientRequest.from(request)
+                .body((message, context) -> Mono.delay(Duration.ofMillis(500))
+                        .then(Mono.defer(() -> request.body().insert(message, context))))
+                .build());
+        try (ResettingServer server = new ResettingServer()) {
+            props.setBaseUrl(server.baseUrl());
+            NetsuiteRestClient resetting = new NetsuiteRestClient(props, tokenProvider,
+                    new UpstreamCallExecutor(List.of(new NetsuiteFailureClassifier())),
+                    WebClient.builder().filter(holdBackBody));
+
+            assertThatThrownBy(() -> call.invoke(resetting)).isInstanceOf(RuntimeException.class);
+
+            verify(tokenProvider, times(1)).accessToken();
+            verify(tokenProvider, never()).evict();
+            await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(2))
+                    .until(server.connections::get, count -> count == 1);
+        }
+    }
+
+    /**
+     * A server on a free loopback port that accepts every connection and resets it at once (linger 0, then close),
+     * counting the connections it accepted.
+     */
+    private static final class ResettingServer implements AutoCloseable {
+
+        private final ServerSocket socket = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
+
+        private final AtomicInteger connections = new AtomicInteger();
+
+        private final AtomicReference<IOException> failure = new AtomicReference<>();
+
+        ResettingServer() throws IOException {
+            Thread acceptor = new Thread(this::resetEveryConnection, "netsuite-resetting-server");
+            acceptor.setDaemon(true);
+            acceptor.start();
+        }
+
+        String baseUrl() {
+            return "http://127.0.0.1:" + socket.getLocalPort();
+        }
+
+        private void resetEveryConnection() {
+            try {
+                while (true) {
+                    try (Socket connection = socket.accept()) {
+                        connections.incrementAndGet();
+                        connection.setSoLinger(true, 0);
+                    }
+                }
+            } catch (IOException e) {
+                // accept() fails this way once close() has closed the socket; any other failure is the test's.
+                if (!socket.isClosed()) {
+                    failure.set(e);
+                }
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+            IOException failed = failure.get();
+            if (failed != null) {
+                throw failed;
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------------------- Configuration
 
     @Test
@@ -555,6 +723,70 @@ class NetsuiteRestClientTest {
                 .hasMessageContaining("netsuite.account");
         verify(tokenProvider, never()).accessToken();
         netsuite.verify(0, anyRequestedFor(anyUrl()));
+    }
+
+    @ParameterizedTest(name = "{0} = {2}")
+    @MethodSource("invalidTimeouts")
+    void invalidTimeoutFailsStartUpNamingTheKeyBeforeAnyRequest(String key,
+            BiConsumer<NetsuiteProperties, Duration> setting, Duration timeout, String message) {
+        setting.accept(props, timeout);
+
+        assertThatThrownBy(() -> newClient(props)).isInstanceOf(IllegalStateException.class).hasMessage(message);
+        assertThatThrownBy(() -> NetsuiteRestClient.connector(props))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(message);
+        // The token request runs on the same transport, so the token provider fails start-up the same way.
+        assertThatThrownBy(() -> new NetsuiteTokenProvider(props, WebClient.builder()))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(message);
+        assertThat(message).startsWith(key + " ");
+        verify(tokenProvider, never()).accessToken();
+        netsuite.verify(0, anyRequestedFor(anyUrl()));
+    }
+
+    static Stream<Arguments> invalidTimeouts() {
+        String connect = "netsuite.connect-timeout";
+        String read = "netsuite.read-timeout";
+        String tooShort = " must be a positive duration of at least 1 ms";
+        BiConsumer<NetsuiteProperties, Duration> setConnect = NetsuiteProperties::setConnectTimeout;
+        BiConsumer<NetsuiteProperties, Duration> setRead = NetsuiteProperties::setReadTimeout;
+        // Zero is Netty's "no timeout"; a positive sub-millisecond value would be truncated to it.
+        return Stream.of(
+                Arguments.of(connect, setConnect, Duration.ZERO, connect + tooShort),
+                Arguments.of(connect, setConnect, Duration.ofMillis(-1), connect + tooShort),
+                Arguments.of(connect, setConnect, Duration.ofNanos(999_999), connect + tooShort),
+                Arguments.of(connect, setConnect, Duration.ofMillis(Integer.MAX_VALUE + 1L),
+                        connect + " must not exceed 2147483647 ms"),
+                Arguments.of(read, setRead, Duration.ZERO, read + tooShort),
+                Arguments.of(read, setRead, Duration.ofMillis(-1), read + tooShort),
+                Arguments.of(read, setRead, Duration.ofNanos(999_999), read + tooShort),
+                Arguments.of(read, setRead, Duration.ofSeconds(Long.MAX_VALUE),
+                        read + " must not exceed 9223372036854775807 ms"));
+    }
+
+    @ParameterizedTest(name = "connect {0}, read {1}")
+    @MethodSource("acceptedTimeouts")
+    void acceptedTimeoutsReachTheTransportWhichNeverRetries(Duration connect, Duration read, int connectMillis,
+            Duration responseTimeout) {
+        NetsuiteProperties properties = mock(NetsuiteProperties.class);
+        when(properties.getConnectTimeout()).thenReturn(connect);
+        when(properties.getReadTimeout()).thenReturn(read);
+
+        HttpClientConfig transport = NetsuiteRestClient.httpClient(properties).configuration();
+
+        assertThat(transport.options().get(ChannelOption.CONNECT_TIMEOUT_MILLIS)).isEqualTo(connectMillis);
+        assertThat(transport.responseTimeout()).isEqualTo(responseTimeout);
+        assertThat(transport.isRetryDisabled()).isTrue();
+        assertThatCode(() -> newClient(properties)).doesNotThrowAnyException();
+    }
+
+    static Stream<Arguments> acceptedTimeouts() {
+        return Stream.of(
+                // A setting that returns null gets the 10 s default, the Mule default response timeout.
+                Arguments.of(null, null, 10_000, Duration.ofSeconds(10)),
+                Arguments.of(Duration.ofMillis(1), Duration.ofMillis(1), 1, Duration.ofMillis(1)),
+                Arguments.of(Duration.ofMillis(Integer.MAX_VALUE), Duration.ofMillis(Long.MAX_VALUE),
+                        Integer.MAX_VALUE, Duration.ofMillis(Long.MAX_VALUE)));
     }
 
     @Test

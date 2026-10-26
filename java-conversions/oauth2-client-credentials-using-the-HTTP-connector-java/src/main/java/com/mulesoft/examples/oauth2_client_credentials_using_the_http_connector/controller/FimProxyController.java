@@ -46,8 +46,10 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * <ol>
  *   <li>{@code /FIM/**} also matches the bare {@code /FIM} and {@code /FIM/}; how Mule's {@code /FIM/*} answered
  *       a bare {@code /FIM} is unverified.</li>
- *   <li>Boot's {@code FormContentFilter} consumes form-encoded PUT, PATCH and DELETE bodies, so they arrive here
- *       empty.</li>
+ *   <li>Form-encoded bodies of every method other than a query-less POST (next point) reach this class and are
+ *       forwarded byte for byte, because {@code application.yml} disables Boot's {@code FormContentFilter},
+ *       which would otherwise parse PUT, PATCH and DELETE form bodies before dispatch and leave them empty
+ *       here.</li>
  *   <li>For a form-encoded POST without a query string, Spring's {@code ServletServerHttpRequest} rebuilds the
  *       body from the request parameters, re-encoded and in parameter-map order, so the forwarded form body may
  *       not be byte-identical to the inbound bytes.</li>

@@ -23,6 +23,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.oauth2.core.OAuth2AuthorizationException;
 import org.springframework.security.oauth2.core.OAuth2Error;
+import org.springframework.security.oauth2.core.OAuth2ErrorCodes;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
@@ -38,22 +39,37 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
  *       {@code WebClientRequestException}, and a timed-out token request may additionally be wrapped by Spring
  *       Security in an {@link OAuth2AuthorizationException}; {@link UpstreamFailureClassifier#isUnavailable}
  *       looks through both.</li>
- *   <li>A {@link WebClientResponseException} with HTTP 401 → {@link UpstreamFailureKind#AUTHENTICATION}: the
- *       executor runs the re-authentication step ({@code DynamicsWebApiClient::evictToken}, which drops the cached
- *       Entra token) and retries the call once with a fresh token.</li>
- *   <li>HTTP 429, Dataverse's service-protection throttling → a rate limit carrying the {@code Retry-After} header
- *       value (seconds) exactly as sent, or {@code null} when none was sent; never retried.</li>
- *   <li>An {@link OAuth2AuthorizationException}, including Spring Security's {@code ClientAuthorizationException}
- *       raised when Entra rejects the token request (for example {@code invalid_client} or
- *       {@code unauthorized_client}) → {@link UpstreamFailureKind#AUTHENTICATION}.</li>
+ *   <li>A {@link WebClientResponseException} with HTTP 401, from Dataverse or from the Entra token endpoint →
+ *       {@link UpstreamFailureKind#AUTHENTICATION}: the executor runs the re-authentication step
+ *       ({@code DynamicsWebApiClient::evictToken}, which drops the cached Entra token) and retries the call once with
+ *       a fresh token. The token WebClient of {@code config/DynamicsOAuthConfig} keeps a token 401 with its status,
+ *       so it is an authentication failure whatever its body, an empty or non-JSON one included.</li>
+ *   <li>HTTP 429, Dataverse's service-protection throttling or Entra throttling the token request → a rate limit
+ *       carrying the {@code Retry-After} header value (seconds) exactly as sent, or {@code null} when none was sent;
+ *       never retried. The token WebClient raises a token 429, like a token 401 or 5xx, as a
+ *       {@link WebClientResponseException} that keeps the status and headers Spring Security's OAuth 2.0 body
+ *       extractor would discard.</li>
+ *   <li>An {@link OAuth2AuthorizationException}, including Spring Security's {@code ClientAuthorizationException},
+ *       raised when Entra rejects the token request with an OAuth 2.0 error in a 400 response (for example
+ *       {@code unauthorized_client}, {@code invalid_grant} or {@code invalid_scope}), or carrying any other rejection
+ *       code such as {@code invalid_client} → {@link UpstreamFailureKind#AUTHENTICATION}. The codes that report a
+ *       failed token exchange rather than a rejection are not authentication failures and fall to the next rule:
+ *       {@code invalid_token_response} (Spring Security could not read the token response: not JSON, empty, or
+ *       malformed), {@code server_error} (also Spring Security's code for a token response that carries neither an
+ *       access token nor an error code) and {@code temporarily_unavailable}.</li>
  *   <li>Everything else → {@link UpstreamFailureKind#OTHER}, rethrown unchanged: a Dataverse 400, 403, 404 or 5xx,
- *       and non-HTTP failures such as the {@code IllegalStateException} raised for a blank {@code dynamics.*} key or
- *       the {@code IllegalArgumentException} raised for a contact ID that is not a GUID.</li>
+ *       an Entra 5xx, the token-exchange failures above (an Entra 400, 403 or 404 whose body Spring Security could
+ *       not read included), and non-HTTP failures such as the
+ *       {@code IllegalStateException} raised for a blank {@code dynamics.*} key or the
+ *       {@code IllegalArgumentException} raised for a contact ID that is not a GUID.</li>
  * </ol>
  *
- * <p>The caller-facing message is Dynamics' own error text: the {@code error.message} of the Dataverse OData error
- * body, else the description or code of the Entra OAuth 2.0 error. Request headers, and with them the bearer token
- * and the client secret, never reach it.
+ * <p>The caller-facing message is Dynamics' own error text: the {@code error.message} of a Dataverse OData error
+ * body, else the description or code of the Entra OAuth 2.0 error, whether it arrived as a response body kept with
+ * its HTTP status or as Spring Security's parsed error. A response whose body carries neither, such as an empty or
+ * HTML token 401, falls back to the exception's own message, for example
+ * {@code 401 Unauthorized from POST <token URI>}. Request headers, and with them the bearer token and the client
+ * secret, never reach it.
  *
  * <p>The classifier is stateless and therefore safe for concurrent use; it never logs, because the executor writes
  * the one ERROR line of each upstream failure.
@@ -64,10 +80,30 @@ public class DynamicsFailureClassifier implements UpstreamFailureClassifier {
     /** Parses error bodies only; parse failures are swallowed, so no parser setting needs to hide the input. */
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    /** The OData error object of a Dataverse error body, {@code {"error":{"code":"0x80040217","message":"..."}}}. */
+    /**
+     * The error member of an error body: the OData error object of a Dataverse body,
+     * {@code {"error":{"code":"0x80040217","message":"..."}}}, or the error code string of an Entra OAuth 2.0 body.
+     */
     private static final String ERROR = "error";
 
     private static final String MESSAGE = "message";
+
+    /** The description member of an Entra OAuth 2.0 error body, {@code {"error":"...","error_description":"..."}}. */
+    private static final String ERROR_DESCRIPTION = "error_description";
+
+    /**
+     * The code Spring Security's {@code OAuth2AccessTokenResponseBodyExtractor} gives an {@link OAuth2Error} when it
+     * cannot read a token response (not JSON, empty, or malformed); Spring Security keeps it private.
+     */
+    private static final String INVALID_TOKEN_RESPONSE = "invalid_token_response";
+
+    /**
+     * OAuth 2.0 error codes that report a failed token exchange, not a rejected client or grant: the unreadable
+     * response above, and the two codes RFC 6749 gives a failing or overloaded authorization server;
+     * {@code server_error} is also the code Spring Security gives a response with neither access token nor error.
+     */
+    private static final Set<String> TOKEN_EXCHANGE_FAILURE_CODES = Set.of(
+            INVALID_TOKEN_RESPONSE, OAuth2ErrorCodes.SERVER_ERROR, OAuth2ErrorCodes.TEMPORARILY_UNAVAILABLE);
 
     /**
      * @return {@link UpstreamSystem#MICROSOFT_DYNAMICS_365}
@@ -105,17 +141,30 @@ public class DynamicsFailureClassifier implements UpstreamFailureClassifier {
         if (throttled != null) {
             return UpstreamFailureKind.rateLimit(retryAfter(throttled));
         }
-        if (first(chain, OAuth2AuthorizationException.class) != null) {
+        OAuth2AuthorizationException authorization = first(chain, OAuth2AuthorizationException.class);
+        if (authorization != null && isAuthorizationRejection(authorization.getError())) {
             return UpstreamFailureKind.AUTHENTICATION;
         }
         return UpstreamFailureKind.OTHER;
     }
 
     /**
+     * @param error the OAuth 2.0 error of an {@link OAuth2AuthorizationException}; may be {@code null}
+     * @return {@code true} when its code reports that Entra rejected the client or grant, {@code false} for a code
+     *         of {@link #TOKEN_EXCHANGE_FAILURE_CODES} or a missing code
+     */
+    private static boolean isAuthorizationRejection(OAuth2Error error) {
+        String errorCode = error == null ? null : error.getErrorCode();
+        return errorCode != null && !TOKEN_EXCHANGE_FAILURE_CODES.contains(errorCode);
+    }
+
+    /**
      * Returns Dynamics' own text for a failure, the first available of:
      * <ol>
-     *   <li>the non-blank {@code error.message} of the JSON body of the first {@link WebClientResponseException} in
-     *       the cause chain (a blank, non-JSON or differently shaped body yields nothing);</li>
+     *   <li>from the JSON body of the first {@link WebClientResponseException} in the cause chain: the non-blank
+     *       {@code error.message} of a Dataverse OData error, or, when {@code error} is a string (an Entra OAuth 2.0
+     *       error kept with its token-response status), the non-blank {@code error_description}, else the non-blank
+     *       {@code error} code (a blank, non-JSON or differently shaped body yields nothing);</li>
      *   <li>for the first {@link OAuth2AuthorizationException} in the chain, its error's non-blank description, else
      *       its non-blank error code;</li>
      *   <li>the inherited lookup: the first non-blank message of the chain, else the failure's class name.</li>
@@ -131,7 +180,7 @@ public class DynamicsFailureClassifier implements UpstreamFailureClassifier {
         List<Throwable> chain = causeChain(failure);
         WebClientResponseException response = first(chain, WebClientResponseException.class);
         if (response != null) {
-            String message = dataverseErrorMessage(response);
+            String message = errorBodyMessage(response);
             if (message != null) {
                 return message;
             }
@@ -147,13 +196,16 @@ public class DynamicsFailureClassifier implements UpstreamFailureClassifier {
     }
 
     /**
-     * Reads the message of a Dataverse OData error body, for example
-     * {@code {"error":{"code":"0x80040217","message":"contact With Id = ... Does Not Exist"}}}.
+     * Reads the message of an error body: a Dataverse OData error, for example
+     * {@code {"error":{"code":"0x80040217","message":"contact With Id = ... Does Not Exist"}}}, or an Entra OAuth 2.0
+     * error of a token response, for example
+     * {@code {"error":"temporarily_unavailable","error_description":"AADSTS..."}}.
      *
      * @param response the response exception; never {@code null}
-     * @return the non-blank {@code error.message} text, or {@code null} when the body yields none
+     * @return the non-blank {@code error.message} text of a Dataverse body; for an Entra body the non-blank
+     *         {@code error_description}, else the non-blank {@code error} code; {@code null} when the body yields none
      */
-    private static String dataverseErrorMessage(WebClientResponseException response) {
+    private static String errorBodyMessage(WebClientResponseException response) {
         JsonNode root;
         try {
             String body = response.getResponseBodyAsString();
@@ -169,8 +221,20 @@ public class DynamicsFailureClassifier implements UpstreamFailureClassifier {
         if (root == null) {
             return null;
         }
-        JsonNode message = root.path(ERROR).path(MESSAGE);
-        return message.isTextual() && !message.textValue().isBlank() ? message.textValue() : null;
+        JsonNode error = root.path(ERROR);
+        if (error.isTextual()) {
+            String description = nonBlankText(root.path(ERROR_DESCRIPTION));
+            return description != null ? description : nonBlankText(error);
+        }
+        return nonBlankText(error.path(MESSAGE));
+    }
+
+    /**
+     * @param node a JSON node, possibly missing
+     * @return the node's text when it is a non-blank string, otherwise {@code null}
+     */
+    private static String nonBlankText(JsonNode node) {
+        return node.isTextual() && !node.textValue().isBlank() ? node.textValue() : null;
     }
 
     /**

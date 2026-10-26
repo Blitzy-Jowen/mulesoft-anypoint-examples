@@ -17,6 +17,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.ok;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -83,7 +84,8 @@ import com.sun.net.httpserver.HttpsServer;
  * The transport under {@link BoxProxyClient}, against loopback upstreams: a stalled exchange fails within the
  * timeout, once, and gives its connection up; no failure is retried; responses come back unparsed and cookies are
  * never replayed; the headers the header mapping keeps, {@code Expect} and {@code Upgrade} included, reach the
- * upstream; a request without body bytes is framed by its method; a TRACE with body bytes is refused before
+ * upstream; header bytes, obs-text included, travel unchanged both ways while control characters are substituted;
+ * a request without body bytes is framed by its method; a TRACE with body bytes is refused before
  * anything is sent, and through {@link RestProxyService} the bytes of TRACE and PRI, which the Mule requester sent
  * without payload, never reach the upstream; a redirect carries the caller's headers only on the original origin,
  * and one from https to http is returned unfollowed, so nothing reaches the cleartext target; and
@@ -274,6 +276,63 @@ class BoxProxyClientTransportTest {
         RequestHead head = raw.nextRequestHead();
         assertThat(head.requestLine()).isEqualTo("GET /2.0/users/me HTTP/1.1");
         assertThat(head.headers()).containsEntry(HttpHeaders.UPGRADE, "example/1");
+    }
+
+    static Stream<Arguments> requestHeaderValues() {
+        return Stream.of(
+                Arguments.of("UTF-8 euro sign", asReceived("5 \u20ac"), "5 \u20ac".getBytes(UTF_8)),
+                Arguments.of("UTF-8 filename", asReceived("attachment; filename=\"r\u00e9sum\u00e9 \u2713.txt\""),
+                        "attachment; filename=\"r\u00e9sum\u00e9 \u2713.txt\"".getBytes(UTF_8)),
+                Arguments.of("UTF-8 name", asReceived("M\u00fcller \u2713"), "M\u00fcller \u2713".getBytes(UTF_8)),
+                Arguments.of("NUL, SOH and DEL", "a\u0000b\u0001c\u007fd", "a?b?c?d".getBytes(US_ASCII)),
+                Arguments.of("CR, LF, VT, FF and HTAB", "a\rb\nc\u000bd\u000ce\tf", "a b c d e\tf".getBytes(US_ASCII)));
+    }
+
+    // Obs-text bytes arrive unchanged; a control character other than HTAB becomes SP or '?'.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("requestHeaderValues")
+    void requestHeaderValueBytesReachTheUpstream(String scenario, String value, byte[] expected) throws Exception {
+        raw = new RawUpstream(RawUpstream::answerEmpty);
+        HttpHeaders headers = new HttpHeaders();
+        headers.add("X-Value", value);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+
+        ResponseEntity<byte[]> response = client.exchange(HttpMethod.GET, "/headers", null, headers, null);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        RequestHead head = raw.nextRequestHead();
+        assertThat(head.requestLine()).isEqualTo("GET /headers HTTP/1.1");
+        assertThat(head.headers().get("X-Value").getBytes(ISO_8859_1)).isEqualTo(expected);
+    }
+
+    // The listener accepts only token methods; a direct caller's CR and LF still cannot split the request line.
+    @Test
+    void controlCharactersInAMethodTokenAreSubstitutedInTheRequestLine() throws Exception {
+        raw = new RawUpstream(RawUpstream::answerEmpty);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+
+        ResponseEntity<byte[]> response =
+                client.exchange(HttpMethod.valueOf("GE\r\nT"), "/method", null, new HttpHeaders(), null);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(raw.nextRequestHead().requestLine().getBytes(ISO_8859_1))
+                .isEqualTo("GE??T /method HTTP/1.1".getBytes(US_ASCII));
+    }
+
+    @Test
+    void responseHeaderObsTextIsReturnedAsTheBytesTheUpstreamSent() throws Exception {
+        byte[] value = "M\u00fcller \u2713 \u20ac".getBytes(UTF_8);
+        raw = new RawUpstream((stub, head, in, out) -> {
+            out.write("HTTP/1.1 200 OK\r\nX-Utf8: ".getBytes(US_ASCII));
+            out.write(value);
+            out.write("\r\nContent-Length: 0\r\n\r\n".getBytes(US_ASCII));
+        });
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+
+        ResponseEntity<byte[]> response = client.exchange(HttpMethod.GET, "/utf8", null, new HttpHeaders(), null);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(response.getHeaders().getFirst("X-Utf8").getBytes(ISO_8859_1)).isEqualTo(value);
     }
 
     static Stream<Arguments> requestsWithoutBodyBytes() {
@@ -534,6 +593,11 @@ class BoxProxyClientTransportTest {
         return Stream.iterate(failure, Objects::nonNull, Throwable::getCause).toList();
     }
 
+    /** A header value as the listener hands it over for the UTF-8 bytes of {@code text}: one character per byte. */
+    private static String asReceived(String text) {
+        return new String(text.getBytes(UTF_8), ISO_8859_1);
+    }
+
     /** What a raw upstream does on a connection once it has read the request head. */
     @FunctionalInterface
     interface Responder {
@@ -541,7 +605,10 @@ class BoxProxyClientTransportTest {
                 throws IOException, InterruptedException;
     }
 
-    /** A request head as a raw upstream received it; header names match ignoring case. */
+    /**
+     * A request head as a raw upstream received it, one ISO-8859-1 character per byte; header names match ignoring
+     * case.
+     */
     record RequestHead(String requestLine, Map<String, String> headers) {
 
         static RequestHead parse(String head) {
@@ -725,7 +792,7 @@ class BoxProxyClientTransportTest {
                 head.write(b);
                 matched = b == terminator[matched] ? matched + 1 : (b == '\r' ? 1 : 0);
             }
-            return head.toString(US_ASCII);
+            return head.toString(ISO_8859_1);
         }
     }
 

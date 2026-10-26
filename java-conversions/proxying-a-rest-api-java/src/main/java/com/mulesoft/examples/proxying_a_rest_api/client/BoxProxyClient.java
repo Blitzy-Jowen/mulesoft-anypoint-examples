@@ -15,6 +15,8 @@ import java.io.OutputStream;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.time.Duration;
@@ -39,6 +41,7 @@ import org.apache.hc.client5.http.impl.ChainElement;
 import org.apache.hc.client5.http.impl.DefaultRedirectStrategy;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.ManagedHttpClientConnectionFactory;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
@@ -46,15 +49,21 @@ import org.apache.hc.client5.http.protocol.RedirectLocations;
 import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactoryBuilder;
 import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.http.ClassicHttpResponse;
+import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.HttpException;
 import org.apache.hc.core5.http.HttpRequest;
 import org.apache.hc.core5.http.HttpResponse;
 import org.apache.hc.core5.http.ProtocolException;
+import org.apache.hc.core5.http.config.CharCodingConfig;
+import org.apache.hc.core5.http.impl.io.DefaultHttpRequestWriterFactory;
 import org.apache.hc.core5.http.io.entity.HttpEntityWrapper;
+import org.apache.hc.core5.http.message.BasicLineFormatter;
+import org.apache.hc.core5.http.message.RequestLine;
 import org.apache.hc.core5.http.protocol.HttpContext;
 import org.apache.hc.core5.io.CloseMode;
 import org.apache.hc.core5.net.URIAuthority;
+import org.apache.hc.core5.util.CharArrayBuffer;
 import org.apache.hc.core5.util.Timeout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -82,6 +91,11 @@ import org.springframework.web.client.RestClient;
  * and the body exactly as received, and returns the upstream status, headers and body without parsing or
  * decompressing them ({@code parseResponse="false"}). Which headers travel in either direction, and how an
  * upstream error status is answered, are decided by the caller.
+ *
+ * <p>Header values are written as ISO-8859-1 bytes, one byte per character, as the listener reads them, so
+ * obs-text such as UTF-8 reaches the upstream unchanged; response heads are read the same way. A control character
+ * other than HTAB never reaches the wire: CR, LF, FF and VT in a value become SP, the others and DEL become
+ * {@code ?}, as httpcore5's default writer substitutes them.
  *
  * <p>As the Mule 3.8 requester did by default, redirects are followed, except from an {@code https} URL to an
  * {@code http} one. {@code proxy.response-timeout-ms} bounds the connect, the TLS handshake, every write of the
@@ -165,9 +179,20 @@ public class BoxProxyClient implements AutoCloseable {
         this.writeDeadlines.setRemoveOnCancelPolicy(true);
 
         Timeout limit = Timeout.of(timeout);
-        // httpclient5's default of five connections per route would queue concurrent proxied calls.
+        // httpclient5's default of five connections per route would queue concurrent proxied calls. The connections
+        // encode and decode heads in ISO-8859-1, the listener's one character per byte, so header bytes from 0x80 to
+        // 0x9F pass unchanged, which httpcore5 without a charset writes as '?'; the formatter keeps substituting
+        // control characters as that writer does.
         PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
                 .setSSLSocketFactory(SSLConnectionSocketFactoryBuilder.create().setSslContext(sslContext).build())
+                .setConnectionFactory(ManagedHttpClientConnectionFactory.builder()
+                        .charCodingConfig(CharCodingConfig.custom()
+                                .setCharset(StandardCharsets.ISO_8859_1)
+                                .setMalformedInputAction(CodingErrorAction.REPLACE)
+                                .setUnmappableInputAction(CodingErrorAction.REPLACE)
+                                .build())
+                        .requestWriterFactory(new DefaultHttpRequestWriterFactory(new ObsTextLineFormatter()))
+                        .build())
                 .setDefaultConnectionConfig(ConnectionConfig.custom()
                         .setConnectTimeout(limit)
                         .setSocketTimeout(limit)
@@ -393,6 +418,39 @@ public class BoxProxyClient implements AutoCloseable {
             return followed == null || followed.size() == 0
                     ? original.getScheme()
                     : followed.get(followed.size() - 1).getScheme();
+        }
+    }
+
+    /**
+     * httpcore5's request line and header formatting for connections that encode in ISO-8859-1. Each formatted
+     * line keeps HTAB, U+0020 to U+007E and U+0080 to U+00FF, which that encoding writes as the same byte, so
+     * obs-text passes unchanged; every other character becomes {@code ?}, as httpcore5 writes it without a charset,
+     * so no control character, DEL included, reaches the wire. CR, LF, FF and VT in a header value have already
+     * become SP.
+     */
+    private static final class ObsTextLineFormatter extends BasicLineFormatter {
+
+        @Override
+        public void formatRequestLine(CharArrayBuffer buffer, RequestLine line) {
+            CharArrayBuffer formatted = new CharArrayBuffer(128);
+            super.formatRequestLine(formatted, line);
+            appendWritable(buffer, formatted);
+        }
+
+        @Override
+        public void formatHeader(CharArrayBuffer buffer, Header header) {
+            CharArrayBuffer formatted = new CharArrayBuffer(128);
+            super.formatHeader(formatted, header);
+            appendWritable(buffer, formatted);
+        }
+
+        private static void appendWritable(CharArrayBuffer buffer, CharArrayBuffer formatted) {
+            Objects.requireNonNull(buffer, "Char array buffer");
+            for (int i = 0; i < formatted.length(); i++) {
+                char c = formatted.charAt(i);
+                boolean writable = c == '\t' || (c >= 0x20 && c <= 0x7E) || (c >= 0x80 && c <= 0xFF);
+                buffer.append(writable ? c : '?');
+            }
         }
     }
 

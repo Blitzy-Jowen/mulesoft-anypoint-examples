@@ -6,6 +6,15 @@ http:
 server:
   port: ${http.port:8081}
   address: 0.0.0.0      # http:listener-config host (proxying-a-rest-api.xml:3)
+  undertow:
+    # The raw request target reaches the proxy undecoded, so the caller's percent-encoding is forwarded as sent;
+    # config.RequestTargetEscapingFilter escapes whatever the upstream URI cannot carry.
+    decode-url: false
+    options:
+      server:
+        # The original Grizzly listener accepted targets with raw | { } ^ " < > ` \ and the like and forwarded them;
+        # Undertow answers them with a bare 400 unless this option is on.
+        ALLOW_UNESCAPED_CHARACTERS_IN_URL: true
 spring:
   application:
     name: proxying-a-rest-api-java

@@ -17,6 +17,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.security.oauth2.client.AuthorizedClientServiceReactiveOAuth2AuthorizedClientManager;
@@ -31,7 +33,10 @@ import org.springframework.security.oauth2.client.registration.ReactiveClientReg
 import org.springframework.security.oauth2.client.web.reactive.function.client.ServerOAuth2AuthorizedClientExchangeFilterFunction;
 import org.springframework.security.oauth2.core.AuthorizationGrantType;
 import org.springframework.security.oauth2.core.ClientAuthenticationMethod;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClient;
 
@@ -57,7 +62,8 @@ import reactor.netty.http.client.HttpClient;
  * <p>Beans: the client registration repository, the in-memory authorized-client service that caches the token
  * (and through which {@code client/DynamicsWebApiClient} evicts it), the client-credentials authorized-client
  * manager, and the only {@link WebClient} bean, which attaches the bearer token and the OData headers. Every call,
- * the token request included, uses a 10 s connect and read timeout, the Mule default response timeout.
+ * the token request included, uses a 10 s connect and read timeout, the Mule default response timeout, and makes
+ * exactly one transport attempt.
  *
  * <p>Missing credentials fail late. The application context starts with every {@code dynamics.*} secret blank, and
  * only the first token or Dataverse call throws {@link IllegalStateException} naming the missing key, because the
@@ -85,6 +91,15 @@ public class DynamicsOAuthConfig {
     public static final String PRINCIPAL_NAME = "anonymousUser";
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+
+    /** The shortest timeout Netty can apply: it sets both bounds in whole milliseconds. */
+    private static final Duration MIN_TIMEOUT = Duration.ofMillis(1);
+
+    /** The longest connect timeout {@link ChannelOption#CONNECT_TIMEOUT_MILLIS}, an {@code int}, holds. */
+    private static final Duration MAX_CONNECT_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
+
+    /** The longest response timeout whose {@link Duration#toMillis()}, which Reactor Netty calls, cannot overflow. */
+    private static final Duration MAX_READ_TIMEOUT = Duration.ofMillis(Long.MAX_VALUE);
 
     private static final String ENTRA_HOST = "login.microsoftonline.com";
 
@@ -239,23 +254,48 @@ public class DynamicsOAuthConfig {
     }
 
     /**
-     * Builds the reactor-netty connector shared by the token and Dataverse WebClients: connect timeout
+     * Builds the reactor-netty connector shared by the token and Dataverse WebClients, over the client
+     * {@link #httpClient(DynamicsProperties)} configures: both timeouts applied and one transport attempt per call.
+     *
+     * @param properties the bound {@code dynamics.*} settings
+     * @return a connector with both timeouts applied and Reactor Netty's transport retry disabled
+     * @throws IllegalStateException when a configured timeout is shorter than 1 ms, which would disable it
+     */
+    public static ReactorClientHttpConnector connector(DynamicsProperties properties) {
+        return new ReactorClientHttpConnector(httpClient(properties));
+    }
+
+    /**
+     * Builds the reactor-netty client of every token and Dataverse call: connect timeout
      * {@code dynamics.connect-timeout} and response timeout {@code dynamics.read-timeout}, each 10 s when unset. An
      * expired response timeout surfaces as a {@code WebClientRequestException} caused by Netty's
      * {@code ReadTimeoutException}, which the Dynamics failure classifier reports as unavailable.
      *
+     * <p>Every call makes exactly one transport attempt. Reactor Netty by default sends a request again, on a new
+     * connection, when its connection is reset before the request headers were written; that retry is disabled, so a
+     * connectivity failure reaches the failure classifier the first time it occurs and is never retried, not even
+     * silently inside the transport.
+     *
+     * <p>Netty applies both timeouts in whole milliseconds, which is why {@link #positiveTimeout} rejects anything
+     * shorter than 1 ms. A connect timeout beyond {@link Integer#MAX_VALUE} ms, the most
+     * {@link ChannelOption#CONNECT_TIMEOUT_MILLIS} holds, is capped there, and a response timeout beyond
+     * {@link Long#MAX_VALUE} ms, the most Reactor Netty's per-request millisecond conversion holds, is capped there,
+     * so no setting overflows.
+     *
      * @param properties the bound {@code dynamics.*} settings
-     * @return a connector with both timeouts applied
-     * @throws IllegalStateException when a configured timeout is zero or negative, which would disable it
+     * @return the configured client
+     * @throws IllegalStateException when a configured timeout is shorter than 1 ms
      */
-    public static ReactorClientHttpConnector connector(DynamicsProperties properties) {
+    static HttpClient httpClient(DynamicsProperties properties) {
         Duration connectTimeout = positiveTimeout(properties.connectTimeout(), "dynamics.connect-timeout");
         Duration readTimeout = positiveTimeout(properties.readTimeout(), "dynamics.read-timeout");
-        int connectTimeoutMillis = (int) Math.min(Integer.MAX_VALUE, connectTimeout.toMillis());
-        HttpClient httpClient = HttpClient.create()
+        int connectTimeoutMillis = connectTimeout.compareTo(MAX_CONNECT_TIMEOUT) >= 0
+                ? Integer.MAX_VALUE
+                : (int) connectTimeout.toMillis();
+        return HttpClient.create()
+                .disableRetry(true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, connectTimeoutMillis)
-                .responseTimeout(readTimeout);
-        return new ReactorClientHttpConnector(httpClient);
+                .responseTimeout(readTimeout.compareTo(MAX_READ_TIMEOUT) > 0 ? MAX_READ_TIMEOUT : readTimeout);
     }
 
     /**
@@ -303,6 +343,16 @@ public class DynamicsOAuthConfig {
      *
      * <p>The token request uses its own WebClient, built here rather than published as a bean so that the
      * Dataverse WebClient stays the only {@link WebClient} bean, and carrying no OAuth filter, which would recurse.
+     * Its one filter, {@link #preserveTokenErrorStatus}, turns an Entra 401, 429 or 5xx response into a
+     * {@link WebClientResponseException} carrying the status, the headers ({@code Retry-After} included) and the
+     * body, because Spring Security reads every token response as an OAuth 2.0 body without checking the status
+     * and would otherwise report it as an {@code OAuth2AuthorizationException} without status or headers. A
+     * rejected token request ({@code 401}, for example Entra's {@code invalid_client}) is thereby classified as an
+     * authentication failure whatever its body, even one Spring Security could not read; a throttled one as a rate
+     * limit with Entra's {@code Retry-After}, never retried; an Entra 5xx is rethrown unchanged. Every other
+     * response, Entra's 400 OAuth 2.0 errors such as {@code unauthorized_client} or {@code invalid_grant} included,
+     * still reaches Spring Security, which raises the authorization exception the classifier reads as an
+     * authentication failure.
      *
      * @param repository the {@value #REGISTRATION_ID} registration repository
      * @param service    the authorized-client service that caches the token
@@ -316,7 +366,10 @@ public class DynamicsOAuthConfig {
             DynamicsProperties properties) {
         WebClientReactiveClientCredentialsTokenResponseClient tokenClient =
                 new WebClientReactiveClientCredentialsTokenResponseClient();
-        tokenClient.setWebClient(WebClient.builder().clientConnector(connector(properties)).build());
+        tokenClient.setWebClient(WebClient.builder()
+                .clientConnector(connector(properties))
+                .filter(ExchangeFilterFunction.ofResponseProcessor(DynamicsOAuthConfig::preserveTokenErrorStatus))
+                .build());
 
         ReactiveOAuth2AuthorizedClientProvider provider = ReactiveOAuth2AuthorizedClientProviderBuilder.builder()
                 .clientCredentials(clientCredentials -> clientCredentials.accessTokenResponseClient(tokenClient))
@@ -364,12 +417,46 @@ public class DynamicsOAuthConfig {
                 .build();
     }
 
+    /**
+     * The response processor of the token WebClient: fails an unauthorized ({@code 401}), throttled ({@code 429}) or
+     * server-error ({@code 5xx}) Entra token response with the {@link WebClientResponseException}
+     * {@link ClientResponse#createException()} builds from it, which carries the status, the headers and the body,
+     * before Spring Security's OAuth 2.0 body extractor discards them.
+     *
+     * <p>A 401 is kept with its status because the extractor reads an empty or non-JSON 401 body, such as a proxy's
+     * HTML page, as an unreadable token response rather than a rejection; with its status kept, every token 401 is
+     * an authentication failure whatever its body says. A 400, Entra's status for OAuth 2.0 errors such as
+     * {@code unauthorized_client} or {@code invalid_grant}, and every other status pass through to Spring Security.
+     *
+     * @param response the token endpoint's response
+     * @return the response itself for every other status, otherwise an error with the response exception
+     */
+    private static Mono<ClientResponse> preserveTokenErrorStatus(ClientResponse response) {
+        HttpStatusCode status = response.statusCode();
+        if (status.value() == HttpStatus.UNAUTHORIZED.value()
+                || status.value() == HttpStatus.TOO_MANY_REQUESTS.value()
+                || status.is5xxServerError()) {
+            return response.createException().flatMap(Mono::error);
+        }
+        return Mono.just(response);
+    }
+
+    /**
+     * Validates one timeout of {@link #httpClient(DynamicsProperties)}.
+     *
+     * @param configured the bound timeout; {@code null} when the key is unset
+     * @param key        the property key, named in the exception
+     * @return the configured timeout, or the 10 s default when it is {@code null}
+     * @throws IllegalStateException when the timeout is shorter than 1 ms: zero or negative, or a positive fraction
+     *                               of a millisecond, which Netty would truncate to 0 and so disable
+     */
     private static Duration positiveTimeout(Duration configured, String key) {
         if (configured == null) {
             return DEFAULT_TIMEOUT;
         }
-        if (configured.isZero() || configured.isNegative()) {
-            throw new IllegalStateException(key + " must be a positive duration");
+        if (configured.compareTo(MIN_TIMEOUT) < 0) {
+            throw new IllegalStateException(
+                    key + " must be a positive duration of at least 1 ms, but was " + configured);
         }
         return configured;
     }

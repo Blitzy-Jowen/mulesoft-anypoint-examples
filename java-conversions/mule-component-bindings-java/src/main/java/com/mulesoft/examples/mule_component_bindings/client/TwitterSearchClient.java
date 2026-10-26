@@ -17,6 +17,7 @@ import twitter4j.QueryResult;
 import twitter4j.Twitter;
 import twitter4j.TwitterException;
 import twitter4j.TwitterFactory;
+import twitter4j.conf.Configuration;
 import twitter4j.conf.ConfigurationBuilder;
 
 /**
@@ -28,9 +29,24 @@ import twitter4j.conf.ConfigurationBuilder;
  * <p>Both original searches go through {@link #search(String, String, String)}: the fixed {@code AAPL} search of
  * the {@code "/"} listener flow and the {@code TwitterFlow} search behind the component binding. Callers compute
  * the query and the {@code yyyy-MM-dd} dates; this client only executes the search.
+ *
+ * <p>Every search has a 10 s connect timeout and a 10 s read timeout and is never retried, in place of
+ * twitter4j's own defaults of 20 s and 120 s, which external twitter4j configuration could also change.
  */
 @Component
 public class TwitterSearchClient {
+
+	/**
+	 * Connect timeout of every Twitter call, in milliseconds: the Mule default response timeout, which also bounded
+	 * the original request-response VM binding to {@code TwitterFlow}.
+	 */
+	private static final int HTTP_CONNECTION_TIMEOUT_MILLIS = 10_000;
+
+	/** Read timeout of every Twitter call, in milliseconds: the longest any single read of the response may block. */
+	private static final int HTTP_READ_TIMEOUT_MILLIS = 10_000;
+
+	/** HTTP retries after a failed Twitter call: none, so a timed-out or failed search is never sent again. */
+	private static final int HTTP_RETRY_COUNT = 0;
 
 	private final StockStatsProperties properties;
 
@@ -72,18 +88,31 @@ public class TwitterSearchClient {
 			synchronized (this) {
 				instance = twitter;
 				if (instance == null) {
-					instance = new TwitterFactory(new ConfigurationBuilder()
-							.setOAuthConsumerKey(properties.twitterApiKey())
-							.setOAuthConsumerSecret(properties.twitterApiSecret())
-							.setOAuthAccessToken(properties.twitterAccessKey())
-							.setOAuthAccessTokenSecret(properties.twitterAccessSecret())
-							.setRestBaseURL(properties.twitterRestBaseUrl())
-							.build()).getInstance();
+					instance = new TwitterFactory(configuration(properties)).getInstance();
 					twitter = instance;
 				}
 			}
 		}
 		return instance;
+	}
+
+	/**
+	 * The twitter4j configuration of every search: the OAuth credentials and REST base URL of {@code properties},
+	 * the 10 s connect and read timeouts and no HTTP retry. The explicit setters override whatever
+	 * {@link ConfigurationBuilder} loaded from {@code twitter4j.*} system properties, environment variables or a
+	 * {@code twitter4j.properties} file, so no external twitter4j configuration can change these bounds.
+	 */
+	static Configuration configuration(StockStatsProperties properties) {
+		return new ConfigurationBuilder()
+				.setOAuthConsumerKey(properties.twitterApiKey())
+				.setOAuthConsumerSecret(properties.twitterApiSecret())
+				.setOAuthAccessToken(properties.twitterAccessKey())
+				.setOAuthAccessTokenSecret(properties.twitterAccessSecret())
+				.setRestBaseURL(properties.twitterRestBaseUrl())
+				.setHttpConnectionTimeout(HTTP_CONNECTION_TIMEOUT_MILLIS)
+				.setHttpReadTimeout(HTTP_READ_TIMEOUT_MILLIS)
+				.setHttpRetryCount(HTTP_RETRY_COUNT)
+				.build();
 	}
 
 }

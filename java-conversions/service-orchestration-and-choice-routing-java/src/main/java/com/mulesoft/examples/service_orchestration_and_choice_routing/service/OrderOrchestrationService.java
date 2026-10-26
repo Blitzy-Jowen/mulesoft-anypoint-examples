@@ -29,7 +29,7 @@ public class OrderOrchestrationService {
 	 * @param payload the message payload when the error occurred; {@code null} is logged as {@code "null"}
 	 */
 	public void logError(Object payload) {
-		LOG.info("Error occurred: " + String.valueOf(payload));
+		LOG.info("Error occurred: {}", String.valueOf(payload));
 	}
 
 }

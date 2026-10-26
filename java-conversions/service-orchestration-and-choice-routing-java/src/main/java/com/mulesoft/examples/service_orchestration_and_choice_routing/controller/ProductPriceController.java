@@ -8,10 +8,17 @@
 
 package com.mulesoft.examples.service_orchestration_and_choice_routing.controller;
 
+import java.util.List;
+
+import jakarta.servlet.http.HttpServletRequest;
+
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 
 import com.mulesoft.examples.service_orchestration_and_choice_routing.service.ProductPriceService;
@@ -21,10 +28,13 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.service.Pr
  * {@code allowedMethods="POST"} and path {@code api} in front of {@code jersey:resources} over the JAX-RS resource
  * {@code ProductPrice} ({@code @Path("/prices")}, {@code @Path("/{productId}")}, {@code text/plain}).
  *
- * <p>The mapping joins the listener path with the two JAX-RS paths, and only POST is mapped because the listener
+ * <p>The mapping joins the listener path with the two JAX-RS paths, and only POST is served because the listener
  * accepts only POST: any other method gets the 405 of {@code exception.GlobalExceptionHandler}, an unmapped path
- * under {@code /api} its no-listener 404. Confining {@code /api/**} to port 9999 is the listener routing's job
- * ({@code listeners.additional} entry {@code prices}), not this class's.
+ * under {@code /api} its no-listener 404. {@code OPTIONS} alone needs a mapping of its own,
+ * {@link #rejectOptions(HttpServletRequest)}, because Spring MVC would otherwise answer it itself with 200 and an
+ * {@code Allow} header. {@code TRACE} needs none: {@code spring.mvc.dispatch-trace-request} hands it to the
+ * dispatcher, whose handler mapping rejects it like {@code GET}. Confining {@code /api/**} to port 9999 is the
+ * listener routing's job ({@code listeners.additional} entry {@code prices}), not this class's.
  *
  * <p>The Content-Type is set on the response rather than declared with {@code produces}: a preset type makes Spring
  * write the body without {@code Accept} negotiation, so a caller's {@code Accept} header can never turn the price
@@ -46,6 +56,12 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.service.Pr
 @RestController
 public class ProductPriceController {
 
+    /** Listener path {@code api} joined with the JAX-RS paths {@code /prices} and {@code /{productId}}. */
+    private static final String PRICE_PATH = "/api/prices/{productId}";
+
+    /** The listener's {@code allowedMethods}. */
+    private static final String ALLOWED_METHOD = "POST";
+
     private final ProductPriceService productPriceService;
 
     public ProductPriceController(ProductPriceService productPriceService) {
@@ -58,10 +74,25 @@ public class ProductPriceController {
      * @param productId the product identifier from the request path
      * @return 200 {@code text/plain} with the price
      */
-    @PostMapping("/api/prices/{productId}")
+    @PostMapping(PRICE_PATH)
     public ResponseEntity<String> getProductPrice(@PathVariable("productId") String productId) {
         return ResponseEntity.ok()
                 .contentType(MediaType.TEXT_PLAIN)
                 .body(productPriceService.getProductPrice(productId));
+    }
+
+    /**
+     * Rejects {@code OPTIONS} on the price path with the listener's 405, which the generic handler of the exception
+     * package writes as {@code Method not allowed for endpoint: <path>}, without an {@code Allow} header.
+     *
+     * <p>The listener allowed {@code POST} only. Without this mapping Spring MVC would answer {@code OPTIONS} itself
+     * with 200 and {@code Allow: POST,OPTIONS}. The price service is not called.
+     *
+     * @param request the rejected request, whose method is reported
+     * @throws HttpRequestMethodNotSupportedException always
+     */
+    @RequestMapping(path = PRICE_PATH, method = RequestMethod.OPTIONS)
+    public void rejectOptions(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(request.getMethod(), List.of(ALLOWED_METHOD));
     }
 }

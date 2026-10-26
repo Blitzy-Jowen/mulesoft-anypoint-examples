@@ -218,15 +218,31 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
      * names {@code application/raml+yaml}. Every other request to {@code <base>/} is the unknown resource it
      * was for APIkit.
      *
-     * <p>Mapped for every method so that a non-RAML request answers APIkit's 404 rather than a 405. The
-     * trailing {@code /} is significant: Spring matches no optional trailing slash, so neither {@code <base>}
-     * nor any resource below it reaches this method.
+     * <p>Mapped without a method, so that every method but OPTIONS, a non-standard one such as
+     * {@code PROPFIND} included, reaches it and a non-RAML request answers APIkit's 404 rather than a 405;
+     * Spring never matches a plain OPTIONS request to a mapping without a method, so {@link #apiRootOptions}
+     * answers that one. The trailing {@code /} is significant: Spring matches no optional trailing slash, so
+     * neither {@code <base>} nor any resource below it reaches this method.
      */
     @RequestMapping("${apikit.base-path:/api}/")
     public ResponseEntity<byte[]> apiRoot(HttpServletRequest request) {
         if (isGetOrHead(request) && wantsRaml(request)) {
             return raml(request);
         }
+        throw new ApiKitNotFoundException(NOT_FOUND_MESSAGE);
+    }
+
+    /**
+     * OPTIONS on the API root, the unknown resource APIkit answered with its 404 like every other non-RAML
+     * request to {@code <base>/}. The explicit mapping is needed because Spring leaves a plain OPTIONS request
+     * out of a mapping that declares no method, such as {@link #apiRoot}, and would otherwise answer it itself
+     * with 200 and an {@code Allow} header.
+     *
+     * @return never
+     * @throws ApiKitNotFoundException always, which SC-3 answers with APIkit's 404 body
+     */
+    @RequestMapping(value = "${apikit.base-path:/api}/", method = RequestMethod.OPTIONS)
+    public ResponseEntity<byte[]> apiRootOptions() {
         throw new ApiKitNotFoundException(NOT_FOUND_MESSAGE);
     }
 

@@ -8,17 +8,23 @@
 
 package com.mulesoft.examples.mule_component_bindings.client;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StreamUtils;
 import org.springframework.web.client.RestClient;
@@ -35,17 +41,62 @@ import com.mulesoft.examples.mule_component_bindings.service.SentimentService;
 
 /**
  * A SentimentService implementation that delegates to the Sentiment140 cloud API.
+ *
+ * <p>The call runs over {@link java.net.HttpURLConnection} with a 10 s connect timeout and a 10 s read timeout,
+ * the Mule default response timeout. The read timeout is the socket's own, so it bounds the wait for the
+ * response headers and every blocking read of the body: an upstream that never answers, or that sends its
+ * headers and then stalls its body, fails the call 10 s after it falls silent with a
+ * {@link org.springframework.web.client.ResourceAccessException} caused by a
+ * {@link java.net.SocketTimeoutException}. A failed call is never retried.
  */
 @Component
 public class Sentiment140SentimentService implements SentimentService {
+
+	/** Connect and read timeout of the application's client: the Mule default response timeout. */
+	private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+
+	/** Shortest accepted timeout: {@link java.net.HttpURLConnection} takes whole milliseconds and reads 0 as none. */
+	private static final Duration MIN_TIMEOUT = Duration.ofMillis(1);
+
+	/** Longest accepted timeout: {@link java.net.HttpURLConnection} takes an {@code int} of milliseconds. */
+	private static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
 
 	private final StockStatsProperties properties;
 	private final RestClient client;
 	private final ObjectMapper objectMapper = new ObjectMapper();
 
+	/**
+	 * Creates the service the application uses, with the 10 s Mule default connect and read timeouts.
+	 *
+	 * @param restClientBuilder the builder the client is built from; its request factory is replaced by the timed one
+	 * @param properties        the Sentiment140 base URL and application id
+	 */
+	@Autowired
 	public Sentiment140SentimentService(RestClient.Builder restClientBuilder, StockStatsProperties properties) {
+		this(restClientBuilder, properties, DEFAULT_TIMEOUT);
+	}
+
+	/**
+	 * Creates the service with the given connect and read timeout. Building the client opens no connection.
+	 *
+	 * @param restClientBuilder the builder the client is built from; its request factory is replaced by the timed one
+	 * @param properties        the Sentiment140 base URL and application id
+	 * @param timeout           the connect timeout, and the longest any single read of the response, headers or
+	 *                          body, may block; from 1 ms to {@link Integer#MAX_VALUE} ms
+	 * @throws IllegalArgumentException when {@code timeout} is {@code null} or outside that range; below 1 ms it
+	 *                                  would truncate to 0, which means no timeout at all
+	 */
+	public Sentiment140SentimentService(RestClient.Builder restClientBuilder, StockStatsProperties properties,
+			Duration timeout) {
+		if (timeout == null || timeout.compareTo(MIN_TIMEOUT) < 0 || timeout.compareTo(MAX_TIMEOUT) > 0) {
+			throw new IllegalArgumentException("Sentiment140 timeout must be from " + MIN_TIMEOUT.toMillis()
+					+ " ms to " + MAX_TIMEOUT.toMillis() + " ms, was " + timeout);
+		}
+		SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+		requestFactory.setConnectTimeout(timeout);
+		requestFactory.setReadTimeout(timeout);
 		this.properties = properties;
-		this.client = restClientBuilder.build();
+		this.client = restClientBuilder.requestFactory(requestFactory).build();
 	}
 
 	@Override
@@ -81,9 +132,7 @@ public class Sentiment140SentimentService implements SentimentService {
 				.header("appid", properties.sentiment140ApiKey())
 				.contentType(MediaType.TEXT_PLAIN)
 				.body(body)
-				.exchange((request, response) -> new RawResponse(
-						response.getStatusCode().value(),
-						StreamUtils.copyToString(response.getBody(), charsetOf(response.getHeaders().getContentType()))));
+				.exchange((request, response) -> readResponse(response));
 
 		if (raw.status() != HttpStatus.OK.value()) {
 			throw new RuntimeException("Sentiment140 returned status " + raw.status());
@@ -115,6 +164,28 @@ public class Sentiment140SentimentService implements SentimentService {
 
 		} catch (Exception e) {
 			throw new RuntimeException(e);
+		}
+	}
+
+	/**
+	 * Reads the status and the whole body. The status comes first, because {@link java.net.HttpURLConnection}
+	 * hands out the body of an error status only once that status has been read. When reading the body fails, a
+	 * read timeout included, the body stream is closed before the failure propagates: closing the response drains
+	 * the stream first, and on a stalled body that drain would block for a second full read timeout.
+	 */
+	private static RawResponse readResponse(ClientHttpResponse response) throws IOException {
+		int status = response.getStatusCode().value();
+		InputStream bodyStream = response.getBody();
+		try {
+			return new RawResponse(status,
+					StreamUtils.copyToString(bodyStream, charsetOf(response.getHeaders().getContentType())));
+		} catch (IOException | RuntimeException failure) {
+			try {
+				bodyStream.close();
+			} catch (IOException closeFailure) {
+				failure.addSuppressed(closeFailure);
+			}
+			throw failure;
 		}
 	}
 
