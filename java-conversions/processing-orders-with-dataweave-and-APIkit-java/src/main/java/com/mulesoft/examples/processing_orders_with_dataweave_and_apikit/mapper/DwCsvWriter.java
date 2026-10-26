@@ -34,10 +34,11 @@ import org.springframework.stereotype.Component;
  * </ul>
  *
  * <p>Quoting: a field (header name or value) holding a comma, a double quote, a CR or an LF is wrapped in double
- * quotes, and each double quote inside it is preceded by a backslash, DataWeave 1.0's default CSV escape
- * character; every other field is written verbatim. No committed output of the originals contains such a field,
- * so this rule is a plan default and a Tier 2A verification point: a fixture captured from the original runtime
- * that shows other bytes governs, and the rule changes here and in every copy.
+ * quotes, and each double quote and each backslash inside it is preceded by a backslash, DataWeave 1.0's default
+ * CSV escape character, so no backslash in the field can be read as escaping the quote after it; every other
+ * field, any backslash in it included, is written verbatim. No committed output of the originals contains such a
+ * field, so this rule is a plan default and a Tier 2A verification point: a fixture captured from the original
+ * runtime that shows other bytes governs, and the rule changes here and in every copy.
  *
  * <p>Copy rule: this project is the first consumer, so this class is the reference implementation. Every other
  * project that writes CSV carries a copy of it, and of its unit test, differing in the {@code package} line
@@ -151,7 +152,7 @@ public class DwCsvWriter {
         csv.append(QUOTE);
         for (int i = 0; i < field.length(); i++) {
             char c = field.charAt(i);
-            if (c == QUOTE) {
+            if (c == QUOTE || c == ESCAPE) {
                 csv.append(ESCAPE);
             }
             csv.append(c);

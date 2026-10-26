@@ -73,6 +73,9 @@ import org.xml.sax.SAXParseException;
  *   <li>Only {@code GET} is handled. A request whose path matches no registration, whose query is neither
  *       {@code wsdl} (any case) nor {@code xsd=<registered key>}, or that uses another method continues down the
  *       filter chain untouched.</li>
+ *   <li>A served request is logged at DEBUG with registration-owned identity only (the document kind, its registered
+ *       WSDL or schema key and resource, and the registration's patterns), never the request's query, parameters,
+ *       path or URL, which carry caller-supplied data.</li>
  *   <li>Documents are parsed with DOCTYPE declarations, external entities, external DTDs and XInclude disabled, and
  *       serialized without added indentation behind the declaration {@code <?xml version="1.0" encoding="UTF-8"?>}.</li>
  * </ul>
@@ -138,8 +141,11 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
     private record Reference(Element element, String attribute, String location) {
     }
 
-    /** The registration a request matched and the cached document its query selects. */
-    private record Selection(Published target, byte[] document) {
+    /**
+     * The registration a request matched, the cached document its query selects, and that document's description
+     * for diagnostics, built from registration data alone.
+     */
+    private record Selection(Published target, byte[] document, String description) {
     }
 
     /**
@@ -214,7 +220,7 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
         }
         String requestUrl = request.getRequestURL().toString();
         byte[] body = rewrite(selection.document(), selection.target().registration().schemas().keySet(), requestUrl);
-        log.debug("Serving metadata '{}' at {}", request.getQueryString(), requestUrl);
+        log.debug("Serving {} for {}", selection.description(), selection.target().registration().patterns());
         response.setStatus(HttpServletResponse.SC_OK);
         response.setContentType(CONTENT_TYPE);
         response.setContentLength(body.length);
@@ -222,7 +228,10 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
         response.flushBuffer();
     }
 
-    /** The registration and cached document a metadata query asks for, or {@code null} when it is not served here. */
+    /**
+     * The registration and cached document a metadata query asks for, or {@code null} when it is not served here.
+     * The description is built from the registration: its WSDL resource, or the closure's own schema key and resource.
+     */
     private Selection select(HttpServletRequest request) {
         String query = request.getQueryString();
         if (query == null) {
@@ -232,14 +241,20 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
         if (target == null) {
             return null;
         }
-        byte[] document = null;
+        Registration registration = target.registration();
         if (WSDL_QUERY.equalsIgnoreCase(query)) {
-            document = target.wsdl();
-        } else if (query.startsWith(XSD_QUERY_PREFIX)) {
-            String key = request.getParameter(XSD_PARAMETER);
-            document = key == null ? null : target.schemas().get(key);
+            return new Selection(target, target.wsdl(), "WSDL " + registration.wsdl().getDescription());
         }
-        return document == null ? null : new Selection(target, document);
+        if (query.startsWith(XSD_QUERY_PREFIX)) {
+            String key = request.getParameter(XSD_PARAMETER);
+            for (Map.Entry<String, Resource> schema : registration.schemas().entrySet()) {
+                if (schema.getKey().equals(key)) {
+                    return new Selection(target, target.schemas().get(schema.getKey()),
+                            "schema '" + schema.getKey() + "' (" + schema.getValue().getDescription() + ")");
+                }
+            }
+        }
+        return null;
     }
 
     private Published matchingRegistration(String path) {
