@@ -58,6 +58,8 @@ import ch.qos.logback.core.read.ListAppender;
  *
  * <p>The broker's log is captured at DEBUG with a Logback {@link ListAppender}, and the logger's level is restored
  * after each test. Every check of the captured events also asserts that none breaks a line or carries a throwable.
+ * Logback is the logging backend every Spring Boot project carries through its starters, so this test is copied
+ * between the projects sharing the broker with only its {@code package} line changed.
  */
 class AjaxChannelBrokerTest {
 
@@ -572,8 +574,10 @@ class AjaxChannelBrokerTest {
                         (BrokerScenario) broker -> broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET),
                         Level.DEBUG, "No subscriber on Ajax channel " + FORGED_CHANNEL_RENDERING + "; message dropped"),
                 Arguments.of("timeout", Map.of(timeout, "100"), (BrokerScenario) broker -> {
+                    // Blocks on a latch nobody releases; the 100 ms response timeout interrupts it.
+                    CountDownLatch never = new CountDownLatch(1);
                     broker.registerInbound(FORGED_CHANNEL, data -> {
-                        Thread.sleep(WAIT_MS);
+                        never.await(WAIT_MS, TimeUnit.MILLISECONDS);
                         return null;
                     });
                     broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);

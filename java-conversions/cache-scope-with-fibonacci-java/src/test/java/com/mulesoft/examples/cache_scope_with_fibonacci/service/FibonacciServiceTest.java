@@ -60,19 +60,21 @@ class FibonacciServiceTest {
 
     @ParameterizedTest
     @NullSource
-    @ValueSource(strings = {"5", "20"})
+    @ValueSource(strings = {"10", "20"})
     void faviconBodyIsFilteredWithAnEmptyReplyAndNoCost(String n) {
         assertEquals(new FibonacciReply("", null), service.handle(n, "/favicon.ico", false, false));
         verifyNoInteractions(cacheService);
     }
 
+    // A null body is the absent request body, which the filter passes like any text other than "/favicon.ico".
     @ParameterizedTest
+    @NullSource
     @ValueSource(strings = {"/FAVICON.ICO", "x/favicon.ico"})
     void filterMatchesOnlyTheExactCaseSensitiveText(String body) {
-        when(cacheService.calculate("5", true, true)).thenReturn(new FibonacciResult("5", 6));
+        when(cacheService.calculate("10", true, true)).thenReturn(new FibonacciResult("55", 11));
 
-        assertEquals(new FibonacciReply("Fibonacci(5) = 5\nCOST: 6", 6), service.handle("5", body, false, false));
-        verify(cacheService).calculate("5", true, true);
+        assertEquals(new FibonacciReply("Fibonacci(10) = 55\nCOST: 11", 11), service.handle("10", body, false, false));
+        verify(cacheService).calculate("10", true, true);
         verifyNoMoreInteractions(cacheService);
     }
 
@@ -80,7 +82,7 @@ class FibonacciServiceTest {
     @NullSource
     @ValueSource(strings = {"20"})
     void missingOrTooHighNTakesTheOtherwiseBranch(String n) {
-        assertEquals(new FibonacciReply(TOO_HIGH, null), service.handle(n, null, false, false));
+        assertEquals(new FibonacciReply(TOO_HIGH, null), service.handle(n, "", false, false));
         verifyNoInteractions(cacheService);
     }
 
@@ -88,7 +90,7 @@ class FibonacciServiceTest {
         return Stream.of(
                 Arguments.of("19", new FibonacciResult("4181", 20), "Fibonacci(19) = 4181\nCOST: 20"),
                 // The raw query text is the cache key and is echoed unchanged in the reply.
-                Arguments.of("05", new FibonacciResult("5", 6), "Fibonacci(05) = 5\nCOST: 6"),
+                Arguments.of("05", new FibonacciResult("5", 0), "Fibonacci(05) = 5\nCOST: 0"),
                 Arguments.of("-3", new FibonacciResult("-3", 1), "Fibonacci(-3) = -3\nCOST: 1"));
     }
 
@@ -114,7 +116,7 @@ class FibonacciServiceTest {
         when(cacheService.calculate("10", useCache, childrenUseCache)).thenReturn(new FibonacciResult("55", 11));
 
         assertEquals(new FibonacciReply("Fibonacci(10) = 55\nCOST: 11", 11),
-                service.handle("10", null, nocacheHeader, nocacheQuery));
+                service.handle("10", "", nocacheHeader, nocacheQuery));
         verify(cacheService).calculate("10", useCache, childrenUseCache);
         verifyNoMoreInteractions(cacheService);
     }
@@ -123,7 +125,7 @@ class FibonacciServiceTest {
     @ValueSource(strings = {"abc", "", " 5"})
     void nonNumericNIsRejectedWithoutTouchingTheCache(String n) {
         IllegalArgumentException thrown =
-                assertThrows(IllegalArgumentException.class, () -> service.handle(n, null, false, false));
+                assertThrows(IllegalArgumentException.class, () -> service.handle(n, "", false, false));
 
         assertEquals("Invalid value for n: " + n, thrown.getMessage());
         assertInstanceOf(NumberFormatException.class, thrown.getCause());

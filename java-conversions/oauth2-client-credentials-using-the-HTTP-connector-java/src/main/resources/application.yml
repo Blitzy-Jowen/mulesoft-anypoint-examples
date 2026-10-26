@@ -22,6 +22,12 @@ server:
   port: ${http.port:8081}
   address: 0.0.0.0      # http:listener-config host (xml:9)
   undertow:
+    # The /FIM/* flow forwards http.request.uri raw (xml:41). With ALLOW_UNESCAPED_CHARACTERS_IN_URL on, Undertow's
+    # URL decoding also rewrites HttpServletRequest.getRequestURI() of any percent-encoded target to its decoded form
+    # (/FIM/a%20b becomes "/FIM/a b"), so it stays off: the request URI and query reach the controller as sent.
+    # Spring MVC decodes path segments itself for mapping, and form bodies are still decoded; only query-string
+    # values read through getParameter stay percent-encoded, and no handler in this project reads them.
+    decode-url: false
     options:
       server:
         # The /FIM/* flow forwards the raw http.request.uri, whose literal {client_id} placeholders the uri-param
