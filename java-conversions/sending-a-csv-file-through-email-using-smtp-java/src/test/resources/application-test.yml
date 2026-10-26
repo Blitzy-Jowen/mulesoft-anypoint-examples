@@ -1,0 +1,27 @@
+# Spring profile "test" of sending-a-csv-file-through-email-using-smtp-java (tests activate it with
+# @ActiveProfiles("test")). Replaces the never-committed mule.test.properties of the original test: the Gmail
+# account becomes a GreenMail SMTP server. Demo values only; no real host, account or credential. Tests replace
+# the SMTP port with GreenMail's dynamic port through @DynamicPropertySource (smtp.port and spring.mail.port).
+#
+# Notes for the tests that use this profile:
+# - The csv-email.* keys are deliberately absent: the surefire system property csv-email.input-dir (pom.xml,
+#   under target/test-csv-email/) and each test's @DynamicPropertySource own the input directory, so no test
+#   ever polls, and deletes, src/main/resources/input.
+# - FixtureParityTest runs without this profile.
+smtp:
+  host: localhost
+  port: 3025              # GreenMail's conventional SMTP port; replaced by the dynamic port in every test
+  # GreenMail user the tests register with withUser("test@localhost", "secret"), as a plain address
+  # (the original's %40-encoded smtp.user_enc was a Mule endpoint-URI artefact).
+  user: test@localhost
+  password: secret
+mail:
+  # The original test sent to and from its own SMTP account and fixed the subject.
+  from: test@localhost
+  to: test@localhost
+  subject: "Mule flow completed!"
+spring:
+  mail:
+    properties:
+      # GreenMail SMTP is plain text; mail.smtp.auth stays true, so authentication runs against the GreenMail user.
+      "[mail.smtp.starttls.enable]": false

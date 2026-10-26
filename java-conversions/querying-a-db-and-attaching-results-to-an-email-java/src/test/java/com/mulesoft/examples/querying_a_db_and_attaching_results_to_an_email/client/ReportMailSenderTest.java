@@ -1,0 +1,253 @@
+/**
+ * MuleSoft Examples
+ * Copyright 2014 MuleSoft, Inc.
+ *
+ * This product includes software developed at
+ * MuleSoft, Inc. (http://www.mulesoft.com/).
+ */
+
+package com.mulesoft.examples.querying_a_db_and_attaching_results_to_an_email.client;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.io.InputStream;
+import java.net.ServerSocket;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
+import java.util.Properties;
+
+import com.icegreen.greenmail.configuration.GreenMailConfiguration;
+import com.icegreen.greenmail.junit5.GreenMailExtension;
+import com.icegreen.greenmail.util.ServerSetupTest;
+import jakarta.mail.Address;
+import jakarta.mail.BodyPart;
+import jakarta.mail.Message;
+import jakarta.mail.Part;
+import jakarta.mail.internet.InternetAddress;
+import jakarta.mail.internet.MimeMessage;
+import jakarta.mail.internet.MimeMultipart;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.springframework.mail.MailException;
+import org.springframework.mail.MailPreparationException;
+import org.springframework.mail.javamail.JavaMailSenderImpl;
+
+/**
+ * Client test of {@link ReportMailSender}, the {@code set-attachment} and {@code smtp:outbound-endpoint} of the
+ * original {@code attachmentsFlow1} (attachments.xml:35-36), against an in-process GreenMail SMTP server standing in
+ * for the Gmail account the original integration test read back over IMAPS. No Spring context is started: the sender
+ * and the {@code JavaMailSender} are built here as the test profile configures them.
+ */
+class ReportMailSenderTest {
+
+    /** GreenMail account; the original test sent from and to its own SMTP account. */
+    private static final String ACCOUNT = "test@localhost";
+
+    private static final String PASSWORD = "secret";
+
+    /** {@code mail.subject} of the original test (QueryingDbAndAttachingResultsToAnEmailIT:121). */
+    private static final String SUBJECT = "Mule flow completed!";
+
+    /** {@code EmployeeCsvMapper} output for the three employees of the original {@code message.xml}. */
+    private static final String CSV = "first_name,last_name,gender,dob,hire_date\n"
+            + "Chava,Puckett,F,1985-09-02,2008-10-12\n"
+            + "Quentin,Puckett,F,1971-10-21,2008-09-15\n"
+            + "Mona,Sosa,M,1950-09-26,2007-11-27\n";
+
+    /** The two rows the original test expected in the mail (QueryingDbAndAttachingResultsToAnEmailIT:52-53). */
+    private static final String REPLY_1 = "Chava,Puckett,F,1985-09-02,2008-10-12";
+
+    private static final String REPLY_2 = "Mona,Sosa,M,1950-09-26,2007-11-27";
+
+    private static final long DELIVERY_TIMEOUT_MS = 5000;
+
+    // A dynamic port instead of GreenMail's fixed 3025: concurrent builds on this host and the project's other
+    // GreenMail tests would otherwise contend for one port. One server serves the class and is purged per test.
+    @RegisterExtension
+    static final GreenMailExtension greenMail = new GreenMailExtension(ServerSetupTest.SMTP.dynamicPort())
+            .withConfiguration(GreenMailConfiguration.aConfig().withUser(ACCOUNT, PASSWORD))
+            .withPerMethodLifecycle(false);
+
+    private ReportMailSender sender;
+
+    @BeforeEach
+    void setUp() throws Exception {
+        greenMail.purgeEmailFromAllMailboxes();
+        sender = new ReportMailSender(mailSenderOn(greenMail.getSmtp().getPort()), ACCOUNT, ACCOUNT, SUBJECT);
+    }
+
+    @Test
+    void sendsOneMessageWithConfiguredEnvelope() throws Exception {
+        sender.send(CSV);
+
+        MimeMessage message = singleReceivedMessage();
+        assertThat(addresses(message.getFrom())).containsExactly(ACCOUNT);
+        assertThat(addresses(message.getRecipients(Message.RecipientType.TO))).containsExactly(ACCOUNT);
+        assertThat(message.getSubject()).isEqualTo(SUBJECT);
+    }
+
+    @Test
+    void messageIsMultipartMixedWithBodyThenAttachment() throws Exception {
+        sender.send(CSV);
+
+        MimeMessage message = singleReceivedMessage();
+        assertThat(message.isMimeType("multipart/mixed")).as(message.getContentType()).isTrue();
+        assertThat(message.getContent()).isInstanceOf(MimeMultipart.class);
+        MimeMultipart multipart = (MimeMultipart) message.getContent();
+        assertThat(multipart.getCount()).isEqualTo(2);
+
+        // The part the original test's getAttachment read: neither an attachment nor named.
+        BodyPart body = multipart.getBodyPart(0);
+        assertThat(body.isMimeType("text/plain")).as(body.getContentType()).isTrue();
+        assertThat(contentTypeOf(body)).contains("charset=utf-8");
+        assertThat(body.getDisposition()).isNull();
+        assertThat(body.getFileName()).isNull();
+        assertThat(body.getDescription()).isEqualTo("Payload");
+        assertThat(text(body)).isEqualTo(CSV).contains(REPLY_1, REPLY_2);
+
+        BodyPart attachment = multipart.getBodyPart(1);
+        assertThat(Part.ATTACHMENT.equalsIgnoreCase(attachment.getDisposition()))
+                .as(attachment.getDisposition()).isTrue();
+        assertThat(attachment.getFileName()).isEqualTo("employees.csv");
+        assertThat(attachment.getDescription()).isEqualTo("employees.csv");
+        assertThat(attachment.isMimeType("text/plain")).as(attachment.getContentType()).isTrue();
+        // ASCII content keeps the flow's bare text/plain, which JavaMail labels us-ascii as it did for the original.
+        assertThat(contentTypeOf(attachment)).contains("charset=us-ascii");
+        assertThat(text(attachment)).isEqualTo(CSV);
+    }
+
+    @Test
+    void nonAsciiReportArrivesIntactAndLabelledUtf8() throws Exception {
+        String csv = "first_name,last_name,gender,dob,hire_date\nJosé,Núñez,M,1980-01-02,2010-03-04\n";
+        String subject = "Informe de empleados – año 2008";
+        ReportMailSender utf8Sender =
+                new ReportMailSender(mailSenderOn(greenMail.getSmtp().getPort()), ACCOUNT, ACCOUNT, subject);
+
+        utf8Sender.send(csv);
+
+        MimeMessage message = singleReceivedMessage();
+        assertThat(message.getSubject()).isEqualTo(subject);
+        MimeMultipart multipart = (MimeMultipart) message.getContent();
+        BodyPart body = multipart.getBodyPart(0);
+        assertThat(contentTypeOf(body)).contains("charset=utf-8");
+        assertThat(text(body)).isEqualTo(csv);
+        BodyPart attachment = multipart.getBodyPart(1);
+        assertThat(contentTypeOf(attachment)).contains("charset=utf-8");
+        assertThat(attachment.getFileName()).isEqualTo("employees.csv");
+        assertThat(text(attachment)).isEqualTo(csv);
+    }
+
+    @Test
+    void commaSeparatedRecipientsEachReceiveTheReport() throws Exception {
+        List<String> recipients = List.of("hr@localhost", "payroll@localhost");
+        ReportMailSender listSender = new ReportMailSender(
+                mailSenderOn(greenMail.getSmtp().getPort()), ACCOUNT, String.join(",", recipients), SUBJECT);
+
+        listSender.send(CSV);
+
+        assertThat(greenMail.waitForIncomingEmail(DELIVERY_TIMEOUT_MS, recipients.size())).isTrue();
+        MimeMessage[] received = greenMail.getReceivedMessages();
+        assertThat(received).hasSize(recipients.size());
+        for (MimeMessage message : received) {
+            assertThat(addresses(message.getRecipients(Message.RecipientType.TO)))
+                    .containsExactlyElementsOf(recipients);
+        }
+    }
+
+    @Test
+    void unreachableSmtpServerFailsWithMailException() throws Exception {
+        int closedPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            closedPort = socket.getLocalPort();
+        }
+        JavaMailSenderImpl unreachable = mailSenderOn(closedPort);
+        unreachable.getJavaMailProperties().setProperty("mail.smtp.connectiontimeout", "2000");
+        unreachable.getJavaMailProperties().setProperty("mail.smtp.timeout", "2000");
+        ReportMailSender failingSender = new ReportMailSender(unreachable, ACCOUNT, ACCOUNT, SUBJECT);
+
+        assertThatThrownBy(() -> failingSender.send(CSV)).isInstanceOf(MailException.class);
+
+        assertThat(greenMail.getReceivedMessages()).isEmpty();
+    }
+
+    @Test
+    void invalidSenderAddressFailsBeforeSending() {
+        ReportMailSender invalidSender = new ReportMailSender(
+                mailSenderOn(greenMail.getSmtp().getPort()), "not an address", ACCOUNT, SUBJECT);
+
+        assertThatThrownBy(() -> invalidSender.send(CSV)).isInstanceOf(MailPreparationException.class);
+
+        assertThat(greenMail.getReceivedMessages()).isEmpty();
+    }
+
+    @Test
+    void nullReportIsRejectedWithoutSending() {
+        assertThatThrownBy(() -> sender.send(null)).isInstanceOf(NullPointerException.class).hasMessage("csv");
+
+        assertThat(greenMail.getReceivedMessages()).isEmpty();
+    }
+
+    @Test
+    void attachmentConstantsMatchOriginalFlow() {
+        assertThat(ReportMailSender.ATTACHMENT_NAME).isEqualTo("employees.csv");
+        assertThat(ReportMailSender.ATTACHMENT_CONTENT_TYPE).isEqualTo("text/plain");
+    }
+
+    /** A sender set up as the test profile's {@code spring.mail.*} keys set it up, aimed at the given port. */
+    private static JavaMailSenderImpl mailSenderOn(int port) {
+        JavaMailSenderImpl mailSender = new JavaMailSenderImpl();
+        mailSender.setHost("localhost");
+        mailSender.setPort(port);
+        mailSender.setUsername(ACCOUNT);
+        mailSender.setPassword(PASSWORD);
+        mailSender.setDefaultEncoding(UTF_8.name());
+        Properties properties = new Properties();
+        properties.setProperty("mail.smtp.auth", "true");
+        properties.setProperty("mail.smtp.starttls.enable", "false");
+        // responseTimeout="10000" of the original endpoint; also keeps a failing send from hanging the build.
+        properties.setProperty("mail.smtp.connectiontimeout", "10000");
+        properties.setProperty("mail.smtp.timeout", "10000");
+        properties.setProperty("mail.smtp.writetimeout", "10000");
+        mailSender.setJavaMailProperties(properties);
+        return mailSender;
+    }
+
+    private static MimeMessage singleReceivedMessage() {
+        assertThat(greenMail.waitForIncomingEmail(DELIVERY_TIMEOUT_MS, 1)).isTrue();
+        MimeMessage[] received = greenMail.getReceivedMessages();
+        assertThat(received).hasSize(1);
+        return received[0];
+    }
+
+    /** Decoded text of a part, whether JavaMail hands it back as a string or as a stream. */
+    private static String text(Part part) throws Exception {
+        Object content = part.getContent();
+        if (content instanceof InputStream stream) {
+            try (stream) {
+                return normalize(new String(stream.readAllBytes(), UTF_8));
+            }
+        }
+        return normalize(content);
+    }
+
+    /**
+     * SMTP DATA canonicalizes bare LF line ends to CRLF in 7bit and quoted-printable text parts, as the original
+     * Mule/JavaMail stack did, so received text is compared with CRLF read as LF. Base64 content is unaffected.
+     */
+    static String normalize(Object content) {
+        return content.toString().replace("\r\n", "\n");
+    }
+
+    private static String contentTypeOf(Part part) throws Exception {
+        return part.getContentType().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
+    }
+
+    private static List<String> addresses(Address[] addresses) {
+        assertThat(addresses).isNotNull();
+        return Arrays.stream(addresses).map(address -> ((InternetAddress) address).getAddress()).toList();
+    }
+}
