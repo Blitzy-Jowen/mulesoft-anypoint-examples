@@ -442,6 +442,21 @@ class TshirtServiceClientTest {
     }
 
     @Test
+    void propertiesDefaultToMulesTenSecondTimeoutsAndNoKeyAndNeverRenderTheKey() {
+        TshirtServiceProperties defaults = new TshirtServiceProperties();
+
+        assertThat(defaults.getConnectTimeout()).isEqualTo(DEFAULT_TIMEOUT);
+        assertThat(defaults.getReadTimeout()).isEqualTo(DEFAULT_TIMEOUT);
+        assertThat(defaults.getApiKey()).isEmpty();
+        assertThat(defaults).hasToString("TshirtServiceProperties{serviceAddress='http://tshirt-service.cloudhub.io',"
+                + " apiKey='', connectTimeout=PT10S, readTimeout=PT10S}");
+
+        TshirtServiceProperties configured = new TshirtServiceProperties();
+        configured.setApiKey(API_KEY);
+        assertThat(configured.toString()).contains("apiKey='****'").doesNotContain(API_KEY);
+    }
+
+    @Test
     void orderTshirtSendsOneSoap11PostWithItsActionTheAuthenticationHeaderAndTheBodyUnchanged() {
         stubService(soapResponse(200, ORDER_RESPONSE));
 
@@ -576,6 +591,7 @@ class TshirtServiceClientTest {
         SoapFaultClientException fault = assertThrows(SoapFaultClientException.class, () -> operation.call(client));
 
         assertThat(fault.getFaultStringOrReason()).isEqualTo("Invalid API key");
+        assertThat(fault.getMessage()).isEqualTo("Invalid API key");
         assertThat(fault.getFaultCode()).isEqualTo(new QName(SOAP_ENVELOPE_NAMESPACE, "Client"));
         wm.verify(exactly(1), postRequestedFor(urlEqualTo(SERVICE_PATH)));
     }
