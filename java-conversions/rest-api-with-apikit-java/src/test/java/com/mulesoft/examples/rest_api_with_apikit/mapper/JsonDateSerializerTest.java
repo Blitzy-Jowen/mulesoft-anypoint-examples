@@ -79,6 +79,10 @@ class JsonDateSerializerTest {
 
         @JsonSerialize(using = JsonDateSerializer.class)
         public Date when;
+
+        Holder(Date when) {
+            this.when = when;
+        }
     }
 
     static Stream<Date> instants() {
@@ -105,10 +109,7 @@ class JsonDateSerializerTest {
     @ParameterizedTest
     @MethodSource("instants")
     void serializesAnnotatedFieldOfHolder(Date date) throws Exception {
-        Holder holder = new Holder();
-        holder.when = date;
-
-        assertEquals("{\"when\":" + expected(date) + "}", new ObjectMapper().writeValueAsString(holder));
+        assertEquals("{\"when\":" + expected(date) + "}", new ObjectMapper().writeValueAsString(new Holder(date)));
     }
 
     @ParameterizedTest
@@ -158,17 +159,22 @@ class JsonDateSerializerTest {
         try {
             List<Future<Void>> futures = new ArrayList<>(THREADS);
             for (int t = 0; t < THREADS; t++) {
-                int offset = t * ITERATIONS;
+                int thread = t;
                 Callable<Void> worker = () -> {
                     start.await();
                     for (int i = 0; i < ITERATIONS; i++) {
-                        Date date = new Date(BASE + (offset + i) * STEP);
-                        String actual = mapper.writeValueAsString(date);
+                        Date date = new Date(BASE + (thread * (long) ITERATIONS + i) * STEP);
                         String want = expected(date);
-                        if (!want.equals(actual)) {
-                            failures.add(date.getTime() + ": expected " + want + " but was " + actual);
+                        try {
+                            String actual = mapper.writeValueAsString(date);
+                            serialized.incrementAndGet();
+                            if (!want.equals(actual)) {
+                                failures.add("t=" + thread + " i=" + i + " expected=" + want + " actual=" + actual);
+                            }
+                        } catch (Exception e) {
+                            // Recorded rather than rethrown so one worker's failure cannot hide the others'.
+                            failures.add("t=" + thread + " i=" + i + " " + e);
                         }
-                        serialized.incrementAndGet();
                     }
                     return null;
                 };
@@ -180,11 +186,11 @@ class JsonDateSerializerTest {
             }
         } finally {
             pool.shutdownNow();
-            terminated = pool.awaitTermination(10, TimeUnit.SECONDS);
+            terminated = pool.awaitTermination(30, TimeUnit.SECONDS);
         }
 
         assertTrue(terminated, "worker threads terminate");
-        assertTrue(failures.isEmpty(), () -> failures.size() + " wrong renderings, first: "
+        assertTrue(failures.isEmpty(), () -> failures.size() + " failed serializations, first: "
                 + failures.stream().limit(5).collect(Collectors.joining("; ")));
         assertEquals(THREADS * ITERATIONS, serialized.get());
     }

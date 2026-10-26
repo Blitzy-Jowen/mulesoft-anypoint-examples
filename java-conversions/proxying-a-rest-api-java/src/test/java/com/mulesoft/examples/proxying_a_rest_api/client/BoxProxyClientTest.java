@@ -62,7 +62,11 @@ import com.github.tomakehurst.wiremock.verification.LoggedRequest;
  */
 class BoxProxyClientTest {
 
+    /** Timeout of the timeout case; the other cases use a generous one so that a slow host cannot fail them. */
     private static final long TIMEOUT_MS = 500;
+
+    /** The production default of {@code proxy.response-timeout-ms}, the Mule default response timeout. */
+    private static final long RESPONSE_TIMEOUT_MS = 10_000;
 
     private static final String STORE_PASSWORD = "test-store-password";
 
@@ -102,7 +106,11 @@ class BoxProxyClientTest {
     }
 
     private static BoxProxyClient httpClient() {
-        return new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), TIMEOUT_MS, "", "", "");
+        return httpClient(RESPONSE_TIMEOUT_MS);
+    }
+
+    private static BoxProxyClient httpClient(long timeoutMs) {
+        return new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), timeoutMs, "", "", "");
     }
 
     /** Bytes that are not valid UTF-8, so any decoding or re-encoding on the way changes them. */
@@ -266,7 +274,7 @@ class BoxProxyClientTest {
     void timeoutFailsWithinTheConfiguredLimitAndIsNotRetried() {
         wm.stubFor(get(urlEqualTo("/2.0/slow")).willReturn(ok().withFixedDelay(2000)));
 
-        try (BoxProxyClient client = httpClient()) {
+        try (BoxProxyClient client = httpClient(TIMEOUT_MS)) {
             long started = System.nanoTime();
             assertThatThrownBy(() -> client.exchange(HttpMethod.GET, "/2.0/slow", null, new HttpHeaders(), null))
                     .isInstanceOf(ResourceAccessException.class);
@@ -285,8 +293,8 @@ class BoxProxyClientTest {
         wm.stubFor(get(urlEqualTo("/2.0/folders/0")).willReturn(ok()));
 
         assertThatCode(() -> {
-            try (BoxProxyClient client = new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), TIMEOUT_MS,
-                    keystoreUri(), STORE_PASSWORD, KEY_PASSWORD)) {
+            try (BoxProxyClient client = new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(),
+                    RESPONSE_TIMEOUT_MS, keystoreUri(), STORE_PASSWORD, KEY_PASSWORD)) {
                 assertThat(client.exchange(HttpMethod.GET, "/2.0/folders/0", null, new HttpHeaders(), null)
                         .getStatusCode().value()).isEqualTo(200);
             }
@@ -295,7 +303,7 @@ class BoxProxyClientTest {
 
     @Test
     void swappedKeystorePasswordsFailNamingKeystorePath() {
-        assertThatThrownBy(() -> new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), TIMEOUT_MS,
+        assertThatThrownBy(() -> new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), RESPONSE_TIMEOUT_MS,
                 keystoreUri(), KEY_PASSWORD, STORE_PASSWORD))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("keystore.path")
@@ -307,7 +315,7 @@ class BoxProxyClientTest {
     void missingKeystoreFileFailsNamingKeystorePath() {
         String missing = tempDir.resolve("missing.jks").toUri().toString();
 
-        assertThatThrownBy(() -> new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), TIMEOUT_MS,
+        assertThatThrownBy(() -> new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), RESPONSE_TIMEOUT_MS,
                 missing, STORE_PASSWORD, KEY_PASSWORD))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("keystore.path")
@@ -321,8 +329,8 @@ class BoxProxyClientTest {
         wm.stubFor(get(urlEqualTo("/2.0/folders/0")).willReturn(ok()));
 
         assertThatCode(() -> {
-            try (BoxProxyClient client = new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(), TIMEOUT_MS,
-                    blankPath, "", "")) {
+            try (BoxProxyClient client = new BoxProxyClient(new DefaultResourceLoader(), wm.baseUrl(),
+                    RESPONSE_TIMEOUT_MS, blankPath, "", "")) {
                 assertThat(client.exchange(HttpMethod.GET, "/2.0/folders/0", null, new HttpHeaders(), null)
                         .getStatusCode().value()).isEqualTo(200);
             }

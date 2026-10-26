@@ -1,0 +1,46 @@
+# Spring profile "test" of querying-a-db-and-attaching-results-to-an-email-java (tests activate it with
+# @ActiveProfiles("test")). Replaces the never-committed mule.test.properties of the original test: the live
+# MySQL server becomes an in-memory H2 database and the Gmail account becomes a GreenMail SMTP server.
+# Demo values only; no real host, account or credential. Tests replace the SMTP port with GreenMail's dynamic
+# port through @DynamicPropertySource (smtp.port and spring.mail.port).
+#
+# Notes for the tests that use this profile:
+# - ${random.uuid} yields a new value on every lookup, so support/ImportOrdersSeeder and the tests use the
+#   injected DataSource or JdbcTemplate and never re-read jdbc.url or spring.datasource.url through @Value or
+#   Environment to open a connection: that would reach a different, empty database.
+# - @JdbcTest classes (client/EmployeeRepositoryTest) declare
+#   @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE); otherwise Boot swaps in its own
+#   embedded H2, which is not in MySQL mode, and ignores this URL.
+# - spring.sql.init stays "never" (main application.yml): import_orders.sql holds MySQL-only statements
+#   (CREATE DATABASE, CREATE USER, GRANT, FLUSH PRIVILEGES, USE, ENUM, two-digit-year dates) that
+#   support/ImportOrdersSeeder adapts for H2. The original assertions expect the attachment rows
+#   Chava,Puckett,F,1985-09-02,2008-10-12 and Mona,Sosa,M,1950-09-26,2007-11-27 (import_orders.sql lines 28
+#   and 84, with '07-11-27' read as 2007-11-27).
+# - FixtureParityTest runs without this profile.
+jdbc:
+  # Unique in-memory database per Spring test context; MySQL emulation of the original server.
+  # - ${random.uuid}: one database per context, so the test contexts never share or re-seed one database.
+  # - MODE=MySQL: emulates the original MySQL server.
+  # - DATABASE_TO_LOWER=TRUE: column labels come back as first_name, last_name, gender, dob, hire_date, as
+  #   MySQL returns them.
+  # - IGNORECASE=TRUE: mirrors MySQL's default case-insensitive collation for the
+  #   first_name = ? and last_name = ? lookup.
+  # - DB_CLOSE_DELAY=-1: keeps the database alive between pooled connections.
+  url: "jdbc:h2:mem:company-${random.uuid};MODE=MySQL;DATABASE_TO_LOWER=TRUE;IGNORECASE=TRUE;DB_CLOSE_DELAY=-1"
+smtp:
+  host: localhost
+  port: 3025              # GreenMail's conventional SMTP port; replaced by the dynamic port in every test
+  # GreenMail user the tests register with withUser("test@localhost", "secret"), as a plain address
+  # (the original's %40-encoded smtp.user_enc was a Mule endpoint-URI artefact).
+  user: test@localhost
+  password: secret
+mail:
+  # The original test sent to and from its own SMTP account and fixed the subject.
+  from: test@localhost
+  to: test@localhost
+  subject: "Mule flow completed!"
+spring:
+  mail:
+    properties:
+      # GreenMail SMTP is plain text; mail.smtp.auth stays true, so authentication runs against the GreenMail user.
+      "[mail.smtp.starttls.enable]": false

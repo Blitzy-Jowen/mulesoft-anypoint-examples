@@ -1,0 +1,51 @@
+# Spring Boot configuration of sending-a-csv-file-through-email-using-smtp-java,
+# converted from the Mule 3.8 flow csv-to-smtpFlow (src/main/app/csv-to-smtp.xml).
+# Original placeholder names are kept (smtp.*, mail.*). Secrets, hosts and addresses
+# have no value here: supply them through the environment variables named below.
+spring:
+  application:
+    name: sending-a-csv-file-through-email-using-smtp-java
+  main:
+    # No HTTP listener in the original: the only trigger is the file poller.
+    web-application-type: none
+  mail:
+    host: ${smtp.host}
+    port: ${smtp.port}
+    username: ${smtp.user}
+    password: ${smtp.password}
+    protocol: smtp
+    default-encoding: UTF-8
+    properties:
+      # smtp:gmail-connector preset: authenticated STARTTLS on port 587.
+      "[mail.smtp.auth]": true
+      "[mail.smtp.starttls.enable]": true
+      # responseTimeout="10000" of the original SMTP endpoint.
+      "[mail.smtp.connectiontimeout]": 10000
+      "[mail.smtp.timeout]": 10000
+      "[mail.smtp.writetimeout]": 10000
+
+smtp:
+  # TODO: supply the SMTP server host (Gmail: smtp.gmail.com)
+  host: ${SMTP_HOST:}
+  # Fixed by the original endpoint (port="587").
+  port: 587
+  # TODO: supply the SMTP login (plain address; the %40 encoding the Mule URI needed is not used)
+  user: ${SMTP_USER:}
+  # TODO: supply the SMTP password or app password
+  password: ${SMTP_PASSWORD:}
+
+mail:
+  # TODO: supply the sender address
+  from: ${MAIL_FROM:}
+  # TODO: supply the recipient address (a comma-separated list is allowed)
+  to: ${MAIL_TO:}
+  # TODO: supply the mail subject
+  subject: ${MAIL_SUBJECT:}
+
+# File trigger (trigger/CsvFileTrigger over SC-5 FileInboundPoller). New keys: the
+# original fixed these on the file:inbound-endpoint. No move directory: the original
+# declares no moveToDirectory, so each file is deleted after processing.
+csv-email:
+  input-dir: src/main/resources/input
+  # Mule 3.8 default pollingFrequency (ms); the original declares none.
+  polling-frequency: 1000
