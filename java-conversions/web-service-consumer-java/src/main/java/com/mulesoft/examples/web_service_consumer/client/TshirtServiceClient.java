@@ -44,7 +44,10 @@ import com.mulesoft.examples.web_service_consumer.config.TshirtServiceProperties
  *       {@code tshirt.read-timeout} (10 s, the Mule default response timeout);</li>
  *   <li>lines 17-23, the {@code soap.header} DataWeave script
  *       {@code ns0#AuthenticationHeader : { apiKey: ... }}: the header is added to every
- *       {@code OrderTshirt} request with the key configured as {@code tshirt.api-key};</li>
+ *       {@code OrderTshirt} request with the key configured as {@code tshirt.api-key}. The key has no default,
+ *       so construction accepts a missing or blank key, and {@code OrderTshirt} then fails with an
+ *       {@link IllegalStateException} naming the key before anything is sent; {@code ListInventory} sends
+ *       no header and never needs the key;</li>
  *   <li>line 25, {@code <ws:consumer operation="OrderTshirt"/>}, and line 38,
  *       {@code <ws:consumer operation="ListInventory"/>}.</li>
  * </ul>
@@ -127,10 +130,15 @@ public class TshirtServiceClient {
      * @return the response Body child ({@code OrderTshirtResponse}) as a document, or {@code null} when the
      *         service returns no response or an empty Body
      * @throws IllegalArgumentException when {@code request} is {@code null}
+     * @throws IllegalStateException when {@code tshirt.api-key} is missing or blank; raised before any request
+     *         is sent, so no empty {@code apiKey} reaches the service
      */
     public Document orderTshirt(Document request) {
         if (request == null) {
             throw new IllegalArgumentException("request must not be null");
+        }
+        if (apiKey.isBlank()) {
+            throw new IllegalStateException("T-shirt service API key (tshirt.api-key) is not configured");
         }
         Element header = authenticationHeader();
         return send(request, message -> {

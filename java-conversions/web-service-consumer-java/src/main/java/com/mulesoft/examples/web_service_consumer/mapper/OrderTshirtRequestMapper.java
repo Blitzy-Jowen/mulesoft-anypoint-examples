@@ -55,6 +55,9 @@ import com.fasterxml.jackson.core.StreamReadFeature;
  * <p>Output rules, as DataWeave applied them to {@code payload}:
  * <ul>
  *   <li>the root is {@code ns0:OrderTshirt}, declaring {@code xmlns:ns0}; every descendant is unqualified;</li>
+ *   <li>a scalar body (string, number or boolean) becomes the text of {@code ns0:OrderTshirt}, and a JSON
+ *       {@code null} body the empty, self-closed root; an array body is rejected by the writer, since XML output
+ *       has a single root element ("XML output requires a single root element");</li>
  *   <li>each member of a JSON object becomes one child element named after its key, in body order (not the
  *       {@code xsd:sequence} order of {@code tshirt.wsdl}), and a key the body repeats is written once per
  *       occurrence;</li>
@@ -89,7 +92,6 @@ public class OrderTshirtRequestMapper {
     private static final String PREFIX = "ns0";
 
     private static final String EMPTY_BODY = "Request body is empty";
-    private static final String NOT_AN_OBJECT = "Request body must be a JSON object";
 
     private static final String DISALLOW_DOCTYPE = "http://apache.org/xml/features/disallow-doctype-decl";
     private static final String EXTERNAL_GENERAL_ENTITIES = "http://xml.org/sax/features/external-general-entities";
@@ -140,18 +142,14 @@ public class OrderTshirtRequestMapper {
      * @return the DataWeave XML document, declaration included, without a trailing line feed
      * @throws IllegalArgumentException when the body is {@code null}, empty or JSON whitespace only
      *         ("Request body is empty"), is not well-formed JSON or holds anything after its value (the parser's
-     *         message, with the parser exception as cause), or is not a JSON object
-     *         ("Request body must be a JSON object")
+     *         message, with the parser exception as cause), or is a JSON array, which the writer rejects
+     *         ("XML output requires a single root element"); a scalar or {@code null} body is not rejected
      */
     public String toXml(byte[] json) {
         if (isBlank(json)) {
             throw new IllegalArgumentException(EMPTY_BODY);
         }
         Object tree = read(json);
-        if (!(tree instanceof Map<?, ?>)) {
-            // DataWeave writes exactly one root element, so an array or a scalar body has no XML form.
-            throw new IllegalArgumentException(NOT_AN_OBJECT);
-        }
         return dwXmlWriter.write(dwXmlWriter.fromObject(PREFIX, NAMESPACE, ROOT, tree));
     }
 
@@ -161,8 +159,10 @@ public class OrderTshirtRequestMapper {
      * original sent the DataWeave output unchanged.
      *
      * @param json the request body
-     * @return the document whose element is {@code OrderTshirt} in {@link #NAMESPACE}
-     * @throws IllegalArgumentException under the conditions of {@link #toXml(byte[])}
+     * @return the document whose element is {@code OrderTshirt} in {@link #NAMESPACE}; for a scalar body that
+     *         element's text is the scalar, and for a JSON {@code null} body it is empty
+     * @throws IllegalArgumentException under the conditions of {@link #toXml(byte[])}, a JSON array body included
+     *         ("XML output requires a single root element")
      * @throws IllegalStateException when no secure XML parser can be configured, or the writer's output cannot
      *         be parsed
      */

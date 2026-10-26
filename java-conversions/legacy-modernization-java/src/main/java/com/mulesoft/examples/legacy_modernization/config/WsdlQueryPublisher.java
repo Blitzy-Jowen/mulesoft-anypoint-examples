@@ -75,7 +75,17 @@ import org.xml.sax.SAXParseException;
  *       filter chain untouched.</li>
  *   <li>A served request is logged at DEBUG with registration-owned identity only (the document kind, its registered
  *       WSDL or schema key and resource, and the registration's patterns), never the request's query, parameters,
- *       path or URL, which carry caller-supplied data.</li>
+ *       path or URL, which carry caller-supplied data. A location that cannot be resolved relative to its referring
+ *       document is logged at DEBUG as well, before the classpath-root fallback is tried.</li>
+ *   <li>Log lines and exception messages name a resource as {@code class path resource [<path>]} or
+ *       {@code URL [<url>]}, and a schema location or key as written, each without URL user information, query or
+ *       fragment; control, line-separator and format characters are escaped ({@code \n}, {@code \r}, {@code \t}
+ *       or a Java-style Unicode escape), a backslash is doubled, and the text is cut to 256 characters with a
+ *       truncation marker. A resource without a URL is named by its type, because its description is free text.
+ *       Parser and I/O failures are reported by exception type, and a parse error by its line and column, never by
+ *       the failure's own message, which can quote document content or a full URL. A parse failure stays attached as
+ *       the cause of the start-up exception; an I/O failure is reported by type only and not attached, because the
+ *       JDK's I/O messages can carry the full URL with its user information and query.</li>
  *   <li>Documents are parsed with DOCTYPE declarations, external entities, external DTDs and XInclude disabled, and
  *       serialized without added indentation behind the declaration {@code <?xml version="1.0" encoding="UTF-8"?>}.</li>
  * </ul>
@@ -99,6 +109,13 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
     private static final Pattern URI_SCHEME = Pattern.compile("^[A-Za-z][A-Za-z0-9+.-]*:");
     private static final String QUERY_SAFE_PUNCTUATION = "-._~/:@!$'()*,;";
     private static final char[] HEX = "0123456789ABCDEF".toCharArray();
+
+    /** Longest diagnostic text, escapes included, before {@link #TRUNCATED} replaces the rest. */
+    private static final int DIAGNOSTIC_LIMIT = 256;
+    /** Appended where {@link #escapedAndBounded(String)} cuts a diagnostic text short. */
+    private static final String TRUNCATED = "...(truncated)";
+    /** URL user information, in a nested URL ({@code jar:http://user:password@host/...}) as well. */
+    private static final Pattern USER_INFO = Pattern.compile("//[^/]*@");
 
     private final AntPathMatcher pathMatcher = new AntPathMatcher();
     private final List<Published> published = new CopyOnWriteArrayList<>();
@@ -178,10 +195,10 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
                 String resolvedIdentity = identity(resolved);
                 Resource previous = schemas.putIfAbsent(reference.location(), resolved);
                 if (previous != null && !identity(previous).equals(resolvedIdentity)) {
-                    throw new IllegalStateException("Schema location '" + reference.location() + "' in "
-                            + current.resource().getDescription() + " resolves to " + resolved.getDescription()
-                            + ", but the same location already denotes " + previous.getDescription()
-                            + " in the closure of " + wsdl.getDescription());
+                    throw new IllegalStateException("Schema location '" + safeLocation(reference.location())
+                            + "' in " + safeResource(current.resource()) + " resolves to " + safeResource(resolved)
+                            + ", but the same location already denotes " + safeResource(previous)
+                            + " in the closure of " + safeResource(wsdl));
                 }
                 if (!documentsByIdentity.containsKey(resolvedIdentity)) {
                     byte[] bytes = read(resolved);
@@ -196,7 +213,7 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
         Registration registration = new Registration(wsdl, List.of(antPatterns), schemas);
         published.add(new Published(registration, wsdlBytes, Map.copyOf(schemaBytes)));
         registrations.add(registration);
-        log.info("Publishing {} for {} with {} referenced schema(s)", wsdl.getDescription(),
+        log.info("Publishing {} for {} with {} referenced schema(s)", safeResource(wsdl),
                 registration.patterns(), schemas.size());
         return this;
     }
@@ -230,7 +247,8 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
 
     /**
      * The registration and cached document a metadata query asks for, or {@code null} when it is not served here.
-     * The description is built from the registration: its WSDL resource, or the closure's own schema key and resource.
+     * The description is built from the registration: its WSDL resource, or the closure's own schema key and resource,
+     * each in its credential-free diagnostic form.
      */
     private Selection select(HttpServletRequest request) {
         String query = request.getQueryString();
@@ -243,14 +261,14 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
         }
         Registration registration = target.registration();
         if (WSDL_QUERY.equalsIgnoreCase(query)) {
-            return new Selection(target, target.wsdl(), "WSDL " + registration.wsdl().getDescription());
+            return new Selection(target, target.wsdl(), "WSDL " + safeResource(registration.wsdl()));
         }
         if (query.startsWith(XSD_QUERY_PREFIX)) {
             String key = request.getParameter(XSD_PARAMETER);
             for (Map.Entry<String, Resource> schema : registration.schemas().entrySet()) {
                 if (schema.getKey().equals(key)) {
                     return new Selection(target, target.schemas().get(schema.getKey()),
-                            "schema '" + schema.getKey() + "' (" + schema.getValue().getDescription() + ")");
+                            "schema '" + safeLocation(schema.getKey()) + "' (" + safeResource(schema.getValue()) + ")");
                 }
             }
         }
@@ -354,8 +372,8 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
                 return relative;
             }
         } catch (IOException ex) {
-            log.debug("{} cannot resolve '{}' relative to itself: {}", referrer.getDescription(), location,
-                    ex.getMessage());
+            log.debug("{} cannot resolve '{}' relative to itself: {}", safeResource(referrer), safeLocation(location),
+                    failure(ex));
         }
         ClassLoader loader = referrer instanceof ClassPathResource classPathReferrer
                 ? classPathReferrer.getClassLoader() : null;
@@ -363,8 +381,8 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
         if (fromRoot.exists()) {
             return fromRoot;
         }
-        throw new IllegalStateException("Schema location '" + location + "' referenced by "
-                + referrer.getDescription() + " exists neither relative to it nor at the classpath root");
+        throw new IllegalStateException("Schema location '" + safeLocation(location) + "' referenced by "
+                + safeResource(referrer) + " exists neither relative to it nor at the classpath root");
     }
 
     /** The URL identifying {@code resource}; resources without one are identified by their description. */
@@ -376,14 +394,111 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
         }
     }
 
+    /**
+     * The credential-free name of {@code resource} for log lines and exception messages. A classpath resource keeps
+     * the form operators know, {@code class path resource [<path>]}; any other resource is named
+     * {@code URL [<url>]}. Both are reduced by {@link #safeLocation(String)}. A resource without a URL is named by its
+     * type alone, because its description is free text that may hold anything.
+     */
+    private static String safeResource(Resource resource) {
+        if (resource instanceof ClassPathResource classPathResource) {
+            return "class path resource [" + safeLocation(classPathResource.getPath()) + "]";
+        }
+        try {
+            return "URL [" + safeLocation(resource.getURL().toExternalForm()) + "]";
+        } catch (IOException ex) {
+            return resource.getClass().getName();
+        }
+    }
+
+    /**
+     * {@code location} as diagnostic text: URL user information (nested URLs included) removed, everything from the
+     * first {@code ?} or {@code #} omitted, and the rest escaped and bounded by {@link #escapedAndBounded(String)}.
+     * User information is removed first, so a password holding {@code ?} or {@code #} cannot survive the cut.
+     */
+    private static String safeLocation(String location) {
+        String withoutUserInfo = USER_INFO.matcher(location).replaceAll("//");
+        int end = withoutUserInfo.length();
+        int query = withoutUserInfo.indexOf('?');
+        if (query >= 0) {
+            end = query;
+        }
+        int fragment = withoutUserInfo.indexOf('#');
+        if (fragment >= 0 && fragment < end) {
+            end = fragment;
+        }
+        return escapedAndBounded(withoutUserInfo.substring(0, end));
+    }
+
+    /**
+     * Escapes every character that could break or forge a log line, so the text always stays on one line, and cuts
+     * the result at {@link #DIAGNOSTIC_LIMIT} characters, never inside an escape or a surrogate pair.
+     */
+    private static String escapedAndBounded(String text) {
+        StringBuilder out = new StringBuilder(Math.min(text.length(), DIAGNOSTIC_LIMIT) + TRUNCATED.length());
+        int index = 0;
+        while (index < text.length()) {
+            int codePoint = text.codePointAt(index);
+            String escaped = escape(codePoint);
+            if (out.length() + escaped.length() > DIAGNOSTIC_LIMIT) {
+                return out.append(TRUNCATED).toString();
+            }
+            out.append(escaped);
+            index += Character.charCount(codePoint);
+        }
+        return out.toString();
+    }
+
+    /**
+     * {@code \n}, {@code \r} and {@code \t} by name, a backslash doubled so an escape cannot be forged, every other
+     * control, line or paragraph separator, format character and unpaired surrogate as Java-style Unicode escapes of
+     * its UTF-16 units, and any other code point unchanged.
+     */
+    private static String escape(int codePoint) {
+        String named = switch (codePoint) {
+            case '\n' -> "\\n";
+            case '\r' -> "\\r";
+            case '\t' -> "\\t";
+            case '\\' -> "\\\\";
+            default -> null;
+        };
+        if (named != null) {
+            return named;
+        }
+        int type = Character.getType(codePoint);
+        if (!Character.isISOControl(codePoint) && type != Character.LINE_SEPARATOR
+                && type != Character.PARAGRAPH_SEPARATOR && type != Character.FORMAT && type != Character.SURROGATE) {
+            return new String(Character.toChars(codePoint));
+        }
+        StringBuilder escaped = new StringBuilder(12);
+        for (char unit : Character.toChars(codePoint)) {
+            escaped.append('\\').append('u').append(HEX[(unit >> 12) & 0x0F]).append(HEX[(unit >> 8) & 0x0F])
+                    .append(HEX[(unit >> 4) & 0x0F]).append(HEX[unit & 0x0F]);
+        }
+        return escaped.toString();
+    }
+
+    /**
+     * Safe metadata of a failure: its type and, for a parse error, its line and column. The failure's message is
+     * never used, because parser and I/O messages can quote document content or a full URL.
+     */
+    private static String failure(Exception ex) {
+        if (ex instanceof SAXParseException parseError) {
+            return ex.getClass().getName() + " at line " + parseError.getLineNumber() + ", column "
+                    + parseError.getColumnNumber();
+        }
+        return ex.getClass().getName();
+    }
+
     private static byte[] read(Resource resource) {
         if (!resource.exists()) {
-            throw new IllegalStateException(resource.getDescription() + " does not exist");
+            throw new IllegalStateException(safeResource(resource) + " does not exist");
         }
         try (InputStream in = resource.getInputStream()) {
             return StreamUtils.copyToByteArray(in);
         } catch (IOException ex) {
-            throw new IllegalStateException("Cannot read " + resource.getDescription(), ex);
+            // Not attached as the cause: its message can quote the full URL, user information and query included.
+            throw new IllegalStateException("Cannot read " + safeResource(resource) + ": " + failure(ex));
         }
     }
 
@@ -409,17 +524,18 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
     }
 
     /**
-     * Parses with the hardened factory. {@code resource} names the document in failure messages; {@code null} marks
-     * a re-parse of bytes that were already parsed successfully at registration.
+     * Parses with the hardened factory. {@code resource} names the document, in its credential-free form, in warnings
+     * and failure messages; {@code null} marks a re-parse of bytes that were already parsed successfully at
+     * registration.
      */
     private static Document parse(byte[] bytes, Resource resource) {
-        String description = resource == null ? "cached metadata document" : resource.getDescription();
+        String description = resource == null ? "cached metadata document" : safeResource(resource);
         try {
             DocumentBuilder builder = newDocumentBuilder();
             builder.setErrorHandler(new FailingErrorHandler(description));
             return builder.parse(new ByteArrayInputStream(bytes));
         } catch (SAXException | IOException ex) {
-            throw new IllegalStateException("Cannot parse " + description + ": " + ex.getMessage(), ex);
+            throw new IllegalStateException("Cannot parse " + description + ": " + failure(ex), ex);
         }
     }
 
@@ -468,10 +584,11 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
 
     /**
      * Turns every parser error into an exception instead of the default handler's report on standard error, and logs
-     * warnings.
+     * warnings by position and type only: a warning's message, public ID and system ID can quote document content.
      */
     private static final class FailingErrorHandler implements ErrorHandler {
 
+        /** The parsed document's credential-free name. */
         private final String description;
 
         private FailingErrorHandler(String description) {
@@ -480,7 +597,7 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
 
         @Override
         public void warning(SAXParseException exception) {
-            log.warn("XML warning in {}: {}", description, exception.getMessage());
+            log.warn("XML warning in {}: {}", description, failure(exception));
         }
 
         @Override

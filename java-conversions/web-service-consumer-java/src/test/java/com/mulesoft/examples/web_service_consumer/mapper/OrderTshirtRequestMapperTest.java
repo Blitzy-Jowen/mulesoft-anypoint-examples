@@ -38,8 +38,10 @@ import com.fasterxml.jackson.core.JsonProcessingException;
  * {@code ns0#OrderTshirt: payload} ({@code %namespace ns0 http://mulesoft.org/tshirt-service},
  * {@code %output application/xml}): the JSON order becomes the {@code ns0:OrderTshirt} element in
  * {@link DwXmlWriter} layout, members in body order, a repeated key or an array item once per occurrence,
- * {@code null} as an empty element, decimals with their scale; anything that is not one JSON object is rejected
- * with {@link IllegalArgumentException} by both conversions.
+ * {@code null} as an empty element, decimals with their scale; a scalar body is the root's text and a {@code null}
+ * body the empty root, as the script places any payload under {@code ns0#OrderTshirt}; an empty or malformed body,
+ * and a root array, which the writer refuses as XML output has a single root, are rejected with
+ * {@link IllegalArgumentException} by both conversions.
  *
  * <p>The sample is the original example's {@code /message.json}, read from the test classpath as bytes. Expected
  * documents are spelled out with explicit {@code \n} and {@code \t}. The mapper is built directly over a real
@@ -51,7 +53,7 @@ class OrderTshirtRequestMapperTest {
 
     private static final String EMPTY_BODY = "Request body is empty";
 
-    private static final String NOT_AN_OBJECT = "Request body must be a JSON object";
+    private static final String SINGLE_ROOT = "XML output requires a single root element";
 
     private static final String DECLARATION_LINE = "<?xml version='1.0' encoding='UTF-8'?>\n";
 
@@ -264,33 +266,76 @@ class OrderTshirtRequestMapperTest {
         assertThatThrownBy(order::clear).isInstanceOf(UnsupportedOperationException.class);
     }
 
-    static Stream<Arguments> bodiesWithoutAnObject() {
+    static Stream<Arguments> scalarBodies() {
         return Stream.of(
-                Arguments.of("null", null, EMPTY_BODY),
-                Arguments.of("no bytes", new byte[0], EMPTY_BODY),
-                Arguments.of("JSON whitespace only", utf8(" \t\r\n "), EMPTY_BODY),
-                Arguments.of("byte-order mark and whitespace", new byte[] {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF, ' '},
-                        EMPTY_BODY),
-                Arguments.of("UTF-16 whitespace", " \n".getBytes(StandardCharsets.UTF_16BE), EMPTY_BODY),
-                Arguments.of("array body", utf8("[1,2]"), NOT_AN_OBJECT),
-                Arguments.of("empty array body", utf8("[]"), NOT_AN_OBJECT),
-                Arguments.of("string body", utf8("\"order\""), NOT_AN_OBJECT),
-                Arguments.of("number body", utf8("42"), NOT_AN_OBJECT),
-                Arguments.of("decimal body", utf8("1.50"), NOT_AN_OBJECT),
-                Arguments.of("boolean body", utf8("true"), NOT_AN_OBJECT),
-                Arguments.of("null literal body", utf8("null"), NOT_AN_OBJECT));
+                Arguments.of("string", "\"order\"", rootWithText("order"), "order"),
+                Arguments.of("integer", "42", rootWithText("42"), "42"),
+                Arguments.of("decimal keeps its scale", "1.50", rootWithText("1.50"), "1.50"),
+                Arguments.of("integer beyond long", "12345678901234567890", rootWithText("12345678901234567890"),
+                        "12345678901234567890"),
+                Arguments.of("true", "true", rootWithText("true"), "true"),
+                Arguments.of("false", "false", rootWithText("false"), "false"),
+                Arguments.of("empty string has a start and an end tag", "\"\"", rootWithText(""), ""),
+                Arguments.of("markup character escaped", "\"a & b\"", rootWithText("a &amp; b"), "a & b"),
+                Arguments.of("null is the self-closed root", "null", EMPTY_ORDER, ""));
     }
 
     @ParameterizedTest(name = "{0}")
-    @MethodSource("bodiesWithoutAnObject")
-    void bodyThatIsNotOneJsonObjectIsRejectedByBothConversions(String description, byte[] body, String message) {
+    @MethodSource("scalarBodies")
+    void scalarOrNullBodyIsTheTextOfTheRootInBothConversions(String description, String json, String expectedXml,
+            String expectedText) {
+        assertThat(mapper.toXml(utf8(json))).isEqualTo(expectedXml);
+
+        Element root = mapper.toDocument(utf8(json)).getDocumentElement();
+        assertThat(root.getNamespaceURI()).isEqualTo(TSHIRT_NAMESPACE);
+        assertThat(root.getLocalName()).isEqualTo("OrderTshirt");
+        assertThat(root.getPrefix()).isEqualTo("ns0");
+        assertThat(root.getElementsByTagName("*").getLength()).isZero();
+        assertThat(root.getTextContent()).isEqualTo(expectedText);
+    }
+
+    static Stream<Arguments> rootArrays() {
+        return Stream.of(
+                Arguments.of("array of numbers", "[1,2]"),
+                Arguments.of("empty array", "[]"),
+                Arguments.of("array of an empty object", "[{}]"),
+                Arguments.of("array of an object", "[{\"a\":1}]"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("rootArrays")
+    void rootArrayIsRejectedByTheWriterInBothConversions(String description, String json) {
+        byte[] body = utf8(json);
+
         assertThatThrownBy(() -> mapper.toXml(body))
                 .isExactlyInstanceOf(IllegalArgumentException.class)
-                .hasMessage(message)
+                .hasMessage(SINGLE_ROOT)
                 .hasNoCause();
         assertThatThrownBy(() -> mapper.toDocument(body))
                 .isExactlyInstanceOf(IllegalArgumentException.class)
-                .hasMessage(message)
+                .hasMessage(SINGLE_ROOT)
+                .hasNoCause();
+    }
+
+    static Stream<Arguments> emptyBodies() {
+        return Stream.of(
+                Arguments.of("null", null),
+                Arguments.of("no bytes", new byte[0]),
+                Arguments.of("JSON whitespace only", utf8(" \t\r\n ")),
+                Arguments.of("byte-order mark and whitespace", new byte[] {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF, ' '}),
+                Arguments.of("UTF-16 whitespace", " \n".getBytes(StandardCharsets.UTF_16BE)));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("emptyBodies")
+    void emptyBodyIsRejectedByBothConversions(String description, byte[] body) {
+        assertThatThrownBy(() -> mapper.toXml(body))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(EMPTY_BODY)
+                .hasNoCause();
+        assertThatThrownBy(() -> mapper.toDocument(body))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(EMPTY_BODY)
                 .hasNoCause();
     }
 
@@ -360,6 +405,12 @@ class OrderTshirtRequestMapperTest {
 
     private static String order(String... childLines) {
         return DECLARATION_LINE + ROOT_START + String.join("\n", childLines) + "\n" + ROOT_END;
+    }
+
+    /** The root holding {@code escapedText} as its text, between its start and end tags on one line. */
+    private static String rootWithText(String escapedText) {
+        return DECLARATION_LINE + "<ns0:OrderTshirt xmlns:ns0=\"http://mulesoft.org/tshirt-service\">" + escapedText
+                + ROOT_END;
     }
 
     private static byte[] utf8(String json) {
