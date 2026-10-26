@@ -162,12 +162,15 @@ class BoxProxyClientTest {
                 .withHeader("X-Custom", equalTo("custom-value")));
     }
 
+    // PROPFIND stands for the extension methods the original listener accepted and its requester sent on.
     static Stream<Arguments> bodiesToForward() {
         return Stream.of(
                 Arguments.of(HttpMethod.POST, "/2.0/folders", MediaType.APPLICATION_JSON_VALUE,
                         "{\"name\":\"Projects\",\"parent\":{\"id\":\"0\"}}".getBytes(UTF_8)),
                 Arguments.of(HttpMethod.PUT, "/2.0/files/1", MediaType.APPLICATION_OCTET_STREAM_VALUE,
-                        binaryPayload()));
+                        binaryPayload()),
+                Arguments.of(HttpMethod.valueOf("PROPFIND"), "/dav/folder", MediaType.APPLICATION_XML_VALUE,
+                        "<propfind/>".getBytes(UTF_8)));
     }
 
     @ParameterizedTest(name = "{0} {1}")

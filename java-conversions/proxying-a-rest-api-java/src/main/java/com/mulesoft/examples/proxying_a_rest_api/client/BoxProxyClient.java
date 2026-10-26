@@ -20,6 +20,7 @@ import java.security.KeyStore;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -30,6 +31,7 @@ import javax.net.ssl.SSLContext;
 
 import org.apache.hc.client5.http.classic.ExecChain;
 import org.apache.hc.client5.http.classic.ExecRuntime;
+import org.apache.hc.client5.http.classic.methods.HttpUriRequestBase;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.config.TlsConfig;
@@ -111,6 +113,9 @@ public class BoxProxyClient implements AutoCloseable {
 
     /** Exchange attribute set once a redirect has left the original request's origin. */
     private static final String LEFT_ORIGIN_ATTRIBUTE = BoxProxyClient.class.getName() + ".leftOrigin";
+
+    /** The methods Spring's request factory builds itself; any other method token is sent as given. */
+    private static final Set<HttpMethod> STANDARD_METHODS = Set.of(HttpMethod.values());
 
     private final CloseableHttpClient httpClient;
 
@@ -197,7 +202,17 @@ public class BoxProxyClient implements AutoCloseable {
                 .addExecInterceptorAfter(ChainElement.REDIRECT.name(), "body-write-deadline", this::boundBodyWrites)
                 .build();
         // The client's default request configuration applies because no factory timeout is set.
-        HttpComponentsClientHttpRequestFactory requestFactory = new HttpComponentsClientHttpRequestFactory(httpClient);
+        // Spring's factory rejects every method outside HttpMethod.values(), while the original requester sent
+        // whatever method the caller used, so an extension method such as PROPFIND travels as a generic request.
+        // The standard methods keep Spring's request classes, whose TRACE refuses a body.
+        HttpComponentsClientHttpRequestFactory requestFactory = new HttpComponentsClientHttpRequestFactory(httpClient) {
+            @Override
+            protected ClassicHttpRequest createHttpUriRequest(HttpMethod httpMethod, URI uri) {
+                return STANDARD_METHODS.contains(httpMethod)
+                        ? super.createHttpUriRequest(httpMethod, uri)
+                        : new HttpUriRequestBase(httpMethod.name(), uri);
+            }
+        };
         // The static builder rather than Boot's RestClient.Builder: no default headers, base URL, URI template
         // handling or customizers may touch a proxied request, and tests construct the class without a context.
         this.restClient = RestClient.builder().requestFactory(requestFactory).build();
@@ -232,7 +247,8 @@ public class BoxProxyClient implements AutoCloseable {
      * {@code http} one is not followed and is returned as received; nothing is sent to the {@code http} URL. Any
      * status, 3xx not followed, 4xx and 5xx included, is returned as a value with its headers and body.
      *
-     * @param method     the inbound request method
+     * @param method     the inbound request method, any token; an extension method such as {@code PROPFIND} is sent
+     *                   as given
      * @param rawPath    the inbound request path, still percent-encoded, starting with {@code /}
      * @param rawQuery   the inbound query string without {@code ?}, still percent-encoded, or {@code null}
      * @param headers    the headers to forward, or {@code null} for none

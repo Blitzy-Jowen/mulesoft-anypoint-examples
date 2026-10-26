@@ -1,0 +1,10 @@
+# Fake values for Spring profile "test", replacing the uncommitted mule.test.properties the original
+# MuleComponentBindingsIT read. None is a real credential; every upstream call in the tests goes to WireMock.
+twitter:
+  accessKey: test-access-key
+  accessSecret: test-access-secret
+  apiKey: test-api-key
+  apiSecret: test-api-secret
+stockstats:
+  stocklyticsApiKey: test-stocklytics-key
+  sentiment140ApiKey: test-sentiment140-key

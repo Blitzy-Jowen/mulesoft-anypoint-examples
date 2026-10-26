@@ -1,0 +1,10 @@
+# Spring profile "test": original demo values of http-oauth-provider (AAP 0.4.6).
+# Source: http-oauth-provider/src/main/app/http-oauth-provider.xml lines 16 (owner) and 28 (client).
+# Not for production; src/main/resources/application.yml keeps these as TODO placeholders.
+oauth:
+  provider:
+    client-id: myclientid
+    client-secret: myclientsecret
+    owner:
+      username: mule
+      password: mule
