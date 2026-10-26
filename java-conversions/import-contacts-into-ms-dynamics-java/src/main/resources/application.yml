@@ -1,0 +1,39 @@
+# import-contacts-into-ms-dynamics-java runtime configuration
+# Replaces import-contacts-into-ms-dynamics/src/main/app/mule-app.properties (empty) and the dynamicscrm:config
+# placeholders (l.3) and file:inbound-endpoint values (l.7) of import-contacts-into-ms-dynamics.xml.
+spring:
+  application:
+    name: import-contacts-into-ms-dynamics-java
+  main:
+    web-application-type: none          # no HTTP listener in the original; webflux is present only for WebClient, so no Netty server starts
+
+# The endpoint's mimeType (application/csv) and responseTimeout are not carried: the content is always read as CSV,
+# and a one-way file inbound sends no reply.
+contacts:
+  input-dir: src/main/resources/input       # original file:inbound-endpoint path (l.7)
+  move-to-dir: src/main/resources/output    # original moveToDirectory (l.7)
+  polling-frequency: 10000                  # original pollingFrequency in ms (l.7)
+
+# Original CRM Online legacy-login keys -> Dataverse Web API v9.2 with a Microsoft Entra client-credentials token:
+#   crm.service-url             -> dynamics.service-url
+#   crm.username, crm.password  -> dynamics.oauth.tenant-id + dynamics.oauth.client-id + dynamics.oauth.client-secret
+#   crm.auth-type (CRMONLINE)   -> no successor; the grant is always client credentials
+# The token client is built from these keys, not from spring.security.oauth2.client.*, so Boot's OAuth2 client
+# auto-configuration stays inactive.
+dynamics:
+  # TODO: supply the Dataverse environment URL, e.g. https://<org>.crm.dynamics.com (no trailing slash); replaces crm.service-url
+  service-url: ${DYNAMICS_SERVICE_URL:}
+  # Connect and read timeouts of the token and Web API calls: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s
+  oauth:
+    # TODO: supply the Microsoft Entra tenant ID (directory ID) of the Dataverse environment
+    tenant-id: ${DYNAMICS_OAUTH_TENANT_ID:}
+    # TODO: supply the application (client) ID of the Entra app registration registered as the Dataverse application user
+    client-id: ${DYNAMICS_OAUTH_CLIENT_ID:}
+    # TODO: supply the client secret of that app registration
+    client-secret: ${DYNAMICS_OAUTH_CLIENT_SECRET:}
+    # Entra v2.0 token endpoint of the tenant; tests override it with a WireMock URL
+    token-uri: https://login.microsoftonline.com/${dynamics.oauth.tenant-id}/oauth2/v2.0/token
+    # Client-credentials scope: the environment URL's .default
+    scope: ${dynamics.service-url}/.default

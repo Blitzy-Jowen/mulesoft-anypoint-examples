@@ -1,0 +1,20 @@
+# Live-sandbox credentials template for SalesforceIdRetrievalIT.
+#
+# Copy this file to src/test/resources/application-it.yml and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it.
+#
+# SalesforceIdRetrievalIT runs under failsafe (mvn -B verify). It is skipped while application-it.yml is
+# missing or while any required key below is missing, blank or still TODO.
+#
+# The test is read-only: it creates and deletes no Salesforce records. It queries existing User records,
+# and its expected values in reply.txt come from the original example's org.
+#
+# These keys replace the sfdc.username, sfdc.password and sfdc.securityToken that the original
+# salesforce-data-retrieval test read from src/test/resources/mule.test.properties.
+sfdc:
+  username:        # TODO: supply the Salesforce sandbox username
+  password:        # TODO: supply the Salesforce password, without the security token
+  securityToken:   # TODO: supply the Salesforce security token
+  # Optional, for sandbox orgs (default https://login.salesforce.com/services/Soap/u/65.0):
+  # auth-endpoint: https://test.salesforce.com/services/Soap/u/65.0

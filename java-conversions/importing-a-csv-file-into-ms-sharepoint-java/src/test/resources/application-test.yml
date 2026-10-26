@@ -1,0 +1,9 @@
+# Profile "test": placeholder values so SharepointProperties' fail-fast check passes.
+# No real credentials; SharePoint is replaced by WireMock in every test (AAP 0.8.3).
+Sharepoint:
+  Username: test-user@example.onmicrosoft.com
+  Password: test-password
+  SiteUrl: http://127.0.0.1:9
+sharepoint-online:
+  sts-url: http://127.0.0.1:9/extSTS.srf
+csvImportFolder: test-folder

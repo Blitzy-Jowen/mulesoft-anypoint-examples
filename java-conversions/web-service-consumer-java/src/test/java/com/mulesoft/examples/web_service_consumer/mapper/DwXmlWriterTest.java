@@ -492,6 +492,7 @@ class DwXmlWriterTest {
         assertThat(writer.write(writer.fromObject("r", "text"))).isEqualTo(DECLARATION_LINE + "<r>text</r>");
         assertThat(writer.write(writer.fromObject("r", 5))).isEqualTo(DECLARATION_LINE + "<r>5</r>");
         assertThat(writer.write(writer.fromObject("r", null))).isEqualTo(DECLARATION_LINE + "<r/>");
+        assertThat(writer.write(writer.fromObject("r", ""))).isEqualTo(DECLARATION_LINE + "<r></r>");
         assertThat(writer.write(writer.fromObject("r", Map.of()))).isEqualTo(DECLARATION_LINE + "<r/>");
         assertThat(writer.write(writer.fromObject("", "", "r", "x"))).isEqualTo(DECLARATION_LINE + "<r>x</r>");
     }
