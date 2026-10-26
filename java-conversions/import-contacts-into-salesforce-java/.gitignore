@@ -1,0 +1,4 @@
+# Maven build output
+target/
+# Live-test credentials (sfdc.username, sfdc.password, sfdc.securityToken); never committed
+src/test/resources/application-it.yml
