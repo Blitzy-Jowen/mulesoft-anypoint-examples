@@ -1,0 +1,27 @@
+# importing-an-email-attachment-using-the-IMAP-connector-java runtime configuration
+# Replaces importing-an-email-attachment-using-the-IMAP-connector/src/main/app/mule-app.properties (empty) and the
+# values imap-to-xml.xml reads or fixes. The original placeholder names imap.host, imap.user and imap.password are
+# kept; the original test's imap.user_enc (a URL-encoded address Mule needed in its endpoint URI) is dropped,
+# because Jakarta Mail takes the plain address.
+spring:
+  main:
+    web-application-type: none     # the original flow has no HTTP listener
+
+imap:
+  # TODO: supply the IMAPS server host name
+  host: ${IMAP_HOST:}
+  # TODO: supply the mailbox user (plain address, e.g. user@example.com)
+  user: ${IMAP_USER:}
+  # TODO: supply the mailbox password
+  password: ${IMAP_PASSWORD:}
+  port: 993                        # fixed on the original imaps:inbound-endpoint (imap-to-xml.xml:10), implicit TLS
+  folder: INBOX                    # Mule's default mailboxFolder
+  check-frequency: 100             # ms between polls; original imaps:connector checkFrequency (imap-to-xml.xml:5)
+  initial-delay: 0                 # ms before the first poll
+  # Extra jakarta.mail session properties, none by default. A key containing dots must be written in bracket
+  # notation so the dots stay inside the map key, e.g. "[mail.imaps.ssl.trust]": "*".
+  properties: {}
+
+orders:
+  output-dir: src/test/resources/output   # original file:outbound-endpoint path, relative to the working directory (imap-to-xml.xml:32)
+  output-file-name: orders.xml            # original outputPattern (imap-to-xml.xml:32)
