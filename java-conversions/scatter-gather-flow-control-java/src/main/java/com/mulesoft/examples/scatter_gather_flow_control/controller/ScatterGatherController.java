@@ -69,7 +69,9 @@ public class ScatterGatherController {
     /**
      * Answers {@code OPTIONS /scatterGather} like every other method. A mapping without methods deliberately does
      * not match {@code OPTIONS}, which Spring MVC would otherwise answer itself with an {@code Allow} header and no
-     * body; the Mule listener ran the flow for {@code OPTIONS} too.
+     * body; the Mule listener ran the flow for {@code OPTIONS} too. A CORS pre-flight reaches this handler as well:
+     * {@code config.PreflightDispatchConfig} dispatches it as the plain {@code OPTIONS} request it is, because the
+     * listener applies no CORS policy.
      *
      * @param response the response the flow's payload is written to
      * @throws IOException when writing the response fails
