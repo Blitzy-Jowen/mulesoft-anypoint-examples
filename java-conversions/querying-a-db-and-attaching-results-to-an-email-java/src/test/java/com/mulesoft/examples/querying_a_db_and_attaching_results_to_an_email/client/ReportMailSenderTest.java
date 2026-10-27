@@ -12,12 +12,17 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.io.IOException;
 import java.io.InputStream;
-import java.net.ServerSocket;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Properties;
+import java.util.stream.Stream;
 
 import com.icegreen.greenmail.configuration.GreenMailConfiguration;
 import com.icegreen.greenmail.junit5.GreenMailExtension;
@@ -160,18 +165,20 @@ class ReportMailSenderTest {
 
     @Test
     void unreachableSmtpServerFailsWithMailException() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
+        try (Socket reserved = reserveRefusingPort()) {
+            JavaMailSenderImpl unreachable = mailSenderOn(reserved.getLocalPort());
+            unreachable.getJavaMailProperties().setProperty("mail.smtp.connectiontimeout", "2000");
+            unreachable.getJavaMailProperties().setProperty("mail.smtp.timeout", "2000");
+            ReportMailSender failingSender = new ReportMailSender(unreachable, ACCOUNT, ACCOUNT, SUBJECT);
+
+            // A MessagingException returns its nested exception from getCause(), so the refusal is on the chain.
+            assertThatThrownBy(() -> failingSender.send(CSV))
+                    .isInstanceOf(MailException.class)
+                    .satisfies(failure -> assertThat(Stream.iterate(failure, Objects::nonNull, Throwable::getCause))
+                            .anyMatch(ConnectException.class::isInstance));
+
+            assertThat(greenMail.getReceivedMessages()).isEmpty();
         }
-        JavaMailSenderImpl unreachable = mailSenderOn(closedPort);
-        unreachable.getJavaMailProperties().setProperty("mail.smtp.connectiontimeout", "2000");
-        unreachable.getJavaMailProperties().setProperty("mail.smtp.timeout", "2000");
-        ReportMailSender failingSender = new ReportMailSender(unreachable, ACCOUNT, ACCOUNT, SUBJECT);
-
-        assertThatThrownBy(() -> failingSender.send(CSV)).isInstanceOf(MailException.class);
-
-        assertThat(greenMail.getReceivedMessages()).isEmpty();
     }
 
     @Test
@@ -214,6 +221,26 @@ class ReportMailSenderTest {
         properties.setProperty("mail.smtp.writetimeout", "10000");
         mailSender.setJavaMailProperties(properties);
         return mailSender;
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
     }
 
     private static MimeMessage singleReceivedMessage() {

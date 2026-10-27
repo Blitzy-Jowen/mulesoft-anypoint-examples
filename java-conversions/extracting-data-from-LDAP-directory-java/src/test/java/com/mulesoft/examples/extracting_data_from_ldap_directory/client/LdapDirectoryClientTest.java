@@ -12,12 +12,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 
+import java.io.IOException;
 import java.io.InputStream;
-import java.net.ServerSocket;
+import java.net.BindException;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -57,6 +62,9 @@ class LdapDirectoryClientTest {
     private static final String ALL = "(objectClass=*)";
 
     private static final String MMC_DN = "cn=mmc,ou=people";
+
+    /** How many reserved-port handoffs the recovery test attempts before it fails. */
+    private static final int HANDOFF_ATTEMPTS = 5;
 
     private static InMemoryDirectoryServer server;
 
@@ -133,25 +141,57 @@ class LdapDirectoryClientTest {
 
     @Test
     void lazyPoolRecoversAfterFailedFirstConnection() throws Exception {
-        int freePort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            freePort = socket.getLocalPort();
-        }
+        LDAPException portTaken = null;
+        for (int attempt = 1; attempt <= HANDOFF_ATTEMPTS; attempt++) {
+            InMemoryDirectoryServer second;
+            try (Socket reserved = reserveRefusingPort()) {
+                int reservedPort = reserved.getLocalPort();
 
-        // Nothing listens on freePort yet: construction must not connect, the first search must fail.
-        client = assertDoesNotThrow(() -> new LdapDirectoryClient(properties(freePort, BIND_PASSWORD)));
-        assertThatThrownBy(() -> client.search(PEOPLE, ALL)).isInstanceOf(LDAPException.class);
+                // Nothing listens on the reserved port: construction must not connect, the first search must fail.
+                client = assertDoesNotThrow(() -> new LdapDirectoryClient(properties(reservedPort, BIND_PASSWORD)));
+                assertThatThrownBy(() -> client.search(PEOPLE, ALL))
+                        .isInstanceOfSatisfying(LDAPException.class, e -> {
+                            assertThat(e.getResultCode()).isEqualTo(ResultCode.CONNECT_ERROR);
+                            assertThat(causeChain(e)).anyMatch(ConnectException.class::isInstance);
+                        });
 
-        // The same instance succeeds once a directory listens there, so the failed pool creation cached nothing.
-        InMemoryDirectoryServer second = startServer(freePort);
-        try {
-            assertThat(client.search(PEOPLE, ALL)).hasSize(3);
-        } finally {
-            second.shutDown(true);
+                second = prepareServer(reservedPort);
+            }
+            // Handoff: the reserved socket was released just above and the prepared directory binds its port next.
+            try {
+                second.startListening(LISTENER);
+            } catch (LDAPException e) {
+                second.shutDown(true);
+                if (causeChain(e).noneMatch(BindException.class::isInstance)) {
+                    throw e;
+                }
+                // Another process bound the released port first: repeat the scenario on a newly reserved port.
+                portTaken = e;
+                client.close();
+                client = null;
+                continue;
+            }
+
+            // The same instance succeeds once a directory listens there, so the failed pool creation cached nothing.
+            try {
+                assertThat(client.search(PEOPLE, ALL)).hasSize(3);
+            } finally {
+                second.shutDown(true);
+            }
+            return;
         }
+        throw new AssertionError("Another process bound the released port before the directory listened on it, in "
+                + "each of " + HANDOFF_ATTEMPTS + " attempts", portTaken);
     }
 
     private static InMemoryDirectoryServer startServer(int listenPort) throws Exception {
+        InMemoryDirectoryServer ds = prepareServer(listenPort);
+        ds.startListening(LISTENER);
+        return ds;
+    }
+
+    /** A directory loaded with {@code ldap-add.ldif} whose listener is configured on {@code listenPort} but idle. */
+    private static InMemoryDirectoryServer prepareServer(int listenPort) throws Exception {
         InMemoryDirectoryServerConfig config = new InMemoryDirectoryServerConfig(BASE_DN);
         config.addAdditionalBindCredentials(BIND_DN, BIND_PASSWORD);
         config.setListenerConfigs(InMemoryListenerConfig.createLDAPConfig(LISTENER, listenPort));
@@ -163,8 +203,32 @@ class LdapDirectoryClientTest {
             int imported = ds.importFromLDIF(true, reader);
             assertThat(imported).isEqualTo(10);
         }
-        ds.startListening(LISTENER);
         return ds;
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
+    }
+
+    /** The failure followed by each of its causes. */
+    private static Stream<Throwable> causeChain(Throwable failure) {
+        return Stream.iterate(failure, Objects::nonNull, Throwable::getCause);
     }
 
     private static LdapProperties properties(int ldapPort, String password) {

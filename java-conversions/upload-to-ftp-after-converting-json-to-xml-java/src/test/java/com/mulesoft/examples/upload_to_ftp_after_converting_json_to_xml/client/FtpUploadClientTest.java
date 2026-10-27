@@ -26,9 +26,12 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
-import java.net.ServerSocket;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -74,14 +77,17 @@ class FtpUploadClientTest {
     /**
      * DataWeave-style XML with LF line ends, tab indentation and multi-byte UTF-8 characters, written with unicode
      * escapes so the source encoding cannot change the bytes. An ASCII-mode transfer would turn each LF into CRLF.
+     * Kept as immutable text that {@link #utf8(String)} encodes into a new array at every use, so the array a test
+     * hands the client is never the array it expects, and a client that alters its input can change neither the
+     * expectation nor a later test.
      */
-    private static final byte[] XML = ("<?xml version='1.0' encoding='UTF-8'?>\n"
+    private static final String XML = "<?xml version='1.0' encoding='UTF-8'?>\n"
             + "<employees>\n"
             + "\t<employee>\n"
             + "\t\t<name>Zo\u00eb</name>\n"
             + "\t\t<lastName>\u65e5\u672c</lastName>\n"
             + "\t</employee>\n"
-            + "</employees>\n").getBytes(StandardCharsets.UTF_8);
+            + "</employees>\n";
 
     private UnixFakeFileSystem fileSystem;
     private FakeFtpServer server;
@@ -119,24 +125,30 @@ class FtpUploadClientTest {
 
     @Test
     void uploadWritesFileByteForByte() throws Exception {
-        new FtpUploadClient(props(port, UPLOAD_PATH, PASSWORD)).upload(FtpUploadClient.OUTPUT_PATTERN, XML);
+        byte[] content = utf8(XML);
+
+        new FtpUploadClient(props(port, UPLOAD_PATH, PASSWORD)).upload(FtpUploadClient.OUTPUT_PATTERN, content);
 
         assertThat(fileSystem.isFile(UPLOADED_FILE)).isTrue();
         byte[] stored = read(UPLOADED_FILE);
-        assertThat(stored).containsExactly(XML);
+        assertThat(stored).containsExactly(utf8(XML));
         // The fake server stores the bytes it receives unchanged, so no CR proves the transfer ran in BINARY mode.
         assertThat(stored).doesNotContain((byte) '\r');
+        // The client only reads the caller's array; it must hand it back unchanged.
+        assertThat(content).containsExactly(utf8(XML));
     }
 
     @Test
     void uploadOverwritesExistingFile() throws Exception {
         fileSystem.add(new FileEntry(UPLOADED_FILE, "previous content that is clearly longer than the replacement"));
         // Non-empty on purpose: the fake server leaves the old bytes in place when it receives no data.
-        byte[] replacement = "<employees/>\n".getBytes(StandardCharsets.UTF_8);
+        String replacement = "<employees/>\n";
+        byte[] content = utf8(replacement);
 
-        new FtpUploadClient(props(port, UPLOAD_PATH, PASSWORD)).upload(FtpUploadClient.OUTPUT_PATTERN, replacement);
+        new FtpUploadClient(props(port, UPLOAD_PATH, PASSWORD)).upload(FtpUploadClient.OUTPUT_PATTERN, content);
 
-        assertThat(read(UPLOADED_FILE)).containsExactly(replacement);
+        assertThat(read(UPLOADED_FILE)).containsExactly(utf8(replacement));
+        assertThat(content).containsExactly(utf8(replacement));
     }
 
     @Test
@@ -164,17 +176,19 @@ class FtpUploadClientTest {
 
     @Test
     void connectionRefusedFails() throws Exception {
-        int refusedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            refusedPort = socket.getLocalPort();
+        try (Socket reserved = reserveRefusingPort()) {
+            int refusedPort = reserved.getLocalPort();
+            FTPClient ftp = spy(new FTPClient());
+
+            Throwable thrown = catchUploadFailure(clientWith(props(refusedPort, UPLOAD_PATH, PASSWORD), ftp));
+
+            assertThat(thrown).isInstanceOf(UncheckedIOException.class);
+            assertThat(Stream.iterate(thrown, Objects::nonNull, Throwable::getCause))
+                    .anyMatch(ConnectException.class::isInstance);
+            // connect(String, int) delegates to this overload, which every String-host connect reaches exactly once.
+            verify(ftp, times(1)).connect(eq(HOST), eq(refusedPort), isNull(), eq(-1));
+            verify(ftp, never()).login(anyString(), anyString());
         }
-        FTPClient ftp = spy(new FTPClient());
-
-        catchUploadFailure(clientWith(props(refusedPort, UPLOAD_PATH, PASSWORD), ftp));
-
-        // connect(String, int) delegates to this overload, which every String-host connect reaches exactly once.
-        verify(ftp, times(1)).connect(eq(HOST), eq(refusedPort), isNull(), eq(-1));
-        verify(ftp, never()).login(anyString(), anyString());
     }
 
     @Test
@@ -208,8 +222,9 @@ class FtpUploadClientTest {
     @Test
     void successfulUploadUsesOneConnectionAndDisconnects() throws Exception {
         FTPClient ftp = spy(new FTPClient());
+        byte[] content = utf8(XML);
 
-        clientWith(props(port, UPLOAD_PATH, PASSWORD), ftp).upload(FtpUploadClient.OUTPUT_PATTERN, XML);
+        clientWith(props(port, UPLOAD_PATH, PASSWORD), ftp).upload(FtpUploadClient.OUTPUT_PATTERN, content);
 
         verify(ftp, times(1)).connect(eq(HOST), eq(port), isNull(), eq(-1));
         verify(ftp, times(1)).login(USER, PASSWORD);
@@ -228,7 +243,8 @@ class FtpUploadClientTest {
         verify(ftp).setSoTimeout(TIMEOUT_MILLIS);
         verify(ftp).setDataTimeout(Duration.ofMillis(TIMEOUT_MILLIS));
 
-        assertThat(read(UPLOADED_FILE)).containsExactly(XML);
+        assertThat(read(UPLOADED_FILE)).containsExactly(utf8(XML));
+        assertThat(content).containsExactly(utf8(XML));
     }
 
     @ParameterizedTest(name = "[{index}] {0}")
@@ -238,7 +254,7 @@ class FtpUploadClientTest {
         unset.accept(properties);
         FTPClient ftp = spy(new FTPClient());
 
-        assertThatThrownBy(() -> clientWith(properties, ftp).upload(FtpUploadClient.OUTPUT_PATTERN, XML))
+        assertThatThrownBy(() -> clientWith(properties, ftp).upload(FtpUploadClient.OUTPUT_PATTERN, utf8(XML)))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining(key);
 
@@ -278,11 +294,19 @@ class FtpUploadClientTest {
         };
     }
 
-    /** Uploads {@link #XML} and returns the failure, which must be one of the two types the client declares. */
+    /**
+     * Uploads a fresh encoding of {@link #XML} and returns the failure, which must be one of the two types the client
+     * declares.
+     */
     private static Throwable catchUploadFailure(FtpUploadClient client) {
-        Throwable thrown = catchThrowable(() -> client.upload(FtpUploadClient.OUTPUT_PATTERN, XML));
+        Throwable thrown = catchThrowable(() -> client.upload(FtpUploadClient.OUTPUT_PATTERN, utf8(XML)));
         assertThat(thrown).isInstanceOfAny(IllegalStateException.class, UncheckedIOException.class);
         return thrown;
+    }
+
+    /** The UTF-8 bytes of {@code text} in a new array on every call, so no two uses ever share one. */
+    private static byte[] utf8(String text) {
+        return text.getBytes(StandardCharsets.UTF_8);
     }
 
     private byte[] read(String path) throws IOException {
@@ -296,6 +320,26 @@ class FtpUploadClientTest {
         for (Throwable c = thrown; c != null; c = c.getCause()) {
             assertThat(String.valueOf(c.getMessage())).doesNotContain(secret);
             assertThat(c.toString()).doesNotContain(secret);
+        }
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
         }
     }
 }

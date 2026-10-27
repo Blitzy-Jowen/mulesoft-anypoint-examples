@@ -31,11 +31,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.ServerSocket;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -268,16 +271,17 @@ class SharepointRestClientTest {
 
     @Test
     void signInRaisesResourceAccessOnConnectionRefused() throws IOException {
-        int port;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            port = socket.getLocalPort();
-        }
-        String closedBase = "http://127.0.0.1:" + port;
-        SharepointRestClient unreachable = new SharepointRestClient(
-                new SharepointProperties(USERNAME, PASSWORD, closedBase, CSV_IMPORT_FOLDER, closedBase + STS_PATH),
-                Duration.ofSeconds(2));
+        try (Socket reserved = reserveRefusingPort()) {
+            String closedBase = "http://127.0.0.1:" + reserved.getLocalPort();
+            SharepointRestClient unreachable = new SharepointRestClient(
+                    new SharepointProperties(USERNAME, PASSWORD, closedBase, CSV_IMPORT_FOLDER, closedBase + STS_PATH),
+                    Duration.ofSeconds(2));
 
-        assertThatThrownBy(unreachable::signIn).isInstanceOf(ResourceAccessException.class);
+            assertThatThrownBy(unreachable::signIn)
+                    .isInstanceOf(ResourceAccessException.class)
+                    .satisfies(failure -> assertThat(Stream.iterate(failure, Objects::nonNull, Throwable::getCause))
+                            .anyMatch(ConnectException.class::isInstance));
+        }
     }
 
     @Test
@@ -342,6 +346,26 @@ class SharepointRestClientTest {
         try (InputStream in = SharepointRestClientTest.class.getResourceAsStream("/contacts.csv")) {
             assertThat(in).as("contacts.csv on the test classpath").isNotNull();
             return in.readAllBytes();
+        }
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
         }
     }
 
