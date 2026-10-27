@@ -2,26 +2,33 @@
 
 `oauth2-client-credentials-using-the-HTTP-connector-java` is the Spring Boot 3.2.12 / Java 17 conversion of the Mule EE 3.8 example [`oauth2-client-credentials-using-the-HTTP-connector`](../../oauth2-client-credentials-using-the-HTTP-connector/) (category General). The original's only flow file is `src/main/app/http-client-credentials.xml`, the single entry of `config.resources` in its `mule-deploy.properties`; its `mule-app.properties` is empty. The original folder stays unchanged beside this project and is the Tier 2A capture source.
 
+## Original example
+
 The example has two flows on one listener (`0.0.0.0:8081`):
 
 - `httpclientcredentialsFlow` (`/oauth`) obtains a Box access token with the OAuth 2.0 client-credentials grant and calls Box's `/api/oauth2/authorize/` with it.
 - `http-client-credentialsFlow` (`/FIM/*`) forwards the request method and raw URI to the IBM FIM demo server `tfim01.demos.ibm.com`.
 
-## Original example and set-up
-
 The original `README.md` describes the authorization-code example instead: `http://localhost:8081/web/{user-id}`, `/web/loginDone`, `http-authorization-code-web.xml` and the redirect URL `https://localhost:8082/redirectUrl`. None of these exist in this example's flow, and none is served here; they belong to [`oauth2-authorization-code-using-the-HTTP-connector`](../../oauth2-authorization-code-using-the-HTTP-connector/). Only two of its set-up steps apply to this example.
+
+### Set-up
 
 **Register a Box application.** In the Box developer portal, create a Box application (Content API), open **Configure Application** and copy its `client_id` and `client_secret`. Supply them as `oauth.client.id` and `oauth.client.secret` (see [Configuration keys](#configuration-keys)). `client.id` is the per-user identifier the `/FIM/**` proxy sends to IBM FIM.
 
-**Create a key store and a trust store.** The Box API requires HTTPS. The original creates both stores with the JDK `keytool`:
+**Create a key store and a trust store.** The Box API requires HTTPS. The original creates both stores with the JDK `keytool`. The commands below add `-storetype JKS`, which the original's commands lacked because its JDK wrote JKS by default:
 
 ```sh
-keytool -genkey -alias replserver -keyalg RSA -keystore keystore.jks
+keytool -genkey -storetype JKS -alias replserver -keyalg RSA -keystore keystore.jks
 keytool -export -alias replserver -file client.cer -keystore keystore.jks
-keytool -import -v -trustcacerts -alias replserver -file client.cer -keystore trust-store
+keytool -import -v -trustcacerts -storetype JKS -alias replserver -file client.cer -keystore trust-store
 ```
 
-The first command asks for a store password and a key password (`keystore.password`, `keystore.key.password`); the third asks for the trust-store password (`truststore.password`). The original's copies of both files are carried unchanged in `src/main/resources/`, which `keystore.path: keystore.jks` and `truststore.path: trust-store` resolve on the classpath.
+- The first command asks for the store password twice (`keystore.password`), then for the certificate's name fields, then `Enter key password for <replserver> (RETURN if same as keystore password)` (`keystore.key.password`).
+- The second asks for the store password and writes the certificate to `client.cer`.
+- The third asks for the trust-store password twice (`truststore.password`), then `Trust this certificate? [no]`, which `yes` answers.
+- Without `-storetype JKS`, Java 17 writes a PKCS12 store whatever the file name (`keystore.type=pkcs12` in the JDK's `conf/security/java.security`), and `-genkey` asks for one password only, which protects both the store and the key. `TlsProperties` loads such a store too, because its JKS loader also reads PKCS12 (`keystore.type.compat=true`); `keystore.key.password` must then equal `keystore.password`.
+
+The original's copies of both files are carried unchanged in `src/main/resources/`, which `keystore.path: keystore.jks` and `truststore.path: trust-store` resolve on the classpath. Both are JKS stores.
 
 ## Endpoints and triggers
 
@@ -80,38 +87,37 @@ SC-1's 405 (`Method not allowed for endpoint: <path>`) cannot occur, because bot
 
 Values as in `src/main/resources/application.yml`. Every secret is written `${ENV_NAME:}` with a `# TODO: supply ...` comment, so it has no value until it is supplied through that environment variable or as a command-line property (AAP 0.4.6).
 
-| Key | Original name | Default | Purpose | Status |
-|---|---|---|---|---|
-| `http.port` | none: the original hard-codes port `8081` (`http-client-credentials.xml:9`) | `8081` | listener port, bound by `server.port: ${http.port:8081}` | default |
-| `oauth.client.id` | `oauth.client.id` (line 14) | none | the Box application's `client_id` | TODO, environment `OAUTH_CLIENT_ID` |
-| `oauth.client.secret` | `oauth.client.secret` (line 14) | none | the Box application's `client_secret` | TODO, environment `OAUTH_CLIENT_SECRET` |
-| `client.id` | `client.id` (line 43) | none | the per-user `client_id` URI parameter of the FIM proxy | TODO, environment `CLIENT_ID` |
-| `keystore.path` | `keystore.path` (line 27) | `keystore.jks` | JKS key store of the Box HTTPS call, looked up on the classpath first, then as a file | default, the carried store |
-| `keystore.password` | `keystore.password` (line 27) | none | store password of the key store | TODO, environment `KEYSTORE_PASSWORD` |
-| `keystore.key.password` | `keystore.key.password` (line 27) | none | password of the private key in the key store | TODO, environment `KEYSTORE_KEY_PASSWORD` |
-| `truststore.path` | `truststore.path` (line 26) | `trust-store` | JKS trust store of the Box HTTPS call, classpath first, then file | default, the carried store |
-| `truststore.password` | `truststore.password` (line 26) | none | store password of the trust store | TODO, environment `TRUSTSTORE_PASSWORD` |
-| `box.oauth.token-url` | none: hard-coded `tokenUrl` (line 16) | `https://app.box.com/api/oauth2/token` | client-credentials token endpoint | default |
-| `box.api.base-url` | none: hard-coded host, port and protocol (lines 12-13) | `https://app.box.com:443` | scheme, host and port of the Box GET | default |
-| `box.api.base-path` | none: hard-coded `basePath` (line 12) | `/api/oauth2/authorize` | path prefix of the Box GET, to which `/` is appended | default |
-| `fim.base-url` | none: hard-coded `HTTP_Request_Configuration1` (line 29) | `https://tfim01.demos.ibm.com:443` | scheme, host and port of the FIM proxy | default |
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original, changing it changes behaviour; `unset` — read by the application's code but not set in `application.yml`, so the stated default applies.
 
-- No credential is hard-coded. The passwords of the carried demo stores are not in the repository; the original read them from properties too. Missing values do not stop the application from starting: they fail only the call that needs them, a `/oauth` call or a `/FIM/**` URI holding `{client_id}` (see [Differences from the original](#differences-from-the-original)).
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `http.port` | `int` | `8081` | none: the original hard-codes port `8081` (`http-client-credentials.xml:9`) | default | listener port, bound by `server.port: ${http.port:8081}` |
+| `oauth.client.id` | `String` | none (`${OAUTH_CLIENT_ID:}`) | `oauth.client.id` (line 14) | TODO, environment `OAUTH_CLIENT_ID` | the Box application's `client_id` |
+| `oauth.client.secret` | `String` | none (`${OAUTH_CLIENT_SECRET:}`) | `oauth.client.secret` (line 14) | TODO (secret), environment `OAUTH_CLIENT_SECRET` | the Box application's `client_secret` |
+| `client.id` | `String` | none (`${CLIENT_ID:}`) | `client.id` (line 43) | TODO, environment `CLIENT_ID` | the per-user `client_id` URI parameter of the FIM proxy |
+| `keystore.path` | `String` | `keystore.jks` | `keystore.path` (line 27) | default, the carried store | JKS key store of the Box HTTPS call, looked up on the classpath first, then as a file; a PKCS12 store loads too (see [Set-up](#set-up)) |
+| `keystore.password` | `String` | none (`${KEYSTORE_PASSWORD:}`) | `keystore.password` (line 27) | TODO (secret), environment `KEYSTORE_PASSWORD` | store password of the key store |
+| `keystore.key.password` | `String` | none (`${KEYSTORE_KEY_PASSWORD:}`) | `keystore.key.password` (line 27) | TODO (secret), environment `KEYSTORE_KEY_PASSWORD` | password of the private key in the key store; for a PKCS12 key store, the same value as `keystore.password` |
+| `truststore.path` | `String` | `trust-store` | `truststore.path` (line 26) | default, the carried store | JKS trust store of the Box HTTPS call, classpath first, then file; a PKCS12 store loads too |
+| `truststore.password` | `String` | none (`${TRUSTSTORE_PASSWORD:}`) | `truststore.password` (line 26) | TODO (secret), environment `TRUSTSTORE_PASSWORD` | store password of the trust store |
+| `box.oauth.token-url` | `String` | `https://app.box.com/api/oauth2/token` | none: hard-coded `tokenUrl` (line 16) | default | client-credentials token endpoint |
+| `box.api.base-url` | `String` | `https://app.box.com:443` | none: hard-coded host, port and protocol (lines 12-13) | default | scheme, host and port of the Box GET |
+| `box.api.base-path` | `String` | `/api/oauth2/authorize` | none: hard-coded `basePath` (line 12) | default | path prefix of the Box GET, to which `/` is appended |
+| `fim.base-url` | `String` | `https://tfim01.demos.ibm.com:443` | none: hard-coded `HTTP_Request_Configuration1` (line 29) | default | scheme, host and port of the FIM proxy |
+| `server.port` | `Integer` | `${http.port:8081}`, so `8081` | none | fixed | the `http:listener-config` port (`http-client-credentials.xml:9`), resolved from `http.port`; set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | none | fixed | `http:listener-config host="0.0.0.0"` (`http-client-credentials.xml:9`) |
+| `server.undertow.decode-url` | `Boolean` | `false` | none | fixed | the raw `http.request.uri` (line 41) reaches `FimProxyController` with its percent-encoding intact |
+| `server.undertow.options.server.ALLOW_UNESCAPED_CHARACTERS_IN_URL` | `Boolean` (Undertow `Option<Boolean>`) | `true` | none | fixed | a request target holding a literal `{client_id}` (lines 41-43) is accepted instead of answered 400; a Tier 2A verification point |
+| `spring.application.name` | `String` | `oauth2-client-credentials-using-the-HTTP-connector-java` | none | fixed | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` reaches both controllers like every other method, instead of the servlet's `message/http` echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | a form body on `PUT`, `PATCH` or `DELETE` reaches the controllers unparsed, so `/FIM/**` forwards it and `/oauth` logs it unchanged |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
+
+- The application's code reads the `oauth.*`, `client.id`, `keystore.*`, `truststore.*`, `box.*` and `fim.base-url` keys with defaults equal to the values above, so such a key left out of `application.yml` keeps its value: `TlsProperties.java:74-78`, `BoxOAuthClient.java:237-241`, `FimProxyClient.java:174` and `FimProxyService.java:70`.
+- No credential is hard-coded. The passwords of the carried demo stores are not in the repository; the original read them from properties too. Missing values do not stop the application from starting: they fail only the call that needs them, a `/oauth` call or a `/FIM/**` URI holding `{client_id}` (see [Behaviours stubbed or externalized](#behaviours-stubbed-or-externalized)).
 - The `TLS_Context` replaces the JVM's trust for the Box GET, so the trust store must hold the CA that signs the certificate Box presents. The carried demo `trust-store` holds a single self-signed certificate (alias `client`, `CN=Unknown`), which is not that CA, so a live Box call needs a trust store of your own, named by `truststore.path`.
 - `src/test/resources/application-test.yml` (Spring profile `test`) supplies placeholder values for the TODO keys, none of them a real credential, and points every upstream URL at `http://127.0.0.1:9`. The tests override the URLs with WireMock, so they need no real credentials and contact no external host. The project has no `application-it.yml`.
-
-Fixed settings in `src/main/resources/application.yml`, none of them a configuration key of the original:
-
-| Setting | Value | Why |
-|---|---|---|
-| `spring.application.name` | `oauth2-client-credentials-using-the-HTTP-connector-java` | application name in log lines |
-| `server.address` | `0.0.0.0` | `http:listener-config host="0.0.0.0"` (`http-client-credentials.xml:9`) |
-| `spring.web.resources.add-mappings` | `false` | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
-| `spring.mvc.dispatch-trace-request` | `true` | `TRACE` reaches both controllers like every other method, instead of the servlet's `message/http` echo |
-| `spring.mvc.formcontent.filter.enabled` | `false` | a form body on `PUT`, `PATCH` or `DELETE` reaches the controllers unparsed, so `/FIM/**` forwards it and `/oauth` logs it unchanged |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
-| `server.undertow.decode-url` | `false` | the raw `http.request.uri` (line 41) reaches `FimProxyController` with its percent-encoding intact |
-| `server.undertow.options.server.ALLOW_UNESCAPED_CHARACTERS_IN_URL` | `true` | a request target holding a literal `{client_id}` (lines 41-43) is accepted instead of answered 400; a Tier 2A verification point |
 
 ## Mule-to-Java mapping
 
@@ -131,7 +137,7 @@ Fixed settings in `src/main/resources/application.yml`, none of them a configura
 | `mule-deploy.properties` (loads `http-client-credentials.xml`) | `Oauth2ClientCredentialsUsingTheHTTPConnectorApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` (empty) and the flow's `${...}` placeholders | `src/main/resources/application.yml` |
 
-## Differences from the original
+## Behaviours stubbed or externalized
 
 - **Token timing.** The original requested the Box token when the application was deployed, and a failed token request failed the deployment (Mule 3.8.0 `ClientCredentialsGrantType.start()`). The conversion requests it on the first `/oauth` call, so the application and the `/FIM/**` proxy start without Box credentials, and a failed token request is answered with the `/oauth` rollback branch's 500. Neither the original nor the conversion refreshes the token proactively on `expires_in`; only a 401 or 403 from Box triggers a new token.
 - **TLS loading.** The `TLS_Context` stores are read on the first HTTPS call to Box, not at start-up, for the same reason: the application starts with blank store passwords.
@@ -211,14 +217,14 @@ No scenario of this project is `unreachable` or `nondeterministic`.
 |---|---|---|---|---|---|---|---|
 | oauth2-client-credentials-using-the-HTTP-connector-java | oauth2-client-credentials-using-the-HTTP-connector | General | PASS | PASS | 100.0% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
-The root `SUMMARY.md` carries the same row and labels (AAP 0.8.7).
+The same row and labels belong in the root `SUMMARY.md` (AAP 0.8.7).
 
-Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+Evidence of the run behind this row, at commit 71fc9421, 2026-10-27 (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 170 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 170 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 40 of 40 lines (`service/BoxClientCredentialsService` 19 of 19, `service/FimProxyService` 21 of 21; the project has no `mapper` package). Total project LINE coverage: 80.0% (368 of 460 lines).
-- The run covered the seven test classes then in the tree, every class in the table above except `controller/OAuthControllerTest`, `controller/FimProxyControllerTest` and `FixtureParityTest`. The boundary integration run on the combined tree re-measures this row.
+- `mvn -B clean package`: `BUILD SUCCESS`; 320 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 320 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 40 of 40 lines (`service/BoxClientCredentialsService` 19 of 19, `service/FimProxyService` 21 of 21; the project has no `mapper` package). Total project LINE coverage: 85.4% (736 of 862 lines).
+- `target/fixture-parity/summary.properties`: `verified=0`, `unverified=7`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)
 

@@ -2,6 +2,8 @@
 
 Spring Boot 3.2.12 / Java 17 conversion, served by Undertow, of the Mule EE 3.8 example [`munit-short-tutorial`](../../munit-short-tutorial/) (category General). The original folder `munit-short-tutorial/` stays unchanged beside this project as the reference and the Tier 2A capture source.
 
+## Original example
+
 The original is a tutorial on writing MUnit tests for a small flow built from Mule core components only, with no Anypoint Connector. Its production code does three things: it receives an HTTP request, extracts the `url_key` query parameter to route the message through a second flow and one of two sub-flows, and chooses the response from the flow variable that sub-flow set. The full tutorial text, with its walk-through of every MUnit test, is in [`munit-short-tutorial/README.md`](../../munit-short-tutorial/README.md) and is not repeated here.
 
 The tutorial's code listing shows `port="9090"` and `version="EE-3.6.1"` (`munit-short-tutorial/README.md:25,32`). The deployed flow file `munit-short-tutorial/src/main/app/production-code.xml` (`version="EE-3.8.0"`, the only `config.resources` entry of `mule-deploy.properties`) uses `port="${http.port}"` instead (`production-code.xml:4`). The original's `mule-app.properties` is empty, and its MUnit run gave `http.port` a dynamic port (`munit-maven-plugin` `dynamicPort` in `munit-short-tutorial/pom.xml`). The conversion keeps the key `http.port`, with default `8081` (AAP 0.4.9).
@@ -24,7 +26,7 @@ The tutorial's code listing shows `port="9090"` and `version="EE-3.6.1"` (`munit
 - Tier 2A verification points (AAP 0.4.7): the absent `Content-Type` of the 200 reply; the bytes of the 404, 405 and 500 defaults; the 405 for `HEAD`, `OPTIONS` and `TRACE`; a repeated `url_key` using its last value, as Mule 3's query parameter map returned for a single-valued lookup; and the 400 for a malformed percent escape. When a captured fixture shows different bytes, the fixture governs and the code is changed to match.
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
-## Flow behaviour
+### Flow behaviour
 
 `ExampleController` binds the query parameters and writes the payload; `service/ExampleFlowService` runs the flow graph of `production-code.xml`, one method per Mule element:
 
@@ -54,9 +56,19 @@ Exchanges (every 200 reply is `HTTP/1.1 200 OK`, `Content-Length: 18`, no `Conte
 
 ## Configuration keys
 
-| Key | Default | Original name | Notes |
-|---|---|---|---|
-| `http.port` | `8081` | `http.port` (unchanged) | bound to `server.port` (`server.port: ${http.port:8081}`). The original's `mule-app.properties` is empty, so `http.port` had no value there; MUnit assigned it a dynamic port. |
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to.
+
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original, changing it changes behaviour; `unset` — read by the application's code but not set in `application.yml`, so the stated default applies.
+
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `http.port` | `int` | `8081` | `http.port` (unchanged) | default | bound to `server.port` (`server.port: ${http.port:8081}`). The original's `mule-app.properties` is empty, so `http.port` had no value there; MUnit assigned it a dynamic port. |
+| `server.port` | `Integer` | `${http.port:8081}`, so `8081` | none | fixed | the `http:listener-config` port `${http.port}` (`production-code.xml:4`), resolved from `http.port`; set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | none | fixed | `http:listener-config host="0.0.0.0"` (`production-code.xml:4`) |
+| `spring.application.name` | `String` | `munit-short-tutorial-java` | none | fixed | log prefix only |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` reaches the dispatcher and gets SC-1's 405, instead of the servlet's `200` echo |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
 
 - The original reads no secret, credential, host or tenant identifier, so the configuration has no TODO placeholder, and the project has no `src/test/resources/application-test.yml` and no `application-it.yml`.
 - Override the port on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`):
@@ -65,16 +77,6 @@ Exchanges (every 200 reply is `HTTP/1.1 200 OK`, `Content-Length: 18`, no `Conte
   mvn spring-boot:run -Dspring-boot.run.arguments=--http.port=9090
   HTTP_PORT=9090 java -jar target/munit-short-tutorial-java-1.0.0-SNAPSHOT.jar
   ```
-
-Fixed settings in `src/main/resources/application.yml`, none of them a configuration key of the original:
-
-| Setting | Value | Why |
-|---|---|---|
-| `server.address` | `0.0.0.0` | `http:listener-config host="0.0.0.0"` (`production-code.xml:4`) |
-| `spring.web.resources.add-mappings` | `false` | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
-| `spring.mvc.dispatch-trace-request` | `true` | `TRACE` reaches the dispatcher and gets SC-1's 405, instead of the servlet's `200` echo |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
-| `spring.application.name` | `munit-short-tutorial-java` | log prefix only |
 
 ## Mule-to-Java mapping
 
@@ -138,7 +140,7 @@ response_payload_1
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
 | `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/` gets exactly the plain `OPTIONS` reply (405 `text/plain` `Method not allowed for endpoint: /`, no `Access-Control-*` or `Vary`) and the flow does not run; a cross-origin `GET` still reaches the controller; a pre-flight to an unserved path gets the no-listener 404 |
 | `config/RequestBodyDrainFilterTest` | pipelined requests behind a body-less request are all answered, on `/` and on an unserved path; draining never changes the chain's outcome and leaves reader-read and asynchronous bodies alone |
-| `FixtureParityTest` | ST-2 fixture replay (section Fixture parity); skipped while no fixture is captured |
+| `FixtureParityTest` | ST-2 fixture replay (see [Fixture parity (ST-2)](#fixture-parity-st-2)); skipped while no fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes, with an HTTPS mode for TLS listeners.
 
@@ -160,7 +162,7 @@ The suite imported `production-code.xml` into a running Mule context and address
 - `doc-test-exampleFlow-functionalTest_2` labels its `munit:set` `Set Message url_key:payload_1` (`:94`) while its value is `payload_2` (`:96`); the value is what the test sends, so `payload_2` is ported.
 - The spy's stubs and recorded invocations are reset after each test, as MUnit reset its mocks between tests.
 
-## Fixture parity
+## Fixture parity (ST-2)
 
 `src/test/java/com/mulesoft/examples/munit_short_tutorial/FixtureParityTest.java` is ST-2, copied from the reference in [`hello-world-java`](../hello-world-java/) with only its `package` line changed; [`src/test/resources/fixtures/SCENARIOS.md`](src/test/resources/fixtures/SCENARIOS.md) lists this project's scenarios and the fixture contract, comparison rules and capture procedure (AAP 0.8.4).
 

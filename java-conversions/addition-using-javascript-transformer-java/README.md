@@ -2,6 +2,8 @@
 
 `addition-using-javascript-transformer-java` converts the Mule EE 3.8 example [`addition-using-javascript-transformer`](../../addition-using-javascript-transformer/) (category General) to Java 17 / Spring Boot 3.2.12 / Maven, package `com.mulesoft.examples.addition_using_javascript_transformer`. It reproduces the original's behaviour, with the one intentional difference described under [Intentional difference](#intentional-difference). The original folder `addition-using-javascript-transformer/` stays unchanged beside this project as the reference and the Tier 2A capture source.
 
+## Original example
+
 A client POSTs a JSON message holding numbers to `/`. The flow converts the body to a string, a JavaScript transformer adds up every value of the parsed object, the outcome is logged, and the response is `Sum is: <sum>.`. With the original README's example body `{ "a": 3, "b": 4 }` the reply is `Sum is: 7.0.` and the log line is `Sum is: 7.0` (`addition-using-javascript-transformer/README.md:22-30`). The single flow `javascript-calculatorFlow1` (`addition-using-javascript-transformer/src/main/app/javascript-calculator.xml:4-16`) declares no exception strategy and calls no other system.
 
 ## Endpoints and triggers
@@ -20,6 +22,56 @@ A client POSTs a JSON message holding numbers to `/`. The flow converts the body
 - A CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered like any other `OPTIONS` request, with the 405 and no `Access-Control-*` or `Vary` header. The original listener applied no CORS policy (`config/PreflightDispatchConfig`).
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
+### Reproduced JavaScript semantics
+
+The reference is the engine Mule 3.8.0 ran the script on: Rhino 1.7R4 behind the JSR-223 bridge `javax.script:js-engine:1.1`. `AdditionService` reads the body by Rhino's literal rules and reimplements the `for-in` loop and the `+` operator with Rhino's conversions:
+
+- Numbers are summed as a `Double`, and MEL rendered the result with `Double.toString`: `Sum is: 3.0.`, `Sum is: 0.30000000000000004.`, `Sum is: 1.0E21.`, `Sum is: Infinity.`, `Sum is: NaN.`.
+- `for-in` visits an object's own properties in insertion order, then those its `__proto__` adds, and an array's present elements in ascending order, so `[1,2,3]` returns `Sum is: 6.0.`. A duplicate key keeps its first position and its last value: `{"a":1,"a":5,"b":2}` returns `Sum is: 7.0.`.
+- A root that is a string such as `"ab"` (Rhino 1.7R4 enumerates no string indices), a number, a boolean, `null` or `undefined` visits nothing, and neither does `{}` or `[]`: each returns `Sum is: 0.0.`.
+- `+` converts `true` to 1, `false` and `null` to 0, and `undefined` to `NaN`.
+- Once a string is added, the sum becomes JavaScript string concatenation: `{ "a": 1, "b": "x" }` returns `Sum is: 1x.` and `{ "a": "x", "b": 1 }` returns `Sum is: 0x1.`. An array or object value is converted with ToPrimitive (`valueOf`, then `toString`): `{a:[1,,2]}` returns `Sum is: 01,,2.`, and `{"a":{"toString":1}}` fails with `TypeError: Cannot find default value for object.`, as the original did.
+- Accepted literal syntax is JSON plus the literal forms JavaScript allows. These are unquoted, keyword and number keys; single-quoted strings with Rhino's escapes; hexadecimal (`0x10`) and legacy octal (`010`) numbers; `NaN`, `Infinity` and `undefined`; leading `+` and `-` signs; array holes and trailing commas; and `//`, `/* */`, `<!--` and line-initial `-->` comments. For example, `{a: 0x10, 'b': 010, c: true, d: null,}` returns `Sum is: 25.0.`.
+- A body Rhino rejects fails with a `SyntaxError:` message, for example `{ "a": ` → `SyntaxError: syntax error (at offset 7)`. An empty or blank body fails with `No content to map due to end-of-input`. Arrays and objects nested more than 1000 levels deep fail, and so does a string longer than a Java string can hold.
+- The expected values in `service/AdditionServiceLiteralParityTest` were produced by running the original script on Rhino 1.7R4 with `javax.script:js-engine:1.1`, the versions Mule 3.8.0 pins.
+
+### Tier 2A verification points
+
+The source does not settle these platform behaviours. When a captured fixture shows different bytes, the fixture governs and the code is changed to match:
+
+- the 500 body for a failed evaluation, whose message is `AdditionService`'s rather than Rhino's or the Mule default exception strategy's;
+- the absent `Content-Type` of the `200` reply;
+- `Sum is: 0.0.` for an empty object, an empty array and a primitive root;
+- the concatenation results for string values, such as `Sum is: 1x.`;
+- the 404 and 405 texts and their `text/plain` type;
+- the form-body handling: the rendering of the parameter map and the 400 for an undecodable body;
+- the 405 for `OPTIONS` and for a CORS pre-flight.
+
+## Configuration keys
+
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to.
+
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original, changing it changes behaviour; `unset` — read by the application's code but not set in `application.yml`, so the stated default applies.
+
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `http.port` | `int` | `8081` | `http.port` (unchanged) | default | bound to `server.port` (`server.port: ${http.port:8081}`). The original reads it at `javascript-calculator.xml:3`; its `mule-app.properties` is empty, so the value came from the deployment, and its README tells users to set port 8081. |
+| `server.port` | `Integer` | `${http.port:8081}`, so `8081` | none | fixed | the `http:listener-config` port `${http.port}` (`javascript-calculator.xml:3`), resolved from `http.port`; set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | none | fixed | `http:listener-config host="0.0.0.0"` (`javascript-calculator.xml:3`) |
+| `spring.application.name` | `String` | `addition-using-javascript-transformer-java` | none | fixed | names the application in its log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` reaches `CalculatorController` and gets the 405, instead of the servlet's `message/http` echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | the listener checked the method before reading the body, so a form body on `PUT`, `PATCH` or `DELETE`, even one that cannot be decoded, reaches the controller and gets the 405 |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
+
+- There are no secrets, credentials, hosts or tenant identifiers, so the configuration has no TODO placeholder and nothing is renamed. The project therefore has no `src/test/resources/application-test.yml` and no `application-it.yml`.
+- Override the port on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`):
+
+  ```sh
+  mvn spring-boot:run -Dspring-boot.run.arguments=--http.port=9090
+  HTTP_PORT=9090 java -jar target/addition-using-javascript-transformer-java-1.0.0-SNAPSHOT.jar
+  ```
+
 ## Mule-to-Java mapping
 
 | Mule construct (`javascript-calculator.xml`) | Java construct (`com.mulesoft.examples.addition_using_javascript_transformer`) |
@@ -36,20 +88,11 @@ A client POSTs a JSON message holding numbers to `/`. The flow converts the body
 | `mule-app.properties` (empty) | `src/main/resources/application.yml` |
 | `AdditionUsingJavascriptTransformerIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`) | `AdditionUsingJavascriptTransformerTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)` with ST-1 `support/HttpTestClient`) |
 
-## Reproduced JavaScript semantics
+## Behaviours stubbed or externalized
 
-The reference is the engine Mule 3.8.0 ran the script on: Rhino 1.7R4 behind the JSR-223 bridge `javax.script:js-engine:1.1`. `AdditionService` reads the body by Rhino's literal rules and reimplements the `for-in` loop and the `+` operator with Rhino's conversions:
+Nothing is stubbed or externalized. The original reaches no external system and holds no credential, so nothing is mocked at runtime or moved to configuration. The JavaScript engine is replaced by Java code (see [Intentional difference](#intentional-difference)). Studio metadata (`mule-project.xml`) and the original's `src/test/resources/log4j2-test.xml` are not carried (AAP 0.2.2); logging uses Spring Boot's default Logback setup.
 
-- Numbers are summed as a `Double`, and MEL rendered the result with `Double.toString`: `Sum is: 3.0.`, `Sum is: 0.30000000000000004.`, `Sum is: 1.0E21.`, `Sum is: Infinity.`, `Sum is: NaN.`.
-- `for-in` visits an object's own properties in insertion order, then those its `__proto__` adds, and an array's present elements in ascending order, so `[1,2,3]` returns `Sum is: 6.0.`. A duplicate key keeps its first position and its last value: `{"a":1,"a":5,"b":2}` returns `Sum is: 7.0.`.
-- A root that is a string such as `"ab"` (Rhino 1.7R4 enumerates no string indices), a number, a boolean, `null` or `undefined` visits nothing, and neither does `{}` or `[]`: each returns `Sum is: 0.0.`.
-- `+` converts `true` to 1, `false` and `null` to 0, and `undefined` to `NaN`.
-- Once a string is added, the sum becomes JavaScript string concatenation: `{ "a": 1, "b": "x" }` returns `Sum is: 1x.` and `{ "a": "x", "b": 1 }` returns `Sum is: 0x1.`. An array or object value is converted with ToPrimitive (`valueOf`, then `toString`): `{a:[1,,2]}` returns `Sum is: 01,,2.`, and `{"a":{"toString":1}}` fails with `TypeError: Cannot find default value for object.`, as the original did.
-- Accepted literal syntax is JSON plus the literal forms JavaScript allows. These are unquoted, keyword and number keys; single-quoted strings with Rhino's escapes; hexadecimal (`0x10`) and legacy octal (`010`) numbers; `NaN`, `Infinity` and `undefined`; leading `+` and `-` signs; array holes and trailing commas; and `//`, `/* */`, `<!--` and line-initial `-->` comments. For example, `{a: 0x10, 'b': 010, c: true, d: null,}` returns `Sum is: 25.0.`.
-- A body Rhino rejects fails with a `SyntaxError:` message, for example `{ "a": ` → `SyntaxError: syntax error (at offset 7)`. An empty or blank body fails with `No content to map due to end-of-input`. Arrays and objects nested more than 1000 levels deep fail, and so does a string longer than a Java string can hold.
-- The expected values in `service/AdditionServiceLiteralParityTest` were produced by running the original script on Rhino 1.7R4 with `javax.script:js-engine:1.1`, the versions Mule 3.8.0 pins.
-
-## Intentional difference
+### Intentional difference
 
 The original runs `eval("(" + payload + ")")`, which executes whatever JavaScript the caller sends. The conversion runs no script engine and never evaluates the request body (AAP 0.3.2: scripts are reimplemented in Java). It reads the body as literal data instead.
 
@@ -57,47 +100,6 @@ The original runs `eval("(" + payload + ")")`, which executes whatever JavaScrip
 - A body that only works when evaluated as code gets the 500 where the original computed a result. Such code includes identifier references other than `undefined`, `NaN` and `Infinity`; function, getter and setter literals; regular expressions; E4X; grouping; operators other than leading signs; member access; calls; the comma operator; and further statements. For example, `{ "a": 1 + 2 }` is answered with `{ "message": "Unsupported input at offset 9: the operator '+' is JavaScript code, and the request body is read as literal data, never evaluated" }`.
 
 The root `DECISIONS.md` records this difference in section 8, beside query hardening (AAP 0.4.10), as an intentional difference for hostile input.
-
-## Tier 2A verification points
-
-The source does not settle these platform behaviours. When a captured fixture shows different bytes, the fixture governs and the code is changed to match:
-
-- the 500 body for a failed evaluation, whose message is `AdditionService`'s rather than Rhino's or the Mule default exception strategy's;
-- the absent `Content-Type` of the `200` reply;
-- `Sum is: 0.0.` for an empty object, an empty array and a primitive root;
-- the concatenation results for string values, such as `Sum is: 1x.`;
-- the 404 and 405 texts and their `text/plain` type;
-- the form-body handling: the rendering of the parameter map and the 400 for an undecodable body;
-- the 405 for `OPTIONS` and for a CORS pre-flight.
-
-## Configuration keys
-
-| Key | Default | Original name | Notes |
-|---|---|---|---|
-| `http.port` | `8081` | `http.port` (unchanged) | bound to `server.port` (`server.port: ${http.port:8081}`). The original reads it at `javascript-calculator.xml:3`; its `mule-app.properties` is empty, so the value came from the deployment, and its README tells users to set port 8081. |
-
-- There are no secrets, credentials, hosts or tenant identifiers, so the configuration has no TODO placeholder and nothing is renamed. The project therefore has no `src/test/resources/application-test.yml` and no `application-it.yml`.
-- Override the port on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`):
-
-  ```sh
-  mvn spring-boot:run -Dspring-boot.run.arguments=--http.port=9090
-  HTTP_PORT=9090 java -jar target/addition-using-javascript-transformer-java-1.0.0-SNAPSHOT.jar
-  ```
-
-Fixed settings in `src/main/resources/application.yml`, none of them a configuration key of the original:
-
-| Setting | Value | Why |
-|---|---|---|
-| `server.address` | `0.0.0.0` | `http:listener-config host="0.0.0.0"` (`javascript-calculator.xml:3`) |
-| `spring.application.name` | `addition-using-javascript-transformer-java` | names the application in its log lines |
-| `spring.web.resources.add-mappings` | `false` | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
-| `spring.mvc.dispatch-trace-request` | `true` | `TRACE` reaches `CalculatorController` and gets the 405, instead of the servlet's `message/http` echo |
-| `spring.mvc.formcontent.filter.enabled` | `false` | the listener checked the method before reading the body, so a form body on `PUT`, `PATCH` or `DELETE`, even one that cannot be decoded, reaches the controller and gets the 405 |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
-
-## Behaviours stubbed or externalized
-
-Nothing is stubbed or externalized. The original reaches no external system and holds no credential, so nothing is mocked at runtime or moved to configuration. The JavaScript engine is replaced by Java code (see [Intentional difference](#intentional-difference)). Studio metadata (`mule-project.xml`) and the original's `src/test/resources/log4j2-test.xml` are not carried (AAP 0.2.2); logging uses Spring Boot's default Logback setup.
 
 ## Build, run and test
 

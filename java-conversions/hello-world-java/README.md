@@ -2,6 +2,8 @@
 
 Spring Boot 3.2.12 / Java 17 conversion of the Mule EE 3.8 example [`hello-world`](../../hello-world/) (category General). The original folder `hello-world/` stays unchanged beside this project and is the Tier 2A capture source.
 
+## Original example
+
 The example answers an HTTP request to `/helloWorld` with the text `Hello World`. The single flow `HelloWorldFlow1` of `hello-world/src/main/app/HelloWorld.xml:4-7` receives the request and sets a constant payload. It declares no logger and no exception strategy, and calls no other system.
 
 ## Endpoints and triggers
@@ -21,9 +23,20 @@ The example answers an HTTP request to `/helloWorld` with the text `Hello World`
 
 ## Configuration keys
 
-| Key | Default | Original name | Notes |
-|---|---|---|---|
-| `http.port` | `8081` | `http.port` (unchanged) | bound to `server.port` (`server.port: ${http.port:8081}`). The original's `mule-app.properties` holds comments only, so `http.port` had no value there; its README tells users to set port 8081 and browse to `http://localhost:8081/helloWorld`. |
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to.
+
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original, changing it changes behaviour; `unset` — read by the application's code but not set in `application.yml`, so the stated default applies.
+
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `http.port` | `int` | `8081` | `http.port` (unchanged) | default | bound to `server.port` (`server.port: ${http.port:8081}`). The original's `mule-app.properties` holds comments only, so `http.port` had no value there; its README tells users to set port 8081 and browse to `http://localhost:8081/helloWorld`. |
+| `server.port` | `Integer` | `${http.port:8081}`, so `8081` | none | fixed | the `http:listener-config` port `${http.port}` (`HelloWorld.xml:3`), resolved from `http.port`; set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | none | fixed | `http:listener-config host="0.0.0.0"` (`HelloWorld.xml:3`) |
+| `spring.application.name` | `String` | `hello-world-java` | none | fixed | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` reaches `HelloWorldController` like every other method, instead of the servlet's `message/http` echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | a form body on `PUT`, `PATCH` or `DELETE` reaches the controller unparsed, as on `POST` |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
 
 - There are no secrets, credentials, hosts or tenant identifiers, so the configuration has no TODO placeholder. The project therefore has no `src/test/resources/application-test.yml` and no `application-it.yml`.
 - Override the port on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`):
@@ -32,16 +45,6 @@ The example answers an HTTP request to `/helloWorld` with the text `Hello World`
   mvn spring-boot:run -Dspring-boot.run.arguments=--http.port=9090
   HTTP_PORT=9090 java -jar target/hello-world-java-1.0.0-SNAPSHOT.jar
   ```
-
-Fixed settings in `src/main/resources/application.yml`, none of them a configuration key of the original:
-
-| Setting | Value | Why |
-|---|---|---|
-| `server.address` | `0.0.0.0` | `http:listener-config host="0.0.0.0"` (`HelloWorld.xml:3`) |
-| `spring.web.resources.add-mappings` | `false` | an unserved path must reach SC-1's no-listener 404, not the static resource handler |
-| `spring.mvc.dispatch-trace-request` | `true` | `TRACE` reaches `HelloWorldController` like every other method, instead of the servlet's `message/http` echo |
-| `spring.mvc.formcontent.filter.enabled` | `false` | a form body on `PUT`, `PATCH` or `DELETE` reaches the controller unparsed, as on `POST` |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
 
 ## Mule-to-Java mapping
 

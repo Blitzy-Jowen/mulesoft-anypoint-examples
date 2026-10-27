@@ -25,21 +25,32 @@ These are the original README's steps, rewritten for the Java run command. They 
    java -jar target/proxying-a-rest-api-java-1.0.0-SNAPSHOT.jar
    ```
 
-4. In a browser, open `http://localhost:8081/oauth2/authorize?response_type=code&client_id=<CLIENT_ID>` and log in to Box. Prepare the next step before you click **Grant access to Box**: the code Box issues expires after about 30 seconds.
-5. Grant access. The browser is sent to your redirect URL with an extra `code=<CODE>` parameter. Exchange it through the proxy:
+4. In a browser, open `http://localhost:8081/oauth2/authorize?response_type=code&client_id=<CLIENT_ID>` and log in to Box. Prepare the next step before you click **Grant access to Box**: the code Box issues expires after about 30 seconds. In the shell you will run step 5 from, set the client credentials now, with your `client_id` between the single quotes; `read -s` keeps the secret off the screen and out of the shell history:
 
    ```sh
+   CLIENT_ID='<your Box client_id>'
+   read -r -s -p 'Box client_secret: ' CLIENT_SECRET; echo
+   ```
+
+5. Grant access. The browser is sent to your redirect URL with an extra `code=<CODE>` parameter. Paste the code at the prompt and exchange it through the proxy at once. Each `--data-urlencode` field is quoted for the shell and percent-encoded for the form, so characters such as `&`, `=`, `+` and `%` in a value reach Box unchanged:
+
+   ```sh
+   read -r -p 'Authorization code: ' CODE
    curl -X POST http://localhost:8081/oauth2/token \
-     -d grant_type=authorization_code -d code=<CODE> -d client_id=<CLIENT_ID> -d client_secret=<CLIENT_SECRET>
+     --data-urlencode 'grant_type=authorization_code' \
+     --data-urlencode "code=$CODE" \
+     --data-urlencode "client_id=$CLIENT_ID" \
+     --data-urlencode "client_secret=$CLIENT_SECRET"
    ```
 
-6. Copy `access_token` from the JSON answer (it lasts about an hour) and call Box through the proxy with it:
+6. Copy `access_token` from the JSON answer (it lasts about an hour), paste it at the prompt, and call Box through the proxy with it:
 
    ```sh
-   curl -i -H 'Authorization: Bearer <access_token>' http://localhost:8081/2.0/folders/0
+   read -r -s -p 'Box access_token: ' ACCESS_TOKEN; echo
+   curl -i -H "Authorization: Bearer $ACCESS_TOKEN" http://localhost:8081/2.0/folders/0
    ```
 
-The original README also says the proxy passes the API's own error statuses back to the application. The flow does not do that: it sets no flag that disables the requester's success-status validator, so an upstream status of 400 or above fails the flow. This conversion follows the flow (next section).
+The original README also says the proxy passes the API's own error statuses back to the application. The flow does not do that: it sets no flag that disables the requester's success-status validator, so an upstream status of 400 or above fails the flow. This conversion follows the flow (see [Behaviour carried from the original](#behaviour-carried-from-the-original)).
 
 ## Endpoints and triggers
 
@@ -49,7 +60,7 @@ The original README also says the proxy passes the API's own error statuses back
 
 The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
-## Behaviour carried from the original
+### Behaviour carried from the original
 
 Request leg:
 
@@ -84,38 +95,55 @@ Known listener differences from the Mule (Grizzly) listener, each a Tier 2A veri
 
 ## Configuration keys
 
-All keys live in `src/main/resources/application.yml`. Secrets have no value: each is written `key: ${ENV_NAME:}` with a `# TODO` comment (AAP 0.4.6), so supply it through the named environment variable or a `--key=value` argument.
+Every key of `src/main/resources/application.yml`, then the `server.*` settings `config/RequestFramingGuardConfig` reads that the file does not set, each with the Java type its value binds to. Secrets have no value: each is written `key: ${ENV_NAME:}` with a `# TODO` comment (AAP 0.4.6), so supply it through the named environment variable or a `--key=value` argument.
 
-| Key | Default | Secret / TODO | Original name | Notes |
-|---|---|---|---|---|
-| `http.port` | `8081` | no | `http.port` (unchanged) | bound to `server.port` (`server.port: ${http.port:8081}`); the original `mule-app.properties` is empty, and its README uses port 8081. `HTTP_PORT` sets it from the environment |
-| `proxy.upstream-url` | `https://api.box.com:443` | no | new key | the original fixed `host="api.box.com" port="443" protocol="HTTPS"` in `HTTP_Request_Configuration` (`proxying-a-rest-api.xml:5`). The caller's raw path and query are appended to it (trailing `/` characters ignored). It must be an absolute `http` or `https` URL with a host and without user information, or the application does not start |
-| `proxy.response-timeout-ms` | `10000` | no | new key | the Mule default response timeout; must be greater than zero |
-| `keystore.path` | empty (`${KEYSTORE_PATH:}`) | TODO: path of the key store created with `keytool` | new key | the original fixed `path="keystore.jks"` on the application classpath. Accepts `classpath:` and `file:` locations; a bare path is read as a file when one exists there, otherwise from the classpath. Empty: JVM default TLS context, no client key |
-| `keystore.key` | empty (`${KEYSTORE_KEY:}`) | TODO secret | `keystore.key` (unchanged) | the **key store (store) password**: Mule `tls:key-store password="${keystore.key}"` |
-| `keystore.password` | empty (`${KEYSTORE_PASSWORD:}`) | TODO secret | `keystore.password` (unchanged) | the **private-key password**: Mule `tls:key-store keyPassword="${keystore.password}"`; empty means the store password is used, which fits a PKCS12 store as `keytool` creates on Java 17 |
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original, changing it changes behaviour; `unset` — read by the application's code but not set in `application.yml`, so the stated default applies.
+
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `http.port` | `int` | `8081` | `http.port` (unchanged) | default | bound to `server.port` (`server.port: ${http.port:8081}`); the original `mule-app.properties` is empty, and its README uses port 8081. `HTTP_PORT` sets it from the environment |
+| `proxy.upstream-url` | `String` | `https://api.box.com:443` | new key | default | the original fixed `host="api.box.com" port="443" protocol="HTTPS"` in `HTTP_Request_Configuration` (`proxying-a-rest-api.xml:5`). The caller's raw path and query are appended to it (trailing `/` characters ignored). It must be an absolute `http` or `https` URL with a host and without user information, or the application does not start. `BoxProxyClient` reads it without a fallback value (`BoxProxyClient.java:182`), so it must stay set |
+| `proxy.response-timeout-ms` | `long` (milliseconds) | `10000` | new key | default | the Mule default response timeout; must be greater than zero, or the application does not start (`BoxProxyClient.java:183,188-191`) |
+| `keystore.path` | `String` | none (`${KEYSTORE_PATH:}`) | new key | TODO, environment `KEYSTORE_PATH`: path of the key store created with `keytool` | the original fixed `path="keystore.jks"` on the application classpath. Accepts `classpath:` and `file:` locations; a bare path is read as a file when one exists there, otherwise from the classpath. Empty: JVM default TLS context, no client key |
+| `keystore.key` | `String` | none (`${KEYSTORE_KEY:}`) | `keystore.key` (unchanged) | TODO (secret), environment `KEYSTORE_KEY` | the **key store (store) password**: Mule `tls:key-store password="${keystore.key}"` |
+| `keystore.password` | `String` | none (`${KEYSTORE_PASSWORD:}`) | `keystore.password` (unchanged) | TODO (secret), environment `KEYSTORE_PASSWORD` | the **private-key password**: Mule `tls:key-store keyPassword="${keystore.password}"`; empty means the store password is used, which fits a PKCS12 store as `keytool` creates on Java 17 |
+| `server.port` | `Integer` | `${http.port:8081}`, so `8081` | none | fixed | the `http:listener-config` port `${http.port}` (`proxying-a-rest-api.xml:3`), resolved from `http.port`; set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | none | fixed | `http:listener-config host="0.0.0.0"` (`proxying-a-rest-api.xml:3`) |
+| `server.undertow.decode-url` | `Boolean` | `false` | none | fixed | the raw target reaches the proxy undecoded, so the caller's percent-encoding is forwarded as sent |
+| `server.undertow.options.server.ALLOW_UNESCAPED_CHARACTERS_IN_URL` | `Boolean` (Undertow `Option<Boolean>`) | `true` | none | fixed | the original listener accepted targets with raw `\|`, `{`, `}`, `^` and the like; Undertow would answer them with 400 |
+| `server.undertow.options.server.MAX_ENTITY_SIZE` | `Long` (Undertow `Option<Long>`, bytes; `-1` no limit) | `-1` | none | fixed | no request body size limit, as on the original listener (Undertow 2.3.17 sets none by default; later releases cap a body at 2 MB) |
+| `spring.application.name` | `String` | `proxying-a-rest-api-java` | none | fixed | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | no static-resource handler competes with the `/**` proxy mapping |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` is forwarded like every other method instead of the servlet's `message/http` echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | `PUT`, `PATCH` and `DELETE` form bodies are forwarded, not consumed |
+| `spring.servlet.multipart.enabled` | `boolean` | `false` | none | fixed | `multipart/form-data` is forwarded as raw bytes, never parsed |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint: `/error` is proxied like any other path |
+| `logging.level.org.apache.hc` | `LogLevel` | `INFO` | none | fixed | the httpclient5 transport; below `INFO` it writes headers, wire bytes, the request line, redirect `Location` values and cookies |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `INFO` | none | fixed | below `INFO` it writes the request line with its query, the parameters (consuming a form body) and the headers |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver` | `LogLevel` | `INFO` | none | fixed | below `INFO` it writes handled exception messages |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor` | `LogLevel` | `INFO` | none | fixed | below `INFO` it writes the 500 body carrying that message |
+| `server.undertow.threads.io` | `Integer` | `max(availableProcessors, 2)` | none | unset | I/O threads of the guarded XNIO worker `config/RequestFramingGuardConfig` creates (`RequestFramingGuardConfig.java:132-134`) |
+| `server.undertow.threads.worker` | `Integer` | `8 × max(availableProcessors, 2)` | none | unset | maximum worker threads of that worker; the default is computed from the CPU count even when `server.undertow.threads.io` is set (`RequestFramingGuardConfig.java:135-137`) |
+| `server.max-http-request-header-size` | `DataSize` | `8KB` (Spring Boot default) | none | unset | the guard's request-head limit (`RequestFramingGuardConfig.java:138,207-210`): a positive value, truncated to `int` bytes, is the limit; zero or negative falls back to Undertow's 1 MiB (`UndertowOptions.DEFAULT_MAX_HEADER_SIZE`, 1048576). A longer head is answered with the empty 400 |
+| `server.ssl.enabled` | `boolean` | unbound: no `server.ssl` | none | unset | any bound `server.ssl.*` key creates Spring Boot's `Ssl` with `enabled=true`, which the guard refuses at start-up unless `server.ssl.enabled=false`; `Ssl.isEnabled` is false only when `server.ssl` is unbound or disabled (`RequestFramingGuardConfig.java:124-127`) |
+| `server.http2.enabled` | `boolean` | `false` | none | unset | `true` is refused at start-up, because the guard reads HTTP/1.1 only (`RequestFramingGuardConfig.java:128-131`) |
 
 - The two passwords keep the original's swapped naming on purpose: `keystore.key` is the store password and `keystore.password` the key password (`proxying-a-rest-api.xml:7`). A key store that does not load with them stops the application at start-up with `Cannot load keystore from keystore.path=<path>`; no password is ever printed.
 - Trust: the JVM default trust store, because the original declared no `tls:trust-store`.
 - Never commit the key store or its passwords; keep them outside the repository and pass them as `KEYSTORE_PATH`, `KEYSTORE_KEY` and `KEYSTORE_PASSWORD`.
 - Test values live in `src/test/resources/application-test.yml` (Spring profile `test`), in place of the uncommitted `mule.test.properties` the original test read: `keystore.path` blank, `keystore.key` `test-store-password`, `keystore.password` `test-key-password`, and the Box test-data keys `box.user` (`mule.tester@example.com`), `box.id` (`test-client-id`) and `box.secret` (`test-client-secret`). None is a real credential. `box.password` and `phantomjs.binary` are dropped, because WireMock replaces Box and no browser is driven. `proxy.upstream-url` is absent there: each test points it at its own WireMock server.
 - The project has no `application-it.yml`: it is not a connector project.
+- The four `logging.level.*` pins: below `INFO` these loggers write the caller's `Authorization`, cookies, query and body, which the original never logged; `config/SensitiveLogGuard` also denies their `DEBUG` and `TRACE` events whatever level is configured.
 
-Fixed settings in `application.yml` and `pom.xml`, none of them a configuration key of the original:
+### Request-framing guard
 
-| Setting | Value | Why |
-|---|---|---|
-| `server.address` | `0.0.0.0` | `http:listener-config host="0.0.0.0"` (`proxying-a-rest-api.xml:3`) |
-| `server.undertow.decode-url` | `false` | the raw target reaches the proxy undecoded, so the caller's percent-encoding is forwarded as sent |
-| `server.undertow.options.server.ALLOW_UNESCAPED_CHARACTERS_IN_URL` | `true` | the original listener accepted targets with raw `\|`, `{`, `}`, `^` and the like; Undertow would answer them with 400 |
-| `server.undertow.options.server.MAX_ENTITY_SIZE` | `-1` | no request body size limit, as on the original listener (Undertow 2.3.17 sets none by default; later releases cap a body at 2 MB) |
-| `spring.web.resources.add-mappings` | `false` | no static-resource handler competes with the `/**` proxy mapping |
-| `spring.mvc.dispatch-trace-request` | `true` | `TRACE` is forwarded like every other method instead of the servlet's `message/http` echo |
-| `spring.mvc.formcontent.filter.enabled` | `false` | `PUT`, `PATCH` and `DELETE` form bodies are forwarded, not consumed |
-| `spring.servlet.multipart.enabled` | `false` | `multipart/form-data` is forwarded as raw bytes, never parsed |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | no Boot `/error` endpoint: `/error` is proxied like any other path |
-| `logging.level` pins (`org.apache.hc`, `DispatcherServlet`, `ExceptionHandlerExceptionResolver`, `HttpEntityMethodProcessor`) | `INFO` | below `INFO` these loggers write the caller's `Authorization`, cookies, query and body, which the original never logged; `config/SensitiveLogGuard` also denies their `DEBUG` and `TRACE` events whatever level is configured |
-| request-framing guard (`config/RequestFramingGuardConfig`, `RequestFramingWorker`, `RequestFramingConduit`, `RequestFramingValidator`, `SentHeaderFields`, `ForwardedRequestHeaders`) | on every accepted connection; TLS (`server.ssl`) and HTTP/2 (`server.http2.enabled`) are refused at start-up | Undertow 2.3.17.Final, the version the Boot 3.2.12 BOM resolves, ends a header line at a bare CR or LF, so `X-Test: a<CR>Authorization: Bearer x` would reach the upstream as a second `Authorization` header; no Undertow option changes that. The guard checks each request head and its body framing on the raw bytes before Undertow parses them and answers a violation with Undertow's own empty `400`. It also records every released head's header fields as sent and attaches them to the request's exchange through the outermost handler of the deployment's initial chain, so the proxy forwards each value with the inner SP and HTAB runs Undertow's parser collapses to one SP. It reads plain HTTP/1.1, hence the refusal of TLS and HTTP/2. Because Undertow sees a head only once it is complete, its 60 s no-request timeout covers the whole head |
+The request-framing guard (`config/RequestFramingGuardConfig`, `RequestFramingWorker`, `RequestFramingConduit`, `RequestFramingValidator`, `SentHeaderFields`, `ForwardedRequestHeaders`) runs on every accepted connection; TLS (`server.ssl`) and HTTP/2 (`server.http2.enabled`) are refused at start-up. It is code, not a configuration key.
+
+- Undertow 2.3.17.Final, the version the Boot 3.2.12 BOM resolves, ends a header line at a bare CR or LF, so `X-Test: a<CR>Authorization: Bearer x` would reach the upstream as a second `Authorization` header; no Undertow option changes that.
+- The guard checks each request head and its body framing on the raw bytes before Undertow parses them and answers a violation with Undertow's own empty `400`.
+- It also records every released head's header fields as sent and attaches them to the request's exchange through the outermost handler of the deployment's initial chain, so the proxy forwards each value with the inner SP and HTAB runs Undertow's parser collapses to one SP.
+- It reads plain HTTP/1.1, hence the refusal of TLS and HTTP/2.
+- Because Undertow sees a head only once it is complete, its 60 s no-request timeout covers the whole head.
 
 ## Mule-to-Java mapping
 
@@ -202,7 +230,7 @@ Date: <current date>
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
 
-## Fixture parity
+## Fixture parity (ST-2)
 
 `FixtureParityTest` (ST-2, copied from `hello-world-java` with only its `package` line changed) replays every fixture `src/test/resources/fixtures/<scenario>.json` against this project, with WireMock serving the recorded Box exchanges, so replay never contacts Box. `src/test/resources/fixtures/SCENARIOS.md` lists the scenarios, the fixture format, the comparison rules and the capture procedure for the original. Fixtures are captured from the running original only, never written by hand or edited to match the Java output; a mismatch is fixed in the Java code. With no fixtures the test reports skipped (`no Tier 2A fixtures captured`), never failed.
 

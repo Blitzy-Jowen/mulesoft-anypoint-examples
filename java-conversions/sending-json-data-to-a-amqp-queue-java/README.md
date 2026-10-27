@@ -1,8 +1,12 @@
 # Sending JSON data to an AMQP queue — Spring Boot conversion
 
-Java 17 / Spring Boot 3.2.12 conversion, on Undertow with Spring AMQP (`RabbitTemplate`), of the Mule EE 3.8 example [`sending-json-data-to-a-amqp-queue`](../../sending-json-data-to-a-amqp-queue/) (category General). Its single flow `json-to-rabbitmqFlow` in `src/main/app/json-to-rabbitmq.xml` receives a JSON message with sample sales data over HTTP and sends it over AMQP to the RabbitMQ queue `sales_queue`, where it can be viewed in the RabbitMQ web console (original `README.md:11-12`). The original folder `sending-json-data-to-a-amqp-queue/` stays unchanged beside this project as the reference and the Tier 2A capture source.
+Java 17 / Spring Boot 3.2.12 conversion, on Undertow with Spring AMQP (`RabbitTemplate`), of the Mule EE 3.8 example [`sending-json-data-to-a-amqp-queue`](../../sending-json-data-to-a-amqp-queue/) (category General).
 
-## Endpoint and behaviour
+## Original example
+
+The example's single flow `json-to-rabbitmqFlow` in `src/main/app/json-to-rabbitmq.xml` receives a JSON message with sample sales data over HTTP and sends it over AMQP to the RabbitMQ queue `sales_queue`, where it can be viewed in the RabbitMQ web console (original `README.md:11-12`). The original folder `sending-json-data-to-a-amqp-queue/` stays unchanged beside this project as the reference and the Tier 2A capture source.
+
+## Endpoints and triggers
 
 | Path | Methods | Host | Port | Source |
 |---|---|---|---|---|
@@ -62,22 +66,30 @@ Date: <current date>
 
 The application logs `payload to be sent: {"ITEM_ID"= 001, "ITEM_NAME" = "Shirt", "QTY" = 1, "PRICE" = 20}`, and the message waits on `sales_queue`.
 
-## Configuration
+## Configuration keys
 
-`src/main/resources/application.yml` keys, read by `config/AmqpConfig` and Spring Boot:
+`src/main/resources/application.yml` keys, read by `config/AmqpConfig` and Spring Boot, with the Java type each value binds to.
 
-| Key | Default | Source |
-|---|---|---|
-| `http.port` | `8081` | original placeholder `${http.port}` (`json-to-rabbitmq.xml:4`); `server.port: ${http.port:8081}` |
-| `server.address` | `0.0.0.0` | original listener host (`json-to-rabbitmq.xml:4`) |
-| `amqp.host` | `localhost` | original test property `amqp.host` (`SendingJsonDataToAmqpQueueIT.java:131`); read through `spring.rabbitmq.host: ${amqp.host:localhost}` |
-| `amqp.exchange-name` | `sales_exchange` | `exchangeName` attribute (`json-to-rabbitmq.xml:9`) |
-| `amqp.queue-name` | `sales_queue` | `queueName` attribute (`json-to-rabbitmq.xml:9`) |
-| `amqp.response-timeout` | `10000` (ms) | `responseTimeout` attribute (`json-to-rabbitmq.xml:9`); must be positive, or the application refuses to start |
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original, changing it changes behaviour; `unset` — read by the application's code but not set in `application.yml`, so the stated default applies.
 
-- Broker connection: Spring Boot's defaults (port `5672`, username `guest`, password `guest`, virtual host `/`) equal the Mule AMQP connector defaults the original relied on; its `amqp:connector` sets none of them (`json-to-rabbitmq.xml:3`). No credential is written in `application.yml` (AAP 0.4.6). To use other values, set `spring.rabbitmq.username` and `spring.rabbitmq.password` (environment `SPRING_RABBITMQ_USERNAME`, `SPRING_RABBITMQ_PASSWORD`), `spring.rabbitmq.port` or `spring.rabbitmq.virtual-host`.
-- Transport timeouts, separate from the reply wait: `spring.rabbitmq.connection-timeout: 10s` (TCP connect) and `spring.rabbitmq.channel-rpc-timeout: 10s` (each channel RPC). `0` is rejected at start-up.
-- Fixed listener settings: `spring.web.resources.add-mappings: false` and the excluded `ErrorMvcAutoConfiguration` send every unserved path, `/error` included, to SC-1's 404; `spring.mvc.dispatch-trace-request: true` sends `TRACE` to the 405.
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `http.port` | `int` | `8081` | `http.port`, the original placeholder `${http.port}` (`json-to-rabbitmq.xml:4`) | default | listener port, bound by `server.port: ${http.port:8081}` |
+| `amqp.host` | `String` | `localhost` | `amqp.host`, the original test property (`SendingJsonDataToAmqpQueueIT.java:131`) | default | broker host, read through `spring.rabbitmq.host: ${amqp.host:localhost}` |
+| `amqp.exchange-name` | `String` | `sales_exchange` | none: the inline `exchangeName` attribute (`json-to-rabbitmq.xml:9`) | default | the exchange each request is published to and checked passively |
+| `amqp.queue-name` | `String` | `sales_queue` | none: the inline `queueName` attribute (`json-to-rabbitmq.xml:9`) | default | the queue checked passively before each publish |
+| `amqp.response-timeout` | `long` (milliseconds) | `10000` | none: the inline `responseTimeout` attribute (`json-to-rabbitmq.xml:9`) | default | the reply wait after the publish, the `RabbitTemplate` reply timeout; must be positive, or the application refuses to start (`AmqpConfig.java:83-88`) |
+| `server.port` | `Integer` | `${http.port:8081}`, so `8081` | none | fixed | the `http:listener-config` port (`json-to-rabbitmq.xml:4`), resolved from `http.port`; set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | none | fixed | original listener host (`json-to-rabbitmq.xml:4`) |
+| `spring.application.name` | `String` | `sending-json-data-to-a-amqp-queue-java` | none | fixed | application name in log lines |
+| `spring.rabbitmq.host` | `String` | `${amqp.host:localhost}`, so `localhost` | none | fixed | the broker host Spring Boot connects to, resolved from `amqp.host`; set `amqp.host` rather than this key |
+| `spring.rabbitmq.connection-timeout` | `Duration` | `10s` | none | fixed | TCP connect to the broker (amqp-client default 60 s), separate from the reply wait; 10 s is the Mule default response timeout. Must be positive: `0` is rejected at start-up by `AmqpConfig`'s `ConnectionFactoryCustomizer` (`AmqpConfig.java:168-182`) |
+| `spring.rabbitmq.channel-rpc-timeout` | `Duration` | `10s` | none | fixed | each channel RPC (`channel.open`, the temporary reply `queue.declare`, `basic.consume`, `basic.cancel`; amqp-client default 10 min), separate from the reply wait. Must be positive: `0` is rejected at start-up by the same customizer |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | with the excluded `ErrorMvcAutoConfiguration`, sends every unserved path, `/error` included, to SC-1's 404 |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | sends `TRACE` to the 405 instead of the servlet's default 200 `TRACE` echo |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
+
+- Broker connection: Spring Boot's defaults (port `5672`, username `guest`, password `guest`, virtual host `/`) equal the Mule AMQP connector defaults the original relied on; its `amqp:connector` sets none of them (`json-to-rabbitmq.xml:3`). No credential is written in `application.yml` (AAP 0.4.6). To use other values, set `spring.rabbitmq.username` and `spring.rabbitmq.password` (both `String`; environment `SPRING_RABBITMQ_USERNAME`, `SPRING_RABBITMQ_PASSWORD`), `spring.rabbitmq.port` (`Integer`) or `spring.rabbitmq.virtual-host` (`String`).
 - `src/test/resources/application-test.yml` holds the embedded-broker values for profile `test`: `amqp.host` and `spring.rabbitmq.host` `localhost`, and the embedded broker's demo user `guest`/`guest`. The tests register the broker's free port through `@DynamicPropertySource`.
 
 Original-to-new key map:
@@ -105,7 +117,7 @@ Override on the command line, for example `java -jar target/sending-json-data-to
 | `mule-deploy.properties` (loads `json-to-rabbitmq.xml`) | `com.mulesoft.examples.sending_json_data_to_a_amqp_queue.SendingJsonDataToAAmqpQueueApplication` |
 | `SendingJsonDataToAmqpQueueIT` (`FunctionalTestCase`, embedded Qpid 0.24) | `SendingJsonDataToAmqpQueueTest` (`@SpringBootTest`, embedded Qpid Broker-J 9.2.1) |
 
-## Externalized or changed behaviours
+## Behaviours stubbed or externalized
 
 - `validateConnections="true"` (`json-to-rabbitmq.xml:3`): Mule checked broker connectivity when the connector started. The Spring application connects on the first publish, so a missing broker surfaces as the 500 of the first request rather than a deployment failure.
 - Mule-internal `MULE_*` message headers the Mule transport may have added to the AMQP message are not reproduced. Tier 2A capture of the queued message settles which, if any, existed.
@@ -143,13 +155,9 @@ There is no `mvn verify` live tier: this is not a connector project, so it has n
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
 
-## Parity
+## Fixture parity (ST-2)
 
-Label: `PARITY: UNVERIFIED — Mule runtime unavailable`.
-
-Tier 2A is blocked until the Mule EE runtime licence and the EE Maven repository credentials are confirmed (see the root `DECISIONS.md`). No fixture can be captured from the original, so parity rests on the fallback of AAP 0.8.4: `SendingJsonDataToAmqpQueueTest` carries the original committed assertion, and the branch tests above cover every reachable branch. This evidence is weaker than captured fixtures: it shows the conversion meets the original's own assertion and the plan's reading of the platform defaults, not that its bytes equal what the original runtime sent.
-
-Scenarios no original assertion covers, tested only by the new tests: reply received; the HTTP response after the 10 s no-reply wait; `GET /` → 405; unknown path → 404; broker failure → 500.
+`src/test/java/com/mulesoft/examples/sending_json_data_to_a_amqp_queue/FixtureParityTest.java` is ST-2, copied from `hello-world-java` with only its `package` line changed. `src/test/resources/fixtures/SCENARIOS.md` lists this project's scenarios and holds its fixture contract and capture procedure; the reference implementation and its format are described in [`hello-world-java`](../hello-world-java/README.md#fixture-parity-st-2-reference-implementation). With no fixtures the test reports skipped (`no Tier 2A fixtures captured`), never failed.
 
 `SCENARIOS.md` scenarios, all `http` and `deterministic`, every one unverified until captured:
 
@@ -172,6 +180,17 @@ Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 - `mvn -B test`: `BUILD SUCCESS`; 165 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 42 of 42 lines of `service/SalesPublisherService` (the project has no `mapper` package). Total project LINE coverage: 97.1% (367 of 378 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=4`, `failed=0`.
+
+## Fallback evidence (AAP 0.8.4)
+
+Tier 2A is blocked until the Mule EE runtime licence and the EE Maven repository credentials are confirmed (see the root `DECISIONS.md`). No fixture can be captured from the original, so parity rests on the fallback of AAP 0.8.4:
+
+- `SendingJsonDataToAmqpQueueTest` carries the original committed assertion, and the branch tests above cover every reachable branch.
+- This evidence is weaker than captured fixtures: it shows the conversion meets the original's own assertion and the plan's reading of the platform defaults, not that its bytes equal what the original runtime sent.
+- Scenarios no original assertion covers, tested only by the new tests: reply received; the HTTP response after the 10 s no-reply wait; `GET /` → 405; unknown path → 404; broker failure → 500.
+- Unverified scenarios, until captured: `post-root-no-reply`, `post-root-reply`, `get-root-method-not-allowed`, `post-unknown-path`.
+
+The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed (AAP 0.8.7).
 
 ## Licence
 
