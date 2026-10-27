@@ -30,7 +30,9 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import java.io.IOException;
 import java.net.ConnectException;
-import java.net.ServerSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -208,24 +210,36 @@ class DynamicsWebApiClientTest {
 
     @Test
     void expiredTokenIsEvictedAndTheCreateRetriedOnceWithANewToken() {
-        wireMock.stubFor(post(urlEqualTo(CONTACTS))
-                .inScenario("expired")
+        // Entra issues a different token on each request; priority 1 outranks the default token stub of resetWireMock.
+        wireMock.stubFor(post(urlEqualTo(TOKEN_PATH))
+                .atPriority(1)
+                .inScenario("token renewal")
                 .whenScenarioStateIs(STARTED)
-                .willReturn(aResponse().withStatus(401))
-                .willSetStateTo("renewed"));
+                .willReturn(okJson(tokenJson("first-token")))
+                .willSetStateTo("first token issued"));
+        wireMock.stubFor(post(urlEqualTo(TOKEN_PATH))
+                .atPriority(1)
+                .inScenario("token renewal")
+                .whenScenarioStateIs("first token issued")
+                .willReturn(okJson(tokenJson("second-token"))));
+        // Dataverse rejects only the first token and accepts only the second; no stub answers any other bearer.
         wireMock.stubFor(post(urlEqualTo(CONTACTS))
-                .inScenario("expired")
-                .whenScenarioStateIs("renewed")
+                .withHeader("Authorization", equalTo("Bearer first-token"))
+                .willReturn(aResponse().withStatus(401)));
+        wireMock.stubFor(post(urlEqualTo(CONTACTS))
+                .withHeader("Authorization", equalTo("Bearer second-token"))
                 .willReturn(noContent().withHeader(ODATA_ENTITY_ID, wireMock.baseUrl() + CONTACT_PATH)));
 
         withClient(client -> assertThat(client.createContact(johnDoe())).isEqualTo(CONTACT_GUID));
 
-        // A second token request proves evictToken removed the cached authorized client before the retry.
+        // A second token request, whose token the retry carries, proves evictToken removed the cached authorized
+        // client before the retry.
         assertThat(tokenRequests()).hasSize(2);
-        assertThat(createRequests()).hasSize(2).allSatisfy(request -> {
-            assertThat(request.getHeader("Authorization")).isEqualTo(BEARER);
-            assertThat(request.getBodyAsString()).isEqualTo(CONTACT_JSON);
-        });
+        List<LoggedRequest> creates = createRequests();
+        assertThat(creates).extracting(request -> request.getHeader("Authorization"))
+                .containsExactly("Bearer first-token", "Bearer second-token");
+        // The retry resends the rejected write unchanged.
+        assertThat(creates).extracting(LoggedRequest::getBodyAsString).containsExactly(CONTACT_JSON, CONTACT_JSON);
     }
 
     @Test
@@ -278,24 +292,22 @@ class DynamicsWebApiClientTest {
 
     @Test
     void refusedConnectionIsUnavailableAndNeitherRetriedNorReauthenticated() throws IOException {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
+        try (Socket reservation = refusingLoopbackPort()) {
+            String serviceUrl = refusingBaseUrl(reservation);
+
+            withClient(overrides("dynamics.service-url", serviceUrl), client ->
+                    assertThatThrownBy(() -> client.createContact(johnDoe()))
+                            .isInstanceOfSatisfying(UpstreamUnavailableException.class, failure -> {
+                                assertThat(failure.getSystem()).isEqualTo(UpstreamSystem.MICROSOFT_DYNAMICS_365);
+                                assertThat(causeChain(failure)).anySatisfy(cause ->
+                                        assertThat(cause).isInstanceOf(ConnectException.class));
+                            }));
+
+            List<LoggedRequest> tokens = tokenRequests();
+            assertThat(tokens).hasSize(1);
+            assertThat(formFields(tokens.get(0))).containsEntry("scope", serviceUrl + "/.default");
+            assertThat(wireMock.getAllServeEvents()).hasSize(1);
         }
-        String serviceUrl = "http://localhost:" + closedPort;
-
-        withClient(overrides("dynamics.service-url", serviceUrl), client ->
-                assertThatThrownBy(() -> client.createContact(johnDoe()))
-                        .isInstanceOfSatisfying(UpstreamUnavailableException.class, failure -> {
-                            assertThat(failure.getSystem()).isEqualTo(UpstreamSystem.MICROSOFT_DYNAMICS_365);
-                            assertThat(causeChain(failure)).anySatisfy(cause ->
-                                    assertThat(cause).isInstanceOf(ConnectException.class));
-                        }));
-
-        List<LoggedRequest> tokens = tokenRequests();
-        assertThat(tokens).hasSize(1);
-        assertThat(formFields(tokens.get(0))).containsEntry("scope", serviceUrl + "/.default");
-        assertThat(wireMock.getAllServeEvents()).hasSize(1);
     }
 
     @ParameterizedTest(name = "HTTP {0}")
@@ -499,6 +511,11 @@ class DynamicsWebApiClientTest {
                 .willReturn(noContent().withHeader(ODATA_ENTITY_ID, wireMock.baseUrl() + CONTACT_PATH)));
     }
 
+    /** An Entra client-credentials token response, shaped as {@link #TOKEN_JSON}, issuing {@code accessToken}. */
+    private static String tokenJson(String accessToken) {
+        return "{\"access_token\":\"" + accessToken + "\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+    }
+
     private static List<LoggedRequest> tokenRequests() {
         return wireMock.findAll(postRequestedFor(urlEqualTo(TOKEN_PATH)));
     }
@@ -540,5 +557,27 @@ class DynamicsWebApiClientTest {
             chain.add(current);
         }
         return chain;
+    }
+
+    /**
+     * Reserves a free TCP port on 127.0.0.1 that refuses every connection: the socket is bound with address reuse
+     * disabled and never listens. While it stays open no other socket can bind or listen on that port, so close it
+     * only after the refused call and its assertions have run.
+     */
+    private static Socket refusingLoopbackPort() throws IOException {
+        Socket reservation = new Socket();
+        try {
+            reservation.setReuseAddress(false);
+            reservation.bind(new InetSocketAddress(InetAddress.getByAddress(new byte[] {127, 0, 0, 1}), 0));
+            return reservation;
+        } catch (IOException | RuntimeException e) {
+            reservation.close();
+            throw e;
+        }
+    }
+
+    /** The {@code http://127.0.0.1:<port>} base URL of a reservation made by {@link #refusingLoopbackPort()}. */
+    private static String refusingBaseUrl(Socket reservation) {
+        return "http://" + reservation.getLocalAddress().getHostAddress() + ":" + reservation.getLocalPort();
     }
 }

@@ -10,6 +10,7 @@ package com.mulesoft.examples.http_multipart_request.controller;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,9 +53,13 @@ import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
  *
  * <p>The cases cover what the listeners decide before and around the flows: methods admitted ignoring letter case, as
  * Mule 3.8's {@code MethodRequestMatcher} compared them; every other method answered with the listeners' 405; the
- * last of several parts named {@code file} uploaded, as Mule 3.8's {@code HashMap} of parts by name kept it; and a
- * request without a {@code file} part answered with the 500 of the failing file-name expression. Uploads are stored in
- * a {@link TempDir}, never in the {@code /tmp} the original fixed, and the directory is emptied before each case.
+ * last of several parts named {@code file} uploaded, as Mule 3.8's {@code HashMap} of parts by name kept it; a
+ * request without a {@code file} part answered with the 500 of the failing file-name expression; a non-ASCII file name
+ * stored with each header byte read as one ISO-8859-1 character, as Mule 3.8's JavaMail parser read it; a file name
+ * joined to the upload directory as Mule's file connector joined them, a leading {@code /} included and missing
+ * subdirectories created; and a failed write answered with the 500 of Mule's streaming failure, which names no
+ * path. Uploads are stored in a {@link TempDir}, never in the {@code /tmp} the original fixed, and the directory is
+ * emptied before each case.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class UploadControllerTest {
@@ -75,6 +80,13 @@ class UploadControllerTest {
 
     private static final byte[] MISSING_PART_BODY =
             "{ \"message\": \"Multipart part 'file' is not present in the request\" }".getBytes(StandardCharsets.UTF_8);
+
+    /** The 500 body of a failed write: Mule 3.8.0's {@code CoreMessages.streamingFailedNoStream()} message. */
+    private static final byte[] STREAMING_FAILED_BODY =
+            "{ \"message\": \"Streaming failed. Could not get output stream\" }".getBytes(StandardCharsets.UTF_8);
+
+    /** Stands, in a file name, for a temporary directory's absolute path less its leading {@code /}. */
+    private static final String OUTSIDE_PLACEHOLDER = "<outside>";
 
     @TempDir
     static Path uploadDir;
@@ -136,6 +148,48 @@ class UploadControllerTest {
         assertArrayEquals(content, response.body(), response::toString);
         assertEquals(List.of(fileName), storedFiles());
         assertArrayEquals(content, Files.readAllBytes(uploadDir.resolve(fileName)));
+    }
+
+    /**
+     * Non-ASCII file names: a label, the multipart {@code Content-Type}, the raw bytes sent as the part's
+     * {@code filename} and the name the file is stored under. Mule 3.8 parsed the parts with JavaMail's
+     * {@code MimeMultipart}, whose {@code InternetHeaders} read each header byte as one ISO-8859-1 character whatever
+     * charset the request named: the windows-1252 bytes a browser sends for {@code é} and {@code ü} become those
+     * characters, and each byte of a UTF-8 name becomes a character of its own. The last two cases name
+     * {@code charset=UTF-8} on the multipart {@code Content-Type}, which that parser did not read either.
+     */
+    private static Stream<Arguments> nonAsciiFileNames() {
+        String utf8ContentType = MULTIPART_CONTENT_TYPE + "; charset=UTF-8";
+        return Stream.of(
+                Arguments.of("caf<E9>-latin1.txt", MULTIPART_CONTENT_TYPE,
+                        "caf\u00e9-latin1.txt".getBytes(StandardCharsets.ISO_8859_1), "caf\u00e9-latin1.txt"),
+                Arguments.of("my file <FC>.txt", MULTIPART_CONTENT_TYPE,
+                        "my file \u00fc.txt".getBytes(StandardCharsets.ISO_8859_1), "my file \u00fc.txt"),
+                Arguments.of("na<C3 AF>ve.txt", MULTIPART_CONTENT_TYPE,
+                        "na\u00efve.txt".getBytes(StandardCharsets.UTF_8), "na\u00c3\u00afve.txt"),
+                Arguments.of("na<C3 AF>ve.txt", utf8ContentType,
+                        "na\u00efve.txt".getBytes(StandardCharsets.UTF_8), "na\u00c3\u00afve.txt"),
+                Arguments.of("caf<E9>-latin1.txt", utf8ContentType,
+                        "caf\u00e9-latin1.txt".getBytes(StandardCharsets.ISO_8859_1), "caf\u00e9-latin1.txt"));
+    }
+
+    @ParameterizedTest(name = "file name bytes {0} with Content-Type {1}")
+    @MethodSource("nonAsciiFileNames")
+    void nonAsciiFileNameIsDecodedAsIso88591(String label, String contentType, byte[] fileName, String storedName)
+            throws IOException {
+        // Latin-1 and UTF-8 bytes in the content too, which is stored and echoed as sent, never decoded.
+        byte[] content = {'c', 'a', 'f', (byte) 0xE9, ' ', (byte) 0xC3, (byte) 0xAF, ' ', (byte) 0xFC, '\r', '\n'};
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", contentType);
+
+        HttpTestClient.Response response = client().send("POST", PATH, headers,
+                multipartWithFileName(fileName, content));
+
+        assertEquals("HTTP/1.1 200 File was uploaded.", response.statusLine(), response::toString);
+        assertNull(response.header("Content-Type"), response::toString);
+        assertArrayEquals(content, response.body(), response::toString);
+        assertEquals(List.of(storedName), storedFiles());
+        assertArrayEquals(content, Files.readAllBytes(uploadDir.resolve(storedName)));
     }
 
     /**
@@ -248,6 +302,95 @@ class UploadControllerTest {
         assertEquals(List.of(), storedFiles());
     }
 
+    /**
+     * File names that lead into a directory that does not exist yet, {@code <outside>} standing for the absolute
+     * path, less its leading {@code /}, of a temporary directory outside the upload directory: an absolute
+     * path naming that directory, the same after two slashes, and a nested name whose parent is missing.
+     *
+     * @return description, file name with {@code <outside>} not yet replaced
+     */
+    private static Stream<Arguments> fileNamesJoinedToTheUploadDirectory() {
+        return Stream.of(
+                Arguments.of("absolute path of another directory", "/" + OUTSIDE_PLACEHOLDER + "/qa-absolute.txt"),
+                Arguments.of("two leading slashes", "//" + OUTSIDE_PLACEHOLDER + "/qa-absolute.txt"),
+                Arguments.of("nested name whose parent is missing", "qa-sub/qa-nested.txt"));
+    }
+
+    /**
+     * The file name is joined to the upload directory as Mule's file connector joined them,
+     * {@code address + "/" + filename} normalised by {@link java.io.File}, which {@link Path#of(String, String...)}
+     * reproduces: a leading {@code /} does not take the file out of the upload directory, whose missing
+     * subdirectories are created, and the directory the name spells stays empty.
+     *
+     * @param description      the case, for the test name
+     * @param fileNameTemplate the file name, {@code <outside>} standing for {@code outside} less its leading
+     *                         {@code /}
+     * @param outside          a temporary directory outside the upload directory
+     * @throws IOException when the request or a file operation of the test fails
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("fileNamesJoinedToTheUploadDirectory")
+    void fileNameIsStoredUnderTheUploadDirectory(String description, String fileNameTemplate, @TempDir Path outside)
+            throws IOException {
+        String fileName = fileNameTemplate.replace(OUTSIDE_PLACEHOLDER, outside.toString().substring(1));
+        byte[] content = bytes("QA_SECURITY_CONTENT");
+
+        HttpTestClient.Response response = client().send("POST", PATH, multipartHeaders(),
+                multipart(new BodyPart("file", fileName, "text/plain", content)));
+
+        assertEquals("HTTP/1.1 200 File was uploaded.", response.statusLine(), response::toString);
+        assertArrayEquals(content, response.body(), response::toString);
+        Path stored = Path.of(uploadDir + "/" + fileName);
+        assertTrue(stored.startsWith(uploadDir), stored::toString);
+        assertArrayEquals(content, Files.readAllBytes(stored));
+        assertEquals(List.of(uploadDir.relativize(stored).getName(0).toString()), storedFiles());
+        try (Stream<Path> entries = Files.list(outside)) {
+            assertEquals(List.of(), entries.toList());
+        }
+    }
+
+    /**
+     * File names whose write fails with a file-system message naming the upload directory or a hidden temporary
+     * file: {@code .}, {@code ..} and the empty name, which resolve to directories, and names longer than the file
+     * system allows, whose rename is refused once the temporary file is written.
+     *
+     * @return description, file name
+     */
+    private static Stream<Arguments> fileNamesWhoseWriteFails() {
+        return Stream.of(
+                Arguments.of("the name .", "."),
+                Arguments.of("the name ..", ".."),
+                Arguments.of("the empty name", ""),
+                Arguments.of("256 characters", "a".repeat(256)),
+                Arguments.of("1,000 characters", "a".repeat(1000)));
+    }
+
+    /**
+     * A failed write gets the unhandled-exception 500 with Mule's streaming-failure message, which names neither the
+     * upload directory nor a temporary file, and leaves nothing in the upload directory.
+     *
+     * @param description the case, for the test name
+     * @param fileName    the file name whose write fails
+     * @throws IOException when the request or a file operation of the test fails
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("fileNamesWhoseWriteFails")
+    void writeFailureGetsTheStreamingFailureResponseNamingNoPath(String description, String fileName)
+            throws IOException {
+        HttpTestClient.Response response = client().send("POST", PATH, multipartHeaders(),
+                multipart(new BodyPart("file", fileName, "text/plain", bytes("QA_SECURITY_CONTENT"))));
+
+        assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
+        String responseType = response.header("Content-Type");
+        assertNotNull(responseType, response::toString);
+        assertTrue(responseType.startsWith("application/json"), response::toString);
+        assertArrayEquals(STREAMING_FAILED_BODY, response.body(), response::toString);
+        String body = new String(response.body(), StandardCharsets.UTF_8);
+        assertFalse(body.contains(uploadDir.toString()), body);
+        assertFalse(body.contains(".tmp"), body);
+        assertEquals(List.of(), storedFiles());
+    }
+
     private HttpTestClient client() {
         return HttpTestClient.localhost(port);
     }
@@ -300,6 +443,21 @@ class UploadControllerTest {
             out.writeBytes(bytes(CRLF));
         }
         out.writeBytes(bytes("--" + BOUNDARY + "--" + CRLF));
+        return out.toByteArray();
+    }
+
+    /**
+     * A {@code multipart/form-data} body with delimiter {@link #BOUNDARY} and one {@code text/plain} part {@code file}
+     * whose {@code filename} is written as {@code fileName} byte for byte, so a name in any encoding reaches the
+     * server unchanged; the lines are those of {@link #multipart}.
+     */
+    private static byte[] multipartWithFileName(byte[] fileName, byte[] content) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.writeBytes(bytes("--" + BOUNDARY + CRLF + "Content-Disposition: form-data; name=\"file\"; filename=\""));
+        out.writeBytes(fileName);
+        out.writeBytes(bytes("\"" + CRLF + "Content-Type: text/plain" + CRLF + CRLF));
+        out.writeBytes(content);
+        out.writeBytes(bytes(CRLF + "--" + BOUNDARY + "--" + CRLF));
         return out.toByteArray();
     }
 

@@ -293,9 +293,13 @@ class UploadServiceTest {
 
         Throwable thrown = catchThrowable(() -> service.upload(part(TEST_TXT_DISPOSITION, "text/plain", stream)));
 
-        // Not wrapped: the writer's own file-system exception, naming the directory it could not create.
-        assertThat(thrown).isInstanceOfSatisfying(FileSystemException.class,
-                failure -> assertThat(failure.getFile()).isEqualTo(uploadDirectory.toString()));
+        // The writer's exception as it threw it: Mule's streaming failure, which names no path, caused by the
+        // file-system exception naming the directory it could not create.
+        assertThat(thrown).isExactlyInstanceOf(IOException.class)
+                .hasMessage("Streaming failed. Could not get output stream")
+                .cause()
+                .isInstanceOfSatisfying(FileSystemException.class,
+                        failure -> assertThat(failure.getFile()).isEqualTo(uploadDirectory.toString()));
         assertThat(stream.closed).isTrue();
         assertThat(Files.readString(uploadDirectory, StandardCharsets.UTF_8)).isEqualTo("not a directory");
         assertThat(regularFilesUnder(root)).containsExactly(uploadDirectory);

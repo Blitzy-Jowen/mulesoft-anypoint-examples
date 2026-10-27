@@ -22,7 +22,9 @@ import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
 import java.net.ConnectException;
-import java.net.ServerSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -227,18 +229,16 @@ class SalesforceTokenClientTest {
 
     @Test
     void closedPortIsUnavailableAndNotRetried() throws IOException {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
+        try (Socket reservation = refusingLoopbackPort()) {
+            SalesforceTokenClient client = newClient(refusingBaseUrl(reservation) + TOKEN_PATH);
+
+            UpstreamUnavailableException thrown = assertThrows(UpstreamUnavailableException.class,
+                    () -> client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI));
+
+            assertThat(thrown.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
+            assertThat(causeChain(thrown)).anyMatch(ConnectException.class::isInstance);
+            verify(classifier, times(1)).classify(any());
         }
-        SalesforceTokenClient client = newClient("http://127.0.0.1:" + closedPort + TOKEN_PATH);
-
-        UpstreamUnavailableException thrown = assertThrows(UpstreamUnavailableException.class,
-                () -> client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI));
-
-        assertThat(thrown.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
-        assertThat(causeChain(thrown)).anyMatch(ConnectException.class::isInstance);
-        verify(classifier, times(1)).classify(any());
     }
 
     private SalesforceTokenClient newClient(String tokenUrl) {
@@ -262,6 +262,28 @@ class SalesforceTokenClientTest {
 
     private String tokenUrl() {
         return wireMock.baseUrl() + TOKEN_PATH;
+    }
+
+    /**
+     * Reserves a free TCP port on 127.0.0.1 that refuses every connection: the socket is bound with address reuse
+     * disabled and never listens. While it stays open no other socket can bind or listen on that port, so close it
+     * only after the refused call and its assertions have run.
+     */
+    private static Socket refusingLoopbackPort() throws IOException {
+        Socket reservation = new Socket();
+        try {
+            reservation.setReuseAddress(false);
+            reservation.bind(new InetSocketAddress(InetAddress.getByAddress(new byte[] {127, 0, 0, 1}), 0));
+            return reservation;
+        } catch (IOException | RuntimeException e) {
+            reservation.close();
+            throw e;
+        }
+    }
+
+    /** The {@code http://127.0.0.1:<port>} base URL of a reservation made by {@link #refusingLoopbackPort()}. */
+    private static String refusingBaseUrl(Socket reservation) {
+        return "http://" + reservation.getLocalAddress().getHostAddress() + ":" + reservation.getLocalPort();
     }
 
     private void stubTokenEndpoint(ResponseDefinitionBuilder response) {

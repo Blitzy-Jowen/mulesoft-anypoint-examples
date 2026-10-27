@@ -38,6 +38,7 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.ConnectException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -59,6 +60,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -87,7 +90,9 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import org.springframework.web.reactive.function.client.ClientRequest;
+import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
+import org.springframework.web.reactive.function.client.ExchangeFunction;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
@@ -128,15 +133,16 @@ class NetsuiteRestClientTest {
     private static final int CONCURRENT_CALLERS = 8;
 
     /**
-     * The delay of the stub the concurrency tests' callers share: long enough that every released caller starts its
-     * call while the first caller's request is still in flight, on a loaded build host too.
+     * The read timeout of the concurrency tests' client, above the 2 s of {@link #configuredProperties(String)}:
+     * the requests its {@link InFlightGate} held reach WireMock at once when the gate opens, on a loaded build host
+     * too. The time a request is held is not part of it, because the gate holds a request before it is sent.
      */
-    private static final int IN_FLIGHT_DELAY_MILLIS = 1500;
-
-    /** The read timeout of the concurrency tests' client, well above {@link #IN_FLIGHT_DELAY_MILLIS}. */
     private static final Duration PATIENT_READ_TIMEOUT = Duration.ofSeconds(10);
 
-    /** The longest a concurrency test waits for its callers, so a regression fails the test instead of hanging it. */
+    /**
+     * The longest a concurrency test waits for its callers, and the longest an {@link InFlightGate} holds a request,
+     * so a regression fails the test instead of hanging it.
+     */
     private static final Duration CALLER_TIMEOUT = Duration.ofSeconds(30);
 
     /**
@@ -190,8 +196,16 @@ class NetsuiteRestClientTest {
 
     /** A client over the given settings that shares this test's token provider and its WireMock token endpoint. */
     private NetsuiteRestClient newClient(NetsuiteProperties properties) {
+        return newClient(properties, WebClient.builder());
+    }
+
+    /**
+     * As {@link #newClient(NetsuiteProperties)}, building the client's {@code WebClient} from {@code builder}; the
+     * token provider keeps its own builder, so a filter of {@code builder} never sees a token request.
+     */
+    private NetsuiteRestClient newClient(NetsuiteProperties properties, WebClient.Builder builder) {
         UpstreamCallExecutor executor = new UpstreamCallExecutor(List.of(new NetsuiteFailureClassifier()));
-        return new NetsuiteRestClient(properties, tokenProvider, executor, WebClient.builder());
+        return new NetsuiteRestClient(properties, tokenProvider, executor, builder);
     }
 
     /**
@@ -245,21 +259,32 @@ class NetsuiteRestClientTest {
                 .hasSize(1);
     }
 
-    /** The result or the failure of one call made by {@link #callTogether(List)}. */
+    /** The result or the failure of one call made by {@link #callTogether(List, InFlightGate)}. */
     private record Outcome<T>(T value, Throwable failure) { }
 
     /**
-     * Makes every call on its own thread of a bounded pool, releasing all of them at once after each thread has
-     * started, and returns their outcomes in call order. Every wait is bounded by {@link #CALLER_TIMEOUT}.
+     * Makes every call on its own thread of a bounded pool, through a client whose NetSuite API requests pass
+     * {@code gate}, and returns their outcomes in call order. The calls are released at once after each thread has
+     * started. The gate then holds every request they make until each caller has joined the acquisition it shares:
+     * it is held at the gate in its own request, or parked waiting for another caller's (see
+     * {@link #waitsForAnotherCallersAcquisition(Thread)}). Only then does the gate let the held requests reach
+     * WireMock, so no caller can start a request after another caller's acquisition has ended, however late its
+     * thread is scheduled, and a failure, which the client never caches, reaches every caller from the held requests
+     * alone. Every wait is bounded by {@link #CALLER_TIMEOUT}.
      */
-    private static <T> List<Outcome<T>> callTogether(List<Callable<T>> calls) throws Exception {
+    private static <T> List<Outcome<T>> callTogether(List<Callable<T>> calls, InFlightGate gate) throws Exception {
         ExecutorService callers = Executors.newFixedThreadPool(calls.size());
         try {
             CountDownLatch started = new CountDownLatch(calls.size());
             CountDownLatch release = new CountDownLatch(1);
+            // Each slot is written before its thread counts started down, so it is visible once started is awaited.
+            Thread[] threads = new Thread[calls.size()];
             List<Future<T>> pending = new ArrayList<>();
-            for (Callable<T> call : calls) {
+            for (int caller = 0; caller < calls.size(); caller++) {
+                int slot = caller;
+                Callable<T> call = calls.get(caller);
                 pending.add(callers.submit(() -> {
+                    threads[slot] = Thread.currentThread();
                     started.countDown();
                     if (!release.await(CALLER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
                         throw new IllegalStateException("the callers were never released");
@@ -270,6 +295,16 @@ class NetsuiteRestClientTest {
             assertThat(started.await(CALLER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)).as("every caller started")
                     .isTrue();
             release.countDown();
+            await("every caller joining the in-flight acquisition").atMost(CALLER_TIMEOUT)
+                    .untilAsserted(() -> assertThat(IntStream.range(0, threads.length)
+                            .filter(caller -> !gate.holds(threads[caller])
+                                    && !waitsForAnotherCallersAcquisition(threads[caller]))
+                            .mapToObj(caller -> "caller " + caller + (pending.get(caller).isDone()
+                                    ? " finished" : " " + threads[caller].getState()))
+                            .toList())
+                            .as("callers neither held at the gate nor waiting for another caller's acquisition")
+                            .isEmpty());
+            gate.open();
             List<Outcome<T>> outcomes = new ArrayList<>();
             for (Future<T> call : pending) {
                 try {
@@ -281,6 +316,70 @@ class NetsuiteRestClientTest {
             return outcomes;
         } finally {
             callers.shutdownNow();
+        }
+    }
+
+    /**
+     * Whether {@code caller} is parked waiting for an acquisition that another call of the client started: in
+     * {@code CompletableFuture.join} or {@code get}, called directly by {@link NetsuiteRestClient}, which waits there
+     * only once its own claims and requests are made.
+     */
+    private static boolean waitsForAnotherCallersAcquisition(Thread caller) {
+        Thread.State state = caller.getState();
+        if (state != Thread.State.WAITING && state != Thread.State.TIMED_WAITING) {
+            return false;
+        }
+        StackTraceElement[] stack = caller.getStackTrace();
+        for (int frame = 0; frame + 1 < stack.length; frame++) {
+            String method = stack[frame].getMethodName();
+            if (stack[frame].getClassName().equals(CompletableFuture.class.getName())
+                    && (method.equals("join") || method.equals("get"))) {
+                return stack[frame + 1].getClassName().equals(NetsuiteRestClient.class.getName());
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Holds each NetSuite API request of the client whose {@code WebClient.Builder} it filters until {@link #open()},
+     * on the thread that makes the request, before the request is sent. The client blocks on every request on its
+     * caller's thread, which therefore subscribes to the deferred hold, so the gate knows which callers it holds. A
+     * request made once the gate is open passes at once; a hold that outlasts {@link #CALLER_TIMEOUT} fails the
+     * request instead of sending it, as an interrupt of the held thread does.
+     */
+    private static final class InFlightGate implements ExchangeFilterFunction {
+
+        private final CountDownLatch opened = new CountDownLatch(1);
+
+        private final Set<Thread> held = ConcurrentHashMap.newKeySet();
+
+        @Override
+        public Mono<ClientResponse> filter(ClientRequest request, ExchangeFunction next) {
+            return Mono.defer(() -> {
+                Thread caller = Thread.currentThread();
+                held.add(caller);
+                try {
+                    if (!opened.await(CALLER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                        return Mono.error(new IllegalStateException("the in-flight gate was never opened"));
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return Mono.error(e);
+                } finally {
+                    held.remove(caller);
+                }
+                return next.exchange(request);
+            });
+        }
+
+        /** Whether {@code caller} is held at the gate in a request of its own. */
+        boolean holds(Thread caller) {
+            return held.contains(caller);
+        }
+
+        /** Lets every held request, and every later one, through. */
+        void open() {
+            opened.countDown();
         }
     }
 
@@ -652,13 +751,14 @@ class NetsuiteRestClientTest {
     @Test
     void concurrentFirstReadsOfAMetadataCatalogShareOneRequest() throws Exception {
         props.setReadTimeout(PATIENT_READ_TIMEOUT);
-        NetsuiteRestClient patient = newClient(props);
+        InFlightGate gate = new InFlightGate();
+        NetsuiteRestClient patient = newClient(props, WebClient.builder().filter(gate));
         netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG))
-                .willReturn(okJson("{\"type\": \"object\", \"properties\": {}}")
-                        .withFixedDelay(IN_FLIGHT_DELAY_MILLIS)));
+                .willReturn(okJson("{\"type\": \"object\", \"properties\": {}}")));
         Callable<Map<String, Object>> read = () -> patient.metadataCatalog("customer");
 
-        List<Outcome<Map<String, Object>>> outcomes = callTogether(Collections.nCopies(CONCURRENT_CALLERS, read));
+        List<Outcome<Map<String, Object>>> outcomes =
+                callTogether(Collections.nCopies(CONCURRENT_CALLERS, read), gate);
 
         assertThat(outcomes).extracting(Outcome::failure).containsOnlyNulls();
         Map<String, Object> catalog = outcomes.get(0).value();
@@ -671,12 +771,13 @@ class NetsuiteRestClientTest {
     @Test
     void concurrentFirstReadsOfAMetadataCatalogShareOneFailureWhichIsNotCached() throws Exception {
         props.setReadTimeout(PATIENT_READ_TIMEOUT);
-        NetsuiteRestClient patient = newClient(props);
-        netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG)).willReturn(aResponse().withStatus(500)
-                .withFixedDelay(IN_FLIGHT_DELAY_MILLIS)));
+        InFlightGate gate = new InFlightGate();
+        NetsuiteRestClient patient = newClient(props, WebClient.builder().filter(gate));
+        netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG)).willReturn(aResponse().withStatus(500)));
         Callable<Map<String, Object>> read = () -> patient.metadataCatalog("customer");
 
-        List<Outcome<Map<String, Object>>> outcomes = callTogether(Collections.nCopies(CONCURRENT_CALLERS, read));
+        List<Outcome<Map<String, Object>>> outcomes =
+                callTogether(Collections.nCopies(CONCURRENT_CALLERS, read), gate);
 
         // Every caller fails as a single caller does, from the one request, which no caller repeats.
         assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome.failure())
@@ -762,17 +863,23 @@ class NetsuiteRestClientTest {
 
     @ParameterizedTest
     @MethodSource("scriptIdsNeedingNoLookup")
-    void customFieldSourceIdsSendsNoRequestWhenNothingIsLeftToLookUp(List<String> scriptIds) {
+    void customFieldSourceIdsSendsNoRequestWhenNothingIsLeftToLookUp(List<String> scriptIds,
+            Map<String, String> expected) {
         props.setCustomFieldTypeIds(Map.of("custentity8", "16"));
 
         Map<String, String> sources = client.customFieldSourceIds(scriptIds);
 
-        assertThat(sources).allSatisfy((id, source) -> assertThat(id).isEqualTo("custentity8"));
+        assertThat(sources).containsExactlyEntriesOf(expected);
         netsuite.verify(0, anyRequestedFor(anyUrl()));
     }
 
-    static Stream<List<String>> scriptIdsNeedingNoLookup() {
-        return Stream.of(null, List.of(), Arrays.asList(" ", null, ""), List.of("custentity8"));
+    static Stream<Arguments> scriptIdsNeedingNoLookup() {
+        return Stream.of(
+                Arguments.of(null, Map.of()),
+                Arguments.of(List.of(), Map.of()),
+                Arguments.of(Arrays.asList(" ", null, ""), Map.of()),
+                // Only the overridden ID: its override is the whole result.
+                Arguments.of(List.of("custentity8"), Map.of("custentity8", "16")));
     }
 
     /**
@@ -786,14 +893,15 @@ class NetsuiteRestClientTest {
             List<String> secondHalf) throws Exception {
         props.setCustomFieldTypeIds(Map.of("custentity5", "55"));
         props.setReadTimeout(PATIENT_READ_TIMEOUT);
-        NetsuiteRestClient patient = newClient(props);
-        stubEveryCustomFieldLookup(okJson(CONCURRENT_LOOKUP_PAGE).withFixedDelay(IN_FLIGHT_DELAY_MILLIS));
+        InFlightGate gate = new InFlightGate();
+        NetsuiteRestClient patient = newClient(props, WebClient.builder().filter(gate));
+        stubEveryCustomFieldLookup(okJson(CONCURRENT_LOOKUP_PAGE));
         List<List<String>> callerIds = new ArrayList<>(Collections.nCopies(CONCURRENT_CALLERS / 2, firstHalf));
         callerIds.addAll(Collections.nCopies(CONCURRENT_CALLERS / 2, secondHalf));
         List<Callable<Map<String, String>>> calls = new ArrayList<>();
         callerIds.forEach(ids -> calls.add(() -> patient.customFieldSourceIds(ids)));
 
-        List<Outcome<Map<String, String>>> outcomes = callTogether(calls);
+        List<Outcome<Map<String, String>>> outcomes = callTogether(calls, gate);
 
         Map<String, String> expected = Map.of("custentity8", "16", "custentity7", "17", "custentity6", "15",
                 "custentity5", "55");
@@ -826,8 +934,9 @@ class NetsuiteRestClientTest {
     @Test
     void concurrentLookupsShareOneFailureAndLeaveItsScriptIdsToALaterLookup() throws Exception {
         props.setReadTimeout(PATIENT_READ_TIMEOUT);
-        NetsuiteRestClient patient = newClient(props);
-        stubEveryCustomFieldLookup(aResponse().withStatus(500).withFixedDelay(IN_FLIGHT_DELAY_MILLIS));
+        InFlightGate gate = new InFlightGate();
+        NetsuiteRestClient patient = newClient(props, WebClient.builder().filter(gate));
+        stubEveryCustomFieldLookup(aResponse().withStatus(500));
         List<Callable<Map<String, String>>> calls = new ArrayList<>();
         for (int caller = 0; caller < CONCURRENT_CALLERS; caller++) {
             List<String> ids = caller % 2 == 0
@@ -836,7 +945,7 @@ class NetsuiteRestClientTest {
             calls.add(() -> patient.customFieldSourceIds(ids));
         }
 
-        List<Outcome<Map<String, String>>> outcomes = callTogether(calls);
+        List<Outcome<Map<String, String>>> outcomes = callTogether(calls, gate);
 
         // Every caller fails as a single caller does: those waiting on another's lookup with that lookup's failure.
         assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome.failure())
@@ -1079,26 +1188,47 @@ class NetsuiteRestClientTest {
 
     @Test
     void closedPortIsUnavailableWithAConnectExceptionAndIsNeverRetried() throws IOException {
-        int port;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            port = socket.getLocalPort();
-        }
-        NetsuiteProperties refusing = configuredProperties("http://localhost:" + port);
-        NetsuiteRestClient unreachable = new NetsuiteRestClient(refusing,
-                new NetsuiteTokenProvider(refusing, WebClient.builder()),
-                new UpstreamCallExecutor(List.of(new NetsuiteFailureClassifier())), WebClient.builder());
+        try (Socket reservation = refusingLoopbackPort()) {
+            NetsuiteProperties refusing = configuredProperties(refusingBaseUrl(reservation));
+            NetsuiteRestClient unreachable = new NetsuiteRestClient(refusing,
+                    new NetsuiteTokenProvider(refusing, WebClient.builder()),
+                    new UpstreamCallExecutor(List.of(new NetsuiteFailureClassifier())), WebClient.builder());
 
-        // The token request is the first to meet the refused connection; it runs inside the executor's attempt.
-        assertThatThrownBy(() -> unreachable.suiteQl("SELECT id FROM customer"))
-                .isInstanceOfSatisfying(UpstreamUnavailableException.class, e -> {
-                    assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
-                    // Netty's AnnotatedConnectException and the native transport's exception both extend it.
-                    assertThat(causeChain(e)).anyMatch(ConnectException.class::isInstance);
-                    // The transport's message names the refused address; the caller's message names neither part.
-                    assertThat(e).hasMessage("NetSuite is unreachable");
-                    assertThat(e.getMessage()).doesNotContain("localhost").doesNotContain(String.valueOf(port));
-                });
-        netsuite.verify(0, anyRequestedFor(anyUrl()));
+            // The token request is the first to meet the refused connection; it runs inside the executor's attempt.
+            assertThatThrownBy(() -> unreachable.suiteQl("SELECT id FROM customer"))
+                    .isInstanceOfSatisfying(UpstreamUnavailableException.class, e -> {
+                        assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
+                        // Netty's AnnotatedConnectException and the native transport's exception both extend it.
+                        assertThat(causeChain(e)).anyMatch(ConnectException.class::isInstance);
+                        // The transport's message names the refused address; the caller's message names neither part.
+                        assertThat(e).hasMessage("NetSuite is unreachable");
+                        assertThat(e.getMessage()).doesNotContain(reservation.getLocalAddress().getHostAddress())
+                                .doesNotContain(String.valueOf(reservation.getLocalPort()));
+                    });
+            netsuite.verify(0, anyRequestedFor(anyUrl()));
+        }
+    }
+
+    /**
+     * Reserves a free TCP port on 127.0.0.1 that refuses every connection: the socket is bound with address reuse
+     * disabled and never listens. While it stays open no other socket can bind or listen on that port, so close it
+     * only after the refused call and its assertions have run.
+     */
+    private static Socket refusingLoopbackPort() throws IOException {
+        Socket reservation = new Socket();
+        try {
+            reservation.setReuseAddress(false);
+            reservation.bind(new InetSocketAddress(InetAddress.getByAddress(new byte[] {127, 0, 0, 1}), 0));
+            return reservation;
+        } catch (IOException | RuntimeException e) {
+            reservation.close();
+            throw e;
+        }
+    }
+
+    /** The {@code http://127.0.0.1:<port>} base URL of a reservation made by {@link #refusingLoopbackPort()}. */
+    private static String refusingBaseUrl(Socket reservation) {
+        return "http://" + reservation.getLocalAddress().getHostAddress() + ":" + reservation.getLocalPort();
     }
 
     /** The throwable and its causes, each once, so a cyclic chain ends. */

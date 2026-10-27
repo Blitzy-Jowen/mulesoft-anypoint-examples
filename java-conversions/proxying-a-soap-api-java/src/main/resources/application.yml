@@ -1,6 +1,7 @@
 # proxying-a-soap-api-java runtime configuration, from proxying-a-soap-api/src/main/app/soap-api-proxy.xml
 # (the original mule-app.properties was empty). The original holds no credentials: the caller's headers and envelope,
-# including any security header, are forwarded to the upstream as data, so no secret or TODO key belongs here.
+# including any security header, are forwarded to the upstream as data, so no secret or TODO key belongs here. The
+# logging block at the end keeps them, and the upstream's answer, out of the log whatever level the root logger has.
 http:
   port: 8081            # original placeholder name ${http.port} of HTTP_Listener_Configuration (DynamicPort in the original test)
 server:
@@ -27,3 +28,14 @@ proxy:
   upstream-url: http://www.predic8.com:8080/shop/ShopService        # http:request-config host/port + http:request path, method POST (soap-api-proxy.xml:4,10)
   wsdl-location: http://www.predic8.com:8080/shop/ShopService?wsdl  # cxf:proxy-service wsdlLocation, served at GET /?wsdl (soap-api-proxy.xml:7)
   response-timeout-ms: 10000                                        # Mule default http:request response timeout
+logging:
+  level:
+    # Below INFO these loggers write the caller's Authorization, token headers, cookies, query and envelope (any
+    # WS-Security header included), the upstream's response headers and body, and the Basic credentials of a
+    # proxy.wsdl-location with user information, none of which the original logged. A logger's own level outranks
+    # logging.level.root and the --debug and --trace logger groups, so neither reaches them.
+    org.apache.hc: INFO                                     # httpclient5 transport of posts and WSDL reads: request and response headers, wire bytes
+    org.springframework.web.servlet.DispatcherServlet: WARN   # request line with its query, response headers; with spring.mvc.log-request-details also request headers and parameters. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # handled exception messages, which can quote upstream content such as a redirect Location
+    org.springframework.web.method.HandlerMethod: INFO      # handler arguments, the exception handed to the 500 advice among them
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # the 500 body carrying that message

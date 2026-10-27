@@ -27,3 +27,10 @@ tshirt:
   # Mule's default response timeout; upstream timeouts are never retried
   connect-timeout: 10s
   read-timeout: 10s
+logging:
+  level:
+    # tshirt-service-consumer.xml has no logger, so neither the API key nor the customer's order is logged at any level: a root DEBUG/TRACE override, or --debug/--trace, must not reach these
+    org.springframework.ws.client.MessageTracing: INFO   # .sent/.received TRACE write every SOAP envelope: the AuthenticationHeader apiKey and the order's name, e-mail and address
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, the handled exception and its message included
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # DEBUG writes the handled exception's message, which can repeat the posted order or the service's fault text
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO          # DEBUG/TRACE write the response body, the 500 body carrying that message included

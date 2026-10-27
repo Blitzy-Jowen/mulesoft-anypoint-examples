@@ -16,8 +16,10 @@ import java.lang.reflect.Field;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -53,9 +55,12 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Unit test of {@link FileOutboundWriter} (shared component SC-6): the Mule 3.8 {@code file:outbound-endpoint}
- * write to {@code <dir>/<name>}, creating the directory, overwriting an existing file, writing bytes exactly and text
- * as UTF-8, resolving a relative directory against the working directory, letting every {@link IOException} reach
- * the caller, and the default {@code <uuid>.dat} name.
+ * write to {@code <dir>/<name>}, creating the directory and the missing parents of a nested name, joining a name
+ * that starts with separators under the directory as Mule's {@code address + "/" + filename} did, overwriting an
+ * existing file, writing bytes exactly and text as UTF-8, resolving a relative directory against the working
+ * directory, reporting every failed write as an {@link IOException} with Mule's message
+ * {@value #STREAMING_FAILED}, which names no path, and the failure as its cause, and the default
+ * {@code <uuid>.dat} name.
  *
  * <p>The overwrite is a whole-file replacement. Simultaneous writers of one name, each with its own instance, never
  * interleave and never expose an empty or partial file to a reader; a write through a symbolic link replaces the
@@ -70,6 +75,12 @@ import org.junit.jupiter.params.provider.ValueSource;
  * type and no resource file. Every file it writes lands under its {@link TempDir}.
  */
 class FileOutboundWriterTest {
+
+    /**
+     * The message of every failed write: Mule 3.8.0's {@code CoreMessages.streamingFailedNoStream()}, core message
+     * 205, with which its file connector wrapped the {@link IOException} of an outbound file write.
+     */
+    private static final String STREAMING_FAILED = "Streaming failed. Could not get output stream";
 
     private static final Pattern DEFAULT_NAME =
             Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.dat");
@@ -208,20 +219,36 @@ class FileOutboundWriterTest {
         assertThat(Files.readString(target.resolve("orders.json"))).isEqualTo("{}");
     }
 
+    /**
+     * A directory path that is an existing regular file, and a file name that is an existing directory: each write
+     * fails with Mule's streaming failure, caused by the file-system exception, and nothing changes.
+     *
+     * @param overload the {@code write} overload called
+     * @throws IOException when a file operation of the test fails
+     */
     @ParameterizedTest
     @EnumSource(Overload.class)
-    @DisplayName("an IOException from creating the directory or writing the file reaches the caller, nothing changes")
-    void letsEveryIOExceptionReachTheCaller(Overload overload) throws IOException {
+    @DisplayName("an IOException from creating the directory or writing the file is the cause of the streaming"
+            + " failure the caller receives, nothing changes")
+    void reportsEveryIOExceptionAsTheStreamingFailure(Overload overload) throws IOException {
         Path regularFile = Files.writeString(tempDir.resolve("output"), "a regular file");
         Path existingDirectory = Files.createDirectory(tempDir.resolve("existing-directory"));
         Path inside = Files.writeString(existingDirectory.resolve("inside.txt"), "kept");
 
         assertThatThrownBy(() -> overload.write(writer, regularFile, "orders.json", "payload"))
                 .as("directory path is an existing regular file")
-                .isInstanceOf(IOException.class);
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
+                .isInstanceOfSatisfying(FileAlreadyExistsException.class, failure ->
+                        assertThat(failure.getFile()).isEqualTo(regularFile.toString()));
         assertThatThrownBy(() -> overload.write(writer, tempDir, "existing-directory", "payload"))
                 .as("file name is an existing directory")
-                .isInstanceOf(IOException.class);
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
+                .isInstanceOfSatisfying(FileSystemException.class, failure ->
+                        assertThat(failure.getReason()).isEqualTo("Is a directory"));
 
         assertThat(Files.readString(regularFile)).isEqualTo("a regular file");
         assertThat(existingDirectory).isDirectory();
@@ -229,6 +256,150 @@ class FileOutboundWriterTest {
             assertThat(listing).containsExactly(inside);
         }
         assertThat(Files.readString(inside)).isEqualTo("kept");
+    }
+
+    /**
+     * Names that start with separators, as an uploaded file's name can. Each continues with the absolute path, less
+     * its leading {@code /}, of a directory beside the target directory, so a write that took the name for an
+     * absolute path would land there. The directory is given as an absolute {@link Path} and as a string relative to
+     * the working directory.
+     *
+     * @return description, the separators the name starts with, the rest of the name after the outside directory's
+     *         path, whether the directory is given relative to the working directory
+     */
+    static Stream<Arguments> namesStartingWithSeparators() {
+        return Stream.of(
+                Arguments.of("one slash: an absolute path", "/", "qa-absolute.txt", false),
+                Arguments.of("two slashes", "//", "qa-absolute.txt", false),
+                Arguments.of("three slashes before a nested name", "///", "etc/qa.txt", false),
+                Arguments.of("one slash, directory relative to the working directory", "/", "qa-absolute.txt", true));
+    }
+
+    /**
+     * A name's leading separators do not take the file out of the directory: Mule joined the two as
+     * {@code address + "/" + filename}, which {@link java.io.File} normalised by collapsing the separators, so the
+     * expected file is {@link Path#of(String, String...)} of that joined text, which collapses them the same way.
+     * The file holds the exact bytes, its missing parents are created, the directory the name spells is left empty
+     * and nothing is written beside the target directory.
+     *
+     * @param description       the case, for the test name
+     * @param separators        the separators the name starts with
+     * @param rest              the name after the outside directory's path
+     * @param relativeDirectory whether the directory is given as a string relative to the working directory
+     * @throws IOException when a file operation of the test fails
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("namesStartingWithSeparators")
+    void leadingSeparatorsOfANameKeepTheFileUnderTheDirectory(String description, String separators, String rest,
+            boolean relativeDirectory) throws IOException {
+        // Real paths, so the relative directory's ".." steps walk the physical parents the operating system follows.
+        Path root = tempDir.toRealPath();
+        Path outside = Files.createDirectories(root.resolve("outside"));
+        Path absoluteDir = root.resolve("out");
+        Path dir = relativeDirectory
+                ? Path.of("").toAbsolutePath().toRealPath().relativize(absoluteDir)
+                : absoluteDir;
+        String outsideWithoutRoot = outside.toString().substring(1);
+        String name = separators + outsideWithoutRoot + "/" + rest;
+        byte[] content = "QA_SECURITY_CONTENT".getBytes(StandardCharsets.UTF_8);
+
+        Path written = relativeDirectory
+                ? writer.write(dir.toString(), name, content)
+                : writer.write(dir, name, content);
+
+        assertThat(written).isEqualTo(Path.of(dir + "/" + name));
+        assertThat(written.isAbsolute()).isEqualTo(!relativeDirectory);
+        assertThat(Files.readAllBytes(absoluteDir.resolve(outsideWithoutRoot).resolve(rest))).isEqualTo(content);
+        assertThat(outside).isEmptyDirectory();
+        assertThat(names(root)).containsExactly("out", "outside");
+    }
+
+    /**
+     * Nested names whose parent directories do not exist yet: one missing parent, three, and a name that climbs out
+     * of the directory with {@code ..} into a missing sibling, which is kept as given, as Mule kept it.
+     *
+     * @return description, the name
+     */
+    static Stream<Arguments> nestedNamesWithMissingParents() {
+        return Stream.of(
+                Arguments.of("one missing parent", "qa-sub/qa-nested.txt"),
+                Arguments.of("three missing parents", "a/b/c/deep.txt"),
+                Arguments.of(".. into a missing sibling of the directory", "../sibling/up.txt"));
+    }
+
+    /**
+     * The missing parent directories of a nested name are created, as Mule's {@code FileUtils.createFile} created
+     * them, and the file holds the exact bytes; a second write of the name replaces it as a whole and leaves no
+     * temporary file beside it.
+     *
+     * @param description the case, for the test name
+     * @param name        the nested name
+     * @throws IOException when a file operation of the test fails
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("nestedNamesWithMissingParents")
+    void nestedNameGetsItsMissingParentDirectoriesCreated(String description, String name) throws IOException {
+        Path dir = tempDir.resolve("out").resolve("inner");
+        byte[] first = bytes(0x00, 'Q', 'A', 0xFF, '\r', '\n');
+        byte[] second = "replaced".getBytes(StandardCharsets.UTF_8);
+
+        Path written = writer.write(dir, name, first);
+
+        assertThat(written).isEqualTo(Path.of(dir + "/" + name));
+        assertThat(Files.readAllBytes(written)).isEqualTo(first);
+
+        Path rewritten = writer.write(dir, name, second);
+
+        assertThat(rewritten).isEqualTo(written);
+        assertThat(Files.readAllBytes(written)).isEqualTo(second);
+        assertThat(names(written.getParent())).containsExactly(written.getFileName().toString());
+    }
+
+    /**
+     * Names whose write fails in a way whose own exception text names the directory or a temporary file: names
+     * longer than the file system allows, at the first refused length and far beyond it, whose rename is refused
+     * once the temporary file was written; {@code .}, {@code ..} and the empty name, which resolve to directories; a
+     * name holding a NUL character, which is no path; and a nested name whose parent is an existing regular file.
+     *
+     * @return description, the name, the type of the failure the streaming failure is caused by
+     */
+    static Stream<Arguments> namesWhoseWriteFails() {
+        return Stream.of(
+                Arguments.of("256-character name", "x".repeat(256), FileSystemException.class),
+                Arguments.of("1,000-character name", "a".repeat(1000), FileSystemException.class),
+                Arguments.of("the name .", ".", FileSystemException.class),
+                Arguments.of("the name ..", "..", FileSystemException.class),
+                Arguments.of("the empty name", "", FileSystemException.class),
+                Arguments.of("a name holding NUL", "a" + cp(0) + ".txt", InvalidPathException.class),
+                Arguments.of("a missing parent blocked by a regular file", "blocker/qa-nested.txt",
+                        FileAlreadyExistsException.class));
+    }
+
+    /**
+     * A failed write is reported with Mule's message alone, which names neither the directory nor a temporary file,
+     * and the failure as its cause; every file and directory is left exactly as it was.
+     *
+     * @param description the case, for the test name
+     * @param name        the name whose write fails
+     * @param cause       the type of the failure the streaming failure is caused by
+     * @throws IOException when a file operation of the test fails
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("namesWhoseWriteFails")
+    void failedWriteIsReportedWithAMessageNamingNoPath(String description, String name,
+            Class<? extends Throwable> cause) throws IOException {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Files.writeString(dir.resolve("blocker"), "a regular file");
+        Map<String, String> before = tree(tempDir);
+
+        assertThatThrownBy(() -> writer.write(dir, name, "payload"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .hasMessageNotContaining(tempDir.toString())
+                .hasMessageNotContaining(".tmp")
+                .hasCauseExactlyInstanceOf(cause);
+
+        assertThat(tree(tempDir)).isEqualTo(before);
     }
 
     static Stream<Arguments> nullArguments() {
@@ -403,7 +574,8 @@ class FileOutboundWriterTest {
     }
 
     /**
-     * Two links naming each other fail as the operating system's lookup would, and nothing is created.
+     * Two links naming each other fail as the operating system's lookup would, the streaming failure caused by the
+     * lookup's {@link FileSystemException}, and nothing is created.
      *
      * @throws IOException when a file operation of the test fails
      */
@@ -414,6 +586,9 @@ class FileOutboundWriterTest {
         Files.createSymbolicLink(dir.resolve("b"), Path.of("a"));
 
         assertThatThrownBy(() -> writer.write(dir, "a", "new"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
                 .isInstanceOfSatisfying(FileSystemException.class, failure -> {
                     assertThat(failure.getFile()).isEqualTo(dir.resolve("a").toString());
                     assertThat(failure.getReason()).isEqualTo("Too many levels of symbolic links");
@@ -437,7 +612,8 @@ class FileOutboundWriterTest {
     }
 
     /**
-     * A chain of forty-one links, one more than a Linux path lookup follows, fails and creates nothing.
+     * A chain of forty-one links, one more than a Linux path lookup follows, fails, the streaming failure caused by
+     * the lookup's {@link FileSystemException}, and creates nothing.
      *
      * @throws IOException when a file operation of the test fails
      */
@@ -447,6 +623,9 @@ class FileOutboundWriterTest {
         String name = linkChain(dir, 41, "linked.json");
 
         assertThatThrownBy(() -> writer.write(dir, name, "new"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
                 .isInstanceOfSatisfying(FileSystemException.class, failure ->
                         assertThat(failure.getReason()).isEqualTo("Too many levels of symbolic links"));
         assertThat(dir.resolve("linked.json")).doesNotExist();
@@ -577,8 +756,9 @@ class FileOutboundWriterTest {
     /**
      * A read-only file is refused as an in-place write refused it, although a rename needs write permission on
      * the directory only. {@link Files#isWritable(Path)} decides the expectation: when the process may not write
-     * the file, the write fails with an {@link AccessDeniedException} naming it and the directory is left exactly
-     * as it was; when it may, as a superuser may, the content is replaced. The file stays read-only either way.
+     * the file, the write fails, the streaming failure caused by an {@link AccessDeniedException} naming it, and the
+     * directory is left exactly as it was; when it may, as a superuser may, the content is replaced. The file stays
+     * read-only either way.
      *
      * @throws Exception when a file operation fails or the lock map cannot be read
      */
@@ -597,6 +777,9 @@ class FileOutboundWriterTest {
             assertThat(names(dir)).containsExactly("report.csv");
         } else {
             assertThatThrownBy(() -> writer.write(dir, "report.csv", "second"))
+                    .isExactlyInstanceOf(IOException.class)
+                    .hasMessage(STREAMING_FAILED)
+                    .cause()
                     .isInstanceOfSatisfying(AccessDeniedException.class, failure ->
                             assertThat(failure.getFile()).isEqualTo(target.toString()));
 
@@ -656,9 +839,9 @@ class FileOutboundWriterTest {
     /**
      * A new file in a directory made read-and-search only: {@link Files#isWritable(Path)} on the directory decides
      * the expectation. When the process may still add to it, as a superuser may, the file is created with the
-     * permissions an ordinary create gives it; otherwise the write fails with an {@link AccessDeniedException}
-     * naming the file, as its in-place create failed, and the directory is left exactly as it was. The lock entry
-     * is released either way.
+     * permissions an ordinary create gives it; otherwise the write fails, the streaming failure caused by an
+     * {@link AccessDeniedException} naming the file, as its in-place create failed, and the directory is left
+     * exactly as it was. The lock entry is released either way.
      *
      * @throws Exception when a file operation fails or the lock map cannot be read
      */
@@ -680,6 +863,9 @@ class FileOutboundWriterTest {
                 assertThat(names(dir)).containsExactly("orders.json", "reference.dat");
             } else {
                 assertThatThrownBy(() -> writer.write(dir, "orders.json", "{}"))
+                        .isExactlyInstanceOf(IOException.class)
+                        .hasMessage(STREAMING_FAILED)
+                        .cause()
                         .isInstanceOfSatisfying(AccessDeniedException.class, failure ->
                                 assertThat(failure.getFile()).isEqualTo(target.toString()));
 
@@ -730,8 +916,9 @@ class FileOutboundWriterTest {
     }
 
     /**
-     * A name that resolves to a directory, directly, as the empty name or through a link, fails with an
-     * {@link IOException}; every file and directory is left exactly as it was and no temporary file appears.
+     * A name that resolves to a directory, directly, as the empty name or through a link, fails, the streaming
+     * failure caused by a {@link FileSystemException} with the reason {@code Is a directory}; every file and
+     * directory is left exactly as it was and no temporary file appears.
      *
      * @param name the file name passed to the writer
      * @throws Exception when a file operation fails or the lock map cannot be read
@@ -747,6 +934,9 @@ class FileOutboundWriterTest {
         Map<String, String> before = tree(dir);
 
         assertThatThrownBy(() -> writer.write(dir, name, "new"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
                 .isInstanceOfSatisfying(FileSystemException.class, failure ->
                         assertThat(failure.getReason()).isEqualTo("Is a directory"));
 

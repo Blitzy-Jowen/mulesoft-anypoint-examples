@@ -21,5 +21,14 @@ spring:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
 logging:
+  level:
+    # Below INFO these loggers write what the caller sent: every request header (Authorization, cookies, custom
+    # headers), the Content-Type, the body bytes and the query string. A logger's own level outranks
+    # logging.level.root and the --debug and --trace groups, so none of them reaches these loggers.
+    org.springframework.web.method.HandlerMethod: INFO   # handler arguments, the request's HttpHeaders among them; argument errors quoting a rejected Content-Type
+    org.springframework.web.servlet.DispatcherServlet: WARN   # request line with the query string; headers when request details are logged. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor: INFO   # the Content-Type and the body bytes read for the handler
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # handled exception messages, which quote a rejected Content-Type
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # the 500 body carrying that message
   pattern:
     correlation: "[transactionId=%X{transactionId:-} businessEvent=%X{businessEvent:-}] "   # renders the tracking MDC on every console and file line: transaction id of tracking:transaction / the default events, business event name of tracking:custom-event

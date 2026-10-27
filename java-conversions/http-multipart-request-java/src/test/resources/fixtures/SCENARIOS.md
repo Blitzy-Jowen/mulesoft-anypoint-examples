@@ -12,12 +12,16 @@ This file follows the reference format of `java-conversions/hello-world-java/src
 | `post-upload-file` | `http` | `deterministic` | `POST /uploadFile`, header `Content-Type: multipart/form-data; boundary=parity-boundary-0001`, body A (see Request bodies) | `upload.directory` = `${dir:upload}`, empty directory `upload` | `httpMultipartRequestFlow` (`allowedMethods="POST"`): file name `test.txt` from the part's `Content-Disposition`, part `Content-Type` logged at ERROR, part content written to `<upload.directory>/test.txt`, response builder with status `200` and reason `File was uploaded.` (`:16`), content echoed | `http-multipart-request/src/main/app/http-multipart-request.xml:13-29` |
 | `post-upload-file-attachment-request` | `http` | `deterministic` | `POST /uploadFile`, header `Content-Type: multipart/form-data; boundary=parity-boundary-0002`, body B (see Request bodies) | `upload.directory` = `${dir:upload}`, empty directory `upload` | same flow, with the part shaped as the original IT's `AttachmentRequest` sent it (`application/octet-stream`, file name `file`); content written to `<upload.directory>/file` (the original asserted `/tmp/file`) | `http-multipart-request/src/main/app/http-multipart-request.xml:13-29`, `http-multipart-request/src/test/java/org/mule/examples/HttpMultpartRequestIT.java:33,66-73`, `http-multipart-request/src/test/java/org/mule/examples/AttachmentRequest.java:93-101` |
 | `post-upload-file-missing-part` | `http` | `deterministic` | `POST /uploadFile`, header `Content-Type: multipart/form-data; boundary=parity-boundary-0003`, body C (see Request bodies; no `file` part) | `upload.directory` = `${dir:upload}`, empty directory `upload` | `inboundAttachments['file']` is absent, so the file-name expression fails → no exception strategy → unhandled-exception platform default 500 (AAP 0.4.7); a Tier 2A verification point where the captured bytes govern; no file stored | `http-multipart-request/src/main/app/http-multipart-request.xml:19-20` |
+| `post-upload-file-latin1-filename` | `http` | `deterministic` | `POST /uploadFile`, header `Content-Type: multipart/form-data; boundary=parity-boundary-0004`, body D (see Request bodies; file name byte `E9`) | `upload.directory` = `${dir:upload}`, empty directory `upload` | `httpMultipartRequestFlow` (`allowedMethods="POST"`): the listener's multipart parser decodes the part's `Content-Disposition`, whose `filename` carries the byte `E9` (a browser's windows-1252 `é`); the file-name expression takes the name from that decoded text, the part `Content-Type` is logged at ERROR and the `file:outbound-endpoint` writes the content under that name; a Tier 2A verification point where the captured stored name governs | `http-multipart-request/src/main/app/http-multipart-request.xml:13-29` |
+| `post-upload-file-absolute-filename` | `http` | `deterministic` | `POST /uploadFile`, header `Content-Type: multipart/form-data; boundary=parity-boundary-0005`, body E (see Request bodies; file name `/qa/absolute.txt`) | `upload.directory` = `${dir:upload}`, empty directory `upload` | same flow, with a file name that starts with `/`: the `file:outbound-endpoint` joins its `path` and that `outputPattern` name; a Tier 2A verification point where the captured stored path governs | `http-multipart-request/src/main/app/http-multipart-request.xml:13-29` |
+| `post-upload-file-nested-filename` | `http` | `deterministic` | `POST /uploadFile`, header `Content-Type: multipart/form-data; boundary=parity-boundary-0006`, body F (see Request bodies; file name `qa-sub/qa-nested.txt`) | `upload.directory` = `${dir:upload}`, empty directory `upload`, so no `qa-sub` directory exists | same flow, with a file name whose directory segment `qa-sub` does not exist under the endpoint's `path`: the `file:outbound-endpoint` writes under that name; a Tier 2A verification point where the captured stored path governs | `http-multipart-request/src/main/app/http-multipart-request.xml:13-29` |
+| `post-upload-file-write-failure` | `http` | `deterministic` | `POST /uploadFile`, header `Content-Type: multipart/form-data; boundary=parity-boundary-0007`, body G (see Request bodies; file name `.`) | `upload.directory` = `${dir:upload}`, empty directory `upload` | same flow, with the file name `.`, which names the endpoint's `path` directory itself: the `file:outbound-endpoint` write targets that directory, and the flow declares no exception strategy, so a failure there takes the unhandled-exception platform default (AAP 0.4.7); a Tier 2A verification point where the captured bytes govern | `http-multipart-request/src/main/app/http-multipart-request.xml:13-29` |
 | `put-upload-file-method-not-allowed` | `http` | `deterministic` | `PUT /uploadFile`, header `Content-Length: 0`, empty body | `upload.directory` = `${dir:upload}`, empty directory `upload` | method outside both listeners' `allowedMethods` (`GET`, `POST`) → 405 (platform default, AAP 0.4.7); a Tier 2A verification point where the captured bytes govern; no file stored | `http-multipart-request/src/main/app/http-multipart-request.xml:8,15` |
 | `get-unknown-path` | `http` | `deterministic` | `GET /unknown`, empty body | `upload.directory` = `${dir:upload}`, empty directory `upload` | no listener for the path (both listeners serve `/uploadFile`) → 404 (platform default, AAP 0.4.7); a Tier 2A verification point where the captured bytes govern; no file stored | `http-multipart-request/src/main/app/http-multipart-request.xml:4,8,15` |
 
-The `Request` cells of the three multipart rows name their body by letter; its bytes are in `## Request bodies` below, and the row's `Content-Type` header names the boundary that body uses.
+The `Request` cells of the seven multipart rows name their body by letter; its bytes are in `## Request bodies` below, and the row's `Content-Type` header names the boundary that body uses.
 
-Every row seeds the same `state`: the property `upload.directory` points at the temporary replay directory `upload`, which starts empty, so replay never writes to `/tmp`, the directory the original's `file:outbound-endpoint` fixes (`http-multipart-request/src/main/app/http-multipart-request.xml:27`). Each fixture records the final content of that directory in `response.directories`, which is empty for the four rows that store no file.
+Every row seeds the same `state`: the property `upload.directory` points at the temporary replay directory `upload`, which starts empty, so replay never writes to `/tmp`, the directory the original's `file:outbound-endpoint` fixes (`http-multipart-request/src/main/app/http-multipart-request.xml:27`). Each fixture records the final content of that directory, and of any subdirectory the flow created in it, in `response.directories`, which is empty for the four rows whose request never reaches the file write (`get-upload-file`, `post-upload-file-missing-part`, `put-upload-file-method-not-allowed`, `get-unknown-path`). For the four rows that vary the file name (`post-upload-file-latin1-filename`, `post-upload-file-absolute-filename`, `post-upload-file-nested-filename`, `post-upload-file-write-failure`), the stored names and paths, or the failure, are what the capture records; nothing about them is written here.
 
 No scenario of this project is `unreachable` or `nondeterministic`: every branch is selected by its request, the stored file's name and content come from the request alone, and the flows read no clock, random value or generated name.
 
@@ -36,7 +40,7 @@ Table rules, for every project that copies this format:
 
 ## Request bodies
 
-The bodies of the three multipart rows are written here, inline, and are not classpath files. `\r\n` stands for CRLF (bytes `0D 0A`); every line below, the closing delimiter line included, ends with CRLF, and no other byte separates the lines. Each body is sent with header `Content-Type: multipart/form-data; boundary=<boundary>`, naming the boundary its delimiter lines use. Capture step 4 writes each body with `printf` from the same text, and the fixture's `request.body` holds the bytes as sent.
+The bodies of the seven multipart rows are written here, inline, and are not classpath files. `\r\n` stands for CRLF (bytes `0D 0A`), and `\351` for the single byte `E9`, the octal escape `printf` reads; every other byte is printable ASCII written as itself. Every line below, the closing delimiter line included, ends with CRLF, and no other byte separates the lines. Each body is sent with header `Content-Type: multipart/form-data; boundary=<boundary>`, naming the boundary its delimiter lines use. Capture step 4 writes each body with `printf` from the same text, and the fixture's `request.body` holds the bytes as sent.
 
 Body A, 159 bytes, boundary `parity-boundary-0001`, sent by `post-upload-file`. Its content line is the 13 bytes of `src/test/resources/test.txt` (the project copy of `http-multipart-request/src/test/resources/test.txt`), `file uploaded` without a line ending:
 
@@ -69,6 +73,52 @@ Content-Disposition: form-data; name="description"\r\n
 \r\n
 no file part\r\n
 --parity-boundary-0003--\r\n
+```
+
+Bodies D to G have the lines of body A, each with its own boundary and file name and the same 13-byte content line `file uploaded`.
+
+Body D, 166 bytes, boundary `parity-boundary-0004`, sent by `post-upload-file-latin1-filename`. Its file name is `caf\351-latin1.txt`: the byte `E9` is `é` in ISO-8859-1 and windows-1252, and is what a browser sends for `é` in a file name from `uploadFile.html`, which declares no charset:
+
+```text
+--parity-boundary-0004\r\n
+Content-Disposition: form-data; name="file"; filename="caf\351-latin1.txt"\r\n
+Content-Type: text/plain\r\n
+\r\n
+file uploaded\r\n
+--parity-boundary-0004--\r\n
+```
+
+Body E, 167 bytes, boundary `parity-boundary-0005`, sent by `post-upload-file-absolute-filename`. Its file name `/qa/absolute.txt` starts with `/`:
+
+```text
+--parity-boundary-0005\r\n
+Content-Disposition: form-data; name="file"; filename="/qa/absolute.txt"\r\n
+Content-Type: text/plain\r\n
+\r\n
+file uploaded\r\n
+--parity-boundary-0005--\r\n
+```
+
+Body F, 171 bytes, boundary `parity-boundary-0006`, sent by `post-upload-file-nested-filename`. Its file name `qa-sub/qa-nested.txt` holds the directory segment `qa-sub`:
+
+```text
+--parity-boundary-0006\r\n
+Content-Disposition: form-data; name="file"; filename="qa-sub/qa-nested.txt"\r\n
+Content-Type: text/plain\r\n
+\r\n
+file uploaded\r\n
+--parity-boundary-0006--\r\n
+```
+
+Body G, 152 bytes, boundary `parity-boundary-0007`, sent by `post-upload-file-write-failure`. Its file name is `.`:
+
+```text
+--parity-boundary-0007\r\n
+Content-Disposition: form-data; name="file"; filename="."\r\n
+Content-Type: text/plain\r\n
+\r\n
+file uploaded\r\n
+--parity-boundary-0007--\r\n
 ```
 
 ## Fixture contract
@@ -128,7 +178,7 @@ Fixtures are `fixtures/<scenario>.json` beside this file (`src/test/resources/fi
   - `mails`: `[{mimeBase64}]`, the mails the flow sent during the run, as raw MIME. The replay compares them with every mail GreenMail holds after the run, in any mailbox, except the input mail the replay delivered itself, which this comparison leaves out whether or not the flow removed it.
   - `mailboxes`: `{<email>: [{mimeBase64}]}`, the final contents of each named mailbox after the run, keyed by an email of `state.mail.users`: one raw MIME entry per message still in the mailbox, in mailbox order, the delivered input mail included when the flow did not remove it, and `[]` for a mailbox the capture found empty. The replay compares the message count first, then each message; a message flagged deleted but not expunged still counts.
   - `logs`: `[{logger, level, message}]`, matched as an ordered subsequence of the logged events.
-- For http-multipart-request, `response.directories` is `{"upload": [...]}` in every fixture: one `{name, body or bodyBase64}` entry per file the original stored in `/tmp`, keyed by its name relative to `upload.directory` (`test.txt` for `post-upload-file`, `file` for `post-upload-file-attachment-request`), and `[]` for `get-upload-file`, `post-upload-file-missing-part`, `put-upload-file-method-not-allowed` and `get-unknown-path`. Replay compares it with `<upload.directory>/<name>` in the temporary directory. `logs` is not recorded, because the capture below reads no runtime log.
+- For http-multipart-request, `response.directories` is `{"upload": [...]}` in every fixture: one `{name, body or bodyBase64}` entry per file the original stored directly in `/tmp`, keyed by its name relative to `upload.directory` (`test.txt` for `post-upload-file`, `file` for `post-upload-file-attachment-request`), and `[]` for `get-upload-file`, `post-upload-file-missing-part`, `put-upload-file-method-not-allowed` and `get-unknown-path`. A file the original stored in a subdirectory of `/tmp` is listed under the further key `upload/<subdirectory>`, the subdirectory's path relative to `/tmp`, because replay compares each key with the regular files directly inside its directory. Replay compares `upload` with `<upload.directory>/<name>` and each `upload/<subdirectory>` key with `<upload.directory>/<subdirectory>/<name>` in the temporary directory. `logs` is not recorded, because the capture below reads no runtime log.
 
 Placeholders, allowed in `state.properties` values, in `request.file.directory` and in directory keys, and resolved at replay:
 
@@ -183,7 +233,7 @@ Each run writes `target/fixture-parity/summary.properties` in the project direct
 
 `VERIFIED` counts as verified, every `UNVERIFIED-*` status as unverified and `FAILED` as failed; `UNREACHABLE` is counted in none.
 
-With no fixtures the test is reported skipped (`Assumptions.assumeTrue`, reason `no Tier 2A fixtures captured`), never failed. For http-multipart-request the summary then holds `verified=0`, `unverified=6` and `failed=0`, followed by one `scenario.<name>=UNVERIFIED-uncaptured` line for each of `get-upload-file`, `post-upload-file`, `post-upload-file-attachment-request`, `post-upload-file-missing-part`, `put-upload-file-method-not-allowed` and `get-unknown-path`, in that order.
+With no fixtures the test is reported skipped (`Assumptions.assumeTrue`, reason `no Tier 2A fixtures captured`), never failed. For http-multipart-request the summary then holds `verified=0`, `unverified=10` and `failed=0`, followed by one `scenario.<name>=UNVERIFIED-uncaptured` line for each of `get-upload-file`, `post-upload-file`, `post-upload-file-attachment-request`, `post-upload-file-missing-part`, `post-upload-file-latin1-filename`, `post-upload-file-absolute-filename`, `post-upload-file-nested-filename`, `post-upload-file-write-failure`, `put-upload-file-method-not-allowed` and `get-unknown-path`, in that order.
 
 These statuses feed the parity label of the project README and of the root `SUMMARY.md` (AAP 0.8.7):
 
@@ -198,7 +248,7 @@ This project is labelled `PARITY: UNVERIFIED — Mule runtime unavailable` in it
 
 ## Capture (Tier 2A)
 
-The capture output of each scenario is kept unedited as the evidence for its fixture and is committed with it in `src/test/capture/<scenario>/`, outside `fixtures/` and off the test classpath: `response.http` holds the `curl --raw -i` output, `curl-trace.txt` curl's `-v` trace with the request as sent, and `upstream-journal.json`, for an original with upstream calls, the recorded exchanges. Working files that can hold live values stay under `target/fixture-capture/` and are never committed. For this project the evidence also holds `request.body`, the multipart body sent, and `upload/`, a copy of each file the original left in `/tmp` under the two names its scenarios store (`test.txt`, `file`). Every command after step 1 runs in the project directory (`java-conversions/http-multipart-request-java/`).
+The capture output of each scenario is kept unedited as the evidence for its fixture and is committed with it in `src/test/capture/<scenario>/`, outside `fixtures/` and off the test classpath: `response.http` holds the `curl --raw -i` output, `curl-trace.txt` curl's `-v` trace with the request as sent, and `upstream-journal.json`, for an original with upstream calls, the recorded exchanges. Working files that can hold live values stay under `target/fixture-capture/` and are never committed. For this project the evidence also holds `request.body`, the multipart body sent, and `upload/`, a copy of each file the original left in `/tmp` under the names its scenarios' requests can reach (`test.txt`, `file`, `caf*-latin1.txt` whatever byte its name was stored with, and the trees `qa/` and `qa-sub/` with their relative paths). Every command after step 1 runs in the project directory (`java-conversions/http-multipart-request-java/`).
 
 1. Build the unmodified original `http-multipart-request` with `mvn -B package`, with the EE repository credentials in `settings.xml`. Never edit the original folder.
 2. HTTP and SOAP upstreams; skipped for http-multipart-request, whose flows make no outbound call. Every exchange is recorded through WireMock standalone 3.13.2 (`org.wiremock:wiremock-standalone`, the version the projects pin) running as a recording proxy in front of the real services, and its request journal is the recording. WireMock's `--record-mappings` files are not used, because they store a gzip-encoded body decoded and without its `Content-Encoding`.
@@ -227,23 +277,31 @@ The capture output of each scenario is kept unedited as the evidence for its fix
    capture() { d="src/test/capture/$1"; shift; mkdir -p "$d"; curl --raw -i -sS -v --http1.1 "$@" > "$d/response.http" 2> "$d/curl-trace.txt"; }
    ```
 
-   The original stores uploads under its fixed `/tmp/<file name>`, so each scenario starts with neither `/tmp/test.txt` nor `/tmp/file` present and ends by copying whichever of them the flow wrote into the evidence directory `upload/`. The three multipart bodies are first written with `printf` from the text of `## Request bodies`, and `wc -c` must print 159, 204 and 118 bytes:
+   The original stores uploads under its fixed `/tmp/<file name>`, so each scenario starts with none of `/tmp/test.txt`, `/tmp/file`, `/tmp/caf*-latin1.txt`, `/tmp/qa` and `/tmp/qa-sub` present (so `qa-sub` is missing when `post-upload-file-nested-filename` runs) and ends by copying whichever of them the flow wrote, a directory with everything in it, into the evidence directory `upload/`. The seven multipart bodies are first written with `printf` from the text of `## Request bodies`, and `wc -c` must print 159, 204, 118, 166, 167, 171 and 152 bytes:
 
    ```sh
    body() { mkdir -p "src/test/capture/$1"; printf -- "$2" > "src/test/capture/$1/request.body"; }
-   produced() { d="src/test/capture/$1/upload"; mkdir -p "$d"; for f in /tmp/test.txt /tmp/file; do if [ -f "$f" ]; then cp "$f" "$d/"; fi; done; }
-   run() { s="$1"; rm -f /tmp/test.txt /tmp/file; capture "$@" && produced "$s"; }
+   produced() { d="src/test/capture/$1/upload"; mkdir -p "$d"; for f in /tmp/test.txt /tmp/file /tmp/caf*-latin1.txt /tmp/qa /tmp/qa-sub; do if [ -e "$f" ]; then cp -R "$f" "$d/"; fi; done; }
+   run() { s="$1"; rm -rf /tmp/test.txt /tmp/file /tmp/caf*-latin1.txt /tmp/qa /tmp/qa-sub; capture "$@" && produced "$s"; }
    body post-upload-file '--parity-boundary-0001\r\nContent-Disposition: form-data; name="file"; filename="test.txt"\r\nContent-Type: text/plain\r\n\r\nfile uploaded\r\n--parity-boundary-0001--\r\n'
    body post-upload-file-attachment-request '--parity-boundary-0002\r\nContent-Disposition: form-data; name="file"; filename="file"\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n\r\nfile uploaded\r\n--parity-boundary-0002--\r\n'
    body post-upload-file-missing-part '--parity-boundary-0003\r\nContent-Disposition: form-data; name="description"\r\n\r\nno file part\r\n--parity-boundary-0003--\r\n'
-   wc -c src/test/capture/post-upload-file/request.body src/test/capture/post-upload-file-attachment-request/request.body src/test/capture/post-upload-file-missing-part/request.body
+   body post-upload-file-latin1-filename '--parity-boundary-0004\r\nContent-Disposition: form-data; name="file"; filename="caf\351-latin1.txt"\r\nContent-Type: text/plain\r\n\r\nfile uploaded\r\n--parity-boundary-0004--\r\n'
+   body post-upload-file-absolute-filename '--parity-boundary-0005\r\nContent-Disposition: form-data; name="file"; filename="/qa/absolute.txt"\r\nContent-Type: text/plain\r\n\r\nfile uploaded\r\n--parity-boundary-0005--\r\n'
+   body post-upload-file-nested-filename '--parity-boundary-0006\r\nContent-Disposition: form-data; name="file"; filename="qa-sub/qa-nested.txt"\r\nContent-Type: text/plain\r\n\r\nfile uploaded\r\n--parity-boundary-0006--\r\n'
+   body post-upload-file-write-failure '--parity-boundary-0007\r\nContent-Disposition: form-data; name="file"; filename="."\r\nContent-Type: text/plain\r\n\r\nfile uploaded\r\n--parity-boundary-0007--\r\n'
+   wc -c src/test/capture/post-upload-file/request.body src/test/capture/post-upload-file-attachment-request/request.body src/test/capture/post-upload-file-missing-part/request.body src/test/capture/post-upload-file-latin1-filename/request.body src/test/capture/post-upload-file-absolute-filename/request.body src/test/capture/post-upload-file-nested-filename/request.body src/test/capture/post-upload-file-write-failure/request.body
    run get-upload-file http://localhost:8081/uploadFile
    run post-upload-file -X POST -H 'Content-Type: multipart/form-data; boundary=parity-boundary-0001' --data-binary @src/test/capture/post-upload-file/request.body http://localhost:8081/uploadFile
    run post-upload-file-attachment-request -X POST -H 'Content-Type: multipart/form-data; boundary=parity-boundary-0002' --data-binary @src/test/capture/post-upload-file-attachment-request/request.body http://localhost:8081/uploadFile
    run post-upload-file-missing-part -X POST -H 'Content-Type: multipart/form-data; boundary=parity-boundary-0003' --data-binary @src/test/capture/post-upload-file-missing-part/request.body http://localhost:8081/uploadFile
+   run post-upload-file-latin1-filename -X POST -H 'Content-Type: multipart/form-data; boundary=parity-boundary-0004' --data-binary @src/test/capture/post-upload-file-latin1-filename/request.body http://localhost:8081/uploadFile
+   run post-upload-file-absolute-filename -X POST -H 'Content-Type: multipart/form-data; boundary=parity-boundary-0005' --data-binary @src/test/capture/post-upload-file-absolute-filename/request.body http://localhost:8081/uploadFile
+   run post-upload-file-nested-filename -X POST -H 'Content-Type: multipart/form-data; boundary=parity-boundary-0006' --data-binary @src/test/capture/post-upload-file-nested-filename/request.body http://localhost:8081/uploadFile
+   run post-upload-file-write-failure -X POST -H 'Content-Type: multipart/form-data; boundary=parity-boundary-0007' --data-binary @src/test/capture/post-upload-file-write-failure/request.body http://localhost:8081/uploadFile
    run put-upload-file-method-not-allowed -X PUT -H 'Content-Length: 0' http://localhost:8081/uploadFile
    run get-unknown-path http://localhost:8081/unknown
-   rm -f /tmp/test.txt /tmp/file
+   rm -rf /tmp/test.txt /tmp/file /tmp/caf*-latin1.txt /tmp/qa /tmp/qa-sub
    ```
 
    The first argument of each `run` line is the scenario name, and the rest are its `curl` request arguments. `--data-binary @<file>` sends the body file's bytes unchanged, CRLFs included. The flow writes the file before it returns the response, so `produced` runs once `curl` has read the whole response.
@@ -256,7 +314,7 @@ The capture output of each scenario is kept unedited as the evidence for its fix
    curl -sS "http://localhost:$W/__admin/requests" > "target/fixture-capture/<scenario>-journal.json"
    ```
 
-5. `request` comes from the `> ` lines of `curl-trace.txt`, each read without its line ending: `method`, `path` and `query` (the raw query string without `?`, `""` when there is none) from the request line; then each `> Name: value` line is one `[name, value]` pair of `headers`, in the order sent, so a repeated name stays in separate pairs and is never joined; `body` is the bytes curl sent (the `--data-binary` argument, or the content of its `@file`); and `"port": 8081`.
+5. `request` comes from the `> ` lines of `curl-trace.txt`, each read without its line ending: `method`, `path` and `query` (the raw query string without `?`, `""` when there is none) from the request line; then each `> Name: value` line is one `[name, value]` pair of `headers`, in the order sent, so a repeated name stays in separate pairs and is never joined; `body` is the bytes curl sent (the `--data-binary` argument, or the content of its `@file`), written as `bodyBase64` instead when they are not valid UTF-8, as the byte `E9` of body D is not; and `"port": 8081`.
 6. `response` comes from `response.http` with only the HTTP/1.1 message framing removed, under the framing rules ST-1 applies on replay:
    - `status` and `reason`: the code and the reason phrase of the final status line, skipping any interim `1xx` response curl wrote before it.
    - `headers`: the `Content-Type` and `Location` values as received.
@@ -363,9 +421,9 @@ The capture output of each scenario is kept unedited as the evidence for its fix
    ```
 
    The journal lists the newest call first, so its entries are reversed into call order. `url` is the path and query relative to the WireMock base, so the fixture names no live host. A repeated header name becomes consecutive pairs at the position of its first occurrence, the order the journal keeps. Bodies are `bodyBase64`, the entity bytes as recorded: a chunked body in either direction is de-chunked with its trailer fields dropped, and a gzip-encoded response body keeps its encoded bytes and its `Content-Encoding` header, as step 6 defines for `response`. The command fails on a call no mapping proxied or that did not reach its upstream, which is captured again once the mapping is fixed, and on a request body with a `Content-Encoding`, which WireMock stores decoded and re-encodes on the proxied leg, so that scenario omits `upstream`.
-8. Write `fixtures/<scenario>.json` from `request` (step 5), `state` (`{"properties": {"upload.directory": "${dir:upload}"}, "directories": {"upload": []}}` for http-multipart-request, never `/tmp`), `upstream` (step 7) and `response` (step 6), every value as produced. `response.directories.upload` holds one `{name, body or bodyBase64}` entry per file in `src/test/capture/<scenario>/upload/`, its name as the original stored it and its bytes as `body` when they are valid UTF-8, otherwise as `bodyBase64`; it is `[]` when that directory holds no file. This maps the capture-side `/tmp` to the replay directory `upload`, and it is the only mapping applied. For an original with upstreams, `state.properties` points each upstream key of the Java project at `${wiremock.baseUrl}`, or host `localhost` and port `${wiremock.port}`, with the path the capture used, and gives each credential key its marker. Before committing, `grep -rF -e "<live value>" src/test/resources/fixtures src/test/capture` runs for every live value: a match in `upstream` or a journal means that scenario omits `upstream` and drops its journal, and a match in `request` or `response` means it gets no fixture. Captured values and entity bytes are never adjusted afterwards, to match the Java output or for any other reason.
+8. Write `fixtures/<scenario>.json` from `request` (step 5), `state` (`{"properties": {"upload.directory": "${dir:upload}"}, "directories": {"upload": []}}` for http-multipart-request, never `/tmp`), `upstream` (step 7) and `response` (step 6), every value as produced. `response.directories.upload` holds one `{name, body or bodyBase64}` entry per regular file directly in `src/test/capture/<scenario>/upload/`, its name as the original stored it and its bytes as `body` when they are valid UTF-8, otherwise as `bodyBase64`; it is `[]` when that directory holds no regular file. Each subdirectory found below it, at any depth, adds the key `upload/<subdirectory>` (its path relative to `upload/`), with one such entry per regular file directly inside it. A name is the file name as the capture host's file system lists it. This maps the capture-side `/tmp` to the replay directory `upload`, and it is the only mapping applied. For an original with upstreams, `state.properties` points each upstream key of the Java project at `${wiremock.baseUrl}`, or host `localhost` and port `${wiremock.port}`, with the path the capture used, and gives each credential key its marker. Before committing, `grep -rF -e "<live value>" src/test/resources/fixtures src/test/capture` runs for every live value: a match in `upstream` or a journal means that scenario omits `upstream` and drops its journal, and a match in `request` or `response` means it gets no fixture. Captured values and entity bytes are never adjusted afterwards, to match the Java output or for any other reason.
 
 ## Integrity rule
 
-- A fixture is never edited to match the Java output. A mismatch is fixed in the Java code; for `put-upload-file-method-not-allowed` and `get-unknown-path`, that means SC-1 `GlobalExceptionHandler`, for `post-upload-file-missing-part` SC-1 `GlobalExceptionHandler` and `service/UploadService`, for `get-upload-file` `controller/UploadController`, `service/UploadService` and SC-14 `mapper/ParseTemplateRenderer`, and for `post-upload-file` and `post-upload-file-attachment-request` `controller/UploadController`, `service/UploadService`, SC-2 `config/ReasonPhrase` and SC-6 `service/FileOutboundWriter`. No expected value is written by hand, in this file or in a fixture (AAP 0.8.4).
+- A fixture is never edited to match the Java output. A mismatch is fixed in the Java code; for `put-upload-file-method-not-allowed` and `get-unknown-path`, that means SC-1 `GlobalExceptionHandler`, for `post-upload-file-missing-part` SC-1 `GlobalExceptionHandler` and `service/UploadService`, for `get-upload-file` `controller/UploadController`, `service/UploadService` and SC-14 `mapper/ParseTemplateRenderer`, for `post-upload-file`, `post-upload-file-attachment-request`, `post-upload-file-absolute-filename` and `post-upload-file-nested-filename` `controller/UploadController`, `service/UploadService`, SC-2 `config/ReasonPhrase` and SC-6 `service/FileOutboundWriter`, for `post-upload-file-latin1-filename` those four and `config/MultipartHeaderCharsetConfig`, which decides how the part headers are decoded, and for `post-upload-file-write-failure` those four and SC-1 `GlobalExceptionHandler`. No expected value is written by hand, in this file or in a fixture (AAP 0.8.4).
 - `DECISIONS.md` records the Tier 2A blocked state ("Mule EE licence and EE Maven repository credentials unconfirmed") and the escalation of AAP 0.8.8: once both are confirmed, a human is notified to begin capture and receives the list of scenarios left unverified.

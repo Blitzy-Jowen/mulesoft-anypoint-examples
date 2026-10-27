@@ -517,7 +517,10 @@ class GreetingServiceTest {
         // A regular file where the endpoint's directory belongs: the directory cannot be created.
         Files.createFile(outDir);
 
-        assertThatThrownBy(() -> call.invoke(service)).isExactlyInstanceOf(FileAlreadyExistsException.class);
+        assertThatThrownBy(() -> call.invoke(service))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage("Streaming failed. Could not get output stream")
+                .hasCauseExactlyInstanceOf(FileAlreadyExistsException.class);
         assertThat(outDir).isRegularFile().isEmptyFile();
     }
 

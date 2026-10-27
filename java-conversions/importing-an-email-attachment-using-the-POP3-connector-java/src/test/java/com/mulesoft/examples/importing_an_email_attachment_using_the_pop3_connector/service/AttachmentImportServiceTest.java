@@ -333,8 +333,9 @@ class AttachmentImportServiceTest {
                 new AttachmentImportService(reader, mapper, writer, blocker.toString(), FILE_NAME);
 
         assertThatThrownBy(() -> blocked.process(List.of(octetStream(inputCsv))))
-                .isInstanceOf(IOException.class)
-                .isInstanceOf(FileAlreadyExistsException.class);
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage("Streaming failed. Could not get output stream")
+                .hasCauseExactlyInstanceOf(FileAlreadyExistsException.class);
 
         assertThat(blocker).isRegularFile().isEmptyFile();
         try (Stream<Path> entries = Files.list(tempDir)) {

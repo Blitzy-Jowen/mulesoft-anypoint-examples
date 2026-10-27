@@ -103,9 +103,10 @@ public class UploadService {
      * the opening quote, up to, not including, its last character, the closing quote.
      *
      * <p>The name is neither unquoted, decoded nor sanitised, and {@code filename*} is not read: the original
-     * stored the file under exactly this text, and the file writer resolves it against the upload directory as
-     * given, so a name with path segments reaches a path outside that directory as it did in Mule. Without
-     * {@code filename=} the range starts at index 9, as the expression computed it.
+     * stored the file under exactly this text, and the file writer joins it to the upload directory as Mule's file
+     * connector did, so a leading {@code /} keeps the file under that directory while a name with {@code ..}
+     * segments reaches a path outside it, as it did in Mule. Without {@code filename=} the range starts at index 9,
+     * as the expression computed it.
      *
      * @param contentDisposition the part's {@code Content-Disposition} header value
      * @return the file name, for example {@code test.txt} for {@code form-data; name="file"; filename="test.txt"}

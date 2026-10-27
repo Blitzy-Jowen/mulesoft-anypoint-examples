@@ -113,7 +113,8 @@ public class ShippingOrderExportService {
      * @param confirmation the confirmation the fulfillment service returned
      * @return the written file
      * @throws IllegalArgumentException when a part the CSV script navigates is {@code null}; no file is written
-     * @throws Exception                when the file cannot be written, unchanged from {@link FileOutboundWriter}
+     * @throws Exception                when the file cannot be written: the {@link java.io.IOException}
+     *                                  {@link FileOutboundWriter} reports the failure with, passed on as thrown
      */
     Path exportNow(ShippingOrderConfirmation confirmation) throws Exception {
         String content = mapper.toCsv(confirmation);

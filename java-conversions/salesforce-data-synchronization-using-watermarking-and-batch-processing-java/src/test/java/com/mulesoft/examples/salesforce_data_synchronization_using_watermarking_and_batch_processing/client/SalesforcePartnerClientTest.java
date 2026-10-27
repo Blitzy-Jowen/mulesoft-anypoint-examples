@@ -25,7 +25,9 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.ConnectException;
-import java.net.ServerSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -464,25 +466,23 @@ class SalesforcePartnerClientTest {
     @ParameterizedTest(name = "{0}")
     @MethodSource("everyOperation")
     void refusedConnectionIsUnavailableForEveryOperation(ClientCall operation) throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
+        try (Socket reservation = refusingLoopbackPort()) {
+            SalesforceProperties unreachable = new SalesforceProperties();
+            unreachable.setUsername(USERNAME);
+            unreachable.setPassword(PASSWORD);
+            unreachable.setSecurityToken(SECURITY_TOKEN);
+            unreachable.setAuthEndpoint(refusingBaseUrl(reservation) + LOGIN_PATH);
+            unreachable.setConnectTimeout(Duration.ofSeconds(2));
+            unreachable.setReadTimeout(Duration.ofMillis(500));
+            SalesforcePartnerClient client = new SalesforcePartnerClient(unreachable, executor, noSessionSource());
+
+            Throwable thrown = catchThrowable(() -> operation.invoke(client));
+
+            assertThat(thrown).isInstanceOfSatisfying(UpstreamUnavailableException.class, e -> {
+                assertThat(e.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
+                assertThat(causes(e)).anyMatch(ConnectException.class::isInstance);
+            });
         }
-        SalesforceProperties unreachable = new SalesforceProperties();
-        unreachable.setUsername(USERNAME);
-        unreachable.setPassword(PASSWORD);
-        unreachable.setSecurityToken(SECURITY_TOKEN);
-        unreachable.setAuthEndpoint("http://localhost:" + closedPort + LOGIN_PATH);
-        unreachable.setConnectTimeout(Duration.ofSeconds(2));
-        unreachable.setReadTimeout(Duration.ofMillis(500));
-        SalesforcePartnerClient client = new SalesforcePartnerClient(unreachable, executor, noSessionSource());
-
-        Throwable thrown = catchThrowable(() -> operation.invoke(client));
-
-        assertThat(thrown).isInstanceOfSatisfying(UpstreamUnavailableException.class, e -> {
-            assertThat(e.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
-            assertThat(causes(e)).anyMatch(ConnectException.class::isInstance);
-        });
     }
 
     @Test
@@ -719,6 +719,28 @@ class SalesforcePartnerClientTest {
 
     private static ObjectProvider<SessionSource> noSessionSource() {
         return new DefaultListableBeanFactory().getBeanProvider(SessionSource.class);
+    }
+
+    /**
+     * Reserves a free TCP port on 127.0.0.1 that refuses every connection: the socket is bound with address reuse
+     * disabled and never listens. While it stays open no other socket can bind or listen on that port, so close it
+     * only after the refused call and its assertions have run.
+     */
+    private static Socket refusingLoopbackPort() throws IOException {
+        Socket reservation = new Socket();
+        try {
+            reservation.setReuseAddress(false);
+            reservation.bind(new InetSocketAddress(InetAddress.getByAddress(new byte[] {127, 0, 0, 1}), 0));
+            return reservation;
+        } catch (IOException | RuntimeException e) {
+            reservation.close();
+            throw e;
+        }
+    }
+
+    /** The {@code http://127.0.0.1:<port>} base URL of a reservation made by {@link #refusingLoopbackPort()}. */
+    private static String refusingBaseUrl(Socket reservation) {
+        return "http://" + reservation.getLocalAddress().getHostAddress() + ":" + reservation.getLocalPort();
     }
 
     private String apiUrl() {

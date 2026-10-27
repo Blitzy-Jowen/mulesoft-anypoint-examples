@@ -17,6 +17,13 @@ server:
   port: ${ports.twitter-search}    # HTTP_Listener_Configuration, mule-component-bindings.xml:31
   address: localhost               # :31 host="localhost"
 
+logging:
+  level:
+    # Below INFO these loggers write credentials the original never logged. A logger's own level outranks
+    # logging.level.root and the --debug and --trace logger groups, so neither reaches them.
+    twitter4j: INFO   # consumer key and access token: in the OAuth base string, and the config dump of twitter4j.debug
+    sun.net.www.protocol.http.HttpURLConnection: INFO   # JDK client header dumps (JUL): OAuth Authorization, api_key, appid
+
 ports:
   twitter-search: 8081             # mule-component-bindings.xml:31
   stock-stats: 8180                # :40

@@ -24,8 +24,9 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * <p>Component scanning from this package root picks up the flows' parts: {@code controller.UploadController} (the
  * two {@code /uploadFile} listeners), {@code service.UploadService} (the template, file-name extraction, content-type
  * logger and reason phrase), {@code service.FileOutboundWriter} (the SC-6 file outbound endpoint),
- * {@code mapper.ParseTemplateRenderer} (the SC-14 parse-template), {@code config.PreflightDispatchConfig} and the
- * SC-1 {@code exception.GlobalExceptionHandler} (the platform-default error responses).
+ * {@code mapper.ParseTemplateRenderer} (the SC-14 parse-template), {@code config.MultipartHeaderCharsetConfig} (the
+ * listener's ISO-8859-1 decoding of multipart part headers), {@code config.PreflightDispatchConfig} and the SC-1
+ * {@code exception.GlobalExceptionHandler} (the platform-default error responses).
  */
 @SpringBootApplication
 public class HttpMultipartRequestApplication {

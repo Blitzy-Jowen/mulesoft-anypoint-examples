@@ -68,3 +68,17 @@ oauth:
       password: ${OAUTH_PROVIDER_OWNER_PASSWORD:}
       authorities:
         - RESOURCE_OWNER
+
+# Below INFO these loggers write the client secret, authorization codes, access tokens and the resource owner's
+# password, which the original never logged. A logger's own level outranks logging.level.root and the groups that
+# --debug and --trace raise, so pinning each at INFO, or WARN where noted, keeps them out of the log at every root level.
+logging:
+  level:
+    # request lines with their query (client_secret, code, access_token), the redirect view's URL with its code,
+    # and, with spring.mvc.log-request-details, the parameters and headers (Authorization, Location).
+    # WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    # response bodies written, the token JSON among them, and resolved exception messages
+    org.springframework.web.servlet.mvc.method.annotation: INFO
+    org.springframework.web.method.HandlerMethod: INFO   # handler arguments: owner password, client secret, code, Authorization
+    io.undertow.request.io: INFO                         # request-parse failures quoting a query value that does not decode
