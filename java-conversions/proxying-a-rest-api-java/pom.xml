@@ -31,6 +31,11 @@
     <properties>
         <java.version>17</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- The Boot 3.2.12 BOM resolves Undertow 2.3.17.Final, whose parser ends a header line at a bare CR, so
+             "X-Test: a<CR>Authorization: Bearer x" reaches the upstream as a separate Authorization header.
+             2.3.25.Final carries the strict HTTP/1.1 parser of undertow PR #1963 (UNDERTOW-2594, UNDERTOW-2595,
+             UNDERTOW-2596), which answers a bare CR in a header with 400 before any handler runs. -->
+        <undertow.version>2.3.25.Final</undertow.version>
     </properties>
 
     <dependencies>

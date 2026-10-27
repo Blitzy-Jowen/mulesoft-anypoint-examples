@@ -25,9 +25,11 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -37,6 +39,8 @@ import java.net.SocketTimeoutException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyStore;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -48,6 +52,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -88,8 +93,12 @@ import com.sun.net.httpserver.HttpsServer;
  * a request without body bytes is framed by its method; a TRACE with body bytes is refused before
  * anything is sent, and through {@link RestProxyService} the bytes of TRACE and PRI, which the Mule requester sent
  * without payload, never reach the upstream; a redirect carries the caller's headers only on the original origin,
- * and one from https to http is returned unfollowed, so nothing reaches the cleartext target; and
- * {@link BoxProxyClient#close()} releases pooled connections.
+ * and one from https to http is returned unfollowed, so nothing reaches the cleartext target;
+ * {@link BoxProxyClient#close()} releases pooled connections; and a body stream within
+ * {@link BoxProxyClient#BUFFERED_BODY_LIMIT_BYTES} keeps its exact length and the re-send of a 307, while a larger
+ * one reaches the upstream byte for byte as it arrives, with the caller's framing and under the write deadline, is
+ * answered by a redirect unfollowed, and is never sent with another length than the declared one nor completed after
+ * a failure.
  */
 class BoxProxyClientTransportTest {
 
@@ -389,7 +398,8 @@ class BoxProxyClientTransportTest {
         inbound.add(HttpHeaders.CONTENT_LENGTH, String.valueOf(body.length));
 
         ResponseEntity<byte[]> response = new RestProxyService(new ProxyHeaderMapper(), client)
-                .forward(HttpMethod.valueOf(methodName), "/trace/x", null, inbound, body);
+                .forward(HttpMethod.valueOf(methodName), "/trace/x", null, inbound, new ByteArrayInputStream(body),
+                        body.length);
 
         assertThat(response.getStatusCode().value()).isEqualTo(200);
         RequestHead head = raw.nextRequestHead();
@@ -533,6 +543,222 @@ class BoxProxyClientTransportTest {
         assertThat(raw.awaitClientClose(Duration.ofSeconds(5))).as("connection closed by close()").isTrue();
     }
 
+    static Stream<Arguments> streamedBodyFramings() {
+        long size = 16L * 1024 * 1024;
+        return Stream.of(
+                Arguments.of("declared length", size, size, null, String.valueOf(size), null, -1),
+                Arguments.of("no declared length", size, -1L, null, null, "chunked", -1),
+                Arguments.of("declared length and Expect: 100-continue", size, size, "100-continue",
+                        String.valueOf(size), null, 0));
+    }
+
+    // 16 MiB, far beyond the buffered limit, generated as it is read, so neither side holds the body to compare it.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("streamedBodyFramings")
+    void bodyStreamBeyondTheBufferedLimitReachesTheUpstreamByteExactWithTheCallersFraming(
+            String scenario, long size, long declaredLength, String expect, String contentLength,
+            String transferEncoding, int bytesBeforeContinue) throws Exception {
+        raw = new RawUpstream(RawUpstream::storeBodyThenAnswer);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+        HttpHeaders headers = new HttpHeaders();
+        if (expect != null) {
+            headers.add(HttpHeaders.EXPECT, expect);
+        }
+
+        ResponseEntity<byte[]> response = client.exchange(HttpMethod.PUT, "/2.0/files/1/content", null, headers,
+                CallerBody.of(size), declaredLength);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(response.getBody()).isEqualTo("stored".getBytes(US_ASCII));
+        RequestHead head = raw.nextRequestHead();
+        assertThat(head.requestLine()).isEqualTo("PUT /2.0/files/1/content HTTP/1.1");
+        assertThat(head.headers().get(HttpHeaders.CONTENT_LENGTH)).isEqualTo(contentLength);
+        assertThat(head.headers().get(HttpHeaders.TRANSFER_ENCODING)).isEqualTo(transferEncoding);
+        assertThat(head.headers()).doesNotContainKey(HttpHeaders.CONTENT_TYPE);
+        StoredBody stored = raw.nextStoredBody();
+        assertThat(stored.complete()).as("body complete").isTrue();
+        assertThat(stored.length()).isEqualTo(size);
+        assertThat(stored.sha256()).isEqualTo(CallerBody.sha256(size));
+        assertThat(raw.bytesBeforeContinue()).as("body bytes sent before 100 Continue").isEqualTo(bytesBeforeContinue);
+    }
+
+    // The upstream holds more than the client may buffer while the caller has not sent the rest yet, so the body is
+    // forwarded as it arrives rather than collected first.
+    @Test
+    void bodyStreamBeyondTheBufferedLimitReachesTheUpstreamWhileTheCallerIsStillSending() throws Exception {
+        long pauseAt = 4L * BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES;
+        long size = 5L * BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES;
+        raw = new RawUpstream(RawUpstream::storeBodyThenAnswer);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+        CallerBody body = CallerBody.of(size).pausingAt(pauseAt);
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<ResponseEntity<byte[]>> exchange = caller.submit(
+                    () -> client.exchange(HttpMethod.POST, "/2.0/files/content", null, new HttpHeaders(), body, size));
+
+            assertThat(body.awaitPause(Duration.ofSeconds(5))).as("caller stream blocked").isTrue();
+            await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertThat(raw.bodyBytes())
+                    .as("body bytes received while the caller is blocked")
+                    .isGreaterThan(BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES));
+            assertThat(body.position()).as("caller bytes read").isEqualTo(pauseAt);
+            assertThat(exchange).isNotDone();
+
+            body.resume();
+
+            ResponseEntity<byte[]> response = exchange.get(10, TimeUnit.SECONDS);
+            assertThat(response.getStatusCode().value()).isEqualTo(200);
+        } finally {
+            body.resume();
+            caller.shutdownNow();
+        }
+        StoredBody stored = raw.nextStoredBody();
+        assertThat(stored.complete()).as("body complete").isTrue();
+        assertThat(stored.length()).isEqualTo(size);
+        assertThat(stored.sha256()).isEqualTo(CallerBody.sha256(size));
+    }
+
+    static Stream<Arguments> bodiesWithinTheBufferedLimit() {
+        int limit = BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES;
+        return Stream.of(
+                Arguments.of(0, 0L),
+                Arguments.of(0, -1L),
+                Arguments.of(7, 7L),
+                Arguments.of(limit, (long) limit),
+                Arguments.of(limit, -1L));
+    }
+
+    // Read whole before it is sent, so a chunked caller's body too keeps its exact length and stays repeatable.
+    @ParameterizedTest(name = "{0} bytes, declared length {1}")
+    @MethodSource("bodiesWithinTheBufferedLimit")
+    void bodyStreamWithinTheBufferedLimitKeepsItsExactLengthAndIsResentByA307(int size, long declaredLength)
+            throws Exception {
+        byte[] body = CallerBody.of(size).readAllBytes();
+        upstream.stubFor(any(urlEqualTo("/from")).willReturn(aResponse().withStatus(307)
+                .withHeader(HttpHeaders.LOCATION, upstreamBaseUrl() + "/to")));
+        upstream.stubFor(any(urlEqualTo("/to")).willReturn(ok("done")));
+        client = new BoxProxyClient(null, upstreamBaseUrl(), TIMEOUT_MS, "", "", "");
+
+        ResponseEntity<byte[]> response = client.exchange(HttpMethod.POST, "/from", null, new HttpHeaders(),
+                new ByteArrayInputStream(body), declaredLength);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(response.getBody()).isEqualTo("done".getBytes(UTF_8));
+        for (String path : List.of("/from", "/to")) {
+            upstream.verify(1, new RequestPatternBuilder(RequestMethod.POST, urlEqualTo(path))
+                    .withHeader(HttpHeaders.CONTENT_LENGTH, equalTo(String.valueOf(size)))
+                    .withoutHeader(HttpHeaders.TRANSFER_ENCODING)
+                    .withRequestBody(binaryEqualTo(body)));
+        }
+    }
+
+    // httpclient5 follows no redirect of a body it cannot write again, so nothing is re-sent, nor sent as a GET.
+    @ParameterizedTest(name = "answered {0}")
+    @ValueSource(ints = {301, 302, 303, 307, 308})
+    void redirectAnsweringAStreamedBodyIsReturnedAsReceivedAndNothingIsResent(int status) throws Exception {
+        int size = 2 * BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES;
+        byte[] body = CallerBody.of(size).readAllBytes();
+        String location = upstreamBaseUrl() + "/to";
+        upstream.stubFor(any(urlEqualTo("/from")).willReturn(aResponse().withStatus(status)
+                .withHeader(HttpHeaders.LOCATION, location).withBody("moved")));
+        upstream.stubFor(any(urlEqualTo("/to")).willReturn(ok("done")));
+        client = new BoxProxyClient(null, upstreamBaseUrl(), TIMEOUT_MS, "", "", "");
+
+        ResponseEntity<byte[]> response = client.exchange(HttpMethod.POST, "/from", null, new HttpHeaders(),
+                new ByteArrayInputStream(body), size);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(status);
+        assertThat(response.getHeaders().getFirst(HttpHeaders.LOCATION)).isEqualTo(location);
+        assertThat(response.getBody()).isEqualTo("moved".getBytes(UTF_8));
+        upstream.verify(1, new RequestPatternBuilder(RequestMethod.POST, urlEqualTo("/from"))
+                .withHeader(HttpHeaders.CONTENT_LENGTH, equalTo(String.valueOf(size)))
+                .withRequestBody(binaryEqualTo(body)));
+        upstream.verify(0, anyRequestedFor(urlEqualTo("/to")));
+    }
+
+    static Stream<Arguments> bodiesThatCannotBeSentAsDeclared() {
+        long limit = BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES;
+        return Stream.of(
+                Arguments.of("streamed body ending before its declared length", CallerBody.of(3 * limit),
+                        3 * limit + 1000, 1),
+                Arguments.of("streamed body running past its declared length", CallerBody.of(3 * limit), 2 * limit, 1),
+                Arguments.of("streamed body running past a declared length its buffered bytes end on",
+                        CallerBody.of(3 * limit), limit + 1, 1),
+                Arguments.of("caller stream failing within a declared length", CallerBody.of(3 * limit)
+                        .failingAt(2 * limit), 3 * limit, 1),
+                Arguments.of("caller stream failing within a chunked body", CallerBody.of(3 * limit)
+                        .failingAt(2 * limit), -1L, 1),
+                Arguments.of("declared length shorter than the bytes buffered", CallerBody.of(3 * limit), limit / 2, 0),
+                Arguments.of("small body ending before its declared length", CallerBody.of(100), 200L, 0),
+                Arguments.of("small body running past its declared length", CallerBody.of(100), 50L, 0),
+                Arguments.of("caller stream failing within the buffered limit", CallerBody.of(100).failingAt(50),
+                        100L, 0));
+    }
+
+    // Without the length check the upstream would wait for the missing bytes until the timeout, and without
+    // discarding the connection httpcore5 would end a chunked body cut short with its last chunk, as if complete.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("bodiesThatCannotBeSentAsDeclared")
+    void bodyStreamThatCannotBeSentAsDeclaredFailsAtOnceAndNeverReachesTheUpstreamComplete(
+            String scenario, CallerBody body, long declaredLength, int connections) throws Exception {
+        raw = new RawUpstream(RawUpstream::storeBodyThenAnswer);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+
+        long started = System.nanoTime();
+        Throwable failure = assertTimeoutPreemptively(Duration.ofSeconds(10), () -> catchThrowable(
+                () -> client.exchange(HttpMethod.POST, "/2.0/files/content", null, new HttpHeaders(), body,
+                        declaredLength)));
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertThat(failure).isInstanceOf(ResourceAccessException.class);
+        assertThat(causeChain(failure)).hasAtLeastOneElementOfType(IOException.class);
+        assertThat(elapsedMs).as("elapsed, well inside the %d ms timeout", TIMEOUT_MS).isLessThan(3000);
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3))
+                .untilAsserted(() -> assertThat(raw.accepted()).as("connections accepted").isEqualTo(connections));
+        if (connections > 0) {
+            // Once the upstream has seen the connection end, whatever it read of the body has been recorded; a
+            // failure before the first body byte leaves even the request head unsent, so nothing is read at all.
+            assertThat(raw.awaitClientClose(Duration.ofSeconds(5))).as("connection closed by the client").isTrue();
+        }
+        assertThat(raw.storedBodies()).as("bodies the upstream read").noneMatch(StoredBody::complete);
+    }
+
+    // The bytes past the buffered limit change nothing: the entity is refused before a connection is opened.
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"TRACE", "trace"})
+    void traceWithAStreamedBodyIsRefusedBeforeAnythingReachesTheUpstream(String methodName) throws Exception {
+        raw = new RawUpstream(RawUpstream::answerEmpty);
+        client = new BoxProxyClient(null, raw.baseUrl(), TIMEOUT_MS, "", "", "");
+        long size = 2L * BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES;
+
+        Throwable failure = catchThrowable(() -> client.exchange(HttpMethod.valueOf(methodName), "/trace/x", null,
+                new HttpHeaders(), CallerBody.of(size), size));
+
+        assertThat(failure).isExactlyInstanceOf(IllegalStateException.class).hasMessageContaining("TRACE");
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3))
+                .untilAsserted(() -> assertThat(raw.accepted()).as("connections accepted").isZero());
+    }
+
+    // The write deadline bounds the writes of a streamed body as it bounds those of a buffered one.
+    @Test
+    void streamedBodyTheUpstreamNeverReadsTimesOutOnceAndReleasesItsConnection() throws Exception {
+        raw = new RawUpstream(RawUpstream::neverReadBody);
+        client = new BoxProxyClient(null, raw.baseUrl(), STALL_TIMEOUT_MS, "", "", "");
+        long size = 16L * 1024 * 1024;
+
+        long started = System.nanoTime();
+        Throwable failure = assertTimeoutPreemptively(Duration.ofSeconds(10), () -> catchThrowable(
+                () -> client.exchange(HttpMethod.POST, "/stall", null, new HttpHeaders(), CallerBody.of(size), size)));
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertThat(failure).isInstanceOf(ResourceAccessException.class);
+        assertThat(causeChain(failure)).hasAtLeastOneElementOfType(SocketTimeoutException.class);
+        assertThat(elapsedMs).isLessThan(3000);
+        raw.release();
+        assertThat(raw.awaitClientClose(Duration.ofSeconds(5))).as("connection closed by the client").isTrue();
+        await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3))
+                .untilAsserted(() -> assertThat(raw.accepted()).as("connections accepted").isEqualTo(1));
+    }
+
     private static String upstreamBaseUrl() {
         return "http://127.0.0.1:" + upstream.getPort();
     }
@@ -643,6 +869,10 @@ class BoxProxyClientTransportTest {
 
         private final AtomicLong unreadBytes = new AtomicLong();
 
+        private final AtomicLong bodyBytes = new AtomicLong();
+
+        private final BlockingQueue<StoredBody> storedBodies = new LinkedBlockingQueue<>();
+
         private final CountDownLatch clientClosed = new CountDownLatch(1);
 
         private final CountDownLatch released = new CountDownLatch(1);
@@ -692,6 +922,87 @@ class BoxProxyClientTransportTest {
             out.write("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\ncreated".getBytes(US_ASCII));
         }
 
+        /**
+         * Answers {@code Expect: 100-continue} as {@link #continueThenAnswer} does, reads the body as its head frames
+         * it, by {@code Content-Length} or chunked, counting its bytes as they arrive, and records its length,
+         * SHA-256 and whether it arrived complete. Only a complete body is answered: 200 "stored".
+         */
+        static void storeBodyThenAnswer(RawUpstream upstream, RequestHead head, InputStream in, OutputStream out)
+                throws IOException, InterruptedException {
+            if ("100-continue".equalsIgnoreCase(head.headers().get(HttpHeaders.EXPECT))) {
+                TimeUnit.MILLISECONDS.sleep(200);
+                upstream.bytesBeforeContinue.set(in.available());
+                out.write("HTTP/1.1 100 Continue\r\n\r\n".getBytes(US_ASCII));
+                out.flush();
+            }
+            MessageDigest digest = sha256();
+            String contentLength = head.headers().get(HttpHeaders.CONTENT_LENGTH);
+            boolean complete;
+            try {
+                complete = contentLength != null
+                        ? upstream.readBody(in, Long.parseLong(contentLength), digest)
+                        : upstream.readChunkedBody(in, digest);
+            } catch (IOException e) {
+                // A reset is the client abandoning the request part-way.
+                complete = false;
+            }
+            upstream.storedBodies.add(new StoredBody(upstream.bodyBytes.get(), digest.digest(), complete));
+            if (complete) {
+                out.write("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nstored".getBytes(US_ASCII));
+            }
+        }
+
+        /** Reads {@code length} body bytes into {@code digest}; {@code false} when the connection ends first. */
+        private boolean readBody(InputStream in, long length, MessageDigest digest) throws IOException {
+            byte[] buffer = new byte[8192];
+            for (long remaining = length; remaining > 0; ) {
+                int read = in.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                if (read == -1) {
+                    return false;
+                }
+                digest.update(buffer, 0, read);
+                bodyBytes.addAndGet(read);
+                remaining -= read;
+            }
+            return true;
+        }
+
+        /**
+         * Reads a chunked body's data into {@code digest} through its last chunk and trailer section; {@code false}
+         * when the connection ends first.
+         */
+        private boolean readChunkedBody(InputStream in, MessageDigest digest) throws IOException {
+            for (String sizeLine = readLine(in); sizeLine != null; sizeLine = readLine(in)) {
+                int extension = sizeLine.indexOf(';');
+                long size = Long.parseLong((extension < 0 ? sizeLine : sizeLine.substring(0, extension)).trim(), 16);
+                if (size == 0) {
+                    for (String trailer = readLine(in); trailer != null; trailer = readLine(in)) {
+                        if (trailer.isEmpty()) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                if (!readBody(in, size, digest) || !"".equals(readLine(in))) {
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        /** One line without its CRLF, or {@code null} when the connection ends before the line does. */
+        private static String readLine(InputStream in) throws IOException {
+            ByteArrayOutputStream line = new ByteArrayOutputStream();
+            for (int b = in.read(); b != -1; b = in.read()) {
+                if (b == '\n') {
+                    String text = line.toString(ISO_8859_1);
+                    return text.endsWith("\r") ? text.substring(0, text.length() - 1) : text;
+                }
+                line.write(b);
+            }
+            return null;
+        }
+
         String baseUrl() {
             return "http://" + authority();
         }
@@ -720,6 +1031,21 @@ class BoxProxyClientTransportTest {
 
         int accepted() {
             return accepted.get();
+        }
+
+        /** Body bytes {@link #storeBodyThenAnswer} has read so far. */
+        long bodyBytes() {
+            return bodyBytes.get();
+        }
+
+        List<StoredBody> storedBodies() {
+            return List.copyOf(storedBodies);
+        }
+
+        StoredBody nextStoredBody() throws InterruptedException {
+            StoredBody body = storedBodies.poll(10, TimeUnit.SECONDS);
+            assertThat(body).as("request body read").isNotNull();
+            return body;
         }
 
         /** Lets a {@link #neverReadBody} connection go on to read, so it can see the client close. */
@@ -793,6 +1119,136 @@ class BoxProxyClientTransportTest {
                 matched = b == terminator[matched] ? matched + 1 : (b == '\r' ? 1 : 0);
             }
             return head.toString(ISO_8859_1);
+        }
+    }
+
+    /** A request body a raw upstream read: how many bytes arrived, their SHA-256, and whether the body was complete. */
+    record StoredBody(long length, byte[] sha256, boolean complete) {
+    }
+
+    private static MessageDigest sha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required of every Java platform", e);
+        }
+    }
+
+    /**
+     * A caller's request body of {@code size} bytes generated from their offsets as they are read, so no test holds
+     * a large body in memory, read as the listener's stream is read: it can block at one offset until
+     * {@link #resume()}, as a caller that has not sent the rest yet, or fail at one with an {@link IOException}, as a
+     * caller that goes away.
+     */
+    static final class CallerBody extends InputStream {
+
+        private final long size;
+
+        private final long pauseAt;
+
+        private final long failAt;
+
+        private final CountDownLatch paused = new CountDownLatch(1);
+
+        private final CountDownLatch resumed = new CountDownLatch(1);
+
+        private volatile long position;
+
+        private CallerBody(long size, long pauseAt, long failAt) {
+            this.size = size;
+            this.pauseAt = pauseAt;
+            this.failAt = failAt;
+        }
+
+        static CallerBody of(long size) {
+            return new CallerBody(size, -1, -1);
+        }
+
+        /** The same body, blocking once {@code offset} bytes have been read until {@link #resume()}. */
+        CallerBody pausingAt(long offset) {
+            return new CallerBody(size, offset, failAt);
+        }
+
+        /** The same body, failing once {@code offset} bytes have been read. */
+        CallerBody failingAt(long offset) {
+            return new CallerBody(size, pauseAt, offset);
+        }
+
+        /** The SHA-256 of the first {@code size} bytes every such body yields. */
+        static byte[] sha256(long size) throws IOException {
+            MessageDigest digest = BoxProxyClientTransportTest.sha256();
+            byte[] buffer = new byte[8192];
+            try (InputStream body = of(size)) {
+                for (int read = body.read(buffer); read != -1; read = body.read(buffer)) {
+                    digest.update(buffer, 0, read);
+                }
+            }
+            return digest.digest();
+        }
+
+        boolean awaitPause(Duration timeout) throws InterruptedException {
+            return paused.await(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        }
+
+        void resume() {
+            resumed.countDown();
+        }
+
+        /** Bytes read so far. */
+        long position() {
+            return position;
+        }
+
+        @Override
+        public int read() throws IOException {
+            byte[] one = new byte[1];
+            return read(one, 0, 1) == -1 ? -1 : one[0] & 0xFF;
+        }
+
+        @Override
+        public int read(byte[] bytes, int offset, int length) throws IOException {
+            Objects.checkFromIndexSize(offset, length, bytes.length);
+            if (length == 0) {
+                return 0;
+            }
+            if (position == pauseAt && resumed.getCount() > 0) {
+                paused.countDown();
+                try {
+                    if (!resumed.await(10, TimeUnit.SECONDS)) {
+                        throw new IOException("The caller never sent the rest of its body");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new InterruptedIOException("Interrupted while the caller's body was blocked");
+                }
+            }
+            if (position == failAt) {
+                throw new IOException("The caller closed its connection part-way through its body");
+            }
+            if (position >= size) {
+                return -1;
+            }
+            long end = size;
+            if (pauseAt > position) {
+                end = Math.min(end, pauseAt);
+            }
+            if (failAt > position) {
+                end = Math.min(end, failAt);
+            }
+            int count = (int) Math.min(length, end - position);
+            for (int i = 0; i < count; i++) {
+                bytes[offset + i] = byteAt(position + i);
+            }
+            position += count;
+            return count;
+        }
+
+        /** SplitMix64's finaliser over the offset, so neighbouring bytes and repeated runs differ. */
+        private static byte byteAt(long offset) {
+            long z = (offset + 1) * 0x9E3779B97F4A7C15L;
+            z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+            z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+            return (byte) (z ^ (z >>> 31));
         }
     }
 

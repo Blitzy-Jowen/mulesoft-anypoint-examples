@@ -9,6 +9,9 @@
 package com.mulesoft.examples.proxying_a_rest_api.client;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.any;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.binaryEqualTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
@@ -338,6 +341,47 @@ class BoxProxyClientTest {
                         .getStatusCode().value()).isEqualTo(200);
             }
         }).doesNotThrowAnyException();
+    }
+
+    // Appended to the upstream URL, "@evil.example/x" would turn its host and port into user information of
+    // evil.example; the listener never hands such a path over, and the client refuses it should one arrive.
+    @ParameterizedTest(name = "rawPath \"{0}\"")
+    @ValueSource(strings = {"@evil.example/x", "evil.example/x", ":8443/x", "evil.example:8443", "*", "?q=1", ""})
+    void pathWithoutLeadingSlashIsRefusedWithoutRepeatingTheUpstreamUrl(String rawPath) {
+        try (BoxProxyClient client = httpClient()) {
+            assertThatThrownBy(() -> client.exchange(HttpMethod.GET, rawPath, null, new HttpHeaders(), null))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("The request path must start with '/'");
+        }
+        wm.verify(0, anyRequestedFor(anyUrl()));
+    }
+
+    // Whatever follows the leading '/', the configured scheme, host and port stay the target.
+    @ParameterizedTest(name = "rawPath \"{0}\"")
+    @ValueSource(strings = {"//evil.example/x", "/@evil.example:8443/x", "/http://evil.example/", "/"})
+    void pathWithLeadingSlashReachesOnlyTheConfiguredUpstream(String rawPath) {
+        wm.stubFor(any(anyUrl()).willReturn(ok()));
+
+        try (BoxProxyClient client = httpClient()) {
+            assertThat(client.exchange(HttpMethod.GET, rawPath, "q=1", new HttpHeaders(), null)
+                    .getStatusCode().value()).isEqualTo(200);
+        }
+        wm.verify(1, getRequestedFor(urlEqualTo(rawPath + "?q=1")));
+    }
+
+    // Every request would fail with an error naming the URL, credentials included, so the application must not start.
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"http://user:pw@localhost:1", "https://user@localhost:1/", "http://:pw@localhost:1",
+            "http://user:pw@localhost:1/base", "http://@localhost:1", "http://user:p w@localhost:1"})
+    void upstreamUrlWithUserInformationFailsConstructionWithoutRepeatingIt(String upstreamUrl) {
+        assertThatThrownBy(() -> new BoxProxyClient(new DefaultResourceLoader(), upstreamUrl, RESPONSE_TIMEOUT_MS,
+                "", "", ""))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("proxy.upstream-url must ")
+                .hasMessageNotContaining("user")
+                .hasMessageNotContaining("pw")
+                .hasMessageNotContaining("p w")
+                .hasNoCause();
     }
 
     private static ResponseEntity<byte[]> sendWithBody(HttpMethod method, String path, String contentType,

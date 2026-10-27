@@ -8,6 +8,7 @@
 
 package com.mulesoft.examples.proxying_a_rest_api.service;
 
+import java.io.InputStream;
 import java.util.Set;
 
 import org.springframework.http.HttpHeaders;
@@ -41,6 +42,12 @@ import com.mulesoft.examples.proxying_a_rest_api.mapper.ProxyHeaderMapper;
  *       sent without one too: the requester's Grizzly client writes no payload for a method whose payload
  *       expectation is {@code NOT_ALLOWED}, so their bytes never left Mule. Every other method sends the request
  *       bytes, an empty body included.</li>
+ *   <li>{@code requestStreamingMode} AUTO: the listener's payload is a stream, and the requester streamed it. The
+ *       caller's body stream is therefore passed on unread, and {@link BoxProxyClient} holds at most one byte more
+ *       than {@code BoxProxyClient.BUFFERED_BODY_LIMIT_BYTES} of it in memory, whatever its size: a body within that
+ *       limit is sent with its exact length and re-sent by a 307 or 308 redirect, a larger one is streamed with
+ *       the caller's declared length, or chunked when none was declared, and a redirect answering it is returned
+ *       unfollowed, so the listener answers it 200 like any 3xx the requester did not follow.</li>
  *   <li>The second {@code copy-headers} removes {@code http.status} with the other {@code http.*} properties, so the
  *       listener answers 200 for every upstream status below 400: 201, a 3xx the requester did not follow and 304
  *       alike.</li>
@@ -50,7 +57,8 @@ import com.mulesoft.examples.proxying_a_rest_api.mapper.ProxyHeaderMapper;
  *       and the flow's runtime behaviour governs.</li>
  * </ul>
  *
- * <p>The service is stateless and thread-safe; it never modifies the headers or body it is given.
+ * <p>The service is stateless and thread-safe; it never modifies the headers it is given and never reads the body
+ * stream itself: the client reads it once, as it sends it, and a bodiless method leaves it unread.
  */
 @Service
 public class RestProxyService {
@@ -86,24 +94,30 @@ public class RestProxyService {
     /**
      * Forwards one caller request to the upstream API and returns what the original listener answered.
      *
-     * @param method   the caller's request method, any token
-     * @param rawPath  the caller's request path, still percent-encoded; passed through untouched
-     * @param rawQuery the caller's query string without {@code ?}, still percent-encoded, or {@code null};
-     *                 passed through untouched
-     * @param inbound  the caller's request headers, filtered by {@link ProxyHeaderMapper#toUpstream}
-     * @param body     the caller's request bytes, or {@code null}; dropped for GET, HEAD, OPTIONS, TRACE, CONNECT
-     *                 and PRI, otherwise forwarded as given, {@code null} as an empty body
+     * @param method        the caller's request method, any token
+     * @param rawPath       the caller's request path, still percent-encoded; passed through untouched
+     * @param rawQuery      the caller's query string without {@code ?}, still percent-encoded, or {@code null};
+     *                      passed through untouched
+     * @param inbound       the caller's request headers, filtered by {@link ProxyHeaderMapper#toUpstream}
+     * @param body          the caller's request body stream, or {@code null} for none; left unread and dropped for
+     *                      GET, HEAD, OPTIONS, TRACE, CONNECT and PRI, otherwise forwarded by
+     *                      {@link BoxProxyClient#exchange(HttpMethod, String, String, HttpHeaders, InputStream, long)},
+     *                      which reads it once and never holds more than a bounded prefix of it in memory; a body
+     *                      larger than that prefix is streamed, and a redirect answering it is returned unfollowed
+     *                      and answered 200 (a Tier 2A verification point)
+     * @param contentLength the length the caller declared for {@code body}, or -1 when it declared none (chunked)
      * @return 200 with the upstream response headers filtered by {@link ProxyHeaderMapper#toCaller} and the upstream
      *         body bytes unparsed, an empty array when the upstream sent none
      * @throws IllegalStateException when the upstream status is 400 or above, with {@link #VALIDATOR_FAILURE_MESSAGE}
      *                               formatted with that status
      */
     public ResponseEntity<byte[]> forward(HttpMethod method, String rawPath, String rawQuery,
-                                          HttpHeaders inbound, byte[] body) {
+                                          HttpHeaders inbound, InputStream body, long contentLength) {
         HttpHeaders outbound = proxyHeaderMapper.toUpstream(inbound);
-        byte[] bodyOrNull = BODILESS_METHODS.contains(method) ? null : (body != null ? body : new byte[0]);
+        boolean bodiless = BODILESS_METHODS.contains(method);
 
-        ResponseEntity<byte[]> upstream = boxProxyClient.exchange(method, rawPath, rawQuery, outbound, bodyOrNull);
+        ResponseEntity<byte[]> upstream = boxProxyClient.exchange(method, rawPath, rawQuery, outbound,
+                bodiless ? null : body, bodiless ? -1 : contentLength);
 
         int status = upstream.getStatusCode().value();
         if (status >= 400) {

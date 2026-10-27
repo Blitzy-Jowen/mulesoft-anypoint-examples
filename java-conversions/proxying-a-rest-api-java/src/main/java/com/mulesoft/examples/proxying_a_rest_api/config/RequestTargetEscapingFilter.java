@@ -32,7 +32,10 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * non-ASCII byte among them, is treated the same way.
  *
  * <p>Undertow accepts such a target and keeps it undecoded because {@code server.undertow.decode-url} is off and its
- * {@code ALLOW_UNESCAPED_CHARACTERS_IN_URL} option is on, each byte becoming one ISO-8859-1 character. Two later
+ * {@code ALLOW_UNESCAPED_CHARACTERS_IN_URL} option is on, each byte becoming one ISO-8859-1 character. The one
+ * exception is a {@code %} followed by neither two hexadecimal digits nor another {@code %}, as in {@code %zz},
+ * {@code %4} or a final {@code %}, which Undertow's HTTP/1.1 parser answers with 400 whatever its options, before this
+ * filter runs; the filter still escapes such a {@code %} for a request that reaches it without that parser. Two later
  * steps would still refuse it: Spring MVC's path parsing fails on an invalid escape before any handler or advice
  * runs, and {@code java.net.URI}, which carries the upstream URL, rejects the raw characters and reads a {@code #} as
  * the start of a fragment, dropping the rest of the target. This filter runs before every other filter and the

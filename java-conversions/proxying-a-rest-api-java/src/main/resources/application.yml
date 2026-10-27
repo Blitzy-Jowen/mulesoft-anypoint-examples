@@ -15,6 +15,9 @@ server:
         # The original Grizzly listener accepted targets with raw | { } ^ " < > ` \ and the like and forwarded them;
         # Undertow answers them with a bare 400 unless this option is on.
         ALLOW_UNESCAPED_CHARACTERS_IN_URL: true
+        # No request body size limit, as the original listener had none. Undertow 2.3.25 caps a body at 2 MB by
+        # default and server.undertow.max-http-post-size only passes positive values, so -1 is set here.
+        MAX_ENTITY_SIZE: -1
 spring:
   application:
     name: proxying-a-rest-api-java
@@ -42,3 +45,12 @@ keystore:
   key: ${KEYSTORE_KEY:}
   # TODO: supply the private-key password — Mule tls:key-store keyPassword
   password: ${KEYSTORE_PASSWORD:}
+logging:
+  level:
+    # Below INFO these loggers write the caller's Authorization, cookies, other headers, query and body, which the
+    # original never logged. Pinned here so a root DEBUG or TRACE does not reach them; an explicit DEBUG or TRACE for
+    # one of them has no effect either, because config.SensitiveLogGuard denies their DEBUG and TRACE events.
+    org.apache.hc: INFO                                  # httpclient5 transport: headers, wire bytes, request line, redirect Location, cookies
+    org.springframework.web.servlet.DispatcherServlet: INFO   # request line with query; parameters (consuming a form body) and headers
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # handled exception messages
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO          # the 500 body carrying that message

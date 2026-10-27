@@ -19,7 +19,6 @@ import io.undertow.util.HttpString;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
-import org.springframework.util.StreamUtils;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -34,7 +33,9 @@ import com.mulesoft.examples.proxying_a_rest_api.service.RestProxyService;
  * <p>The class only binds the caller's request and writes the answer back. Header copying, the upstream call and
  * the treatment of the upstream status belong to {@link RestProxyService}. The request is read raw, never as
  * parameters or parts, so form and multipart bodies, the percent-encoding of path and query, and the caller's
- * {@code Authorization} header reach the service exactly as sent. The handlers write the response themselves
+ * {@code Authorization} header reach the service exactly as sent. The body is handed over unread, as the request's
+ * input stream with its declared length, so it reaches the upstream as a stream, as the Mule listener's stream
+ * payload did, and is never held in memory whole. The handlers write the response themselves
  * instead of returning a value, so Spring MVC adds no {@code Content-Type} from {@code Accept} negotiation,
  * answers no conditional request with 304 from the upstream {@code ETag} or {@code Last-Modified}, and does not
  * fail on a {@code Content-Type} or {@code Accept} it cannot parse. Any exception from the service, such as the
@@ -51,8 +52,14 @@ import com.mulesoft.examples.proxying_a_rest_api.service.RestProxyService;
  * <ul>
  *   <li>the response is written with a fixed {@code Content-Length}, never chunked;</li>
  *   <li>multipart forwarding is a Tier 2A verification point;</li>
- *   <li>{@code DEBUG} logging of {@code org.springframework.web.servlet.DispatcherServlet} reads the request
- *       parameters to log them, which consumes a form body before it can be forwarded.</li>
+ *   <li>Undertow's parser drops the leading and trailing whitespace of a request header value and keeps only the
+ *       first SP or HTAB of every run inside it, with no option to turn that off, so a Digest
+ *       {@code username="John  Smith"} reaches the upstream as {@code username="John Smith"} and the upstream may
+ *       reject the credential; the Mule listener kept the value as sent (Tier 2A verification point);</li>
+ *   <li>a request whose header value holds a CR, an LF or another control character except HTAB, one whose target
+ *       holds a {@code %} followed by neither two hexadecimal digits nor another {@code %}, and an absolute-form
+ *       target whose host the {@code Host} header does not name are answered with an empty 400 before any handler
+ *       runs, so none of them is forwarded (Tier 2A verification point).</li>
  * </ul>
  */
 @RestController
@@ -73,9 +80,10 @@ public class RestProxyController {
      * pre-flight is matched by its {@code Access-Control-Request-Method} instead, so it arrives here unless that
      * header names {@code OPTIONS}, and it is forwarded as the {@code OPTIONS} request it is.
      *
-     * @param request  the caller's request, read raw
+     * @param request  the caller's request, read raw; its body is passed on as its input stream and
+     *                 {@link HttpServletRequest#getContentLengthLong() declared length}, unread
      * @param response written with the status, headers and body bytes {@link RestProxyService#forward} returns
-     * @throws IOException when the request body cannot be read or the response cannot be written
+     * @throws IOException when the request body stream cannot be opened or the response cannot be written
      */
     @RequestMapping("/**")
     public void proxy(HttpServletRequest request, HttpServletResponse response) throws IOException {
@@ -88,9 +96,9 @@ public class RestProxyController {
                 headers.add(name, value);
             }
         }
-        byte[] body = StreamUtils.copyToByteArray(request.getInputStream());
 
-        ResponseEntity<byte[]> result = restProxyService.forward(method, rawPath, rawQuery, headers, body);
+        ResponseEntity<byte[]> result = restProxyService.forward(method, rawPath, rawQuery, headers,
+                request.getInputStream(), request.getContentLengthLong());
 
         byte[] bytes = result.getBody() != null ? result.getBody() : new byte[0];
         response.setStatus(result.getStatusCode().value());
@@ -113,7 +121,7 @@ public class RestProxyController {
      *
      * @param request  the caller's request, read raw
      * @param response written as by {@link #proxy}
-     * @throws IOException when the request body cannot be read or the response cannot be written
+     * @throws IOException when the request body stream cannot be opened or the response cannot be written
      */
     @RequestMapping(path = "/**", method = RequestMethod.OPTIONS)
     public void options(HttpServletRequest request, HttpServletResponse response) throws IOException {

@@ -12,14 +12,19 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
@@ -43,10 +48,11 @@ import com.mulesoft.examples.proxying_a_rest_api.mapper.ProxyHeaderMapper;
 
 /**
  * Unit test of {@link RestProxyService}, the original flow {@code rest-api-proxy}: SC-13 header copying on the
- * caller's headers, one upstream call with the caller's method, raw path, raw query and the body the Mule
- * requester sent for that method, the requester's default success-status validator, and SC-13 header copying on
- * the upstream response. The client is a Mockito mock and the header mapper the real SC-13 component, so the
- * headers each leg carries are the ones the running proxy produces.
+ * caller's headers, one upstream call with the caller's method, raw path, raw query and, for the methods the Mule
+ * requester sent a body with, the caller's body stream unread with its declared length, the requester's default
+ * success-status validator, and SC-13 header copying on the upstream response. The client is a Mockito mock and
+ * the header mapper the real SC-13 component, so the headers each leg carries are the ones the running proxy
+ * produces.
  */
 class RestProxyServiceTest {
 
@@ -64,42 +70,39 @@ class RestProxyServiceTest {
     private final RestProxyService service = new RestProxyService(headerMapper, client);
 
     /**
-     * Caller method, the body the caller sent, and the body the client must receive: none for GET, HEAD and
-     * OPTIONS ({@code sendBodyMode} AUTO) and for TRACE, CONNECT and PRI (no payload from the requester's Grizzly
-     * client) whatever was sent; for every other method, an extension method or a lower-case {@code trace} token
-     * included, the bytes as sent, an empty or absent body as empty bytes.
+     * Caller method, the length the caller declared for its body, and whether the client receives the body: not
+     * for GET, HEAD and OPTIONS ({@code sendBodyMode} AUTO) nor for TRACE, CONNECT and PRI (no payload from the
+     * requester's Grizzly client), whatever was sent; for every other method, an extension method or a lower-case
+     * {@code trace} token included, the caller's stream itself with its declared length, an empty body, a small
+     * one, one far larger than any buffer and one of undeclared length (chunked) alike.
      */
     static Stream<Arguments> requestBodies() {
+        List<Named<Long>> declaredLengths = List.of(Named.of("an empty body", 0L),
+                Named.of("the request bytes", (long) REQUEST_BODY.length),
+                Named.of("a 64 MiB body", 64L * 1024 * 1024), Named.of("a chunked body", -1L));
         Stream<Arguments> bodiless = Stream.of("GET", "HEAD", "OPTIONS", "TRACE", "CONNECT", "PRI")
-                .flatMap(method -> Stream.of(
-                        Arguments.of(method, Named.of("request bytes", REQUEST_BODY), null),
-                        Arguments.of(method, Named.of("empty bytes", new byte[0]), null),
-                        Arguments.of(method, Named.of("no body", null), null)));
+                .flatMap(method -> declaredLengths.stream().map(length -> Arguments.of(method, length, false)));
         Stream<Arguments> bodied = Stream.of("POST", "PUT", "PATCH", "DELETE", "PROPFIND", "trace")
-                .flatMap(method -> Stream.of(
-                        Arguments.of(method, Named.of("request bytes", REQUEST_BODY), REQUEST_BODY),
-                        Arguments.of(method, Named.of("empty bytes", new byte[0]), new byte[0]),
-                        Arguments.of(method, Named.of("no body", null), new byte[0])));
+                .flatMap(method -> declaredLengths.stream().map(length -> Arguments.of(method, length, true)));
         return Stream.concat(bodiless, bodied);
     }
 
+    // The service never reads the body, so whatever its size nothing of it is held here: the client reads what it
+    // forwards, and the body of a bodiless method stays unread.
     @ParameterizedTest(name = "{0} with {1}")
     @MethodSource("requestBodies")
-    void requestBodyReachesTheClientAsTheMuleRequesterSentIt(String methodName, byte[] sent, byte[] expected) {
+    void requestBodyStreamReachesTheClientUnreadAsTheMuleRequesterSentIt(String methodName, long declaredLength,
+                                                                          boolean forwarded) {
         HttpMethod method = HttpMethod.valueOf(methodName);
+        InputStream body = mock(InputStream.class);
         stubUpstream(ResponseEntity.ok(UPSTREAM_BODY));
 
-        service.forward(method, PATH, null, new HttpHeaders(), sent);
+        service.forward(method, PATH, null, new HttpHeaders(), body, declaredLength);
 
-        ArgumentCaptor<byte[]> forwarded = ArgumentCaptor.forClass(byte[].class);
         verify(client, times(1)).exchange(eq(method), eq(PATH), isNull(), any(HttpHeaders.class),
-                forwarded.capture());
+                forwarded ? same(body) : isNull(), eq(forwarded ? declaredLength : -1L));
         verifyNoMoreInteractions(client);
-        if (expected == null) {
-            assertThat(forwarded.getValue()).isNull();
-        } else {
-            assertThat(forwarded.getValue()).isNotNull().isEqualTo(expected).hasSize(expected.length);
-        }
+        verifyNoInteractions(body);
     }
 
     @ParameterizedTest(name = "path {0}, query {1}")
@@ -112,10 +115,10 @@ class RestProxyServiceTest {
     void rawPathAndQueryReachTheClientUntouched(String rawPath, String rawQuery) {
         stubUpstream(ResponseEntity.ok(UPSTREAM_BODY));
 
-        service.forward(HttpMethod.GET, rawPath, rawQuery, new HttpHeaders(), null);
+        service.forward(HttpMethod.GET, rawPath, rawQuery, new HttpHeaders(), null, -1);
 
         verify(client, times(1)).exchange(eq(HttpMethod.GET), eq(rawPath), eq(rawQuery), any(HttpHeaders.class),
-                isNull());
+                isNull(), eq(-1L));
         verifyNoMoreInteractions(client);
     }
 
@@ -124,12 +127,12 @@ class RestProxyServiceTest {
     void everyUpstreamStatusBelow400IsAnswered200WithTheUnparsedBody(int upstreamStatus) {
         stubUpstream(ResponseEntity.status(upstreamStatus).body(UPSTREAM_BODY));
 
-        ResponseEntity<byte[]> result = service.forward(HttpMethod.GET, PATH, null, new HttpHeaders(), null);
+        ResponseEntity<byte[]> result = service.forward(HttpMethod.GET, PATH, null, new HttpHeaders(), null, -1);
 
         assertThat(result.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(result.getStatusCode().value()).isEqualTo(200);
         assertThat(result.getBody()).isEqualTo(UPSTREAM_BODY);
-        verify(client, times(1)).exchange(any(), any(), any(), any(), any());
+        verify(client, times(1)).exchange(any(), any(), any(), any(), any(), anyLong());
         verifyNoMoreInteractions(client);
     }
 
@@ -138,13 +141,13 @@ class RestProxyServiceTest {
     void everyUpstreamStatusFrom400FailsWithTheDefaultValidatorMessage(int upstreamStatus) {
         stubUpstream(ResponseEntity.status(upstreamStatus).body(UPSTREAM_BODY));
 
-        assertThatThrownBy(() -> service.forward(HttpMethod.GET, PATH, null, new HttpHeaders(), null))
+        assertThatThrownBy(() -> service.forward(HttpMethod.GET, PATH, null, new HttpHeaders(), null, -1))
                 .isExactlyInstanceOf(IllegalStateException.class)
                 .hasMessage("Response code " + upstreamStatus
                         + " mapped as failure. Message payload is of type: BufferInputStream")
                 .hasMessage(String.format(RestProxyService.VALIDATOR_FAILURE_MESSAGE, upstreamStatus))
                 .hasNoCause();
-        verify(client, times(1)).exchange(any(), any(), any(), any(), any());
+        verify(client, times(1)).exchange(any(), any(), any(), any(), any(), anyLong());
         verifyNoMoreInteractions(client);
     }
 
@@ -161,10 +164,11 @@ class RestProxyServiceTest {
         upstreamHeaders.add("X-Box-Request-Id", "abc123");
         stubUpstream(ResponseEntity.status(200).headers(upstreamHeaders).body(UPSTREAM_BODY));
 
-        ResponseEntity<byte[]> result = service.forward(HttpMethod.GET, PATH, null, inbound, null);
+        ResponseEntity<byte[]> result = service.forward(HttpMethod.GET, PATH, null, inbound, null, -1);
 
         ArgumentCaptor<HttpHeaders> sentHeaders = ArgumentCaptor.forClass(HttpHeaders.class);
-        verify(client, times(1)).exchange(eq(HttpMethod.GET), eq(PATH), isNull(), sentHeaders.capture(), isNull());
+        verify(client, times(1)).exchange(eq(HttpMethod.GET), eq(PATH), isNull(), sentHeaders.capture(), isNull(),
+                eq(-1L));
         verifyNoMoreInteractions(client);
         HttpHeaders upstream = sentHeaders.getValue();
         assertThat(upstream).isNotSameAs(inbound);
@@ -186,7 +190,7 @@ class RestProxyServiceTest {
     void anUpstreamResponseWithoutABodyIsAnsweredWithEmptyBytes() {
         stubUpstream(ResponseEntity.status(200).build());
 
-        ResponseEntity<byte[]> result = service.forward(HttpMethod.GET, PATH, null, new HttpHeaders(), null);
+        ResponseEntity<byte[]> result = service.forward(HttpMethod.GET, PATH, null, new HttpHeaders(), null, -1);
 
         assertThat(result.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(result.getBody()).isNotNull().isEmpty();
@@ -196,17 +200,19 @@ class RestProxyServiceTest {
     @Test
     void aClientFailurePropagatesUnchangedAndIsNeverRetried() {
         ResourceAccessException timeout = new ResourceAccessException("timeout");
-        when(client.exchange(any(), any(), any(), any(), any())).thenThrow(timeout);
+        when(client.exchange(any(), any(), any(), any(), any(), anyLong())).thenThrow(timeout);
+        InputStream body = new ByteArrayInputStream(REQUEST_BODY);
 
-        assertThatThrownBy(() -> service.forward(HttpMethod.POST, PATH, null, new HttpHeaders(), REQUEST_BODY))
+        assertThatThrownBy(() -> service.forward(HttpMethod.POST, PATH, null, new HttpHeaders(), body,
+                REQUEST_BODY.length))
                 .isSameAs(timeout);
         verify(client, times(1)).exchange(eq(HttpMethod.POST), eq(PATH), isNull(), any(HttpHeaders.class),
-                eq(REQUEST_BODY));
+                same(body), eq((long) REQUEST_BODY.length));
         verifyNoMoreInteractions(client);
     }
 
     private void stubUpstream(ResponseEntity<byte[]> upstream) {
-        when(client.exchange(any(), any(), any(), any(), any())).thenReturn(upstream);
+        when(client.exchange(any(), any(), any(), any(), any(), anyLong())).thenReturn(upstream);
     }
 
     /**

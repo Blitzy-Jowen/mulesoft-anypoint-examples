@@ -1,0 +1,3 @@
+# Keeps the caller's credentials and content out of the log at every level (config.SensitiveLogGuard).
+org.springframework.context.ApplicationListener=\
+com.mulesoft.examples.proxying_a_rest_api.config.SensitiveLogGuardInstaller
