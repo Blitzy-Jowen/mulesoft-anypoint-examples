@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
@@ -32,6 +33,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
@@ -44,6 +47,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
 import org.springframework.web.server.ResponseStatusException;
 
+import com.mulesoft.examples.mule_component_bindings.exception.InvalidStockSymbol;
 import com.mulesoft.examples.mule_component_bindings.model.StockStats;
 import com.mulesoft.examples.mule_component_bindings.model.Tweet;
 import com.mulesoft.examples.mule_component_bindings.service.SentimentService;
@@ -145,10 +149,20 @@ class StockStatsControllerTest {
 
         assertThat(response.statusLine()).as(response.toString()).isEqualTo(NO_CONTENT);
         verify(stockService).getHistoricalPrices(eq(expectedStock), eq(day(DAY)));
+        // the stock is looked up once, so a later value of a repeated parameter is never asked for
+        verifyNoMoreInteractions(stockService);
     }
 
     @ParameterizedTest(name = "[{index}] ?{0} -> 400 {1}")
     @CsvSource(delimiter = '|', value = {
+        // an empty value is blank
+        "stock=&date=2012-10-26                | stock is required",
+        // date absent
+        "stock=AAPL                            | date is required",
+        // a date of another length than yyyy-MM-dd
+        "stock=AAPL&date=2012-1-26             | date format must be YYYY-MM-DD",
+        // a date of the right length that does not parse
+        "stock=AAPL&date=abcd-ef-gh            | date format must be YYYY-MM-DD",
         // a bare name binds the empty value
         "stock&date=2012-10-26                 | stock is required",
         // ';' is not a separator: date is part of the stock value
@@ -262,6 +276,34 @@ class StockStatsControllerTest {
         assertThat(response.body()).isEmpty();
         verify(stockService).getHistoricalPrices(eq("AAPL"), any(Date.class));
         verify(twitterSearchService).search(eq("AAPL"), any(Date.class), anyInt(), anyInt());
+    }
+
+    @Test
+    void invalidStockSymbolIsAnswered400NamingTheSymbol() throws Exception {
+        when(stockService.getHistoricalPrices(eq("XYZ"), any())).thenThrow(new InvalidStockSymbol("XYZ"));
+
+        Response response = stockStats.get(STOCK_STATS + "?stock=XYZ&date=" + DAY);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(BAD_REQUEST);
+        assertThat(response.header("Content-Type")).isEqualTo("application/json");
+        assertThat(response.bodyAsString()).isEqualTo("Invalid stock symbol XYZ");
+        verify(stockService).getHistoricalPrices(eq("XYZ"), eq(day(DAY)));
+        verifyNoInteractions(twitterSearchService, sentimentService);
+    }
+
+    @ParameterizedTest(name = "[{index}] RuntimeException({0})")
+    @NullSource
+    @ValueSource(strings = "boom")
+    void unexpectedFailureIsAnswered500WithItsMessageAsTheRawBody(String message) throws Exception {
+        // The resource's catch-all branch, not the { "message": ... } 500 of the generic handler.
+        when(stockService.getHistoricalPrices(eq("AAPL"), any())).thenThrow(new RuntimeException(message));
+
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
+        assertThat(response.header("Content-Type")).isEqualTo("application/json");
+        assertThat(response.bodyAsString()).isEqualTo(message == null ? "" : message);
+        verifyNoInteractions(twitterSearchService, sentimentService);
     }
 
     @Test
