@@ -167,7 +167,9 @@ class SalesforcePartnerClientTest {
         props.setPassword(PASSWORD);
         props.setSecurityToken(SECURITY_TOKEN);
         props.setAuthEndpoint("http://localhost:" + wm.port() + LOGIN_PATH);
-        props.setReadTimeout(Duration.ofMillis(500));
+        // Generous, so a slow first exchange on a loaded host never times out an ordinary stub and the suite is not
+        // load-sensitive; a test of timeout behaviour sets its own short read timeout before it builds its client.
+        props.setReadTimeout(Duration.ofSeconds(5));
         props.setConnectTimeout(Duration.ofSeconds(2));
         executor = new UpstreamCallExecutor(List.of(new SalesforceFailureClassifier()));
     }
@@ -439,6 +441,8 @@ class SalesforcePartnerClientTest {
         stubLogin();
         stubApi("create", soap(envelope("<createResponse><result><id>" + CONTACT_ID + "</id>"
                 + "<success>true</success></result></createResponse>")).withFixedDelay(2000));
+        // Well below the 2000 ms delay, so this client's create times out.
+        props.setReadTimeout(Duration.ofMillis(500));
 
         Throwable thrown = catchThrowable(() -> loginModeClient().create("Contact", List.of(contact())));
 
