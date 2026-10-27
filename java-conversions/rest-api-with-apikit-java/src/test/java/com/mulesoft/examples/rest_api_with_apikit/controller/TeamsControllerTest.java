@@ -15,9 +15,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -46,7 +56,9 @@ import org.springframework.test.annotation.DirtiesContext;
  *
  * <p>The league is an in-memory singleton that these tests change, so every write goes to a team id the writing
  * method creates itself, the seeded teams of {@code teams.json} are only read, and the context is discarded after
- * the class. The exact {@code reply.json} comparison of the original test is ported in {@code RestApiWithApiKitTest}.
+ * the class. Two tests send their POSTs from many threads at once, as concurrent clients do, so that every created
+ * team stays listed and only one POST of an id is created while the others get the 409. The exact
+ * {@code reply.json} comparison of the original test is ported in {@code RestApiWithApiKitTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -67,6 +79,22 @@ class TeamsControllerTest {
     private static final Map<String, String> JSON_CONTENT = Map.of("Content-Type", "application/json");
 
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** Teams the concurrent POST test creates, ids {@code 000}..{@code 199}, and the threads that send them. */
+    private static final int PARALLEL_TEAMS = 200;
+
+    private static final int PARALLEL_THREADS = 16;
+
+    /** Home city of the concurrently created teams only, so the city filter must return exactly them. */
+    private static final String PARALLEL_CITY = "Parallelville";
+
+    /** Rounds of the same-id race, ids {@code R00}..{@code R19}, and the threads posting each round's id. */
+    private static final int RACE_ROUNDS = 20;
+
+    private static final int RACE_THREADS = 8;
+
+    /** Bound on each wait for the request threads, well above {@link HttpTestClient#TIMEOUT_MILLIS}. */
+    private static final long CONCURRENT_TIMEOUT_SECONDS = 60;
 
     @LocalServerPort
     private int port;
@@ -203,6 +231,81 @@ class TeamsControllerTest {
         assertFalse(teamIds().contains("TSP"));
     }
 
+    @Test
+    void concurrentPostsOfDistinctTeamsAreAllCreatedAndListed()
+            throws InterruptedException, ExecutionException, TimeoutException {
+        Set<String> before = teamIds();
+        List<String> newIds = new ArrayList<>();
+        List<Callable<Response>> posts = new ArrayList<>();
+        for (int i = 0; i < PARALLEL_TEAMS; i++) {
+            String id = String.format("%03d", i);
+            newIds.add(id);
+            posts.add(() -> postJson(TEAMS, teamJson(id, "Parallel " + id, PARALLEL_CITY)));
+        }
+
+        List<Response> responses = sendTogether(PARALLEL_THREADS, posts);
+
+        for (Response response : responses) {
+            assertEquals(201, response.status(), response::toString);
+            assertEquals("Created", response.reason(), response::toString);
+        }
+        Set<String> expected = new HashSet<>(before);
+        expected.addAll(newIds);
+        Response all = client.get(TEAMS);
+        assertEquals(200, all.status(), all::toString);
+        List<String> listed = new ArrayList<>();
+        for (JsonNode team : json(all).path("teams")) {
+            listed.add(team.path("id").textValue());
+        }
+        assertEquals(before.size() + PARALLEL_TEAMS, listed.size(), all::toString);
+        assertEquals(expected, new HashSet<>(listed), all::toString);
+
+        Response byCity = client.get(TEAMS + "?city=" + PARALLEL_CITY);
+        assertEquals(200, byCity.status(), byCity::toString);
+        JsonNode cityTeams = json(byCity).path("teams");
+        assertEquals(PARALLEL_TEAMS, cityTeams.size(), byCity::toString);
+        Set<String> cityIds = new HashSet<>();
+        for (JsonNode team : cityTeams) {
+            assertEquals(PARALLEL_CITY, team.path("homeCity").textValue(), () -> "homeCity of " + team);
+            cityIds.add(team.path("id").textValue());
+        }
+        assertEquals(new HashSet<>(newIds), cityIds, byCity::toString);
+
+        Response positions = client.get("/api/positions");
+        assertEquals(200, positions.status(), positions::toString);
+        assertEquals(expected.size(), json(positions).path("positions").size(), positions::toString);
+    }
+
+    @Test
+    void concurrentPostsOfOneIdCreateOneTeamAndConflictForTheRest()
+            throws InterruptedException, ExecutionException, TimeoutException {
+        for (int round = 0; round < RACE_ROUNDS; round++) {
+            String id = String.format("R%02d", round);
+            List<Callable<Response>> posts = new ArrayList<>();
+            for (int thread = 0; thread < RACE_THREADS; thread++) {
+                String name = raceTeamName(thread);
+                posts.add(() -> postJson(TEAMS, teamJson(id, name)));
+            }
+
+            List<Response> responses = sendTogether(RACE_THREADS, posts);
+
+            List<Integer> created = new ArrayList<>();
+            for (int thread = 0; thread < responses.size(); thread++) {
+                Response response = responses.get(thread);
+                if (response.status() == 201) {
+                    assertEquals("Created", response.reason(), response::toString);
+                    created.add(thread);
+                } else {
+                    assertApiKitError(response, 409, "Conflict",
+                            "{ \"message\": \"There is already a team with id " + id + "\" }");
+                }
+            }
+            assertEquals(1, created.size(), () -> "POSTs of " + id + " answered 201: " + created);
+            JsonNode team = getExistingTeam(id);
+            assertEquals(raceTeamName(created.get(0)), team.path("name").textValue(), team::toString);
+        }
+    }
+
     // GET /api/teams/{teamId}
 
     @Test
@@ -330,8 +433,49 @@ class TeamsControllerTest {
     }
 
     private static String teamJson(String id, String name) {
-        return "{\"id\":\"" + id + "\",\"name\":\"" + name + "\",\"homeCity\":\"Testville\","
+        return teamJson(id, name, "Testville");
+    }
+
+    private static String teamJson(String id, String name, String homeCity) {
+        return "{\"id\":\"" + id + "\",\"name\":\"" + name + "\",\"homeCity\":\"" + homeCity + "\","
                 + "\"stadium\":\"Test Park\"}";
+    }
+
+    /** Name the same-id race gives the team posted by its thread {@code thread}. */
+    private static String raceTeamName(int thread) {
+        return "Racer " + thread;
+    }
+
+    /**
+     * Runs every request on a pool of {@code threads} threads and returns the responses in request order. The pool's
+     * threads each take a request and wait at one gate until all of them hold one, then are released together, so
+     * the requests reach the listener at the same time.
+     */
+    private static List<Response> sendTogether(int threads, List<Callable<Response>> requests)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        CountDownLatch ready = new CountDownLatch(Math.min(threads, requests.size()));
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            List<Future<Response>> futures = new ArrayList<>();
+            for (Callable<Response> request : requests) {
+                futures.add(executor.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    return request.call();
+                }));
+            }
+            assertTrue(ready.await(CONCURRENT_TIMEOUT_SECONDS, TimeUnit.SECONDS), "request threads ready");
+            start.countDown();
+            List<Response> responses = new ArrayList<>();
+            for (Future<Response> future : futures) {
+                responses.add(future.get(CONCURRENT_TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            }
+            return responses;
+        } finally {
+            start.countDown();
+            executor.shutdownNow();
+        }
     }
 
     /** GET {@code /api/teams/<id>}, asserting 200, and the team as a JSON tree. */

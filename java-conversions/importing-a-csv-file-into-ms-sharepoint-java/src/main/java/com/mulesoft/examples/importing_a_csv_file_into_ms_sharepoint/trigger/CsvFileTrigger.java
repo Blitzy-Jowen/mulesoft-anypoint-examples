@@ -23,9 +23,11 @@ import com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.service.Sha
  * pollingFrequency="10000"/>}.
  *
  * <p>Every {@code csv-import.polling-frequency} milliseconds the input directory is polled and each file's bytes are
- * handed unchanged to {@link SharepointImportService#importFile(byte[])}. Reading, the in-process mark, the ERROR log
- * of a failed import and the move to {@code csv-import.move-to-dir} after success and after failure all belong to
- * {@link FileInboundPoller}, which reproduces the default Mule file connector the original relies on.
+ * handed unchanged to {@link SharepointImportService#importFile(byte[])}. Reading, the in-process mark, the move to
+ * {@code csv-import.move-to-dir} after success and after failure, and the ERROR log naming the file and the type of a
+ * failed import's exception all belong to {@link FileInboundPoller}, which reproduces the default Mule file connector
+ * the original relies on. {@link SharepointImportService} logs the failing SharePoint step and its reason first,
+ * then rethrows the exception unchanged to the poller.
  */
 @Component
 public class CsvFileTrigger {

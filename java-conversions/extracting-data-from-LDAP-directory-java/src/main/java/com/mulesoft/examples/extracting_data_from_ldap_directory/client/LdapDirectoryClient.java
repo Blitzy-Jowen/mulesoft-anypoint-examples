@@ -13,6 +13,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import com.mulesoft.examples.extracting_data_from_ldap_directory.config.LdapProperties;
@@ -46,11 +48,17 @@ import jakarta.annotation.PreDestroy;
  * directory, as the Mule application did; missing configuration likewise fails the first search, not the start-up.
  * A failed creation caches nothing: the next search tries again.
  *
- * <p>Directory failures ({@link LDAPException}) propagate unchanged to the caller; a failed or timed-out
- * operation is never retried. Instances are thread-safe.
+ * <p>Every directory failure ({@link LDAPException}), whether raised while the pool is created and bound or by the
+ * search itself, is logged once at ERROR with its result code, the server and the full search base taken from
+ * {@code ldap.url}, and its message (withheld should it contain the bind password, which is never logged), so
+ * invalid credentials, a timeout, an unreachable server and a missing base tell apart in the log alone; the same
+ * exception instance then propagates unchanged to the caller. A failed or timed-out operation is never retried.
+ * Instances are thread-safe.
  */
 @Component
 public class LdapDirectoryClient {
+
+    private static final Logger LOG = LoggerFactory.getLogger(LdapDirectoryClient.class);
 
     private static final int INITIAL_CONNECTIONS = 1;
 
@@ -61,6 +69,26 @@ public class LdapDirectoryClient {
 
     /** The only {@code ldap.url} scheme served: the server set opens plain LDAP connections. */
     private static final String SUPPORTED_SCHEME = "ldap";
+
+    /** Longest logged server, search base, result code name or message, in characters after escaping. */
+    private static final int LOG_VALUE_LIMIT = 512;
+
+    private static final String NULL_LOG_TOKEN = "(null)";
+
+    private static final String TRUNCATION_LOG_MARKER = "...[truncated]";
+
+    private static final String URL_NOT_CONFIGURED_LOG_TOKEN = "<ldap.url not configured>";
+
+    private static final String URL_INVALID_LOG_TOKEN = "<ldap.url invalid>";
+
+    private static final String URL_WITHOUT_HOST_LOG_TOKEN = "<ldap.url has no host>";
+
+    private static final String UNKNOWN_URL_BASE_LOG_SUFFIX = " relative to an unknown ldap.url base DN";
+
+    /** Logged in place of a failure message that contains the configured bind password. */
+    private static final String MESSAGE_WITHHELD_LOG_TOKEN = "<message withheld>";
+
+    private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
 
     private final LdapProperties properties;
 
@@ -91,21 +119,28 @@ public class LdapDirectoryClient {
      *         {@code ldap.dn} or {@code ldap.password} is not configured (result code {@code PARAM_ERROR}), when the
      *         directory cannot be reached, the bind fails, the search base does not exist or the search fails, or
      *         when connecting, the bind or the search response takes longer than 10 s (an unanswered bind or
-     *         search has result code {@code TIMEOUT})
+     *         search has result code {@code TIMEOUT}); the failure is first logged on one ERROR line with its
+     *         result code, the server and the full search base, and is then rethrown as the same instance the SDK
+     *         or the configuration check raised, neither wrapped nor retried
      */
     public List<Entry> search(String relativeBaseDn, String filter) throws LDAPException {
-        LDAPConnectionPool connections = pool();
-        DN urlBaseDn = baseDn;
+        try {
+            LDAPConnectionPool connections = pool();
+            DN urlBaseDn = baseDn;
 
-        SearchResult result = connections.search(searchBase(relativeBaseDn, urlBaseDn), SearchScope.ONE, filter,
-                SearchRequest.ALL_USER_ATTRIBUTES);
+            SearchResult result = connections.search(searchBase(relativeBaseDn, urlBaseDn), SearchScope.ONE,
+                    filter, SearchRequest.ALL_USER_ATTRIBUTES);
 
-        List<SearchResultEntry> found = result.getSearchEntries();
-        List<Entry> entries = new ArrayList<>(found.size());
-        for (SearchResultEntry entry : found) {
-            entries.add(new Entry(relativeTo(entry.getParsedDN(), urlBaseDn), entry.getAttributes()));
+            List<SearchResultEntry> found = result.getSearchEntries();
+            List<Entry> entries = new ArrayList<>(found.size());
+            for (SearchResultEntry entry : found) {
+                entries.add(new Entry(relativeTo(entry.getParsedDN(), urlBaseDn), entry.getAttributes()));
+            }
+            return Collections.unmodifiableList(entries);
+        } catch (LDAPException e) {
+            logFailure(relativeBaseDn, e);
+            throw e;
         }
-        return Collections.unmodifiableList(entries);
     }
 
     /**
@@ -205,5 +240,120 @@ public class LdapDirectoryClient {
             return dn;
         }
         return new DN(Arrays.copyOf(dn.getRDNs(), dn.getRDNs().length - urlBaseDn.getRDNs().length));
+    }
+
+    /**
+     * Logs a failed search on one ERROR line, for example {@code LDAP search failed with result code 49 (invalid
+     * credentials) on server localhost:389 for base 'ou=people,dc=my-domain,dc=com': Unable to bind as user ...}.
+     *
+     * <p>The server ({@code host:port}) and the base the search used, or would have used, come from
+     * {@code ldap.url}; when it is unset, unparseable or has no host, a marker in angle brackets stands for what it
+     * cannot supply, and an unknown URL base leaves the relative base logged as such.
+     *
+     * <p>The message is logged because every failure here is raised by the SDK or by the configuration checks of
+     * {@link #createPool()}, and no request content reaches the directory: the search base and filter are the
+     * flow's constants. It is withheld when it contains the configured bind password, which is never logged. The
+     * exception itself is not handed to the logger, so no stack trace, cause or suppressed exception is written.
+     * Every value is escaped onto one line and bounded in length.
+     */
+    private void logFailure(String relativeBaseDn, LDAPException failure) {
+        String server;
+        String base;
+        String configuredUrl = properties.getUrl();
+        LDAPURL url = parsedOrNull(configuredUrl);
+        if (url == null) {
+            server = configuredUrl == null || configuredUrl.isBlank()
+                    ? URL_NOT_CONFIGURED_LOG_TOKEN
+                    : URL_INVALID_LOG_TOKEN;
+            base = quotedForLog(relativeBaseDn == null ? "" : relativeBaseDn) + UNKNOWN_URL_BASE_LOG_SUFFIX;
+        } else {
+            server = url.hostProvided() ? sanitizeForLog(hostAndPort(url)) : URL_WITHOUT_HOST_LOG_TOKEN;
+            base = quotedForLog(searchBase(relativeBaseDn, url.getBaseDN()));
+        }
+
+        // A blank password is refused before any bind, so it is no secret and never withholds a message.
+        String message = failure.getMessage();
+        String password = properties.getPassword();
+        String loggedMessage = message != null && password != null && !password.isBlank()
+                && message.contains(password)
+                ? MESSAGE_WITHHELD_LOG_TOKEN
+                : sanitizeForLog(message);
+
+        ResultCode resultCode = failure.getResultCode();
+        LOG.error("LDAP search failed with result code {} ({}) on server {} for base {}: {}",
+                resultCode.intValue(), sanitizeForLog(resultCode.getName()), server, base, loggedMessage);
+    }
+
+    /** Parses {@code ldap.url} for the failure log; {@code null} when it is unset or not a valid LDAP URL. */
+    private static LDAPURL parsedOrNull(String configuredUrl) {
+        if (configuredUrl == null || configuredUrl.isBlank()) {
+            return null;
+        }
+        try {
+            return new LDAPURL(configuredUrl);
+        } catch (LDAPException invalid) {
+            return null;
+        }
+    }
+
+    /** {@code host:port}, with an IPv6 literal in brackets so its colons cannot be read as the port separator. */
+    private static String hostAndPort(LDAPURL url) {
+        String host = url.getHost();
+        return (host.indexOf(':') >= 0 ? "[" + host + "]" : host) + ":" + url.getPort();
+    }
+
+    private static String quotedForLog(String value) {
+        return "'" + sanitizeForLog(value) + "'";
+    }
+
+    /**
+     * Makes {@code value} safe to log on one line, with the escaping the project's unhandled-exception log uses:
+     * ISO control characters (CR, LF, TAB, NUL and NEL included), line and paragraph separators, format characters
+     * (bidirectional overrides, zero-width characters, the byte order mark), unpaired surrogates and the reverse
+     * solidus are each written as {@code \}{@code u} and four lower-case hex digits per UTF-16 unit; every other
+     * character is copied unchanged. A value longer than {@link #LOG_VALUE_LIMIT} characters after escaping is cut
+     * before the first character or escape that would exceed it, never inside a surrogate pair or an escape, and
+     * {@code ...[truncated]} is appended. {@code null} is written as {@code (null)}.
+     */
+    private static String sanitizeForLog(String value) {
+        if (value == null) {
+            return NULL_LOG_TOKEN;
+        }
+        StringBuilder out = new StringBuilder(Math.min(value.length(), LOG_VALUE_LIMIT)
+                + TRUNCATION_LOG_MARKER.length());
+        int i = 0;
+        while (i < value.length()) {
+            int codePoint = value.codePointAt(i);
+            int units = Character.charCount(codePoint);
+            boolean escape = mustEscapeForLog(codePoint);
+            if (out.length() + (escape ? 6 * units : units) > LOG_VALUE_LIMIT) {
+                return out.append(TRUNCATION_LOG_MARKER).toString();
+            }
+            for (int unit = i; unit < i + units; unit++) {
+                char c = value.charAt(unit);
+                if (escape) {
+                    out.append("\\u")
+                            .append(HEX_DIGITS[(c >> 12) & 0xF])
+                            .append(HEX_DIGITS[(c >> 8) & 0xF])
+                            .append(HEX_DIGITS[(c >> 4) & 0xF])
+                            .append(HEX_DIGITS[c & 0xF]);
+                } else {
+                    out.append(c);
+                }
+            }
+            i += units;
+        }
+        return out.toString();
+    }
+
+    private static boolean mustEscapeForLog(int codePoint) {
+        if (codePoint == '\\' || Character.isISOControl(codePoint)) {
+            return true;
+        }
+        int type = Character.getType(codePoint);
+        return type == Character.LINE_SEPARATOR
+                || type == Character.PARAGRAPH_SEPARATOR
+                || type == Character.FORMAT
+                || type == Character.SURROGATE;
     }
 }

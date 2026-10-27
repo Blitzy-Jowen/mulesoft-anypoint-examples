@@ -21,11 +21,16 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.ServerSocket;
+import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
@@ -39,12 +44,19 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.http.QueryParameter;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
@@ -92,6 +104,22 @@ class CmisAtomPubClientTest {
     private static final String APP = "http://www.w3.org/2007/app";
     private static final String CMIS = "http://docs.oasis-open.org/ns/cmis/core/200908/";
     private static final String CMISRA = "http://docs.oasis-open.org/ns/cmis/restatom/200908/";
+
+    /** The client's three requests, in the order it sends them, by the step names its messages use. */
+    private static final String SERVICE_DOCUMENT = "service document";
+    private static final String FOLDER_ENTRY = "folder entry";
+    private static final String CREATE_DOCUMENT = "create-document";
+    private static final List<String> STEPS = List.of(SERVICE_DOCUMENT, FOLDER_ENTRY, CREATE_DOCUMENT);
+
+    /** Text of an OpenKM stack trace, which must never reach an exception message. */
+    private static final String STACK_TRACE_MARKER = "javax.servlet.ServletException: "
+            + "com.openkm.core.DatabaseException: Connection refused "
+            + "at com.openkm.cmis.CmisRepository.create(CmisRepository.java:412)";
+
+    /** A Tomcat error page carrying the stack trace, padded past 200,000 bytes. */
+    private static final String UPSTREAM_ERROR_PAGE = padded("<!doctype html><html><head><title>HTTP Status 500"
+            + "</title></head><body><pre>" + STACK_TRACE_MARKER + "</pre><h3>Apache Tomcat/8.5.23</h3>", 200_000)
+            + "</body></html>";
 
     @RegisterExtension
     static WireMockExtension wm = WireMockExtension.newInstance()
@@ -169,10 +197,114 @@ class CmisAtomPubClientTest {
 
         RestClientResponseException e = assertThrows(RestClientResponseException.class, () -> createDocument(client));
 
+        assertInstanceOf(HttpClientErrorException.class, e);
         assertEquals(401, e.getStatusCode().value());
+        assertEquals("CMIS service document request failed with HTTP status 401", e.getMessage());
         wm.verify(1, getRequestedFor(urlPathEqualTo(BASE_PATH)));
         wm.verify(0, anyRequestedFor(urlPathEqualTo(OBJECT_BY_PATH)));
         wm.verify(0, anyRequestedFor(urlPathEqualTo(CHILDREN)));
+    }
+
+    static Stream<Arguments> errorStatuses() {
+        return Stream.of(
+                Arguments.of(SERVICE_DOCUMENT, 503, HttpServerErrorException.class),
+                Arguments.of(FOLDER_ENTRY, 404, HttpClientErrorException.class),
+                Arguments.of(CREATE_DOCUMENT, 409, HttpClientErrorException.class),
+                Arguments.of(CREATE_DOCUMENT, 500, HttpServerErrorException.class),
+                Arguments.of(CREATE_DOCUMENT, 502, HttpServerErrorException.class));
+    }
+
+    /**
+     * An error status keeps Spring's 4xx/5xx exception type and code, but its message is fixed text: the caller's
+     * 500 body reports the message verbatim, so the upstream error page, its stack trace and its size never reach
+     * the caller. The request that failed is sent once and no later step runs.
+     */
+    @ParameterizedTest
+    @MethodSource("errorStatuses")
+    void errorStatusRaisesFixedMessageWithoutUpstreamBody(String step, int status,
+            Class<? extends RestClientResponseException> expectedType) {
+        stubFailingStep(step, aResponse()
+                .withStatus(status)
+                .withHeader("Content-Type", "text/html;charset=UTF-8")
+                .withBody(UPSTREAM_ERROR_PAGE));
+
+        RestClientResponseException e = assertThrows(RestClientResponseException.class, () -> createDocument(client));
+
+        assertInstanceOf(expectedType, e);
+        assertEquals(status, e.getStatusCode().value());
+        assertEquals("CMIS " + step + " request failed with HTTP status " + status, e.getMessage());
+        assertFalse(e.getMessage().contains(STACK_TRACE_MARKER), e.getMessage());
+        assertEquals(0, e.getResponseBodyAsByteArray().length);
+        verifyRequestsThrough(step);
+    }
+
+    /**
+     * A response slower than the read timeout fails with a fixed message that names neither the URL nor a Java
+     * type, and is not retried. The GETs time out while the connection waits for the status line; the POST, whose
+     * status line RestClient reads only when it handles the response, times out there.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {SERVICE_DOCUMENT, FOLDER_ENTRY, CREATE_DOCUMENT})
+    void readTimeoutRaisesFixedMessageWithoutRetry(String step) {
+        props.setReadTimeout(Duration.ofMillis(300));
+        CmisAtomPubClient impatient = new CmisAtomPubClient(props);
+        stubFailingStep(step, aResponse().withStatus(200).withFixedDelay(2_000));
+
+        ResourceAccessException e = assertThrows(ResourceAccessException.class, () -> createDocument(impatient));
+
+        assertEquals("CMIS " + step + " request timed out", e.getMessage());
+        assertInstanceOf(SocketTimeoutException.class, e.getCause());
+        verifyRequestsThrough(step);
+    }
+
+    /**
+     * A connection broken while the created entry is awaited or read fails with a fixed message, and the POST is
+     * never re-sent, so no second document is created.
+     */
+    @ParameterizedTest
+    @EnumSource(value = Fault.class,
+            names = {"CONNECTION_RESET_BY_PEER", "EMPTY_RESPONSE", "MALFORMED_RESPONSE_CHUNK"})
+    void createDocumentConnectionFaultRaisesFixedMessageAndIsSentOnce(Fault fault) {
+        stubFailingStep(CREATE_DOCUMENT, aResponse().withFault(fault));
+
+        ResourceAccessException e = assertThrows(ResourceAccessException.class, () -> createDocument(client));
+
+        assertEquals("CMIS create-document request failed with an I/O error", e.getMessage());
+        assertInstanceOf(IOException.class, e.getCause());
+        verifyRequestsThrough(CREATE_DOCUMENT);
+    }
+
+    @Test
+    void connectionRefusedRaisesFixedMessageWithoutUrl() throws IOException {
+        int closedPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            closedPort = socket.getLocalPort();
+        }
+        props.setBaseUrl("http://localhost:" + closedPort + BASE_PATH);
+        CmisAtomPubClient unreachable = new CmisAtomPubClient(props);
+
+        ResourceAccessException e = assertThrows(ResourceAccessException.class, () -> createDocument(unreachable));
+
+        assertEquals("CMIS service document request failed with an I/O error", e.getMessage());
+        assertInstanceOf(ConnectException.class, e.getCause());
+    }
+
+    /**
+     * RestClient parses the Content-Type before any status handler runs, so a value that is not a media type would
+     * otherwise reach the caller inside Spring's {@code Invalid mime type "..."} message.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {200, 500})
+    void unparseableContentTypeRaisesFixedMessage(int status) {
+        wm.stubFor(get(urlPathEqualTo(BASE_PATH)).willReturn(aResponse()
+                .withStatus(status)
+                .withHeader("Content-Type", STACK_TRACE_MARKER)
+                .withBody(serviceDocument(true))));
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> createDocument(client));
+
+        assertEquals("CMIS service document response has an invalid Content-Type", e.getMessage());
+        verifyRequestsThrough(SERVICE_DOCUMENT);
     }
 
     @Test
@@ -267,6 +399,37 @@ class CmisAtomPubClientTest {
         stubServiceDocument(true);
         stubFolderEntry(true);
         stubCreate(true);
+    }
+
+    /** Stubs every step before {@code step} to succeed and {@code step} itself to answer with {@code failure}. */
+    private static void stubFailingStep(String step, ResponseDefinitionBuilder failure) {
+        switch (step) {
+            case SERVICE_DOCUMENT -> wm.stubFor(get(urlPathEqualTo(BASE_PATH)).willReturn(failure));
+            case FOLDER_ENTRY -> {
+                stubServiceDocument(true);
+                wm.stubFor(get(urlPathEqualTo(OBJECT_BY_PATH)).willReturn(failure));
+            }
+            case CREATE_DOCUMENT -> {
+                stubServiceDocument(true);
+                stubFolderEntry(true);
+                wm.stubFor(post(urlPathEqualTo(CHILDREN)).willReturn(failure));
+            }
+            default -> fail("Unknown step " + step);
+        }
+    }
+
+    /** Each step up to and including {@code step} was requested exactly once, and nothing else was requested. */
+    private static void verifyRequestsThrough(String step) {
+        int last = STEPS.indexOf(step);
+        wm.verify(1, getRequestedFor(urlPathEqualTo(BASE_PATH)));
+        wm.verify(last >= STEPS.indexOf(FOLDER_ENTRY) ? 1 : 0, getRequestedFor(urlPathEqualTo(OBJECT_BY_PATH)));
+        wm.verify(last >= STEPS.indexOf(CREATE_DOCUMENT) ? 1 : 0, postRequestedFor(urlPathEqualTo(CHILDREN)));
+        wm.verify(last + 1, anyRequestedFor(anyUrl()));
+    }
+
+    /** {@code prefix} followed by {@code x} characters up to {@code length} characters in all. */
+    private static String padded(String prefix, int length) {
+        return prefix + "x".repeat(Math.max(0, length - prefix.length()));
     }
 
     private static void stubServiceDocument(boolean withObjectByPath) {

@@ -10,6 +10,7 @@ package com.mulesoft.examples.document_integration_using_the_cmis_connector.clie
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -19,9 +20,12 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilder;
@@ -29,11 +33,19 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
 
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.InvalidMediaTypeException;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestClientResponseException;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -63,10 +75,15 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.confi
  * request authenticates with HTTP Basic as that service account, so both {@code cmis.username} and
  * {@code cmis.password} are required: when either is blank, {@link #createDocumentByPath} fails with an
  * {@link IllegalStateException} naming the key before any request is made. Construction accepts blank values, so
- * the application starts with the credentials unset. HTTP failures propagate unchanged as Spring's
- * {@code RestClientResponseException} subtypes (4xx/5xx) or {@code ResourceAccessException} (transport); missing
- * protocol elements and unreadable XML raise {@link IllegalStateException}. No call is retried. The class holds no
- * mutable state and is safe to share.
+ * the application starts with the credentials unset. Request failures carry fixed messages naming the step
+ * ({@code service document}, {@code folder entry} or {@code create-document}), because the caller's 500 body
+ * reports a message verbatim: an error status raises Spring's {@code HttpClientErrorException} (4xx) or
+ * {@code HttpServerErrorException} (5xx) with {@code CMIS <step> request failed with HTTP status <code>}; a
+ * transport or body-read failure raises {@code ResourceAccessException} with {@code CMIS <step> request timed out}
+ * or {@code CMIS <step> request failed with an I/O error}; missing protocol elements, an unparseable Content-Type
+ * and unreadable XML raise {@link IllegalStateException}. Upstream bodies, reason phrases and header text, request
+ * URLs and Java type names are never copied into a message. No call is retried. The class holds no mutable state
+ * and is safe to share.
  */
 @Component
 public class CmisAtomPubClient {
@@ -177,13 +194,12 @@ public class CmisAtomPubClient {
         Document folderEntry = get(folderEntryUri, ENTRY_TYPE, "folder entry");
         URI createUri = withVersioningState(childrenFeedUri(folderEntry, folderEntryUri, folderPath), versioningState);
 
-        byte[] created = restClient.post()
+        byte[] created = send(restClient.post()
                 .uri(createUri)
                 .contentType(ENTRY_MEDIA_TYPE)
                 .header(HttpHeaders.ACCEPT, ENTRY_TYPE)
-                .body(entry(name, mimeType, objectTypeId, content).getBytes(StandardCharsets.UTF_8))
-                .retrieve()
-                .body(byte[].class);
+                .body(entry(name, mimeType, objectTypeId, content).getBytes(StandardCharsets.UTF_8)),
+                "create-document");
         return objectId(parse(created, "create-document"));
     }
 
@@ -211,12 +227,74 @@ public class CmisAtomPubClient {
 
     /** URIs are always passed as {@link URI}: a String would be re-expanded and re-encoded by RestClient. */
     private Document get(URI uri, String accept, String what) {
-        byte[] body = restClient.get()
+        byte[] body = send(restClient.get()
                 .uri(uri)
-                .header(HttpHeaders.ACCEPT, accept)
-                .retrieve()
-                .body(byte[].class);
+                .header(HttpHeaders.ACCEPT, accept), what);
         return parse(body, what);
+    }
+
+    /**
+     * Sends {@code request} once and returns the response body, or null when the response has none. These failures
+     * carry a fixed message naming the step {@code what}: an error status raises
+     * {@link HttpClientErrorException} (4xx) or {@link HttpServerErrorException} (5xx) with
+     * {@code CMIS <what> request failed with HTTP status <code>}, built without reading the body; a transport or
+     * body-read failure raises the exception of {@link #transportFailure}; a Content-Type that is not a media type,
+     * which RestClient parses before any status handler runs, raises {@link IllegalStateException}. No message
+     * carries the upstream body, reason phrase or header text, the request URL or a Java type name, because the
+     * caller's 500 body reports the message verbatim.
+     */
+    private static byte[] send(RestClient.RequestHeadersSpec<?> request, String what) {
+        try {
+            return request.retrieve()
+                    .onStatus(HttpStatusCode::isError, (clientRequest, response) -> {
+                        throw statusFailure(response, what);
+                    })
+                    .body(byte[].class);
+        } catch (RestClientResponseException e) {
+            throw e;
+        } catch (RestClientException e) {
+            throw transportFailure(e, what);
+        } catch (InvalidMediaTypeException e) {
+            throw new IllegalStateException("CMIS " + what + " response has an invalid Content-Type", e);
+        }
+    }
+
+    /** The exception for an error status (4xx or 5xx), keeping status, reason and headers but not the body. */
+    private static RestClientResponseException statusFailure(ClientHttpResponse response, String what)
+            throws IOException {
+        HttpStatusCode status = response.getStatusCode();
+        String message = "CMIS " + what + " request failed with HTTP status " + status.value();
+        String statusText = Objects.requireNonNullElse(response.getStatusText(), "");
+        HttpHeaders headers = response.getHeaders();
+        return status.is4xxClientError()
+                ? HttpClientErrorException.create(message, status, statusText, headers, null, null)
+                : HttpServerErrorException.create(message, status, statusText, headers, null, null);
+    }
+
+    /**
+     * The exception for a request that got no usable response: a {@link ResourceAccessException} whose cause is the
+     * first {@link IOException} in the cause chain of {@code failure}, with {@code CMIS <what> request timed out}
+     * when a {@link SocketTimeoutException} is in that chain and {@code CMIS <what> request failed with an I/O
+     * error} otherwise; a {@link RestClientException} {@code CMIS <what> request failed} caused by {@code failure}
+     * when the chain holds no {@link IOException}.
+     */
+    private static RestClientException transportFailure(RestClientException failure, String what) {
+        IOException ioFailure = null;
+        boolean timedOut = false;
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = failure.getCause(); cause != null && seen.add(cause); cause = cause.getCause()) {
+            timedOut |= cause instanceof SocketTimeoutException;
+            if (ioFailure == null && cause instanceof IOException io) {
+                ioFailure = io;
+            }
+        }
+        if (ioFailure == null) {
+            return new RestClientException("CMIS " + what + " request failed", failure);
+        }
+        String message = timedOut
+                ? "CMIS " + what + " request timed out"
+                : "CMIS " + what + " request failed with an I/O error";
+        return new ResourceAccessException(message, ioFailure);
     }
 
     private static String objectByPathTemplate(Document serviceDocument, String repositoryId) {

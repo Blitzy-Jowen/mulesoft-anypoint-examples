@@ -27,26 +27,36 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 
+/**
+ * The league service every resource of the API calls.
+ *
+ * <p>Every public method is {@code synchronized} on this singleton. The {@link League} keeps its teams and fixture
+ * in plain {@code HashMap}s that concurrent request threads share: unsynchronized writes corrupt a map, after
+ * which listing the teams fails until the application restarts. The lock also makes each existence check and the
+ * change that follows it one step, so of several POSTs of one team id {@link #addTeam} creates exactly one and the
+ * rest get the {@link ConflictException}. The maps stay {@code HashMap}s because a team may be added with a
+ * {@code null} id, which a concurrent map rejects.
+ */
 @Service
 public class LeagueAPI {
 
     private League league;
 
     @PostConstruct
-    public void initialize() {
+    public synchronized void initialize() {
         league = new League();
         league.initialize();
     }
 
 
-    public void deleteTeam(String teamId) {
+    public synchronized void deleteTeam(String teamId) {
         if(!league.hasTeam(teamId)) {
             throw new ApiKitNotFoundException("Team " + teamId + " does not exist");
         }
         league.deleteTeam(teamId);
     }
 
-    public Teams getTeams(String city) {
+    public synchronized Teams getTeams(String city) {
         List<Team> teamsList = new ArrayList<Team>();
         List<com.mulesoft.examples.rest_api_with_apikit.model.Team> teams = league.getTeams(city);
         for(com.mulesoft.examples.rest_api_with_apikit.model.Team team : teams) {
@@ -63,7 +73,7 @@ public class LeagueAPI {
         return teamsResp;
     }
 
-    public Match getMatch(String homeTeamId, String awayTeamId) {
+    public synchronized Match getMatch(String homeTeamId, String awayTeamId) {
         if(!league.hasMatch(homeTeamId, awayTeamId)) {
             throw new ApiKitNotFoundException("There is no match between team " + homeTeamId + " and team " + awayTeamId);
         }
@@ -78,7 +88,7 @@ public class LeagueAPI {
         return matchResp;
     }
 
-    public Team getTeam(String teamId) {
+    public synchronized Team getTeam(String teamId) {
         if(!league.hasTeam(teamId)) {
             throw new ApiKitNotFoundException("Team " + teamId + " does not exist");
         }
@@ -93,7 +103,7 @@ public class LeagueAPI {
         return teamResp;
     }
 
-    public Positions getPositions() {
+    public synchronized Positions getPositions() {
         Positions positions = new Positions();
         List<com.mulesoft.examples.rest_api_with_apikit.model.Team> teams = league.orderTeamsByPosition();
         List<Position> positionsList = new ArrayList<Position>();
@@ -118,7 +128,7 @@ public class LeagueAPI {
         return positions;
     }
 
-    public Fixture getFixture() {
+    public synchronized Fixture getFixture() {
         Fixture fixture = new Fixture();
         List<com.mulesoft.examples.rest_api_with_apikit.model.Match> matches = league.getMatches();
         List<Match> matchesList = new ArrayList<Match>();
@@ -137,7 +147,7 @@ public class LeagueAPI {
         return fixture;
     }
 
-    public String addTeam(com.mulesoft.examples.rest_api_with_apikit.model.request.Team team) {
+    public synchronized String addTeam(com.mulesoft.examples.rest_api_with_apikit.model.request.Team team) {
         if(league.hasTeam(team.getId())) {
             throw new ConflictException("There is already a team with id " + team.getId());
         }
@@ -152,7 +162,7 @@ public class LeagueAPI {
         return team.getId();
     }
 
-    public void updateScore(String homeTeamId, String awayTeamId, Score score) {
+    public synchronized void updateScore(String homeTeamId, String awayTeamId, Score score) {
         if(!league.hasMatch(homeTeamId, awayTeamId)) {
             throw new ApiKitNotFoundException("There is no match between team " + homeTeamId + " and team " + awayTeamId);
         }
@@ -166,7 +176,7 @@ public class LeagueAPI {
         }
     }
 
-    public void updateTeam(String teamId, UpdateTeam updateTeam) {
+    public synchronized void updateTeam(String teamId, UpdateTeam updateTeam) {
         if(!league.hasTeam(teamId)) {
             throw new ApiKitNotFoundException("Team " + teamId + " does not exist");
         }

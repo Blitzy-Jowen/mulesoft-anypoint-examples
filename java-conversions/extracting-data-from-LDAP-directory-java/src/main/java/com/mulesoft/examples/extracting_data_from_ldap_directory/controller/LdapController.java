@@ -8,11 +8,15 @@
 
 package com.mulesoft.examples.extracting_data_from_ldap_directory.controller;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
 import com.mulesoft.examples.extracting_data_from_ldap_directory.service.LdapSearchService;
 import com.unboundid.ldap.sdk.LDAPException;
 
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import jakarta.servlet.ServletOutputStream;
+import jakarta.servlet.http.HttpServletResponse;
+
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -29,14 +33,14 @@ import org.springframework.web.bind.annotation.RestController;
  * and the caller's {@code Accept}, {@code Content-Type} and body are never rejected. The match is exact: any
  * other path falls through to the no-listener 404 of {@code GlobalExceptionHandler}, which also answers every
  * directory failure with its 500, the flow having no exception strategy.
+ *
+ * <p>The reply carries a {@code Content-Length} and no {@code Content-Type}: the flow ends with
+ * {@code object-to-string-transformer} over the untyped list of entries (ldap.xml:15), which declares no MIME type,
+ * and the Mule listener sent no Content-Type for such a payload. It is written to the servlet response directly,
+ * so no message converter adds one and the caller's {@code Accept} can never turn it into a 406.
  */
 @RestController
 public class LdapController {
-
-    /**
-     * Preset on every reply, so Spring writes the text without consulting {@code Accept} and never answers 406.
-     */
-    private static final MediaType TEXT_PLAIN_UTF8 = MediaType.parseMediaType("text/plain;charset=UTF-8");
 
     private final LdapSearchService ldapSearchService;
 
@@ -48,27 +52,43 @@ public class LdapController {
      * Answers {@code /} for every method except {@code OPTIONS}; a {@code HEAD} response carries the headers
      * without the body.
      *
-     * @return 200 {@code text/plain;charset=UTF-8} with the entries under {@code ou=people} as
-     *         {@code [<ldif>, <ldif>, ...]}, or an empty body when the search finds none
+     * @param response the response the entries under {@code ou=people} are written to: 200 with their
+     *                 {@code [<ldif>, <ldif>, ...]} text as UTF-8 bytes, its {@code Content-Length} and no
+     *                 {@code Content-Type}, or an empty body with {@code Content-Length: 0} when the search finds none
      * @throws LDAPException unchanged from the search, for the 500 of {@code GlobalExceptionHandler}
+     * @throws IOException   when writing the response fails
      */
     @RequestMapping("/")
-    public ResponseEntity<String> search() throws LDAPException {
-        return ResponseEntity.ok()
-                .contentType(TEXT_PLAIN_UTF8)
-                .body(ldapSearchService.searchPeople());
+    public void search(HttpServletResponse response) throws LDAPException, IOException {
+        searchResponse(response);
     }
 
     /**
      * Answers {@code OPTIONS /} like every other method. A mapping without methods deliberately does not match
      * {@code OPTIONS}, which Spring MVC would otherwise answer itself with an {@code Allow} header and no body;
-     * the Mule listener ran the flow for {@code OPTIONS} too.
+     * the Mule listener ran the flow for {@code OPTIONS} too. A CORS pre-flight reaches this method as well,
+     * dispatched as the plain {@code OPTIONS} request it is by {@code PreflightDispatchConfig}.
      *
-     * @return the response {@link #search()} gives
+     * @param response the response written as {@link #search(HttpServletResponse)} writes it
      * @throws LDAPException unchanged from the search, for the 500 of {@code GlobalExceptionHandler}
+     * @throws IOException   when writing the response fails
      */
     @RequestMapping(value = "/", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> searchOptions() throws LDAPException {
-        return search();
+    public void searchOptions(HttpServletResponse response) throws LDAPException, IOException {
+        searchResponse(response);
+    }
+
+    /**
+     * Writes 200 with the search text's UTF-8 bytes and their {@code Content-Length}. The text is obtained before
+     * the response is touched, so a directory failure still finds an uncommitted response for the 500 of
+     * {@code GlobalExceptionHandler}.
+     */
+    private void searchResponse(HttpServletResponse response) throws LDAPException, IOException {
+        byte[] bytes = ldapSearchService.searchPeople().getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        response.setContentLength(bytes.length);
+        ServletOutputStream stream = response.getOutputStream();
+        stream.write(bytes);
+        stream.flush();
     }
 }

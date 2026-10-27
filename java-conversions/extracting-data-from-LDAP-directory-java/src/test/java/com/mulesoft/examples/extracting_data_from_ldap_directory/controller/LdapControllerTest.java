@@ -38,11 +38,11 @@ import org.springframework.http.MediaType;
  * (extracting-data-from-LDAP-directory/src/main/app/ldap.xml:6-8), on the application's own Undertow listener.
  *
  * <p>Requests go through the project's ST-1 {@link HttpTestClient}, which reads the raw status line from the
- * socket, so the reason phrase, the {@code Content-Type} header and the body bytes are asserted exactly as the
- * listener writes them. The happy-path cases cover every method, because the original listener declares no
- * {@code allowedMethods}; the flow has no exception strategy, so the error cases are the listener-level platform
- * defaults of SC-1: the no-listener 404 for paths the flow does not serve and the JSON 500 for a directory
- * failure.
+ * socket, so the reason phrase, the {@code Content-Type} and {@code Content-Length} headers and the body bytes are
+ * asserted exactly as the listener writes them. The happy-path cases cover every method, because the original
+ * listener declares no {@code allowedMethods}; the flow has no exception strategy, so the error cases are the
+ * listener-level platform defaults of SC-1: the no-listener 404 for paths the flow does not serve and the JSON 500
+ * for a directory failure.
  *
  * <p>{@link LdapSearchService} is mocked, so the test needs no directory server, credential or profile and
  * connects to nothing but its own listener on {@code localhost}. The assertions of the original
@@ -59,9 +59,6 @@ class LdapControllerTest {
     /** Request headers for the methods sent with a body, which the flow ignores. */
     static final Map<String, String> TEXT = Map.of("Content-Type", "text/plain");
 
-    /** Content-Type {@link LdapController} presets on every reply. */
-    private static final String TEXT_PLAIN_UTF8 = "text/plain;charset=UTF-8";
-
     @MockBean
     private LdapSearchService searchService;
 
@@ -73,13 +70,13 @@ class LdapControllerTest {
     }
 
     @Test
-    void getRootReturnsServiceTextAsPlainText() throws LDAPException {
+    void getRootReturnsServiceTextWithoutContentType() throws LDAPException {
         when(searchService.searchPeople()).thenReturn(LDIF);
 
         HttpTestClient.Response response = client().get("/");
 
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
-        assertContentType(response, TEXT_PLAIN_UTF8);
+        assertUntypedWithLength(response, LDIF.getBytes(StandardCharsets.UTF_8).length);
         assertEquals(LDIF, response.bodyAsString(), response::toString);
         assertArrayEquals(LDIF.getBytes(StandardCharsets.UTF_8), response.body(), response::toString);
         verify(searchService, times(1)).searchPeople();
@@ -88,12 +85,13 @@ class LdapControllerTest {
     /**
      * The original listener declares no {@code allowedMethods}, so no method is answered with a 405: each runs the
      * search and gets the same text, its request body ignored. {@code OPTIONS} reaches the controller too instead
-     * of Spring MVC's own {@code Allow} reply.
+     * of Spring MVC's own {@code Allow} reply, and {@code TRACE} instead of the servlet's {@code message/http} echo
+     * of the request.
      *
      * @param method the request method, sent with the same text body each time
      */
     @ParameterizedTest
-    @ValueSource(strings = {"POST", "PUT", "DELETE", "OPTIONS"})
+    @ValueSource(strings = {"POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"})
     void everyOtherMethodIsAccepted(String method) throws LDAPException {
         when(searchService.searchPeople()).thenReturn(LDIF);
 
@@ -102,8 +100,25 @@ class LdapControllerTest {
 
         assertEquals(200, response.status(), response::toString);
         assertEquals("OK", response.reason(), response::toString);
-        assertContentType(response, TEXT_PLAIN_UTF8);
-        assertEquals(LDIF, response.bodyAsString(), response::toString);
+        assertUntypedWithLength(response, LDIF.getBytes(StandardCharsets.UTF_8).length);
+        assertArrayEquals(LDIF.getBytes(StandardCharsets.UTF_8), response.body(), response::toString);
+        verify(searchService, times(1)).searchPeople();
+    }
+
+    /**
+     * {@code HEAD} runs the search like {@code GET} and gets its status line and headers, the
+     * {@code Content-Length} of the text included, without the body. ST-1 reads no body bytes for a {@code HEAD}
+     * request whatever its {@code Content-Length}.
+     */
+    @Test
+    void headRunsTheSearchAndIsAnsweredWithoutBody() throws LDAPException {
+        when(searchService.searchPeople()).thenReturn(LDIF);
+
+        HttpTestClient.Response response = client().send("HEAD", "/", null, null);
+
+        assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
+        assertUntypedWithLength(response, LDIF.getBytes(StandardCharsets.UTF_8).length);
+        assertArrayEquals(new byte[0], response.body(), response::toString);
         verify(searchService, times(1)).searchPeople();
     }
 
@@ -138,7 +153,7 @@ class LdapControllerTest {
         verify(searchService, times(1)).searchPeople();
     }
 
-    /** A search that finds nobody is still a 200 text reply, with no body bytes. */
+    /** A search that finds nobody is still a 200 reply, with no body bytes and {@code Content-Length: 0}. */
     @Test
     void emptyResultReturns200WithEmptyBody() throws LDAPException {
         when(searchService.searchPeople()).thenReturn("");
@@ -146,16 +161,25 @@ class LdapControllerTest {
         HttpTestClient.Response response = client().get("/");
 
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
-        assertContentType(response, TEXT_PLAIN_UTF8);
+        assertUntypedWithLength(response, 0);
         assertEquals(0, response.body().length, response::toString);
         verify(searchService, times(1)).searchPeople();
     }
 
     /**
-     * Compares the whole value: each reply presets its media type on the response entity, so the listener writes
-     * exactly one {@code Content-Type} header carrying that value.
+     * Compares the whole value: each error reply presets its media type on the response entity, so the listener
+     * writes exactly one {@code Content-Type} header carrying that value.
      */
     private static void assertContentType(HttpTestClient.Response response, String expected) {
         assertEquals(List.of(expected), response.headers("Content-Type"), response::toString);
+    }
+
+    /**
+     * The flow ends with {@code object-to-string-transformer} over an untyped list, so the Mule listener sent no
+     * {@code Content-Type}: the reply carries none, only exactly one {@code Content-Length} of its body bytes.
+     */
+    private static void assertUntypedWithLength(HttpTestClient.Response response, int bodyBytes) {
+        assertEquals(List.of(), response.headers("Content-Type"), response::toString);
+        assertEquals(List.of(Integer.toString(bodyBytes)), response.headers("Content-Length"), response::toString);
     }
 }

@@ -11,6 +11,7 @@ package com.mulesoft.examples.extracting_data_from_ldap_directory.client;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -27,7 +28,17 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.LoggerFactory;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 
 import com.mulesoft.examples.extracting_data_from_ldap_directory.config.LdapProperties;
 import com.unboundid.ldap.listener.InMemoryDirectoryServer;
@@ -45,6 +56,8 @@ import com.unboundid.ldif.LDIFReader;
  * <p>The directory is the UnboundID in-memory server loaded with the carried {@code ldap-add.ldif}, set up as the
  * original {@code ExtractingDataFromLdapDirectoryIT} set it up (base DN, additional bind credentials, LDIF import),
  * but listening on a free port instead of a configured one.
+ *
+ * <p>The client's failure log is read from a Logback {@link ListAppender} attached to its logger for each test.
  */
 class LdapDirectoryClientTest {
 
@@ -66,23 +79,46 @@ class LdapDirectoryClientTest {
     /** How many reserved-port handoffs the recovery test attempts before it fails. */
     private static final int HANDOFF_ATTEMPTS = 5;
 
+    private static final String PEOPLE_BASE = "'" + PEOPLE + "," + BASE_DN + "'";
+
+    private static final String SDK_PACKAGE = "com.unboundid.ldap.sdk.";
+
     private static InMemoryDirectoryServer server;
 
     private static int port;
 
+    /** Bound but never listening for the whole class, so a connection to {@link #refusingPort} is refused. */
+    private static Socket refusing;
+
+    private static int refusingPort;
+
     private LdapDirectoryClient client;
+
+    private ListAppender<ILoggingEvent> clientLog;
 
     @BeforeAll
     static void startDirectory() throws Exception {
         server = startServer(0);
         port = server.getListenPort(LISTENER);
+        refusing = reserveRefusingPort();
+        refusingPort = refusing.getLocalPort();
     }
 
     @AfterAll
-    static void stopDirectory() {
+    static void stopDirectory() throws IOException {
         if (server != null) {
             server.shutDown(true);
         }
+        if (refusing != null) {
+            refusing.close();
+        }
+    }
+
+    @BeforeEach
+    void captureClientLog() {
+        clientLog = new ListAppender<>();
+        clientLog.start();
+        clientLogger().addAppender(clientLog);
     }
 
     @AfterEach
@@ -91,6 +127,8 @@ class LdapDirectoryClientTest {
             client.close();
             client = null;
         }
+        clientLogger().detachAppender(clientLog);
+        clientLog.stop();
     }
 
     @Test
@@ -102,6 +140,8 @@ class LdapDirectoryClientTest {
         // Neither ou=people itself nor any ou=groups entry may appear.
         assertThat(entries.stream().map(Entry::getDN).toList())
                 .containsExactlyInAnyOrder("cn=mmc,ou=people", "cn=testuser1,ou=people", "cn=admin,ou=people");
+        // Only a failure is logged.
+        assertThat(clientLog.list).isEmpty();
     }
 
     @Test
@@ -137,6 +177,96 @@ class LdapDirectoryClientTest {
         assertThatThrownBy(() -> client.search(PEOPLE, ALL))
                 .isInstanceOfSatisfying(LDAPException.class,
                         e -> assertThat(e.getResultCode()).isEqualTo(ResultCode.INVALID_CREDENTIALS));
+    }
+
+    /**
+     * The failures an operator must tell apart from the log alone.
+     *
+     * @return per failure: scenario, configuration, relative search base, expected result code, the server and the
+     *         search base the log line must name, and the frame that must have raised the exception (the SDK's or the
+     *         client's configuration check, never a wrapper made in {@code search})
+     */
+    static Stream<Arguments> failures() {
+        String server = "localhost:" + port;
+        String configurationCheck = LdapDirectoryClient.class.getName() + ".createPool";
+        String unknownUrlBase = "'" + PEOPLE + "' relative to an unknown ldap.url base DN";
+        return Stream.of(
+                Arguments.of("wrong bind password", properties(port, "wrong-password"), PEOPLE,
+                        ResultCode.INVALID_CREDENTIALS, server, PEOPLE_BASE, SDK_PACKAGE),
+                Arguments.of("missing search base", properties(port, BIND_PASSWORD), "ou=missing",
+                        ResultCode.NO_SUCH_OBJECT, server, "'ou=missing," + BASE_DN + "'", SDK_PACKAGE),
+                Arguments.of("nothing listening", properties(refusingPort, BIND_PASSWORD), PEOPLE,
+                        ResultCode.CONNECT_ERROR, "localhost:" + refusingPort, PEOPLE_BASE, SDK_PACKAGE),
+                Arguments.of("ldap.dn not configured", withoutDn(), PEOPLE,
+                        ResultCode.PARAM_ERROR, server, PEOPLE_BASE, configurationCheck),
+                // An unset password is no secret: the message naming the missing key is logged.
+                Arguments.of("ldap.password not configured", properties(port, ""), PEOPLE,
+                        ResultCode.PARAM_ERROR, server, PEOPLE_BASE, configurationCheck),
+                Arguments.of("ldap.url not configured", withUrl(null), PEOPLE,
+                        ResultCode.PARAM_ERROR, "<ldap.url not configured>", unknownUrlBase, configurationCheck),
+                Arguments.of("ldap.url not an LDAP URL", withUrl("not a url"), PEOPLE,
+                        ResultCode.DECODING_ERROR, "<ldap.url invalid>", unknownUrlBase, SDK_PACKAGE),
+                Arguments.of("ldap.url without host", withUrl("ldap:///" + BASE_DN), PEOPLE,
+                        ResultCode.PARAM_ERROR, "<ldap.url has no host>", PEOPLE_BASE, configurationCheck));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("failures")
+    void failureIsLoggedOnceWithDiagnosticContextThenRethrownUnchanged(String scenario, LdapProperties configuration,
+            String relativeBase, ResultCode expectedCode, String expectedServer, String expectedBase,
+            String raisedBy) {
+        client = new LdapDirectoryClient(configuration);
+
+        LDAPException thrown = assertThrows(LDAPException.class, () -> client.search(relativeBase, ALL));
+
+        assertThat(thrown.getResultCode()).isEqualTo(expectedCode);
+        StackTraceElement raiser = thrown.getStackTrace()[0];
+        assertThat(raiser.getClassName() + "." + raiser.getMethodName()).startsWith(raisedBy);
+        String line = singleErrorLine();
+        assertThat(line)
+                .contains("result code " + expectedCode.intValue() + " (" + expectedCode.getName() + ")")
+                .contains(" on server " + expectedServer + " ")
+                .contains(" for base " + expectedBase + ": ")
+                .endsWith(": " + thrown.getMessage());
+        if (!configuration.getPassword().isEmpty()) {
+            assertThat(line).doesNotContain(configuration.getPassword());
+        }
+    }
+
+    @Test
+    void failureLogEscapesLineBreaksAndBoundsEachValue() {
+        client = new LdapDirectoryClient(properties(port, BIND_PASSWORD));
+        String padding = "x".repeat(600);
+        String forged = "ou=forged\nERROR forged line\\2c" + padding;
+
+        LDAPException thrown = assertThrows(LDAPException.class, () -> client.search(forged, ALL));
+
+        assertThat(thrown.getResultCode()).isEqualTo(ResultCode.NO_SUCH_OBJECT);
+        // The SDK's message repeats the base, so both the base and the message carry the line break and the length.
+        assertThat(thrown.getMessage()).contains("\n", padding);
+        assertThat(singleErrorLine())
+                .doesNotContain("\n", "\r", padding)
+                .contains(" for base 'ou=forged\\u000aERROR forged line\\u005c2cxxx")
+                .contains("...[truncated]': ")
+                .endsWith("...[truncated]");
+    }
+
+    @Test
+    void failureMessageContainingTheBindPasswordIsWithheld() {
+        // ldap.dn is unset, so the configuration check fails with "ldap.dn is not configured", which here contains
+        // the configured password.
+        String password = "dn is not";
+        LdapProperties configuration = properties(port, password);
+        configuration.setDn("");
+        client = new LdapDirectoryClient(configuration);
+
+        LDAPException thrown = assertThrows(LDAPException.class, () -> client.search(PEOPLE, ALL));
+
+        assertThat(thrown.getMessage()).contains(password);
+        assertThat(singleErrorLine())
+                .contains("result code 89 (parameter error)")
+                .endsWith(": <message withheld>")
+                .doesNotContain(password);
     }
 
     @Test
@@ -238,6 +368,31 @@ class LdapDirectoryClientTest {
         properties.setPassword(password);
         properties.setPort(ldapPort);
         return properties;
+    }
+
+    private static LdapProperties withoutDn() {
+        LdapProperties properties = properties(port, BIND_PASSWORD);
+        properties.setDn("");
+        return properties;
+    }
+
+    private static LdapProperties withUrl(String url) {
+        LdapProperties properties = properties(port, BIND_PASSWORD);
+        properties.setUrl(url);
+        return properties;
+    }
+
+    private static Logger clientLogger() {
+        return (Logger) LoggerFactory.getLogger(LdapDirectoryClient.class);
+    }
+
+    /** The one event the client logged: at ERROR, without a stack trace; returns its formatted line. */
+    private String singleErrorLine() {
+        assertThat(clientLog.list).hasSize(1);
+        ILoggingEvent event = clientLog.list.get(0);
+        assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+        assertThat(event.getThrowableProxy()).isNull();
+        return event.getFormattedMessage();
     }
 
     private static Entry entry(List<Entry> entries, String dn) {

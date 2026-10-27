@@ -12,6 +12,8 @@ import com.mulesoft.examples.legacy_modernization.model.Address;
 import com.mulesoft.examples.legacy_modernization.model.Order;
 import com.mulesoft.examples.legacy_modernization.model.ShippingOrder;
 import com.mulesoft.examples.legacy_modernization.model.ShippingOrderConfirmation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.config.ConfigurableBeanFactory;
 import org.springframework.context.annotation.Scope;
 import org.springframework.stereotype.Service;
@@ -22,6 +24,8 @@ import org.springframework.stereotype.Service;
 @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
 public class FulfillmentService implements IFulfillment{
 	
+	private static final Logger log = LoggerFactory.getLogger(FulfillmentService.class);
+
 	public ShippingOrder shippingOrder;
 	public ShippingOrderConfirmation shippingOrderConfirmation;
 	
@@ -34,7 +38,11 @@ public class FulfillmentService implements IFulfillment{
 		} catch(Exception e)
 		
 		{
-			e.printStackTrace();
+			// Only the exception type and its throw site are logged: the exception text can carry request
+			// values (shipping id, addresses, order items).
+			StackTraceElement[] stackTrace = e.getStackTrace();
+			log.error("putShippingOrder failed: {} thrown at {}", e.getClass().getName(),
+					stackTrace.length > 0 ? stackTrace[0] : "unknown");
 		}
 
 		return shippingOrderConfirmation;
