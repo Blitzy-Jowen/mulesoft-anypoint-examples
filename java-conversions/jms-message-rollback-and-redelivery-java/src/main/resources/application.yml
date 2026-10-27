@@ -16,6 +16,8 @@ jms:
   concurrent-consumers: 4              # Mule 3.8 default transacted receivers
 # ActiveMQ RedeliveryPolicy [jms-redelivery.xml:6-12], without exponential back-off (useExponentialBackOff=false);
 # the broker-side address settings for "in" (redelivery-delay 0, max-delivery-attempts 6) are documented in README.md.
+# The listener's consumers run with consumerWindowSize 0 and each is closed before its delivery is processed, both set in
+# config/JmsConfig, so the timing holds for any broker-url.
 redelivery:
   initial-redelivery-delay: 5000       # [jms-redelivery.xml:8]
   redelivery-delay: 2000               # [jms-redelivery.xml:9]

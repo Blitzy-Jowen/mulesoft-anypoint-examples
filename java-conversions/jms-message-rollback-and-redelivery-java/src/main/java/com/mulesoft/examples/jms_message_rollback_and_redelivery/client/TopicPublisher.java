@@ -8,11 +8,18 @@
 
 package com.mulesoft.examples.jms_message_rollback_and_redelivery.client;
 
+import java.util.List;
+
 import jakarta.jms.ConnectionFactory;
+import jakarta.jms.JMSException;
+import jakarta.jms.Message;
+import jakarta.jms.Session;
+import jakarta.jms.StreamMessage;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jms.core.JmsTemplate;
+import org.springframework.jms.support.converter.SimpleMessageConverter;
 import org.springframework.stereotype.Component;
 
 /**
@@ -30,12 +37,42 @@ import org.springframework.stereotype.Component;
  * rollback of deliveries one to four, as {@code ALWAYS_JOIN} did. Called outside a listener, the template
  * opens and commits its own transacted session.
  *
- * <p>Delivery mode, message converter and destination resolver keep their defaults: PERSISTENT reproduces the
- * connector's {@code persistentDelivery="true"}, a {@code String} payload is sent as a {@code TextMessage},
- * and the topic is resolved by name.
+ * <p>Delivery mode and destination resolver keep their defaults: PERSISTENT reproduces the connector's
+ * {@code persistentDelivery="true"}, and the topic is resolved by name. The message converter is
+ * {@link StreamListMessageConverter}: Spring's {@link SimpleMessageConverter}, which sends a {@code String}
+ * payload as a {@code TextMessage} and a JMS {@code Message} payload unchanged, plus the {@code List} rule of
+ * Mule's outbound JMS transformer.
  */
 @Component
 public class TopicPublisher {
+
+    /**
+     * {@link SimpleMessageConverter} with the {@code List} rule of Mule's outbound JMS transformer
+     * ({@code JmsMessageUtils.toMessage}): a {@code List}, the payload a stream message yields, becomes a
+     * {@code StreamMessage} holding its elements in order, where Spring's converter would serialize it into an
+     * {@code ObjectMessage}. Every other payload is converted by {@code SimpleMessageConverter}.
+     */
+    static final class StreamListMessageConverter extends SimpleMessageConverter {
+
+        /**
+         * Converts the payload into the message sent to the topic.
+         *
+         * @throws jakarta.jms.MessageFormatException when a {@code List} element is not a primitive wrapper,
+         *                                            {@code String} or {@code byte[]}, the types a stream message
+         *                                            can hold
+         */
+        @Override
+        public Message toMessage(Object object, Session session) throws JMSException {
+            if (object instanceof List<?> values) {
+                StreamMessage message = session.createStreamMessage();
+                for (Object value : values) {
+                    message.writeObject(value);
+                }
+                return message;
+            }
+            return super.toMessage(object, session);
+        }
+    }
 
     private final JmsTemplate template;
 
@@ -54,6 +91,7 @@ public class TopicPublisher {
         JmsTemplate t = new JmsTemplate(connectionFactory);
         t.setPubSubDomain(true);
         t.setSessionTransacted(true);
+        t.setMessageConverter(new StreamListMessageConverter());
         this.template = t;
         this.topic = topic;
     }
@@ -70,7 +108,8 @@ public class TopicPublisher {
     /**
      * Sends the payload to the configured topic, inside the current listener transaction when there is one.
      *
-     * @param payload the message payload; a {@code String} is sent as a {@code TextMessage}
+     * @param payload the message payload; a {@code String} is sent as a {@code TextMessage}, a {@code List} as a
+     *                {@code StreamMessage}
      * @throws org.springframework.jms.JmsException when the payload cannot be converted or the broker rejects
      *                                              the send; it reaches the caller unwrapped so the flow's
      *                                              exception branches see it

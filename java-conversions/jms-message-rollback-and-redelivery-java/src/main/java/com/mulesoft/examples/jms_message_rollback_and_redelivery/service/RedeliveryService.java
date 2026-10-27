@@ -65,9 +65,21 @@ public class RedeliveryService {
      *
      * <p>On the fifth delivery the message is logged as processed and published to {@code topic1}; any other
      * delivery throws {@link MyException}, as the flow's {@code test:component} does. A failure is then
-     * handled by the choice-exception strategy in declaration order: without a {@code MyException} in its
-     * cause chain it takes the catch branch and the method returns normally (commit); with one it takes the
-     * rollback branch and that {@code MyException} is rethrown (rollback and redelivery).
+     * handled by the choice-exception strategy, {@link #handleFailure(Exception)}: without a {@code MyException}
+     * in its cause chain it takes the catch branch and the method returns normally (commit); with one it takes
+     * the rollback branch and that {@code MyException} is rethrown (rollback and redelivery).
+     *
+     * <p>Delivery counts after a crash: the listener container ({@code JmsConfig.ConsumerClosingListenerContainer})
+     * closes the receive's consumer before the listener runs, so a delivery pausing before its rollback is held
+     * only by its session's transaction, to which the message's acknowledgement belongs. When the application dies
+     * without closing its connection (a hard kill) during that pause, the Artemis broker rolls the transaction back
+     * as it clears the dead connection, the message returns to queue {@code in} with its delivery count unchanged,
+     * and the next delivery continues the count. Artemis does not take back the count of a delivery made to a
+     * failed client, so should it hand the returned message to a consumer of the dead connection it has not cleared
+     * yet, the next {@code deliveryCount} can skip values. A count past 5 is rolled back like every count but 5, as
+     * the original choice does; once the count reaches the address's {@code max-delivery-attempts} of 6, the broker
+     * moves the message to the dead-letter address without it being published. A graceful shutdown waits for the
+     * pause and keeps the counts exact.
      *
      * @param payload       the message body, published unchanged
      * @param deliveryCount the message's {@code JMSXDeliveryCount}, starting at 1
@@ -82,14 +94,57 @@ public class RedeliveryService {
             }
             topicPublisher.publish(payload);
         } catch (Exception e) {
-            MyException cause = findMyException(e);
-            if (cause == null) {
-                LOG.info(CATCH_MESSAGE);
-                return;
-            }
-            LOG.info(ROLLBACK_MESSAGE);
-            throw cause;
+            handleFailure(e);
         }
+    }
+
+    /**
+     * The flow's {@code choice-exception-strategy} ({@code jms-redelivery.xml:39-47}): it dispatches the failure to
+     * one handler method per branch, evaluating the branches' {@code when} conditions in declaration order. It
+     * handles every failure of the flow, including one raised while the inbound message is read, before
+     * {@link #process(Object, int)} runs, as Mule's inbound JMS transformer ran inside the flow.
+     *
+     * <ul>
+     *   <li>Catch branch, when no {@link MyException} is in the failure's cause chain: {@link #catchBranch()}, so
+     *       the method returns normally and the listener's session commits.</li>
+     *   <li>Rollback branch otherwise: {@link #rollbackBranch(MyException)}, and the {@code MyException} it hands
+     *       back is rethrown, so the listener's session rolls back and the broker redelivers.</li>
+     * </ul>
+     *
+     * @param failure the exception the flow raised
+     * @throws MyException the exception found in the failure's cause chain, when the rollback branch runs
+     */
+    public void handleFailure(Exception failure) throws MyException {
+        MyException cause = findMyException(failure);
+        if (cause == null) {
+            catchBranch();
+        } else {
+            throw rollbackBranch(cause);
+        }
+    }
+
+    /**
+     * The {@code catch-exception-strategy} branch ({@code jms-redelivery.xml:40-42}), taken when
+     * {@code !exception.causedBy(org.exceptions.MyException)}: logs {@link #CATCH_MESSAGE} and returns normally,
+     * so the listener's session commits and the message is consumed.
+     */
+    private void catchBranch() {
+        LOG.info(CATCH_MESSAGE);
+    }
+
+    /**
+     * The {@code rollback-exception-strategy} branch ({@code jms-redelivery.xml:44-46}), taken when
+     * {@code exception.causedBy(org.exceptions.MyException)}: logs {@link #ROLLBACK_MESSAGE} and hands back that
+     * {@code MyException}, which {@link #handleFailure(Exception)} rethrows, so the listener's session rolls back
+     * and the broker redelivers. The exception is returned rather than thrown here so that the rethrow stays in
+     * the strategy's own body.
+     *
+     * @param cause the {@link MyException} found in the failure's cause chain
+     * @return {@code cause}, the exception to rethrow out of the transacted listener
+     */
+    private MyException rollbackBranch(MyException cause) {
+        LOG.info(ROLLBACK_MESSAGE);
+        return cause;
     }
 
     /**

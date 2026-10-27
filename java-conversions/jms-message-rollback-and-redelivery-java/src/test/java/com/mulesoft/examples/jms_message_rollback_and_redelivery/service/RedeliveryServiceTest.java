@@ -20,6 +20,8 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 import java.util.List;
 
+import jakarta.jms.MessageFormatException;
+
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -138,5 +140,29 @@ class RedeliveryServiceTest {
         assertSame(inner, thrown);
         assertEquals("x", thrown.getError());
         assertEquals(List.of(RedeliveryService.SUCCESS_MESSAGE, RedeliveryService.ROLLBACK_MESSAGE), infoMessages());
+    }
+
+    @Test
+    @DisplayName("handleFailure, catch branch: an inbound read failure not caused by MyException logs and returns")
+    void handleFailureWithoutMyExceptionTakesCatchBranch() {
+        MessageFormatException failure = new MessageFormatException("Body not assignable to class java.lang.Object");
+
+        assertDoesNotThrow(() -> service.handleFailure(failure));
+
+        verifyNoInteractions(publisher);
+        assertEquals(List.of(RedeliveryService.CATCH_MESSAGE), infoMessages());
+    }
+
+    @Test
+    @DisplayName("handleFailure, rollback branch: a failure caused by MyException rethrows that MyException")
+    void handleFailureCausedByMyExceptionTakesRollbackBranch() {
+        MyException inner = new MyException("y");
+
+        MyException thrown = assertThrows(MyException.class,
+                () -> service.handleFailure(new IllegalStateException(new RuntimeException(inner))));
+
+        assertSame(inner, thrown);
+        verifyNoInteractions(publisher);
+        assertEquals(List.of(RedeliveryService.ROLLBACK_MESSAGE), infoMessages());
     }
 }
