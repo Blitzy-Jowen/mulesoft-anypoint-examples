@@ -294,6 +294,47 @@ class WatermarkStoreTest {
         }
     }
 
+    @Test
+    void storePathIsTheAbsoluteNormalizedFileAndAPathNamingNoFileIsRejected() {
+        assertThat(new WatermarkStore(tempDir.resolve("x").resolve("..").resolve("watermark.properties")).storePath())
+                .isEqualTo(storeFile());
+        // Constructing touches no file, so the relative path below writes nothing to the working directory.
+        assertThat(new WatermarkStore(Path.of("watermark.properties")).storePath())
+                .isEqualTo(Path.of("").toAbsolutePath().resolve("watermark.properties"));
+
+        assertThatThrownBy(() -> new WatermarkStore(tempDir.getRoot()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("names no file");
+        assertThatThrownBy(() -> new WatermarkStore(null)).isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void defaultSupplyingNullIsRejectedNamingTheKeyAndNothingIsStored() {
+        WatermarkStore store = new WatermarkStore(storeFile());
+
+        assertThatThrownBy(() -> store.retrieve(KEY, () -> null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessageContaining("'" + KEY + "'");
+
+        assertThat(storeFile()).doesNotExist();
+    }
+
+    @Test
+    void nullArgumentsAreRejectedWithoutTouchingTheStore() {
+        WatermarkStore store = new WatermarkStore(storeFile());
+
+        assertThatThrownBy(() -> store.current(null)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> store.retrieve(null, () -> DEFAULT_WATERMARK))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> store.retrieve(KEY, null)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> store.updateMax(null, List.of(JULY_4))).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> store.updateMax(KEY, null)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> store.store(null, JULY_4)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> store.store(KEY, null)).isInstanceOf(NullPointerException.class);
+
+        assertThat(storeFile()).doesNotExist();
+    }
+
     private Path storeFile() {
         return tempDir.resolve("watermark.properties");
     }
