@@ -222,9 +222,33 @@ class CreateEpisodeRequestMapperTest {
     }
 
     @Test
-    void toElementFailsWithoutStderrWhenOutputIsNotWellFormed() {
-        // A DOM text node may hold U+0001, which the writer copies unescaped and no XML 1.0 parser accepts.
+    void writerRejectsACharacterXmlForbidsInBothConversions() {
+        // A DOM text node may hold U+0001, which the writer rejects before anything is parsed.
         Element upsertPatientResponse = namespaceUnawareRootWithPatientId("P\u00011");
+        String invalid = "Invalid XML 1.0 character U+0001 in the text of element <ns1:PatientId>";
+
+        assertThat(catchThrowable(() -> mapper.toXml(upsertPatientResponse)))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+        assertThat(catchThrowable(() -> mapper.toElement(upsertPatientResponse)))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+    }
+
+    @Test
+    void toElementFailsWithoutStderrWhenOutputIsNotWellFormed() {
+        // Without strict error checking a DOM accepts an element name that is not an XML Name; the mapper copies
+        // it as it is, so the writer's output is not well-formed and the parser rejects it.
+        Element upsertPatientResponse = patientIdWithChildNamed("a b");
+        assertThat(mapper.toXml(upsertPatientResponse)).isEqualTo(String.join("\n",
+                "<?xml version='1.0' encoding='UTF-8'?>",
+                "<ns0:createEpisode xmlns:ns0=\"http://www.mule-health.com/SOA/message/1.0\">",
+                "\t<ns1:PatientId xmlns:ns1=\"http://www.mule-health.com/SOA/model/1.0\">",
+                "\t\t<a b>1</a b>",
+                "\t</ns1:PatientId>",
+                "</ns0:createEpisode>"));
         PrintStream originalErr = System.err;
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         Throwable thrown;
@@ -289,6 +313,23 @@ class CreateEpisodeRequestMapperTest {
         Element patientId = document.createElementNS(MODEL_NS, "d:PatientId");
         patientId.setTextContent(text);
         root.appendChild(patientId);
+        return root;
+    }
+
+    /**
+     * A namespace-aware response whose model PatientId holds one unqualified child named {@code name} with the text
+     * {@code 1}, created with strict error checking off so that a name which is not an XML Name is accepted.
+     */
+    private static Element patientIdWithChildNamed(String name) {
+        Document document = newDocumentBuilder(true).newDocument();
+        document.setStrictErrorChecking(false);
+        Element root = document.createElementNS(MESSAGE_NS, "ns0:upsertPatientResponse");
+        document.appendChild(root);
+        Element patientId = document.createElementNS(MODEL_NS, "ns1:PatientId");
+        root.appendChild(patientId);
+        Element child = document.createElementNS(null, name);
+        child.setTextContent("1");
+        patientId.appendChild(child);
         return root;
     }
 

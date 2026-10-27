@@ -78,8 +78,9 @@ public class AttachmentImportService {
      * @param attachments the message's attachments in Mule's attachment-list order
      * @return the written file
      * @throws IllegalArgumentException when the message has no attachment; nothing is read, logged or written
-     * @throws IllegalStateException    when the first attachment's content is neither text, a stream nor bytes;
-     *                                  nothing is logged or written
+     * @throws IllegalStateException    when the first attachment's content is neither text, a stream nor bytes, or
+     *                                  a CSV value holds a character XML 1.0 does not allow, which the XML writer
+     *                                  rejects; nothing is logged or written
      * @throws IOException              when the first attachment's content cannot be read or decoded, or the output
      *                                  file cannot be written
      */

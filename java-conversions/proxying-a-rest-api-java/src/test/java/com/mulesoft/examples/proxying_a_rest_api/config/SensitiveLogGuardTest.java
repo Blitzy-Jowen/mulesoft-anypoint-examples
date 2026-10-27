@@ -358,7 +358,11 @@ class SensitiveLogGuardTest {
             assertLogHoldsNoSentinel(output);
             assertThat(output.getAll()).as("INFO and above pass the guard")
                     .contains("ERROR")
-                    .contains("Unhandled exception processing GET /2.0/broken: java.lang.IllegalStateException");
+                    .contains("Unhandled exception processing GET /**: java.lang.IllegalStateException");
+            assertThat(output.getAll().lines().filter(line -> line.contains("Unhandled exception processing")))
+                    .as("the ERROR line names the route, never the request path")
+                    .isNotEmpty()
+                    .noneMatch(line -> line.contains("/2.0/broken"));
         }
 
         private HttpTestClient client() {

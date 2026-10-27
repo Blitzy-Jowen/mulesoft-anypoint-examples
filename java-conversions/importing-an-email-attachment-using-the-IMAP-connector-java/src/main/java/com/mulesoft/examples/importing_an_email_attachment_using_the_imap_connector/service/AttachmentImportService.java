@@ -77,8 +77,9 @@ public class AttachmentImportService {
      * @param attachments the mail's attachments in Mule's attachment-list order, which must be the map's iteration
      *                    order (an insertion-ordered map); only the first one is read
      * @return the written file
-     * @throws IllegalStateException when there is no attachment, or the first one's content is neither text, a
-     *                               stream nor bytes; nothing is logged or written then
+     * @throws IllegalStateException when there is no attachment, the first one's content is neither text, a
+     *                               stream nor bytes, or a CSV value holds a character XML 1.0 does not allow,
+     *                               which the XML writer rejects; nothing is logged or written then
      * @throws Exception             any failure of reading the content, mapping it or writing the file, unchanged
      */
     public Path importAttachments(Map<String, DataHandler> attachments) throws Exception {

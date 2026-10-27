@@ -18,8 +18,12 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * Byte contract of {@link DwXmlWriter}: the single-quoted declaration, a line feed, then the root element in
@@ -354,6 +358,95 @@ class DwXmlWriterTest {
         assertThat(bytes).hasSize(expected.length() + 1 + 2);
     }
 
+    /**
+     * Values holding a character the XML 1.0 {@code Char} production excludes, with the code point the writer
+     * reports: C0 controls other than tab, line feed and carriage return, unpaired surrogates, U+FFFE and U+FFFF.
+     * A value holding several is reported at its first.
+     */
+    static Stream<Arguments> charactersXmlForbids() {
+        return Stream.of(
+                Arguments.of("NUL", "\u0000", "U+0000"),
+                Arguments.of("U+0001 between letters", "a\u0001b", "U+0001"),
+                Arguments.of("backspace", "\b", "U+0008"),
+                Arguments.of("vertical tab", "\u000b", "U+000B"),
+                Arguments.of("form feed", "\f", "U+000C"),
+                Arguments.of("shift out", "\u000e", "U+000E"),
+                Arguments.of("unit separator, the last C0 control", "\u001f", "U+001F"),
+                Arguments.of("lone high surrogate ending the value", "\ud800", "U+D800"),
+                Arguments.of("high surrogate before a letter", "x\ud800y", "U+D800"),
+                Arguments.of("lone low surrogate", "\udc00", "U+DC00"),
+                Arguments.of("low surrogate before a high one", "\udc00\ud800", "U+DC00"),
+                Arguments.of("U+FFFE", "\ufffe", "U+FFFE"),
+                Arguments.of("U+FFFF", "\uffff", "U+FFFF"),
+                Arguments.of("the CSV name of the QA report, two controls", "bad\u0001char\u000b", "U+0001"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("charactersXmlForbids")
+    void characterXmlForbidsFailsTheWriteInTextAttributeAndNamespaceUri(String description, String value,
+            String codePoint) {
+        String invalid = "Invalid XML 1.0 character " + codePoint + " in ";
+        List<Map.Entry<DwXmlWriter.Element, String>> placements = List.of(
+                Map.entry(singleOrder(value), invalid + "the text of element <name>"),
+                Map.entry(DwXmlWriter.element("r").child(DwXmlWriter.element("p", "urn:p", "e").attribute("v", value)),
+                        invalid + "attribute 'v' of element <p:e>"),
+                Map.entry(DwXmlWriter.element("r").child(DwXmlWriter.element("p", value, "e")),
+                        invalid + "the namespace URI of xmlns:p on element <p:e>"),
+                Map.entry(DwXmlWriter.element("r").child(DwXmlWriter.element(null, value, "e")),
+                        invalid + "the namespace URI of xmlns on element <e>"));
+
+        for (Map.Entry<DwXmlWriter.Element, String> placement : placements) {
+            assertThatThrownBy(() -> writer.write(placement.getKey()))
+                    .isExactlyInstanceOf(IllegalStateException.class)
+                    .hasMessage(placement.getValue())
+                    .hasNoCause();
+            assertThatThrownBy(() -> writer.writeBytes(placement.getKey()))
+                    .isExactlyInstanceOf(IllegalStateException.class)
+                    .hasMessage(placement.getValue())
+                    .hasNoCause();
+        }
+    }
+
+    /**
+     * The edges of the XML 1.0 {@code Char} production with their UTF-8 encodings: tab, line feed, carriage
+     * return, U+0020, U+D7FF, U+E000, U+FFFD, and the first and last supplementary characters as surrogate pairs.
+     */
+    static Stream<Arguments> boundaryCharactersXmlAllows() {
+        return Stream.of(
+                Arguments.of("tab", "\t", bytes(0x09)),
+                Arguments.of("line feed", "\n", bytes(0x0A)),
+                Arguments.of("carriage return", "\r", bytes(0x0D)),
+                Arguments.of("space, U+0020", " ", bytes(0x20)),
+                Arguments.of("U+D7FF, below the surrogates", "\ud7ff", bytes(0xED, 0x9F, 0xBF)),
+                Arguments.of("U+E000, above the surrogates", "\ue000", bytes(0xEE, 0x80, 0x80)),
+                Arguments.of("U+FFFD, below U+FFFE", "\ufffd", bytes(0xEF, 0xBF, 0xBD)),
+                Arguments.of("U+10000 as a surrogate pair", "\ud800\udc00", bytes(0xF0, 0x90, 0x80, 0x80)),
+                Arguments.of("U+10FFFF as a surrogate pair", "\udbff\udfff", bytes(0xF4, 0x8F, 0xBF, 0xBF)));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("boundaryCharactersXmlAllows")
+    void boundaryCharacterXmlAllowsIsWrittenUnchangedBesideEscapedMarkup(String description, String character,
+            byte[] utf8) {
+        String value = "a" + character + "&<>\"" + character + "z";
+        DwXmlWriter.Element root = DwXmlWriter.element("r").children(
+                DwXmlWriter.element("text").text(value),
+                DwXmlWriter.element("attr").attribute("v", value));
+
+        String expected = DECLARATION_LINE
+                + "<r>\n"
+                + "\t<text>a" + character + "&amp;&lt;&gt;\"" + character + "z</text>\n"
+                + "\t<attr v=\"a" + character + "&amp;&lt;&gt;&quot;" + character + "z\"/>\n"
+                + "</r>";
+        String output = writer.write(root);
+        assertThat(output).isEqualTo(expected).doesNotContain("&#");
+
+        byte[] written = writer.writeBytes(root);
+        assertThat(character.getBytes(StandardCharsets.UTF_8)).isEqualTo(utf8);
+        assertThat(written).isEqualTo(expected.getBytes(StandardCharsets.UTF_8));
+        assertThat(written).hasSize(expected.length() + 4 * (utf8.length - character.length()));
+    }
+
     @Test
     void attributesKeepFirstInsertionOrderAndNullValueRemovesThem() {
         DwXmlWriter.Element option = DwXmlWriter.element("option")
@@ -678,6 +771,24 @@ class DwXmlWriterTest {
 
     private static DwXmlWriter.Element nonAsciiElement() {
         return DwXmlWriter.element("description").text("\u00d1and\u00fa");
+    }
+
+    /** The {@code orders/order} shape of one CSV row {@code 1,<name>,1,1}. */
+    private static DwXmlWriter.Element singleOrder(String name) {
+        return DwXmlWriter.element("orders").child(DwXmlWriter.element("order").children(
+                DwXmlWriter.element("orderId").text("1"),
+                DwXmlWriter.element("name").text(name),
+                DwXmlWriter.element("units").text("1"),
+                DwXmlWriter.element("pricePerUnit").text("1")));
+    }
+
+    /** Bytes from unsigned values, so UTF-8 sequences read as they are written. */
+    private static byte[] bytes(int... values) {
+        byte[] bytes = new byte[values.length];
+        for (int i = 0; i < values.length; i++) {
+            bytes[i] = (byte) values[i];
+        }
+        return bytes;
     }
 
     /** An insertion-ordered map from alternating keys and values; values may be {@code null}. */

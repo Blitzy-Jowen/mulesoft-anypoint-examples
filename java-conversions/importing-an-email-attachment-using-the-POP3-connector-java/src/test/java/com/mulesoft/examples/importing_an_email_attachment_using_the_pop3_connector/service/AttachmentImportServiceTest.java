@@ -311,6 +311,22 @@ class AttachmentImportServiceTest {
     }
 
     @Test
+    void characterXmlForbidsFailsTheImportBeforeAnythingIsLoggedOrWritten(CapturedOutput output) throws IOException {
+        DataHandler attachment =
+                octetStream("orderId,name,units,pricePerUnit\n1,bad\u0001char\u000b,1,1\n".getBytes(UTF_8));
+
+        assertThatThrownBy(() -> service.process(List.of(attachment)))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("Invalid XML 1.0 character U+0001 in the text of element <name>")
+                .hasNoCause();
+
+        // The XML writer refuses the document, as DataWeave's StAX writer did, so no ill-formed orders.xml exists.
+        assertDirectoryEmpty();
+        assertThat(output.getOut()).doesNotContain("Received:");
+        verifyNoInteractions(writer);
+    }
+
+    @Test
     void writeFailureFromUnwritableDirectoryPropagates() throws Exception {
         Path blocker = Files.createFile(tempDir.resolve("blocker"));
         AttachmentImportService blocked =

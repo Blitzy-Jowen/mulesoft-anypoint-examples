@@ -14,6 +14,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -251,6 +252,22 @@ class AttachmentImportServiceTest {
                 Arguments.of(Named.of("Integer content", new DataHandler(42, "application/x-java-object")),
                         "Unsupported attachment content: java.lang.Integer"),
                 Arguments.of(Named.of("null content", nullContent), "Unsupported attachment content: null"));
+    }
+
+    /** A CSV value XML 1.0 does not allow is refused by the XML writer before anything is logged or written. */
+    @Test
+    void rejectsAnAttachmentHoldingACharacterXmlForbids() throws IOException {
+        FileOutboundWriter writer = mock(FileOutboundWriter.class);
+        DataHandler attachment = csvAttachment("orderId,name,units,pricePerUnit\n1,bad\u0001char\u000b,1,1\n");
+
+        assertThatThrownBy(() -> service(writer).importAttachments(Map.of(ORIGINAL_PART_NAME, attachment)))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("Invalid XML 1.0 character U+0001 in the text of element <name>")
+                .hasNoCause();
+
+        verifyNoInteractions(writer);
+        assertOutputIsEmpty();
+        assertThat(appender.list).isEmpty();
     }
 
     private AttachmentImportService service(FileOutboundWriter writer) {

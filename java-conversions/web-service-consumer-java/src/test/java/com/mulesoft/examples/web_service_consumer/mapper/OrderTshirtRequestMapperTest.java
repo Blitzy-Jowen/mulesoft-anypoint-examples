@@ -387,9 +387,23 @@ class OrderTshirtRequestMapperTest {
                 .satisfies(e -> assertThat(e.getMessage()).doesNotContain("abc12345").doesNotContain("apiKey"));
     }
 
+    @Test
+    void controlCharacterInAValueIsRejectedByTheWriterInBothConversions() {
+        byte[] body = utf8("{\"p\":\"a\\u0001b\"}");
+        String invalid = "Invalid XML 1.0 character U+0001 in the text of element <p>";
+
+        assertThatThrownBy(() -> mapper.toXml(body))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+        assertThatThrownBy(() -> mapper.toDocument(body))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+    }
+
     static Stream<Arguments> bodiesWhoseXmlIsNotWellFormed() {
         return Stream.of(
-                Arguments.of("control character in a value", "{\"p\":\"a\\u0001b\"}"),
                 Arguments.of("space in a key", "{\"a b\":1}"),
                 Arguments.of("key starting with a digit", "{\"1st\":1}"));
     }

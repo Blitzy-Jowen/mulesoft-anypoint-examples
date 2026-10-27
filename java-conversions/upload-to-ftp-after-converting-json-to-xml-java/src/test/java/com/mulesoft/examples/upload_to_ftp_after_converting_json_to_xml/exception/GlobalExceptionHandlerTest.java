@@ -12,7 +12,12 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
+import java.net.ConnectException;
 import java.nio.charset.StandardCharsets;
+import java.sql.SQLException;
+import java.sql.SQLNonTransientConnectionException;
+import java.sql.SQLSyntaxErrorException;
+import java.sql.SQLTransientConnectionException;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -50,6 +55,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.HandlerMapping;
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
@@ -78,10 +84,14 @@ import ch.qos.logback.core.read.ListAppender;
  * <p>The log oracle is a Logback {@link ListAppender} on the advice's logger, attached at {@code ALL} for each test
  * and detached with the logger's level restored afterwards. Failure chains whose message, causes and suppressed
  * exception carry a sentinel and forged line breaks, raised for a forged method on a raw URI, must each yield
- * exactly one ERROR event whose line is the expected one: the escaped method and path, then the chain's types,
- * ending in {@code [circular]} for a loop and {@code ...} beyond ten causes. The event carries no sentinel, no
- * suppressed exception's class, no attached throwable and no unescaped control, separator, format or unpaired
- * surrogate character. Forged methods and paths are logged in exactly their escaped and length-bounded form.
+ * exactly one ERROR event whose line is the expected one: the escaped method and the matched route pattern, never
+ * the request's own path, then the chain's types, ending in {@code [circular]} for a loop and {@code ...} beyond
+ * ten causes. The event carries no sentinel, no suppressed exception's class, no attached throwable and no
+ * unescaped control, separator, format or unpaired surrogate character. Forged methods and route patterns are
+ * logged in exactly their escaped and length-bounded form, and a request without a pattern as {@code (no route)}.
+ * A chain holding a {@link SQLException} within the ten named causes adds the JDBC diagnostic of the innermost one
+ * alone, its SQL state, error code and escaped, bounded message, and the 500 body then carries that driver message
+ * instead of a data-access wrapper's, which repeats the SQL statement.
  *
  * <p>Every project with a Spring MVC controller carries this class with only its {@code package} line changed,
  * so it depends on the JDK, JUnit, Spring Boot, Logback (Spring Boot's default logging binding) and the two SC-1
@@ -114,18 +124,35 @@ class GlobalExceptionHandlerTest {
     /** A request method carrying CR LF; the servlet hands a method it does not know straight to the dispatcher. */
     private static final String FORGED_METHOD = "GET\r\nFORGED";
 
-    /** A raw request URI carrying CR LF and a forged entry. */
-    private static final String FORGED_URI = "/test/log-safety/x\r\n2026-10-26 ERROR forged";
+    /** {@link #FORGED_METHOD} as the ERROR line shows it, escaped. */
+    private static final String ESCAPED_FORGED_METHOD = "GET\\u000d\\u000aFORGED";
 
-    /** The ERROR line's start for {@link #FORGED_METHOD} on {@link #FORGED_URI}, both escaped. */
-    private static final String FORGED_LINE_START = "Unhandled exception processing GET\\u000d\\u000aFORGED "
-            + "/test/log-safety/x\\u000d\\u000a2026-10-26 ERROR forged: ";
+    /** The route pattern of the log-safety mapping, which the ERROR line names instead of the request's path. */
+    private static final String LOG_SAFETY_ROUTE = "/test/log-safety/**";
+
+    /** A raw request URI carrying a personal segment, the sentinel, CR LF and a forged entry. */
+    private static final String FORGED_URI =
+            "/test/log-safety/alice@example.com/" + SENTINEL + "\r\n2026-10-26 ERROR forged";
+
+    /** The ERROR line's start for {@link #FORGED_METHOD} on {@link #FORGED_URI}: the escaped method and the route. */
+    private static final String FORGED_LINE_START =
+            "Unhandled exception processing " + ESCAPED_FORGED_METHOD + " " + LOG_SAFETY_ROUTE + ": ";
 
     /** The single frame of the log-safety failures, so the throw site in the expected line is exact. */
     private static final StackTraceElement THROW_SITE = new StackTraceElement("a.b.C", "d", "C.java", 18);
 
     /** The ERROR line's description of the outer log-safety failure thrown at {@link #THROW_SITE}. */
     private static final String THROWN_AT_SITE = "java.lang.IllegalStateException at a.b.C.d(C.java:18)";
+
+    /** The message of a data-access wrapper such as Spring's {@code BadSqlGrammarException}: it repeats the SQL. */
+    private static final String BAD_SQL_GRAMMAR_MESSAGE =
+            "PreparedStatementCallback; bad SQL grammar [select first_name from employees where last_name = ?]";
+
+    /** A JDBC driver's own message for a missing table, as MySQL words it. */
+    private static final String MISSING_TABLE_MESSAGE = "Table 'company.employees' doesn't exist";
+
+    /** The body a failure whose database diagnostic is {@link #MISSING_TABLE_MESSAGE} is answered with. */
+    private static final String MISSING_TABLE_BODY = "{ \"message\": \"" + MISSING_TABLE_MESSAGE + "\" }";
 
     @LocalServerPort
     int port;
@@ -260,8 +287,8 @@ class GlobalExceptionHandlerTest {
 
     /**
      * A failure whose message, causes and suppressed exception carry the sentinel and forged line breaks, sent with
-     * a forged method and raw URI, yields one ERROR line naming the escaped method and path and the chain's types
-     * alone, with no throwable attached; the body still carries the outer message, escaped.
+     * a forged method and raw URI, yields one ERROR line naming the escaped method, the matched route and the
+     * chain's types alone, with no throwable attached; the body still carries the outer message, escaped.
      */
     @ParameterizedTest(name = "{0}")
     @MethodSource("failureChainCases")
@@ -277,7 +304,7 @@ class GlobalExceptionHandlerTest {
         assertOnlySafeErrorLine(FORGED_LINE_START + expectedTypes);
     }
 
-    /** Label, the failure the controller throws, then the types its ERROR line names after the path. */
+    /** Label, the failure the controller throws, then the types its ERROR line names after the route. */
     private static Stream<Arguments> failureChainCases() {
         IllegalStateException twoCauses = outerFailure(THROW_SITE);
         twoCauses.initCause(new IOException("cause " + SENTINEL + "\nforged",
@@ -295,74 +322,259 @@ class GlobalExceptionHandlerTest {
     }
 
     /**
-     * A circular cause chain is cut at the first repeated cause, marked {@code [circular]}. The advice is called
-     * directly: the dispatcher's exception resolver walks the cause chain with a guard against self-causation only,
-     * so a circular chain never reaches an advice through a dispatch.
+     * A circular cause chain is cut at the first repeated cause, marked {@code [circular]}, and the search for a
+     * database diagnostic ends there too. The advice is called directly: the dispatcher's exception resolver walks
+     * the cause chain with a guard against self-causation only, so a circular chain never reaches an advice through
+     * a dispatch.
      */
-    @Test
-    void circularCauseChainIsLoggedWithCircularMarker() {
-        IllegalStateException failure = outerFailure(THROW_SITE);
-        IOException cause = new IOException("cause " + SENTINEL + "\nforged");
-        failure.initCause(cause);
-        cause.initCause(failure);
-
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("circularCauseChainCases")
+    void circularCauseChainIsLoggedWithCircularMarker(String label, IllegalStateException failure,
+                                                      String expectedDescription, String expectedBody) {
         ResponseEntity<String> response = new GlobalExceptionHandler()
                 .handleUnhandled(failure, new MockHttpServletRequest(FORGED_METHOD, FORGED_URI));
 
         assertEquals(500, response.getStatusCode().value());
         assertEquals(MediaType.APPLICATION_JSON, response.getHeaders().getContentType());
-        assertEquals(FORGED_MESSAGE_BODY, response.getBody());
-        assertOnlySafeErrorLine(FORGED_LINE_START + THROWN_AT_SITE + " <- java.io.IOException <- [circular]");
+        assertEquals(expectedBody, response.getBody());
+        // The direct call bypasses handler mapping, so no route pattern is set on the request.
+        assertOnlySafeErrorLine(
+                "Unhandled exception processing " + ESCAPED_FORGED_METHOD + " (no route): " + expectedDescription);
     }
 
-    /** A forged request method or raw path is logged in exactly its escaped and bounded form, on one line. */
+    /** Label, a failure whose cause loops back to it, then the description its ERROR line ends with and the body. */
+    private static Stream<Arguments> circularCauseChainCases() {
+        IllegalStateException ioLoop = outerFailure(THROW_SITE);
+        IOException ioCause = new IOException("cause " + SENTINEL + "\nforged");
+        ioLoop.initCause(ioCause);
+        ioCause.initCause(ioLoop);
+        IllegalStateException databaseLoop = outerFailure(THROW_SITE);
+        SQLException databaseCause = new SQLException("Communications link failure\r\nforged", "08S01", 0);
+        databaseLoop.initCause(databaseCause);
+        databaseCause.initCause(databaseLoop);
+        return Stream.of(
+                Arguments.of("I/O cause", ioLoop, THROWN_AT_SITE + " <- java.io.IOException <- [circular]",
+                        FORGED_MESSAGE_BODY),
+                Arguments.of("database cause", databaseLoop, THROWN_AT_SITE + " <- java.sql.SQLException <- [circular]"
+                                + "; SQL state 08S01, error code 0: Communications link failure\\u000d\\u000aforged",
+                        "{ \"message\": \"Communications link failure\\r\\nforged\" }"));
+    }
+
+    /**
+     * A data-access wrapper whose message repeats the SQL statement: the 500 body carries the JDBC driver's own
+     * message, and the ERROR line ends with the driver's SQL state, error code and message, never the statement.
+     */
+    @Test
+    void databaseFailureReportsTheDriverMessageInsteadOfTheStatement() throws Exception {
+        MvcResult result = perform(get("/test/database-failure"));
+
+        assertEquals(500, result.getResponse().getStatus());
+        assertContentType(result, MediaType.APPLICATION_JSON);
+        assertBody(result, MISSING_TABLE_BODY);
+        ILoggingEvent event = onlyEvent();
+        assertEquals(Level.ERROR, event.getLevel());
+        assertNull(event.getThrowableProxy(), event::getFormattedMessage);
+        String line = event.getFormattedMessage();
+        assertTrue(line.startsWith(
+                "Unhandled exception processing GET /test/database-failure: java.lang.IllegalStateException at "),
+                () -> "logged: " + line);
+        assertTrue(line.endsWith(" <- java.sql.SQLSyntaxErrorException; SQL state 42S02, error code 1146: "
+                + MISSING_TABLE_MESSAGE), () -> "logged: " + line);
+        assertFalse(line.contains("select first_name"), () -> "SQL statement logged: " + line);
+        assertNoUnsafeCharacter(line);
+    }
+
+    /**
+     * A pool failure over the driver's connection failure, sent with a forged method and raw URI: only the innermost
+     * {@link SQLException}'s state, code and message are logged, escaped, beside the chain's types; every other
+     * message in the chain carries the sentinel and stays out. The body carries the driver's message.
+     */
+    @Test
+    void connectionFailureLogsOnlyTheInnermostDatabaseDiagnostic() throws Exception {
+        IllegalStateException failure = outerFailure(THROW_SITE);
+        failure.initCause(new RuntimeException("pool " + SENTINEL,
+                new SQLTransientConnectionException("HikariPool-1 - Connection is not available " + SENTINEL,
+                        "08001", 0,
+                        new SQLNonTransientConnectionException("Communications link failure\r\n2026-10-26 ERROR forged",
+                                "08S01", 0, new ConnectException("Connection refused " + SENTINEL)))));
+        controller.toThrow = failure;
+
+        MvcResult result = performForged(FORGED_METHOD, FORGED_URI);
+
+        assertEquals(500, result.getResponse().getStatus());
+        assertContentType(result, MediaType.APPLICATION_JSON);
+        assertBody(result, "{ \"message\": \"Communications link failure\\r\\n2026-10-26 ERROR forged\" }");
+        assertOnlySafeErrorLine(FORGED_LINE_START + THROWN_AT_SITE + " <- java.lang.RuntimeException"
+                + " <- java.sql.SQLTransientConnectionException <- java.sql.SQLNonTransientConnectionException"
+                + " <- java.net.ConnectException"
+                + "; SQL state 08S01, error code 0: Communications link failure\\u000d\\u000a2026-10-26 ERROR forged");
+    }
+
+    /**
+     * The database diagnostic's bounds and absent values, and the cause limit it shares with the type chain. The
+     * advice is called directly so that a checked {@link SQLException} can be the unhandled exception itself.
+     */
     @ParameterizedTest(name = "{0}")
-    @MethodSource("forgedRequestFieldCases")
-    void forgedRequestFieldsAreLoggedEscapedAndBounded(String label, String method, String rawPath,
-                                                       String expectedMethod, String expectedPath) throws Exception {
+    @MethodSource("databaseDiagnosticCases")
+    void databaseDiagnosticIsBoundedAndLimitedToTheNamedCauses(String label, Exception failure,
+                                                                String expectedDescription, String expectedBody) {
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/test/log-safety/" + SENTINEL);
+        request.setAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE, LOG_SAFETY_ROUTE);
+
+        ResponseEntity<String> response = new GlobalExceptionHandler().handleUnhandled(failure, request);
+
+        assertEquals(500, response.getStatusCode().value());
+        assertEquals(MediaType.APPLICATION_JSON, response.getHeaders().getContentType());
+        assertEquals(expectedBody, response.getBody());
+        assertOnlySafeErrorLine("Unhandled exception processing GET " + LOG_SAFETY_ROUTE + ": " + expectedDescription);
+    }
+
+    /**
+     * Label, the unhandled exception, then the description its ERROR line shows after the route and the body. A
+     * logged database message holds at most 256 characters after escaping, followed by {@code ...[truncated]} when
+     * cut; an {@link SQLException} beyond the ten named causes is neither logged nor reported.
+     */
+    private static Stream<Arguments> databaseDiagnosticCases() {
+        String longMessage = "D".repeat(300);
+        IllegalStateException overLongMessage = outerFailure(THROW_SITE);
+        overLongMessage.initCause(new SQLException(longMessage, "HY000", 1105));
+        IllegalStateException nullState = outerFailure(THROW_SITE);
+        nullState.initCause(new SQLException("Connection reset", null, 0));
+        IllegalStateException nullMessage = outerFailure(THROW_SITE);
+        nullMessage.initCause(new SQLException(null, "08S01", 0));
+        SQLException itself = new SQLException("Unknown column 'first_name' in 'field list'", "42S22", 1054);
+        itself.setStackTrace(new StackTraceElement[] {THROW_SITE});
+        IllegalStateException atLimit =
+                withRootCause(chainOf(9), new SQLException(MISSING_TABLE_MESSAGE, "42S02", 1146));
+        IllegalStateException beyondLimit = withRootCause(chainOf(10),
+                new SQLException("beyond the limit " + SENTINEL, "42S02", 1146));
+        String nineCauses = " <- java.io.IOException".repeat(9);
+        return Stream.of(
+                Arguments.of("message over the limit", overLongMessage, THROWN_AT_SITE + " <- java.sql.SQLException"
+                                + "; SQL state HY000, error code 1105: " + "D".repeat(256) + "...[truncated]",
+                        "{ \"message\": \"" + longMessage + "\" }"),
+                Arguments.of("no SQL state", nullState, THROWN_AT_SITE + " <- java.sql.SQLException"
+                                + "; SQL state (null), error code 0: Connection reset",
+                        "{ \"message\": \"Connection reset\" }"),
+                Arguments.of("no driver message", nullMessage, THROWN_AT_SITE + " <- java.sql.SQLException"
+                        + "; SQL state 08S01, error code 0: (null)", "{ \"message\": null }"),
+                Arguments.of("unhandled exception is the SQLException", itself,
+                        "java.sql.SQLException at a.b.C.d(C.java:18)"
+                                + "; SQL state 42S22, error code 1054: Unknown column 'first_name' in 'field list'",
+                        "{ \"message\": \"Unknown column 'first_name' in 'field list'\" }"),
+                Arguments.of("SQLException as the tenth cause", atLimit,
+                        THROWN_AT_SITE + nineCauses + " <- java.sql.SQLException"
+                                + "; SQL state 42S02, error code 1146: " + MISSING_TABLE_MESSAGE, MISSING_TABLE_BODY),
+                Arguments.of("SQLException beyond the cause limit", beyondLimit,
+                        THROWN_AT_SITE + nineCauses + " <- java.io.IOException <- ...", FORGED_MESSAGE_BODY));
+    }
+
+    /** A forged request method is logged in exactly its escaped and bounded form, beside the matched route. */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("forgedMethodCases")
+    void forgedMethodIsLoggedEscapedAndBounded(String label, String method, String expectedMethod) throws Exception {
         controller.toThrow = outerFailure(THROW_SITE);
 
-        MvcResult result = performForged(method, rawPath);
+        MvcResult result = performForged(method, "/test/log-safety/m");
 
         assertEquals(500, result.getResponse().getStatus());
         assertContentType(result, MediaType.APPLICATION_JSON);
         assertBody(result, FORGED_MESSAGE_BODY);
         assertOnlySafeErrorLine(
-                "Unhandled exception processing " + expectedMethod + " " + expectedPath + ": " + THROWN_AT_SITE);
+                "Unhandled exception processing " + expectedMethod + " " + LOG_SAFETY_ROUTE + ": " + THROWN_AT_SITE);
     }
 
     /**
-     * Label, the method and raw path sent, then the method and path the ERROR line shows. A logged method holds at
-     * most 32 characters and a logged path 256, after escaping; a longer one is cut before the first character or
+     * Label, the method sent, then the method the ERROR line shows. A logged method holds at most 32 characters
+     * after escaping; a longer one is cut before the first character or escape that would exceed that, and
+     * {@code ...[truncated]} follows.
+     */
+    private static Stream<Arguments> forgedMethodCases() {
+        return Stream.of(
+                Arguments.of("CR LF", FORGED_METHOD, ESCAPED_FORGED_METHOD),
+                Arguments.of("method at the limit", "M".repeat(32), "M".repeat(32)),
+                Arguments.of("method over the limit", "M".repeat(40), "M".repeat(32) + "...[truncated]"));
+    }
+
+    /**
+     * The raw request path never reaches the log, whatever its segments carry: the ERROR line names the matched
+     * route pattern alone.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("rawPathCases")
+    void rawRequestPathIsNeverLogged(String label, String rawPath) throws Exception {
+        controller.toThrow = outerFailure(THROW_SITE);
+
+        MvcResult result = performForged("GET", rawPath);
+
+        assertEquals(500, result.getResponse().getStatus());
+        assertContentType(result, MediaType.APPLICATION_JSON);
+        assertBody(result, FORGED_MESSAGE_BODY);
+        assertOnlySafeErrorLine("Unhandled exception processing GET " + LOG_SAFETY_ROUTE + ": " + THROWN_AT_SITE);
+    }
+
+    /** Label, then a raw path under the log-safety mapping whose segments must stay out of the log. */
+    private static Stream<Arguments> rawPathCases() {
+        String base = "/test/log-safety/";
+        return Stream.of(
+                Arguments.of("personal segment", base + "users/alice@example.com/" + SENTINEL),
+                Arguments.of("token-like segment", base + "tokens/eyJhbGciOiJIUzI1NiJ9." + SENTINEL + ".c2ln"),
+                Arguments.of("CR LF forgery", base + SENTINEL + "\r\n2026-10-26 ERROR forged"),
+                Arguments.of("over-long path", base + SENTINEL + "x".repeat(300)));
+    }
+
+    /**
+     * The matched route pattern is logged in exactly its escaped and bounded form, on one line, and as
+     * {@code (no route)} when the request carries no pattern. The advice is called directly so that each pattern
+     * reaches it unchanged; the request's own path, which carries the sentinel, stays out of the line.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("routeCases")
+    void routeIsLoggedEscapedAndBounded(String label, Object pattern, String expectedRoute) {
+        MockHttpServletRequest request =
+                new MockHttpServletRequest("GET", "/test/log-safety/alice@example.com/" + SENTINEL);
+        if (pattern != null) {
+            request.setAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE, pattern);
+        }
+
+        ResponseEntity<String> response = new GlobalExceptionHandler()
+                .handleUnhandled(outerFailure(THROW_SITE), request);
+
+        assertEquals(500, response.getStatusCode().value());
+        assertEquals(MediaType.APPLICATION_JSON, response.getHeaders().getContentType());
+        assertEquals(FORGED_MESSAGE_BODY, response.getBody());
+        assertOnlySafeErrorLine("Unhandled exception processing GET " + expectedRoute + ": " + THROWN_AT_SITE);
+    }
+
+    /**
+     * Label, the request's route pattern attribute ({@code null} for none), then the route the ERROR line shows. A
+     * logged route holds at most 256 characters after escaping; a longer one is cut before the first character or
      * escape that would exceed that, never inside a surrogate pair or an escape, and {@code ...[truncated]} follows.
      */
-    private static Stream<Arguments> forgedRequestFieldCases() {
-        String base = "/test/log-safety/";
-        String pathAtLimit = base + "x".repeat(256 - base.length());
-        String pathBeforeEscape = base + "x".repeat(254 - base.length());
-        String pathBeforePair = base + "x".repeat(255 - base.length());
+    private static Stream<Arguments> routeCases() {
+        String base = "/test/";
+        String routeAtLimit = base + "x".repeat(256 - base.length());
+        String routeBeforeEscape = base + "x".repeat(254 - base.length());
+        String routeBeforePair = base + "x".repeat(255 - base.length());
         return Stream.of(
-                Arguments.of("CR LF", "GET", base + "a\r\nFORGED b", "GET", base + "a\\u000d\\u000aFORGED b"),
-                Arguments.of("tab, NUL and DEL", "GET", base + "a\tb\u0000c\u007fd", "GET",
-                        base + "a\\u0009b\\u0000c\\u007fd"),
-                Arguments.of("next line", "GET", base + "a\u0085b", "GET", base + "a\\u0085b"),
-                Arguments.of("line and paragraph separators", "GET", base + "a\u2028b\u2029c", "GET",
-                        base + "a\\u2028b\\u2029c"),
-                Arguments.of("bidi override, zero-width space and byte order mark", "GET",
-                        base + "a\u202eb\u200bc\ufeffd", "GET", base + "a\\u202eb\\u200bc\\ufeffd"),
-                Arguments.of("reverse solidus", "GET", base + "a\\u000ab", "GET", base + "a\\u005cu000ab"),
-                Arguments.of("unpaired surrogates", "GET", base + "a\ud800b\udc00c", "GET",
-                        base + "a\\ud800b\\udc00c"),
-                Arguments.of("valid surrogate pair", "GET", base + "a\ud83d\ude00b", "GET", base + "a\ud83d\ude00b"),
-                Arguments.of("path at the limit", "GET", pathAtLimit, "GET", pathAtLimit),
-                Arguments.of("path over the limit", "GET", pathAtLimit + "yz", "GET", pathAtLimit + "...[truncated]"),
-                Arguments.of("escape crossing the path limit", "GET", pathBeforeEscape + "\nz", "GET",
-                        pathBeforeEscape + "...[truncated]"),
-                Arguments.of("surrogate pair crossing the path limit", "GET", pathBeforePair + "\ud83d\ude00z", "GET",
-                        pathBeforePair + "...[truncated]"),
-                Arguments.of("method at the limit", "M".repeat(32), base + "m", "M".repeat(32), base + "m"),
-                Arguments.of("method over the limit", "M".repeat(40), base + "m", "M".repeat(32) + "...[truncated]",
-                        base + "m"));
+                Arguments.of("CR LF", base + "a\r\nFORGED b", base + "a\\u000d\\u000aFORGED b"),
+                Arguments.of("tab, NUL and DEL", base + "a\tb\u0000c\u007fd", base + "a\\u0009b\\u0000c\\u007fd"),
+                Arguments.of("next line", base + "a\u0085b", base + "a\\u0085b"),
+                Arguments.of("line and paragraph separators", base + "a\u2028b\u2029c", base + "a\\u2028b\\u2029c"),
+                Arguments.of("bidi override, zero-width space and byte order mark", base + "a\u202eb\u200bc\ufeffd",
+                        base + "a\\u202eb\\u200bc\\ufeffd"),
+                Arguments.of("reverse solidus", base + "a\\u000ab", base + "a\\u005cu000ab"),
+                Arguments.of("unpaired surrogates", base + "a\ud800b\udc00c", base + "a\\ud800b\\udc00c"),
+                Arguments.of("valid surrogate pair", base + "a\ud83d\ude00b", base + "a\ud83d\ude00b"),
+                Arguments.of("route at the limit", routeAtLimit, routeAtLimit),
+                Arguments.of("route over the limit", routeAtLimit + "yz", routeAtLimit + "...[truncated]"),
+                Arguments.of("escape crossing the route limit", routeBeforeEscape + "\nz",
+                        routeBeforeEscape + "...[truncated]"),
+                Arguments.of("surrogate pair crossing the route limit", routeBeforePair + "\ud83d\ude00z",
+                        routeBeforePair + "...[truncated]"),
+                Arguments.of("no route attribute", null, "(no route)"),
+                Arguments.of("route attribute not a string", new StringBuilder(base + SENTINEL + "\r\nforged"),
+                        "(no route)"));
     }
 
     @ParameterizedTest
@@ -411,7 +623,10 @@ class GlobalExceptionHandlerTest {
                 Arguments.of("GET", "/test/out-of-memory", "HTTP/1.1 500 Internal Server Error", "application/json",
                         "{ \"message\": \"Java heap space\" }"),
                 Arguments.of("GET", "/test/stack-overflow", "HTTP/1.1 500 Internal Server Error", "application/json",
-                        "{ \"message\": null }"));
+                        "{ \"message\": null }"),
+                // A data-access wrapper repeats the SQL statement; only the JDBC driver's message is sent.
+                Arguments.of("GET", "/test/database-failure", "HTTP/1.1 500 Internal Server Error", "application/json",
+                        MISSING_TABLE_BODY));
     }
 
     private static Stream<Arguments> errorResponseJsonCases() {
@@ -501,6 +716,16 @@ class GlobalExceptionHandlerTest {
         return failure;
     }
 
+    /** Sets {@code root} as the cause of the last exception in {@code failure}'s cause chain and returns it. */
+    private static IllegalStateException withRootCause(IllegalStateException failure, Throwable root) {
+        Throwable innermost = failure;
+        while (innermost.getCause() != null) {
+            innermost = innermost.getCause();
+        }
+        innermost.initCause(root);
+        return failure;
+    }
+
     private static void assertBody(MvcResult result, String expected) {
         assertArrayEquals(expected.getBytes(StandardCharsets.UTF_8), result.getResponse().getContentAsByteArray(),
                 () -> "body was: " + new String(result.getResponse().getContentAsByteArray(), StandardCharsets.UTF_8));
@@ -558,6 +783,12 @@ class GlobalExceptionHandlerTest {
         @GetMapping("/test/stack-overflow")
         String stackOverflow() {
             throw new StackOverflowError();
+        }
+
+        @GetMapping("/test/database-failure")
+        String databaseFailure() {
+            throw new IllegalStateException(BAD_SQL_GRAMMAR_MESSAGE,
+                    new SQLSyntaxErrorException(MISSING_TABLE_MESSAGE, "42S02", 1146));
         }
 
         @RequestMapping("/test/log-safety/**")

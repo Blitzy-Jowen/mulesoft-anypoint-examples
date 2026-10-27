@@ -78,8 +78,12 @@ import org.springframework.stereotype.Component;
  * {@link Element#namespace(String, String)} entries in insertion order, followed by its own binding, and
  * skips every binding an ancestor already declared; a declaration's scope ends with its element, so
  * siblings each declare it again. Text escapes {@code &}, {@code <} and {@code >}; attribute values and
- * namespace URIs also escape {@code "}. Nothing else is escaped, so non-ASCII characters are written as they
- * are and encoded in UTF-8 by {@link #writeBytes(Element)}.
+ * namespace URIs also escape {@code "}. A character XML 1.0 does not allow in a text, attribute value or
+ * namespace URI (a C0 control other than tab, line feed and carriage return, an unpaired surrogate, U+FFFE or
+ * U+FFFF) makes {@link #write(Element)} and {@link #writeBytes(Element)} throw {@link IllegalStateException}
+ * naming its code point, as DataWeave's StAX-based writer fails on it, so no ill-formed document is written; the
+ * exact DataWeave failure text is a Tier 2A verification point. Every other character, non-ASCII included, is
+ * written as it is and encoded in UTF-8 by {@link #writeBytes(Element)}.
  *
  * <p>The writer is stateless and thread-safe. {@link Element} is a mutable builder meant to be filled by one
  * thread and then written.
@@ -102,8 +106,10 @@ public class DwXmlWriter {
      * @param root the document element
      * @return the declaration and the document, without a trailing line feed
      * @throws IllegalArgumentException when {@code root} is {@code null}
-     * @throws IllegalStateException when an element holds both text and children, or a prefixed element
-     *         has no namespace URI and its prefix is not bound by an ancestor
+     * @throws IllegalStateException when an element holds both text and children, a prefixed element
+     *         has no namespace URI and its prefix is not bound by an ancestor, or a text, attribute value or
+     *         namespace URI holds a character XML 1.0 does not allow; the message names the first such character
+     *         by its code point ({@code U+0001}) and where it occurs, never the character itself
      */
     public String write(Element root) {
         if (root == null) {
@@ -257,12 +263,20 @@ public class DwXmlWriter {
         for (Map.Entry<String, String> declaration : declarations.entrySet()) {
             String prefix = declaration.getKey();
             out.append(prefix.isEmpty() ? " xmlns" : " xmlns:" + prefix).append("=\"");
-            escape(declaration.getValue(), true, out);
+            int invalid = escape(declaration.getValue(), true, out);
+            if (invalid >= 0) {
+                throw invalidCharacter(declaration.getValue(), invalid, "the namespace URI of "
+                        + (prefix.isEmpty() ? "xmlns" : "xmlns:" + prefix) + " on element <" + qualifiedName + ">");
+            }
             out.append('"');
         }
         for (Map.Entry<String, String> attribute : element.attributes.entrySet()) {
             out.append(' ').append(attribute.getKey()).append("=\"");
-            escape(attribute.getValue(), true, out);
+            int invalid = escape(attribute.getValue(), true, out);
+            if (invalid >= 0) {
+                throw invalidCharacter(attribute.getValue(), invalid,
+                        "attribute '" + attribute.getKey() + "' of element <" + qualifiedName + ">");
+            }
             out.append('"');
         }
 
@@ -271,7 +285,10 @@ public class DwXmlWriter {
                 out.append("/>");
             } else {
                 out.append('>');
-                escape(element.text, false, out);
+                int invalid = escape(element.text, false, out);
+                if (invalid >= 0) {
+                    throw invalidCharacter(element.text, invalid, "the text of element <" + qualifiedName + ">");
+                }
                 out.append("</").append(qualifiedName).append('>');
             }
             return;
@@ -319,17 +336,58 @@ public class DwXmlWriter {
         return declarations;
     }
 
-    private static void escape(String value, boolean attribute, StringBuilder out) {
-        for (int i = 0; i < value.length(); i++) {
+    /**
+     * Appends {@code value} with its markup characters escaped, up to the first character XML 1.0 does not allow.
+     * A high surrogate followed by a low surrogate is one supplementary character, which XML allows, and is
+     * appended as both halves; any other surrogate is unpaired.
+     *
+     * @return the index of the first character XML 1.0 does not allow, or {@code -1} when all of {@code value}
+     *         was appended
+     */
+    private static int escape(String value, boolean attribute, StringBuilder out) {
+        int length = value.length();
+        for (int i = 0; i < length; i++) {
             char c = value.charAt(i);
             switch (c) {
                 case '&' -> out.append("&amp;");
                 case '<' -> out.append("&lt;");
                 case '>' -> out.append("&gt;");
                 case '"' -> out.append(attribute ? "&quot;" : "\"");
-                default -> out.append(c);
+                default -> {
+                    if (isXmlChar(c)) {
+                        out.append(c);
+                    } else if (Character.isHighSurrogate(c) && i + 1 < length
+                            && Character.isLowSurrogate(value.charAt(i + 1))) {
+                        out.append(c).append(value.charAt(i + 1));
+                        i++;
+                    } else {
+                        return i;
+                    }
+                }
             }
         }
+        return -1;
+    }
+
+    /**
+     * True for a character the XML 1.0 {@code Char} production allows on its own: tab, line feed, carriage return,
+     * U+0020 to U+D7FF and U+E000 to U+FFFD. Surrogates are excluded; {@link #escape} accepts them in pairs.
+     */
+    private static boolean isXmlChar(char c) {
+        return c >= '\u0020'
+                ? c < Character.MIN_SURROGATE || (c > Character.MAX_SURROGATE && c <= '\uFFFD')
+                : c == '\t' || c == '\n' || c == '\r';
+    }
+
+    /**
+     * The failure for the character at {@code index} of {@code value}, named by its code point so that the
+     * message, which may reach a SOAP fault or a JSON error body, never carries the character itself.
+     *
+     * @param location where the value is written, for example {@code the text of element <name>}
+     */
+    private static IllegalStateException invalidCharacter(String value, int index, String location) {
+        return new IllegalStateException(
+                String.format("Invalid XML 1.0 character U+%04X in %s", (int) value.charAt(index), location));
     }
 
     /**

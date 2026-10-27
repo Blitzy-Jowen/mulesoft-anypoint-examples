@@ -11,9 +11,13 @@ package com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector
 import java.net.URLEncoder;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -47,6 +51,13 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * API. Every URL and the client ID come from {@link BoxProperties}; the custom parameters {@code box_device_id=1}
  * and {@code box_device_name=device1} are literals of the flow (lines 8-11). Tokens live in memory and are lost on
  * restart, as in the original's default token manager.
+ *
+ * <p>Refreshes are coordinated per resource owner, as the grant's per-owner refresh lock
+ * ({@code ResourceOwnerOAuthContext.getRefreshUserOAuthContextLock()}) coordinates them in Mule 3.8: one request at a
+ * time redeems an owner's refresh token, a request that finds a refresh in progress waits for it and then uses the
+ * tokens stored for the owner without redeeming the refresh token itself, and a refresh result replaces only the
+ * token set it refreshed, so tokens a newer {@code /redirectUrl} callback stored are never overwritten. Callbacks
+ * store their tokens at once, without the lock.
  *
  * <p>Platform-generated statuses and texts (the redirect-URL replies, the refresh failures, the missing-token and
  * failure-status messages) reproduce Mule 3.8.0 and are Tier 2A verification points: a captured fixture of the
@@ -97,11 +108,23 @@ public class BoxOAuthService {
     private static final String REDIRECT_PROCESSING_FAILURE_TEXT =
             "Failed processing redirect URL request done from OAuth provider. See logs for details.";
 
+    /** Number of causes {@link #describe(Throwable)} names after the outermost exception before it stops. */
+    private static final int CAUSE_LOG_LIMIT = 10;
+    private static final String CAUSE_SEPARATOR = " <- ";
+    private static final String MORE_CAUSES_MARKER = "...";
+    private static final String CIRCULAR_CAUSE_MARKER = "[circular]";
+
     private final BoxProperties properties;
     private final BoxApiClient client;
 
     /** Replaces {@code Token_Manager_Config} (line 4): tokens per resource owner, in memory only. */
     private final ConcurrentHashMap<String, TokenSet> tokenStore = new ConcurrentHashMap<>();
+
+    /**
+     * The refresh lock of each resource owner whose tokens {@link #loginDone()} has had to refresh, created on the
+     * first refresh, so the map holds no more owners than the refresh path reaches.
+     */
+    private final ConcurrentHashMap<String, ReentrantLock> refreshLocks = new ConcurrentHashMap<>();
 
     /**
      * @param properties the Box OAuth configuration: URLs, client ID and the {@code /web} redirect location
@@ -199,21 +222,22 @@ public class BoxOAuthService {
      * {@code refreshTokenWhen}) refreshes the tokens and repeats the search exactly once; a final status of 400 or
      * more fails with the success-status validator's message. Exceptions from the Box client propagate unchanged.
      *
+     * <p>The refresh is coordinated per resource owner ({@link #tokensAfterRejection(String, TokenSet)}), so
+     * concurrent rejected searches redeem the refresh token once, and the repeated search uses the tokens stored for
+     * the owner once the refresh, or the wait for another request's refresh, is over.
+     *
      * @return 200 with no {@code Content-Type}, since {@code set-payload} sets none, and the UTF-8 text
      *         {@code The user successfully authorized access to the resource. Searching for files containing "mule": <body>}
-     * @throws IllegalStateException when no access token is stored, when the refresh fails, or when the final search
-     *                               status is 400 or more
+     * @throws IllegalStateException when no access token is stored, before the search or for its repetition, when the
+     *                               refresh fails, or when the final search status is 400 or more
      */
     public Reply loginDone() {
-        TokenSet current = tokens(DEFAULT_RESOURCE_OWNER_ID)
-                .filter(stored -> stored.accessToken() != null)
-                .orElseThrow(() -> new IllegalStateException(NO_ACCESS_TOKEN));
+        TokenSet current = withAccessToken(tokenStore.get(DEFAULT_RESOURCE_OWNER_ID));
 
         RawResponse response = client.search(current.accessToken());
         if (response.status() == 401 || response.status() == 403) {
-            TokenSet refreshed = refresh(current);
-            storeTokens(DEFAULT_RESOURCE_OWNER_ID, refreshed);
-            response = client.search(refreshed.accessToken());
+            TokenSet retry = tokensAfterRejection(DEFAULT_RESOURCE_OWNER_ID, current);
+            response = client.search(retry.accessToken());
         }
         if (response.status() >= 400) {
             throw new IllegalStateException("Response code " + response.status() + " mapped as failure.");
@@ -223,16 +247,60 @@ public class BoxOAuthService {
     }
 
     /**
+     * The tokens to repeat a search with after Box rejected {@code rejected}, the exact token set the search sent,
+     * decided under the owner's refresh lock on the model of the grant type's {@code refreshToken} in Mule 3.8:
+     * <ul>
+     *   <li>a request that finds the lock held waits until it is released and then uses what is stored for the
+     *       owner, whether the holder's refresh succeeded or failed, without redeeming the refresh token itself;</li>
+     *   <li>a request that takes the lock reads the store again: when it no longer holds {@code rejected}
+     *       itself, because another request refreshed or a callback stored newer tokens meanwhile, the stored tokens
+     *       are used without a refresh;</li>
+     *   <li>otherwise it refreshes, and the result replaces the stored tokens only while they are still
+     *       {@code rejected}, so tokens a callback stored during the refresh are kept and used instead.</li>
+     * </ul>
+     *
+     * @throws IllegalStateException with the missing-token message when the tokens to use have no access token, and
+     *                               as {@link #refresh(TokenSet)} throws when the refresh fails
+     */
+    private TokenSet tokensAfterRejection(String owner, TokenSet rejected) {
+        ReentrantLock refreshLock = refreshLocks.computeIfAbsent(owner, key -> new ReentrantLock());
+        if (!refreshLock.tryLock()) {
+            refreshLock.lock();
+            refreshLock.unlock();
+            return withAccessToken(tokenStore.get(owner));
+        }
+        try {
+            TokenSet stored = tokenStore.get(owner);
+            if (stored != rejected) {
+                return withAccessToken(stored);
+            }
+            TokenSet refreshed = refresh(rejected);
+            return withAccessToken(tokenStore.compute(owner, (key, latest) -> latest == rejected ? refreshed : latest));
+        } finally {
+            refreshLock.unlock();
+        }
+    }
+
+    /** Returns {@code tokens} when it holds an access token; otherwise refuses the request as a missing token. */
+    private static TokenSet withAccessToken(TokenSet tokens) {
+        if (tokens == null || tokens.accessToken() == null) {
+            throw new IllegalStateException(NO_ACCESS_TOKEN);
+        }
+        return tokens;
+    }
+
+    /**
      * Refresh-token request of the grant type: the stored refresh token is exchanged at the token URL, and a
      * response without a new refresh token keeps the old one. The failure messages are Tier 2A verification points.
-     * Token response bodies are never logged, because they carry the tokens.
+     * Token response bodies are never logged, because they carry the tokens, and a failed token call is logged by
+     * its exception types only ({@link #describe(Throwable)}) before it is rethrown unchanged.
      */
     private TokenSet refresh(TokenSet current) {
         RawResponse response;
         try {
             response = client.refreshToken(current.refreshToken());
         } catch (RuntimeException e) {
-            LOGGER.error("Failure calling the token url to refresh the access token", e);
+            LOGGER.error("Failure calling the token url to refresh the access token: {}", describe(e));
             throw e;
         }
         if (response.status() >= 400) {
@@ -285,6 +353,8 @@ public class BoxOAuthService {
      * threw or answered 400 or more; 201 no access or refresh token in the response; 300 any other failure. When
      * the state names an {@code onCompleteRedirectTo} URL the browser is sent there with the marker; otherwise the
      * platform text is returned. Every status and text here is platform-generated and a Tier 2A verification point.
+     * A failure marker is logged at ERROR with its detail and, when an exception caused it, that exception's types
+     * only ({@link #describe(Throwable)}).
      *
      * @param code       the {@code code} query parameter, {@code null} when absent
      * @param state      the {@code state} query parameter, URL-decoded, {@code null} when absent
@@ -306,8 +376,8 @@ public class BoxOAuthService {
         int marker = outcome.marker();
         if (marker != SUCCESS) {
             if (outcome.failure() != null) {
-                LOGGER.error("Redirect URL request failed, authorizationStatus {}: {}", marker, outcome.detail(),
-                        outcome.failure());
+                LOGGER.error("Redirect URL request failed, authorizationStatus {}: {}: {}", marker, outcome.detail(),
+                        describe(outcome.failure()));
             } else {
                 LOGGER.error("Redirect URL request failed, authorizationStatus {}: {}", marker, outcome.detail());
             }
@@ -434,6 +504,34 @@ public class BoxOAuthService {
             // An unparseable Content-Type or an unknown or illegal charset name: the body is read as UTF-8.
             return StandardCharsets.UTF_8;
         }
+    }
+
+    /**
+     * Returns the type identifiers of a token-call failure without any of its text: its class name, then the class
+     * name of each cause, separated by {@code " <- "}. Messages, {@code toString()} and suppressed exceptions are
+     * never read, because a transport's diagnostics may quote the token URL, the request or the response. The walk
+     * stops at a cause already named, marked {@code [circular]}, and after {@link #CAUSE_LOG_LIMIT} causes, marked
+     * {@code ...}, so cyclic and very deep chains terminate.
+     */
+    private static String describe(Throwable failure) {
+        StringBuilder out = new StringBuilder(128).append(failure.getClass().getName());
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(failure);
+        int causes = 0;
+        for (Throwable cause = failure.getCause(); cause != null; cause = cause.getCause()) {
+            out.append(CAUSE_SEPARATOR);
+            if (causes == CAUSE_LOG_LIMIT) {
+                out.append(MORE_CAUSES_MARKER);
+                break;
+            }
+            if (!named.add(cause)) {
+                out.append(CIRCULAR_CAUSE_MARKER);
+                break;
+            }
+            out.append(cause.getClass().getName());
+            causes++;
+        }
+        return out.toString();
     }
 
     private static String encode(String value) {

@@ -34,6 +34,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.xml.sax.InputSource;
@@ -240,15 +241,39 @@ class AdmitSubjectResponseMapperTest {
     }
 
     /**
-     * A DOM built in memory can hold a character XML 1.0 forbids, which the writer copies as it is; the
-     * rendered document then does not parse back into an element.
+     * A DOM built in memory can hold a character XML 1.0 forbids, which the writer rejects before anything is
+     * parsed, in both conversions.
+     */
+    @Test
+    void writerRejectsACharacterXmlForbidsInBothConversions() {
+        Element input = parse(episodeResponse(START_DATE_TIME, END_DATE_TIME));
+        input.getElementsByTagName("episodeId").item(0).setTextContent("E\u0001");
+        String invalid = "Invalid XML 1.0 character U+0001 in the text of element <episodeId>";
+
+        assertThatThrownBy(() -> mapper.toXml(input))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+        assertThatThrownBy(() -> mapper.toElement(input))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+    }
+
+    /**
+     * Without strict error checking a DOM accepts an element name that is not an XML Name, which the mapper
+     * copies as it is; the rendered document then does not parse back into an element.
      */
     @Test
     void toElementRejectsARenderedDocumentThatDoesNotParse() {
         Element input = parse(episodeResponse(START_DATE_TIME, END_DATE_TIME));
-        input.getElementsByTagName("episodeId").item(0).setTextContent("E\u0001");
+        Document document = input.getOwnerDocument();
+        document.setStrictErrorChecking(false);
+        Node episodeId = input.getElementsByTagName("episodeId").item(0);
+        episodeId.setTextContent("");
+        episodeId.appendChild(document.createElementNS(null, "a b")).setTextContent("E1");
 
-        assertThat(mapper.toXml(input)).contains("\t\t<episodeId>E\u0001</episodeId>\n");
+        assertThat(mapper.toXml(input)).contains("\t\t<episodeId>\n\t\t\t<a b>E1</a b>\n\t\t</episodeId>\n");
         assertThatThrownBy(() -> mapper.toElement(input))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("Cannot parse the admitSubjectResponse document: ")

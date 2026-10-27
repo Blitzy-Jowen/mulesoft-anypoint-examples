@@ -305,15 +305,37 @@ class UpsertPatientRequestMapperTest {
     }
 
     @Test
-    void toElementFailsWhenWriterOutputCannotBeParsed() {
+    void writerRejectsACharacterXmlForbidsInBothConversions() {
         Document input = builder(true).newDocument();
         Element admitSubject = input.createElementNS(NS0, "ns:admitSubject");
         Element nationalId = input.createElementNS(null, "nationalId");
-        // A DOM built in memory accepts a character XML 1.0 forbids; the writer copies it, the parser rejects it.
+        // A DOM built in memory accepts a character XML 1.0 forbids; the writer rejects it before anything is parsed.
         nationalId.appendChild(input.createTextNode("12\u000134"));
         admitSubject.appendChild(input.createElementNS(NS1, "ns1:Subject")).appendChild(nationalId);
+        String invalid = "Invalid XML 1.0 character U+0001 in the text of element <nationalId>";
 
-        assertThat(mapper.toXml(admitSubject)).isEqualTo(expectedDocument("\t\t<nationalId>12\u000134</nationalId>"));
+        assertThatThrownBy(() -> mapper.toXml(admitSubject))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+        assertThatThrownBy(() -> mapper.toElement(admitSubject))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+    }
+
+    @Test
+    void toElementFailsWhenWriterOutputCannotBeParsed() {
+        Document input = builder(true).newDocument();
+        // Without strict error checking a DOM accepts an element name that is not an XML Name; the mapper copies the
+        // name as it is, so the writer's output is not well-formed and the parser rejects it.
+        input.setStrictErrorChecking(false);
+        Element admitSubject = input.createElementNS(NS0, "ns:admitSubject");
+        Element notAName = input.createElementNS(null, "a b");
+        notAName.appendChild(input.createTextNode("1234"));
+        admitSubject.appendChild(input.createElementNS(NS1, "ns1:Subject")).appendChild(notAName);
+
+        assertThat(mapper.toXml(admitSubject)).isEqualTo(expectedDocument("\t\t<a b>1234</a b>"));
         assertThatThrownBy(() -> mapper.toElement(admitSubject))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("upsertPatient XML could not be parsed: ")

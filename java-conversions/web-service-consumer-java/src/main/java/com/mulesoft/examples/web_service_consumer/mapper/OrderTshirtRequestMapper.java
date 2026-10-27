@@ -144,6 +144,10 @@ public class OrderTshirtRequestMapper {
      *         ("Request body is empty"), is not well-formed JSON or holds anything after its value (the parser's
      *         message, with the parser exception as cause), or is a JSON array, which the writer rejects
      *         ("XML output requires a single root element"); a scalar or {@code null} body is not rejected
+     * @throws IllegalStateException when a string value holds a character XML 1.0 does not allow (a C0 control
+     *         other than tab, line feed and carriage return, an unpaired surrogate, U+FFFE or U+FFFF), which the
+     *         writer rejects, naming its code point and element
+     *         ({@code Invalid XML 1.0 character U+0001 in the text of element <p>})
      */
     public String toXml(byte[] json) {
         if (isBlank(json)) {
@@ -163,8 +167,9 @@ public class OrderTshirtRequestMapper {
      *         element's text is the scalar, and for a JSON {@code null} body it is empty
      * @throws IllegalArgumentException under the conditions of {@link #toXml(byte[])}, a JSON array body included
      *         ("XML output requires a single root element")
-     * @throws IllegalStateException when no secure XML parser can be configured, or the writer's output cannot
-     *         be parsed
+     * @throws IllegalStateException when the writer rejects a character XML 1.0 does not allow, as for
+     *         {@link #toXml(byte[])}, before anything is parsed; when no secure XML parser can be configured; or
+     *         when the writer's output cannot be parsed
      */
     public Document toDocument(byte[] json) {
         String xml = toXml(json);

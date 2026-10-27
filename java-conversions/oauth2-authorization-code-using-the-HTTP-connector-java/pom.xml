@@ -59,6 +59,12 @@
                 </exclusion>
             </exclusions>
         </dependency>
+        <!-- BoxApiClient transport: automatic retries can be switched off, so no Box request is ever re-sent,
+             which java.net.http.HttpClient does not allow. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -15,14 +15,23 @@ import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
+import java.net.SocketException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
@@ -46,6 +55,7 @@ import org.springframework.web.client.ResourceAccessException;
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.classic.spi.ThrowableProxyUtil;
 import ch.qos.logback.core.read.ListAppender;
 
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.client.BoxApiClient;
@@ -64,7 +74,8 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  *
  * <p>{@link BoxApiClient} is a strict Mockito mock, {@link BoxProperties} is real and built from literals (its TLS
  * context is never built), and the log is read from a Logback {@link ListAppender} on the root logger. No Spring
- * context, network or WireMock is used.
+ * context, network or WireMock is used. The refresh-coordination tests run {@code loginDone} on threads of their own,
+ * ordered by latches whose every wait is bounded by {@link #WAIT}.
  */
 @ExtendWith(MockitoExtension.class)
 class BoxOAuthServiceTest {
@@ -113,6 +124,12 @@ class BoxOAuthServiceTest {
             "{\"total_count\":1,\"entries\":[{\"type\":\"file\",\"id\":\"1\",\"name\":\"mule.txt\"}]}";
 
     private static final TokenSet STORED = new TokenSet(ACCESS, REFRESH, "3600", "bearer");
+
+    /** Longest a concurrency test waits for a step, so a regression fails the test instead of hanging the build. */
+    private static final Duration WAIT = Duration.ofSeconds(10);
+
+    /** Text no log line may carry: it stands for a token, credential or URL a transport's diagnostics may quote. */
+    private static final String SENTINEL = "SENTINEL-7f3a-never-logged";
 
     @Mock
     BoxApiClient client;
@@ -347,9 +364,10 @@ class BoxOAuthServiceTest {
         assertThat(service.tokens(DEFAULT_OWNER)).contains(STORED);
         assertThat(serviceEvents()).singleElement().satisfies(event -> {
             assertThat(event.getLevel()).isEqualTo(Level.ERROR);
-            assertThat(event.getFormattedMessage())
-                    .isEqualTo("Failure calling the token url to refresh the access token");
-            assertThat(event.getThrowableProxy().getClassName()).isEqualTo(ResourceAccessException.class.getName());
+            assertThat(event.getFormattedMessage()).isEqualTo(
+                    "Failure calling the token url to refresh the access token: "
+                            + "org.springframework.web.client.ResourceAccessException");
+            assertThat(event.getThrowableProxy()).isNull();
         });
         verify(client).search(ACCESS);
         verify(client).refreshToken(REFRESH);
@@ -438,6 +456,181 @@ class BoxOAuthServiceTest {
         verifyNoMoreInteractions(client);
     }
 
+    // ---------------------------------------------------------------- /web/loginDone refresh coordination
+
+    @Test
+    void tokensStoredWhileTheRejectedSearchWasInFlightAreUsedWithoutARefresh() {
+        TokenSet callbackTokens = new TokenSet(NEW_ACCESS, NEW_REFRESH, "3600", "bearer");
+        service.storeTokens(DEFAULT_OWNER, STORED);
+        when(client.search(ACCESS)).thenAnswer(invocation -> {
+            service.storeTokens(DEFAULT_OWNER, callbackTokens);
+            return json(401, "");
+        });
+        when(client.search(NEW_ACCESS)).thenReturn(json(200, SEARCH_BODY));
+
+        Reply reply = service.loginDone();
+
+        assertThat(text(reply)).isEqualTo(SEARCH_PREFIX + SEARCH_BODY);
+        assertThat(service.tokens(DEFAULT_OWNER)).containsSame(callbackTokens);
+        InOrder order = inOrder(client);
+        order.verify(client).search(ACCESS);
+        order.verify(client).search(NEW_ACCESS);
+        verifyNoMoreInteractions(client);
+    }
+
+    @Test
+    void aRetryWithoutAStoredAccessTokenIsRefusedAsTheFirstSearchIs() {
+        service.storeTokens(DEFAULT_OWNER, STORED);
+        when(client.search(ACCESS)).thenAnswer(invocation -> {
+            service.storeTokens(DEFAULT_OWNER, new TokenSet(null, NEW_REFRESH, null, null));
+            return json(403, "");
+        });
+
+        Throwable thrown = catchThrowable(service::loginDone);
+
+        assertThat(thrown).isExactlyInstanceOf(IllegalStateException.class).hasMessage(NO_ACCESS_TOKEN);
+        verify(client).search(ACCESS);
+        verifyNoMoreInteractions(client);
+    }
+
+    @Test
+    void concurrentRejectedSearchesRedeemTheRefreshTokenOnceAndBothRetryWithTheRefreshedToken() throws Exception {
+        CountDownLatch refreshStarted = new CountDownLatch(1);
+        CountDownLatch releaseRefresh = new CountDownLatch(1);
+        CountDownLatch rejectedSearches = new CountDownLatch(2);
+        service.storeTokens(DEFAULT_OWNER, STORED);
+        when(client.search(ACCESS)).thenAnswer(invocation -> {
+            rejectedSearches.countDown();
+            return json(401, "");
+        });
+        when(client.refreshToken(REFRESH)).thenAnswer(invocation -> {
+            refreshStarted.countDown();
+            await(releaseRefresh);
+            return json(200, tokenBody(NEW_ACCESS, NEW_REFRESH));
+        });
+        when(client.search(NEW_ACCESS)).thenReturn(json(200, SEARCH_BODY));
+
+        try {
+            ConcurrentLoginDone holder = startLoginDone("refresh-holder");
+            await(refreshStarted);
+            ConcurrentLoginDone waiter = startLoginDone("refresh-waiter");
+            await(rejectedSearches);
+            awaitParked(waiter.thread());
+            releaseRefresh.countDown();
+
+            assertThat(holder.outcome()).succeedsWithin(WAIT).extracting(BoxOAuthServiceTest::text)
+                    .isEqualTo(SEARCH_PREFIX + SEARCH_BODY);
+            assertThat(waiter.outcome()).succeedsWithin(WAIT).extracting(BoxOAuthServiceTest::text)
+                    .isEqualTo(SEARCH_PREFIX + SEARCH_BODY);
+        } finally {
+            releaseRefresh.countDown();
+        }
+        assertThat(service.tokens(DEFAULT_OWNER)).contains(new TokenSet(NEW_ACCESS, NEW_REFRESH, "3600", "bearer"));
+        verify(client, times(2)).search(ACCESS);
+        verify(client, times(1)).refreshToken(REFRESH);
+        verify(client, times(2)).search(NEW_ACCESS);
+        verifyNoMoreInteractions(client);
+    }
+
+    @Test
+    void aCallbackDuringARefreshKeepsItsTokensAndTheRetryUsesThem() throws Exception {
+        String callbackAccess = "access-token-3";
+        TokenSet callbackTokens = new TokenSet(callbackAccess, "refresh-token-3", "3600", "bearer");
+        CountDownLatch refreshStarted = new CountDownLatch(1);
+        CountDownLatch releaseRefresh = new CountDownLatch(1);
+        service.storeTokens(DEFAULT_OWNER, STORED);
+        when(client.search(ACCESS)).thenReturn(json(401, ""));
+        when(client.refreshToken(REFRESH)).thenAnswer(invocation -> {
+            refreshStarted.countDown();
+            await(releaseRefresh);
+            return json(200, tokenBody(NEW_ACCESS, NEW_REFRESH));
+        });
+        when(client.requestToken(CODE)).thenReturn(json(200, tokenBody(callbackAccess, "refresh-token-3")));
+        when(client.search(callbackAccess)).thenReturn(json(200, SEARCH_BODY));
+
+        try {
+            ConcurrentLoginDone holder = startLoginDone("refresh-holder");
+            await(refreshStarted);
+            // The callback stores at once: it must complete while the refresh is still held.
+            CompletableFuture<Reply> callback = CompletableFuture.supplyAsync(
+                    () -> service.redirectCallback(CODE, LOGIN_DONE_STATE, "/redirectUrl?code=" + CODE));
+            assertThat(callback).succeedsWithin(WAIT).extracting(Reply::location)
+                    .isEqualTo(LOGIN_DONE_URL + "?authorizationStatus=0");
+            TokenSet stored = service.tokens(DEFAULT_OWNER).orElseThrow();
+            assertThat(stored).isEqualTo(callbackTokens);
+            releaseRefresh.countDown();
+
+            assertThat(holder.outcome()).succeedsWithin(WAIT).extracting(BoxOAuthServiceTest::text)
+                    .isEqualTo(SEARCH_PREFIX + SEARCH_BODY);
+            assertThat(service.tokens(DEFAULT_OWNER)).containsSame(stored);
+        } finally {
+            releaseRefresh.countDown();
+        }
+        InOrder order = inOrder(client);
+        order.verify(client).search(ACCESS);
+        order.verify(client).refreshToken(REFRESH);
+        order.verify(client).search(callbackAccess);
+        verify(client).requestToken(CODE);
+        verifyNoMoreInteractions(client);
+    }
+
+    /** How the token url ends the refresh a second request waits on, and what the refreshing request then throws. */
+    static Stream<Arguments> refreshFailuresAnotherRequestWaitsOn() {
+        return Stream.of(
+                Arguments.of("token url status 400",
+                        (Supplier<RawResponse>) () -> json(400, "{\"error\":\"invalid_grant\"}"),
+                        IllegalStateException.class, TOKEN_URL_FAILURE),
+                Arguments.of("no access token in the refresh response",
+                        (Supplier<RawResponse>) () -> json(200, "{}"),
+                        IllegalStateException.class, TOKEN_NOT_FOUND),
+                Arguments.of("token url call threw",
+                        (Supplier<RawResponse>) () -> {
+                            throw new ResourceAccessException("I/O error on POST request");
+                        },
+                        ResourceAccessException.class, "I/O error on POST request"));
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("refreshFailuresAnotherRequestWaitsOn")
+    void aRequestWaitingOnAFailedRefreshRetriesWithTheStoredTokensWithoutRefreshing(String description,
+            Supplier<RawResponse> refreshEnd, Class<? extends Throwable> holderFailure, String holderMessage)
+            throws Exception {
+        CountDownLatch refreshStarted = new CountDownLatch(1);
+        CountDownLatch releaseRefresh = new CountDownLatch(1);
+        CountDownLatch rejectedSearches = new CountDownLatch(2);
+        service.storeTokens(DEFAULT_OWNER, STORED);
+        when(client.search(ACCESS)).thenAnswer(invocation -> {
+            rejectedSearches.countDown();
+            return json(401, "");
+        });
+        when(client.refreshToken(REFRESH)).thenAnswer(invocation -> {
+            refreshStarted.countDown();
+            await(releaseRefresh);
+            return refreshEnd.get();
+        });
+
+        try {
+            ConcurrentLoginDone holder = startLoginDone("refresh-holder");
+            await(refreshStarted);
+            ConcurrentLoginDone waiter = startLoginDone("refresh-waiter");
+            await(rejectedSearches);
+            awaitParked(waiter.thread());
+            releaseRefresh.countDown();
+
+            assertThat(holder.outcome()).failsWithin(WAIT).withThrowableOfType(ExecutionException.class)
+                    .havingCause().isExactlyInstanceOf(holderFailure).withMessage(holderMessage);
+            assertThat(waiter.outcome()).failsWithin(WAIT).withThrowableOfType(ExecutionException.class)
+                    .havingCause().isExactlyInstanceOf(IllegalStateException.class)
+                    .withMessage("Response code 401 mapped as failure.");
+        } finally {
+            releaseRefresh.countDown();
+        }
+        assertThat(service.tokens(DEFAULT_OWNER)).containsSame(STORED);
+        verify(client, times(3)).search(ACCESS);
+        verify(client, times(1)).refreshToken(REFRESH);
+        verifyNoMoreInteractions(client);
+    }
+
     // ---------------------------------------------------------------- /authorization (localAuthorizationUrl)
 
     static Stream<Arguments> authorizationRedirects() {
@@ -512,9 +705,10 @@ class BoxOAuthServiceTest {
         assertThat(service.tokens(DEFAULT_OWNER)).isEmpty();
         assertThat(serviceEvents()).singleElement().satisfies(event -> {
             assertThat(event.getLevel()).isEqualTo(Level.ERROR);
-            assertThat(event.getFormattedMessage())
-                    .isEqualTo("Redirect URL request failed, authorizationStatus 200: the token url call failed");
-            assertThat(event.getThrowableProxy().getClassName()).isEqualTo(failure.getClass().getName());
+            assertThat(event.getFormattedMessage()).isEqualTo(
+                    "Redirect URL request failed, authorizationStatus 200: the token url call failed: "
+                            + failure.getClass().getName());
+            assertThat(event.getThrowableProxy()).isNull();
         });
         verify(client).requestToken(CODE);
         verifyNoMoreInteractions(client);
@@ -555,12 +749,9 @@ class BoxOAuthServiceTest {
         assertThat(serviceEvents()).singleElement().satisfies(event -> {
             assertThat(event.getLevel()).isEqualTo(Level.ERROR);
             assertThat(event.getFormattedMessage())
-                    .isEqualTo("Redirect URL request failed, authorizationStatus " + marker + ": " + detail);
-            if (loggedFailure == null) {
-                assertThat(event.getThrowableProxy()).isNull();
-            } else {
-                assertThat(event.getThrowableProxy().getClassName()).isEqualTo(loggedFailure.getName());
-            }
+                    .isEqualTo("Redirect URL request failed, authorizationStatus " + marker + ": " + detail
+                            + (loggedFailure == null ? "" : ": " + loggedFailure.getName()));
+            assertThat(event.getThrowableProxy()).isNull();
         });
         assertThat(loggedText()).doesNotContain(ACCESS, REFRESH);
         verify(client).requestToken(CODE);
@@ -673,7 +864,135 @@ class BoxOAuthServiceTest {
         assertThat(service.tokens(DEFAULT_OWNER)).contains(new TokenSet(ACCESS, REFRESH, null, expectedTokenType));
     }
 
+    // ---------------------------------------------------------------- token-call failure logging
+
+    /**
+     * Where a failed token call is logged, the refresh of {@code /web/loginDone} or the code exchange of
+     * {@code /redirectUrl}, with the fixed text that precedes the exception types.
+     */
+    enum TokenCall {
+        REFRESH("Failure calling the token url to refresh the access token: "),
+        CODE_EXCHANGE("Redirect URL request failed, authorizationStatus 200: the token url call failed: ");
+
+        final String logPrefix;
+
+        TokenCall(String logPrefix) {
+            this.logPrefix = logPrefix;
+        }
+    }
+
+    /** Failure chains whose every message and suppressed exception quotes {@link #SENTINEL}, built per call. */
+    static Stream<Arguments> tokenCallFailuresQuotingASecret() {
+        String runtime = " <- java.lang.RuntimeException";
+        return Stream.of(TokenCall.values()).flatMap(call -> Stream.of(
+                Arguments.of(call, "causes and suppressed quote the secret", quotingChain(),
+                        "org.springframework.web.client.ResourceAccessException <- java.io.IOException"
+                                + " <- java.net.SocketException"),
+                Arguments.of(call, "circular cause chain", circularChain(),
+                        "java.lang.IllegalStateException <- java.lang.IllegalArgumentException <- [circular]"),
+                Arguments.of(call, "ten causes", chainWithCauses(10),
+                        "java.lang.IllegalStateException" + runtime.repeat(10)),
+                Arguments.of(call, "eleven causes", chainWithCauses(11),
+                        "java.lang.IllegalStateException" + runtime.repeat(10) + " <- ...")));
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}, {1}")
+    @MethodSource("tokenCallFailuresQuotingASecret")
+    void aFailedTokenCallIsLoggedByItsExceptionTypesOnly(TokenCall call, String description,
+            RuntimeException failure, String expectedTypes) {
+        if (call == TokenCall.REFRESH) {
+            service.storeTokens(DEFAULT_OWNER, STORED);
+            when(client.search(ACCESS)).thenReturn(json(401, ""));
+            when(client.refreshToken(REFRESH)).thenThrow(failure);
+
+            assertThat(catchThrowable(service::loginDone)).isSameAs(failure);
+            assertThat(service.tokens(DEFAULT_OWNER)).containsSame(STORED);
+        } else {
+            when(client.requestToken(CODE)).thenThrow(failure);
+
+            Reply reply = service.redirectCallback(CODE, LOGIN_DONE_STATE, "/redirectUrl?code=" + CODE);
+
+            assertThat(reply.location()).isEqualTo(LOGIN_DONE_URL + "?authorizationStatus=200");
+            assertThat(service.tokens(DEFAULT_OWNER)).isEmpty();
+        }
+
+        assertThat(serviceEvents()).singleElement().satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+            assertThat(event.getFormattedMessage()).isEqualTo(call.logPrefix + expectedTypes);
+            assertThat(event.getThrowableProxy()).isNull();
+        });
+        assertThat(everythingLogged()).doesNotContain(SENTINEL);
+    }
+
     // ---------------------------------------------------------------- helpers
+
+    /** One {@code loginDone} on its own thread, so a test can watch it block and collect its outcome. */
+    private record ConcurrentLoginDone(Thread thread, CompletableFuture<Reply> outcome) {
+    }
+
+    /** Starts {@code loginDone} on a new daemon thread; its reply or what it threw completes the outcome. */
+    private ConcurrentLoginDone startLoginDone(String name) {
+        CompletableFuture<Reply> outcome = new CompletableFuture<>();
+        Thread thread = new Thread(() -> {
+            try {
+                outcome.complete(service.loginDone());
+            } catch (Throwable e) {
+                outcome.completeExceptionally(e);
+            }
+        }, name);
+        thread.setDaemon(true);
+        thread.start();
+        return new ConcurrentLoginDone(thread, outcome);
+    }
+
+    /** Waits for {@code latch}, failing the test instead of hanging once {@link #WAIT} has passed. */
+    private static void await(CountDownLatch latch) throws InterruptedException {
+        assertThat(latch.await(WAIT.toMillis(), TimeUnit.MILLISECONDS)).as("latch released within %s", WAIT).isTrue();
+    }
+
+    /**
+     * Waits until {@code thread} is parked, which after its rejected search means it is waiting for the refresh lock
+     * (or, were the refresh not coordinated, for the blocked refresh itself), failing once {@link #WAIT} has passed.
+     */
+    private static void awaitParked(Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + WAIT.toNanos();
+        while (thread.getState() != Thread.State.WAITING && thread.getState() != Thread.State.TIMED_WAITING) {
+            assertThat(thread.isAlive()).as("%s still running", thread.getName()).isTrue();
+            assertThat(System.nanoTime() - deadline).as("%s parked within %s", thread.getName(), WAIT).isNegative();
+            Thread.sleep(5);
+        }
+    }
+
+    /**
+     * A Spring transport failure quoting the secret in its message, its cause's message, its root cause's message
+     * and in suppressed exceptions of the outer exception and of the root cause.
+     */
+    private static RuntimeException quotingChain() {
+        SocketException root = new SocketException("Connection reset by " + SENTINEL);
+        root.addSuppressed(new IllegalStateException("suppressed on the root " + SENTINEL));
+        IOException cause = new IOException("Read failed for " + SENTINEL, root);
+        ResourceAccessException outer = new ResourceAccessException(
+                "I/O error on POST request for \"https://box.test/" + SENTINEL + "\": " + cause.getMessage(), cause);
+        outer.addSuppressed(new IllegalArgumentException("suppressed " + SENTINEL, new IOException(SENTINEL)));
+        return outer;
+    }
+
+    /** An exception and its cause, each the other's cause, both quoting the secret. */
+    private static RuntimeException circularChain() {
+        IllegalStateException outer = new IllegalStateException("outer " + SENTINEL);
+        IllegalArgumentException inner = new IllegalArgumentException("inner " + SENTINEL, outer);
+        outer.initCause(inner);
+        return outer;
+    }
+
+    /** An {@link IllegalStateException} over {@code causes} nested {@link RuntimeException}s, each quoting the secret. */
+    private static RuntimeException chainWithCauses(int causes) {
+        RuntimeException cause = null;
+        for (int depth = causes; depth > 0; depth--) {
+            cause = new RuntimeException("cause " + depth + " " + SENTINEL, cause);
+        }
+        return new IllegalStateException("outer " + SENTINEL, cause);
+    }
 
     private static BoxProperties properties(String clientId) {
         return new BoxProperties(clientId, CLIENT_SECRET, AUTHORIZATION_URL, LOCAL_AUTHORIZATION_URL, REDIRECT_URL,
@@ -720,6 +1039,20 @@ class BoxOAuthServiceTest {
         for (ILoggingEvent event : serviceEvents()) {
             text.append(event.getFormattedMessage()).append('\n');
             Optional.ofNullable(event.getThrowableProxy()).ifPresent(proxy -> text.append(proxy.getMessage()));
+        }
+        return text.toString();
+    }
+
+    /**
+     * Every event any logger sent to the root, rendered with its formatted message and, when a throwable is
+     * attached, Logback's full rendering of it: causes, suppressed exceptions and their messages.
+     */
+    private String everythingLogged() {
+        StringBuilder text = new StringBuilder();
+        for (ILoggingEvent event : appender.list) {
+            text.append(event.getFormattedMessage()).append('\n');
+            Optional.ofNullable(event.getThrowableProxy())
+                    .ifPresent(proxy -> text.append(ThrowableProxyUtil.asString(proxy)).append('\n'));
         }
         return text.toString();
     }
