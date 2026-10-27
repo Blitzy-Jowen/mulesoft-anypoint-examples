@@ -93,6 +93,7 @@ class TwitterSearchServiceTest {
         assertThat(result).isSameAs(tweets);
         verify(client).search("$AAPL", since, until);
         verifyNoMoreInteractions(client);
+        verify(mapper).toTweets(queryResult);
     }
 
     @Test

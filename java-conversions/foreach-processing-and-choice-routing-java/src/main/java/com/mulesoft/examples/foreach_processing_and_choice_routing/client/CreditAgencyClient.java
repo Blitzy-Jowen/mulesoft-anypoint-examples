@@ -7,9 +7,7 @@ import com.mulesoft.examples.foreach_processing_and_choice_routing.model.soap.Ge
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import org.springframework.ws.client.core.WebServiceMessageCallback;
 import org.springframework.ws.client.core.WebServiceTemplate;
-import org.springframework.ws.soap.client.core.SoapActionCallback;
 
 /**
  * Outbound SOAP client of the credit agency's {@code getCreditProfile} operation. It replaces the CXF JAX-WS client
@@ -30,13 +28,6 @@ import org.springframework.ws.soap.client.core.SoapActionCallback;
 @Component
 public class CreditAgencyClient {
 
-    /**
-     * Sends {@code SOAPAction: ""}, the header CXF's SOAP 1.1 client always wrote. The callback is set explicitly
-     * rather than left to the template, because Spring WS 4.1's SAAJ message writes no SOAPAction header at all when
-     * none is set; it is stateless, so one instance serves concurrent calls.
-     */
-    private static final WebServiceMessageCallback EMPTY_SOAP_ACTION = new SoapActionCallback("");
-
     private final WebServiceTemplate webServiceTemplate;
     private final String targetUri;
 
@@ -55,15 +46,16 @@ public class CreditAgencyClient {
     }
 
     /**
-     * Calls {@code getCreditProfile} on the credit agency with an HTTP POST carrying {@code SOAPAction: ""}, as the CXF
-     * client sent it.
+     * Calls {@code getCreditProfile} on the credit agency with an HTTP POST. No message callback is passed: the
+     * {@code SOAPAction: ""} header the CXF client sent comes from the shared template's
+     * {@code SoapActionHeaderInterceptor} in {@code config.WebServiceConfig}, which writes it on every SOAP 1.1
+     * request.
      *
      * @param customer the customer whose credit profile is requested, sent as the unqualified {@code arg0} child
      * @return the credit profile carried by the reply's {@code return} child
      */
     public CreditProfile getCreditProfile(Customer customer) {
-        Object reply = webServiceTemplate.marshalSendAndReceive(targetUri, new GetCreditProfile(customer),
-                EMPTY_SOAP_ACTION);
+        Object reply = webServiceTemplate.marshalSendAndReceive(targetUri, new GetCreditProfile(customer));
         return ((GetCreditProfileResponse) reply).getReturn();
     }
 

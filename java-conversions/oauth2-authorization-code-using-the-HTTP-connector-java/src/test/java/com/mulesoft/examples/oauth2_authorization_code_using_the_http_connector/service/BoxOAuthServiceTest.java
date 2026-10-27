@@ -495,20 +495,29 @@ class BoxOAuthServiceTest {
         verifyNoInteractions(client);
     }
 
-    @Test
-    void redirectCallbackSendsStatus200WhenTheTokenCallThrows() {
-        when(client.requestToken(CODE)).thenThrow(new ResourceAccessException("I/O error on POST request"));
+    /** A connectivity failure and any other exception of the token call itself: both are marker 200, not 300. */
+    static Stream<RuntimeException> tokenCallFailures() {
+        return Stream.of(new ResourceAccessException("I/O error on POST request"), new IllegalStateException("boom"));
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("tokenCallFailures")
+    void redirectCallbackSendsStatus200WhenTheTokenCallThrows(RuntimeException failure) {
+        when(client.requestToken(CODE)).thenThrow(failure);
 
         Reply reply = service.redirectCallback(CODE, LOGIN_DONE_STATE, "/redirectUrl?code=" + CODE);
 
+        assertThat(reply.status()).isEqualTo(302);
         assertThat(reply.location()).isEqualTo(LOGIN_DONE_URL + "?authorizationStatus=200");
         assertThat(service.tokens(DEFAULT_OWNER)).isEmpty();
         assertThat(serviceEvents()).singleElement().satisfies(event -> {
             assertThat(event.getLevel()).isEqualTo(Level.ERROR);
             assertThat(event.getFormattedMessage())
                     .isEqualTo("Redirect URL request failed, authorizationStatus 200: the token url call failed");
-            assertThat(event.getThrowableProxy().getClassName()).isEqualTo(ResourceAccessException.class.getName());
+            assertThat(event.getThrowableProxy().getClassName()).isEqualTo(failure.getClass().getName());
         });
+        verify(client).requestToken(CODE);
+        verifyNoMoreInteractions(client);
     }
 
     static Stream<Arguments> unusableTokenResponses() {

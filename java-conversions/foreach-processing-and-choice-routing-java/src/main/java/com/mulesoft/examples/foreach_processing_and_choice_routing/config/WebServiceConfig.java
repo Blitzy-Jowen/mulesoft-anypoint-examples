@@ -37,10 +37,15 @@ import org.springframework.util.Assert;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.xml.StaxUtils;
 import org.springframework.ws.client.core.WebServiceTemplate;
+import org.springframework.ws.client.support.interceptor.ClientInterceptor;
+import org.springframework.ws.client.support.interceptor.ClientInterceptorAdapter;
 import org.springframework.ws.config.annotation.WsConfigurer;
+import org.springframework.ws.context.MessageContext;
 import org.springframework.ws.server.EndpointInterceptor;
 import org.springframework.ws.server.endpoint.adapter.method.MarshallingPayloadMethodProcessor;
 import org.springframework.ws.server.endpoint.adapter.method.MethodReturnValueHandler;
+import org.springframework.ws.soap.SoapMessage;
+import org.springframework.ws.soap.SoapVersion;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.springframework.ws.transport.http.HttpUrlConnectionMessageSender;
 import org.w3c.dom.Document;
@@ -173,6 +178,8 @@ public class WebServiceConfig implements WsConfigurer {
      * bounded by the original {@code responseTimeout}. A SOAP fault answer surfaces as
      * {@code SoapFaultClientException} and any other HTTP error as {@code WebServiceTransportException}, because
      * both connection checks keep their default {@code true}. No default URI is set: every call names its target.
+     * Every request carries the {@code SOAPAction} header the CXF client sent, through
+     * {@link SoapActionHeaderInterceptor}, so callers pass no message callback for it.
      *
      * @param responseTimeoutMillis {@code loanbroker.response-timeout}, in milliseconds; must be positive, because
      *                              zero would mean waiting forever
@@ -193,7 +200,28 @@ public class WebServiceConfig implements WsConfigurer {
         template.setMarshaller(marshaller);
         template.setUnmarshaller(marshaller);
         template.setMessageSender(messageSender);
+        template.setInterceptors(new ClientInterceptor[] {new SoapActionHeaderInterceptor()});
         return template;
+    }
+
+    /**
+     * Sends a SOAP 1.1 request's {@code SOAPAction} as an explicit HTTP header. CXF's JAX-WS client sent
+     * {@code SOAPAction: ""} on every SOAP 1.1 request whose operation declares no action, as WS-I Basic Profile
+     * R2744 requires, whereas Spring WS 4.1's SAAJ message writes the header only once an action is set and otherwise
+     * merely reports {@code ""} from {@link SoapMessage#getSoapAction()}. Setting the message's own action again
+     * therefore writes {@code ""} when none was set and keeps any action a caller did set. Stateless, so the shared
+     * template's concurrent calls use one instance.
+     */
+    static final class SoapActionHeaderInterceptor extends ClientInterceptorAdapter {
+
+        @Override
+        public boolean handleRequest(MessageContext messageContext) {
+            if (messageContext.getRequest() instanceof SoapMessage request
+                    && request.getVersion() == SoapVersion.SOAP_11) {
+                request.setSoapAction(request.getSoapAction());
+            }
+            return true;
+        }
     }
 
     /**
