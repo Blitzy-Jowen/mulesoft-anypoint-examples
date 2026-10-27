@@ -32,7 +32,9 @@ import org.springframework.jms.core.JmsTemplate;
  *       {@code ConnectionFactory} from {@code spring.artemis.*}; its {@code maxRedelivery="2"} is enforced by
  *       {@code trigger/OrderQueueListener}, not by the container.</li>
  *   <li>Line 4, {@code db:generic-config url="${jdbc.url}"}: Boot builds the {@code DataSource} from
- *       {@code spring.datasource.url}; {@link #transactionManager} is the only transaction manager over it.</li>
+ *       {@code spring.datasource.url}, except while that URL is blank, when {@link DataSourceConfig} supplies an
+ *       {@code UnconfiguredDataSource} whose every connection request fails naming {@code jdbc.url};
+ *       {@link #transactionManager} is the only transaction manager over it.</li>
  *   <li>Line 7, {@code jms:inbound-endpoint queue="in"}: {@link #jmsListenerContainerFactory} receives in a
  *       locally transacted session, which is the JMS side of the scope.</li>
  *   <li>Line 12, {@code ee:multi-transactional action="ALWAYS_BEGIN"}: {@code service/OrderTransactionService}
@@ -69,7 +71,8 @@ public class TransactionConfig {
      * {@code DataSourceTransactionManagerAutoConfiguration} back off, so it is the only
      * {@code PlatformTransactionManager} in the context.
      *
-     * @param dataSource Boot's {@code DataSource}, built from {@code spring.datasource.url}
+     * @param dataSource Boot's {@code DataSource}, built from {@code spring.datasource.url}, or, while that URL is
+     *                   blank, the {@code UnconfiguredDataSource} of {@link DataSourceConfig}
      * @return the transaction manager behind every {@code @Transactional} method
      */
     @Bean

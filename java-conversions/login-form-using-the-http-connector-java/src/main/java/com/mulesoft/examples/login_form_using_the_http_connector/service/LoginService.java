@@ -27,7 +27,8 @@ import com.mulesoft.examples.login_form_using_the_http_connector.mapper.ParseTem
  * <ul>
  *   <li>{@code GetLoginPageFlow} (xml:7-12): {@link #loginPage()} renders {@code login/index.html}.</li>
  *   <li>{@code DoLoginFlow} (xml:14-31): {@link #login(Map)} logs the username, applies the credential
- *       filter and renders {@code login/loginSuccessful.html}; every failure of those steps surfaces as
+ *       filter (warning when the configured credentials are blank) and renders
+ *       {@code login/loginSuccessful.html}; every failure of those steps surfaces as
  *       {@link LoginFailedException}, which the flow's catch strategy answered with 403 and
  *       {@code loginFailure.html}.</li>
  *   <li>{@code CallLoginFlowUsingRequester} (xml:33-43): {@link #requesterLogin()} posts the configured
@@ -57,6 +58,12 @@ public class LoginService {
 
     /** Form field holding the password. */
     static final String PASSWORD = "password";
+
+    /** Property holding the accepted username; a blank value is named, never shown, in the rejection warning. */
+    static final String USERNAME_KEY = "login.username";
+
+    /** Property holding the accepted password; a blank value is named, never shown, in the rejection warning. */
+    static final String PASSWORD_KEY = "login.password";
 
     private final LoginProperties properties;
     private final ParseTemplateRenderer renderer;
@@ -112,13 +119,20 @@ public class LoginService {
 
     /**
      * The {@code expression-filter} of xml:21 with the configured values in place of {@code 'mule'}. An unset
-     * or blank configured credential rejects every form, so a missing key can never admit an empty form.
+     * or blank configured credential rejects every form, so a missing key can never admit an empty form; each
+     * such rejection logs one WARN naming the blank keys, without any configured or submitted value.
      */
     private boolean credentialsMatch(String user, String pass) {
         String configuredUser = properties.username();
         String configuredPassword = properties.password();
-        if (configuredUser == null || configuredUser.isBlank()
-                || configuredPassword == null || configuredPassword.isBlank()) {
+        boolean userUnset = configuredUser == null || configuredUser.isBlank();
+        boolean passwordUnset = configuredPassword == null || configuredPassword.isBlank();
+        if (userUnset && passwordUnset) {
+            LOG.warn("Login rejected because {} and {} are not configured", USERNAME_KEY, PASSWORD_KEY);
+            return false;
+        }
+        if (userUnset || passwordUnset) {
+            LOG.warn("Login rejected because {} is not configured", userUnset ? USERNAME_KEY : PASSWORD_KEY);
             return false;
         }
         return configuredUser.equals(user) && configuredPassword.equals(pass);

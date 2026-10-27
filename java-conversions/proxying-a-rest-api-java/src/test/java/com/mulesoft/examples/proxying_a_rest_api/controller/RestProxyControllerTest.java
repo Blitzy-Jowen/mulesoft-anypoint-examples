@@ -25,8 +25,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -86,7 +86,8 @@ import com.mulesoft.examples.proxying_a_rest_api.support.HttpTestClient.Response
  * </ul>
  *
  * <p>No request leaves the loopback interface: the listener and WireMock are both bound to {@link #LOOPBACK}, and the
- * unreachable-upstream case points a second application context at a closed loopback port.
+ * unreachable-upstream case points a second application context at a loopback port held by a bound socket that never
+ * listens, so every connection to it is refused.
  */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -361,31 +362,31 @@ class RestProxyControllerTest {
 
     @Test
     void unreachableUpstreamBecomes500Json() throws IOException {
-        int deadPort;
-        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getByName(LOOPBACK))) {
-            deadPort = socket.getLocalPort();
-        }
-        // Command-line arguments outrank application.yml; builder properties() would be overridden by it.
-        ConfigurableApplicationContext context = new SpringApplicationBuilder(ProxyingARestApiApplication.class)
-                .profiles("test")
-                .run("--server.port=0",
-                        "--server.address=" + LOOPBACK,
-                        "--proxy.upstream-url=http://" + LOOPBACK + ":" + deadPort,
-                        "--proxy.response-timeout-ms=" + RESPONSE_TIMEOUT_MS);
-        try {
-            int proxyPort = ((WebServerApplicationContext) context).getWebServer().getPort();
+        // Held until the context has closed, so no other process can bind the port and answer in its place.
+        try (Socket reservation = reserveRefusingPort()) {
+            int deadPort = reservation.getLocalPort();
+            // Command-line arguments outrank application.yml; builder properties() would be overridden by it.
+            ConfigurableApplicationContext context = new SpringApplicationBuilder(ProxyingARestApiApplication.class)
+                    .profiles("test")
+                    .run("--server.port=0",
+                            "--server.address=" + LOOPBACK,
+                            "--proxy.upstream-url=http://" + LOOPBACK + ":" + deadPort,
+                            "--proxy.response-timeout-ms=" + RESPONSE_TIMEOUT_MS);
+            try {
+                int proxyPort = ((WebServerApplicationContext) context).getWebServer().getPort();
 
-            Response response = new HttpTestClient(LOOPBACK, proxyPort).get("/2.0/folders/0");
+                Response response = new HttpTestClient(LOOPBACK, proxyPort).get("/2.0/folders/0");
 
-            assertThat(response.status()).as("%s", response).isEqualTo(500);
-            assertThat(response.statusLine()).isEqualTo("HTTP/1.1 500 Internal Server Error");
-            assertJsonContentType(response);
-            // The text is the transport's connect-failure message, which depends on the JDK and the client.
-            assertThat(response.bodyAsString()).startsWith(ERROR_BODY_START).endsWith("\" }");
-        } finally {
-            context.close();
+                assertThat(response.status()).as("%s", response).isEqualTo(500);
+                assertThat(response.statusLine()).isEqualTo("HTTP/1.1 500 Internal Server Error");
+                assertJsonContentType(response);
+                // The text is the transport's connect-failure message, which depends on the JDK and the client.
+                assertThat(response.bodyAsString()).startsWith(ERROR_BODY_START).endsWith("\" }");
+            } finally {
+                context.close();
+            }
+            assertThat(upstream.getAllServeEvents()).as("calls reaching the shared upstream").isEmpty();
         }
-        assertThat(upstream.getAllServeEvents()).as("calls reaching the shared upstream").isEmpty();
     }
 
     @Test
@@ -411,6 +412,26 @@ class RestProxyControllerTest {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
+    }
 
     /** The one request the upstream received in this test. */
     private static LoggedRequest singleForwardedRequest() {

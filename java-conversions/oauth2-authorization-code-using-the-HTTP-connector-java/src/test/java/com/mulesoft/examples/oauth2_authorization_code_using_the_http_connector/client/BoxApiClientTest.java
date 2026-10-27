@@ -33,6 +33,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLEncoder;
@@ -298,17 +299,17 @@ class BoxApiClientTest {
     @ParameterizedTest
     @EnumSource(Operation.class)
     void refusedConnectionSurfacesAsResourceAccessException(Operation operation) throws IOException {
-        int port;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            port = socket.getLocalPort();
+        // The port stays reserved, and so refusing, until every assertion has run.
+        try (Socket reserved = reserveRefusingPort()) {
+            String refused = "http://127.0.0.1:" + reserved.getLocalPort();
+            Throwable thrown;
+            try (BoxApiClient refusedClient = new BoxApiClient(properties(refused + TOKEN_PATH, refused + "/2.0"))) {
+                thrown = catchThrowable(() -> operation.callOn(refusedClient));
+            }
+
+            assertThat(thrown).isInstanceOf(ResourceAccessException.class);
+            assertThat(causeChain(thrown)).anyMatch(ConnectException.class::isInstance);
         }
-        String closed = "http://127.0.0.1:" + port;
-        BoxApiClient refusedClient = new BoxApiClient(properties(closed + TOKEN_PATH, closed + "/2.0"));
-
-        Throwable thrown = catchThrowable(() -> operation.callOn(refusedClient));
-
-        assertThat(thrown).isInstanceOf(ResourceAccessException.class);
-        assertThat(causeChain(thrown)).anyMatch(ConnectException.class::isInstance);
     }
 
     @ParameterizedTest
@@ -568,13 +569,14 @@ class BoxApiClientTest {
     void debugLogShowsOnlySchemeHostPortAndPath() {
         String sentinel = sentinel();
         String tokenPathAndQuery = TOKEN_PATH + "?tenant=" + sentinel;
-        BoxApiClient sentinelClient =
-                new BoxApiClient(properties(wm.baseUrl() + tokenPathAndQuery, wm.baseUrl() + "/2.0/"));
         wm.stubFor(post(urlEqualTo(tokenPathAndQuery)).willReturn(ok()));
         wm.stubFor(get(urlEqualTo(SEARCH_PATH)).willReturn(ok()));
 
-        assertThat(sentinelClient.requestToken(CODE).status()).isEqualTo(200);
-        assertThat(sentinelClient.search(sentinel).status()).isEqualTo(200);
+        try (BoxApiClient sentinelClient =
+                     new BoxApiClient(properties(wm.baseUrl() + tokenPathAndQuery, wm.baseUrl() + "/2.0/"))) {
+            assertThat(sentinelClient.requestToken(CODE).status()).isEqualTo(200);
+            assertThat(sentinelClient.search(sentinel).status()).isEqualTo(200);
+        }
 
         // The token endpoint's query is sent unchanged, and the access token as the bearer credential...
         wm.verify(1, postRequestedFor(urlEqualTo(tokenPathAndQuery)));
@@ -621,7 +623,12 @@ class BoxApiClientTest {
                 : properties(wm.baseUrl() + TOKEN_PATH, url);
         wm.stubFor(any(anyUrl()).willReturn(ok()));
 
-        Throwable thrown = catchThrowable(() -> operation.callOn(new BoxApiClient(properties)));
+        // Built inside catchThrowable, so the rejection is caught whether construction or the call raises it.
+        Throwable thrown = catchThrowable(() -> {
+            try (BoxApiClient unusableClient = new BoxApiClient(properties)) {
+                operation.callOn(unusableClient);
+            }
+        });
 
         assertThat(thrown).isInstanceOf(IllegalStateException.class).hasMessage(key + " " + problem).hasNoCause();
         assertThat(causeChain(thrown)).extracting(Throwable::toString).noneMatch(text -> text.contains(sentinel));
@@ -647,19 +654,22 @@ class BoxApiClientTest {
         // Over https that abort has to end a TLS read.
         AtomicInteger requests = new AtomicInteger();
         List<Socket> connections = Collections.synchronizedList(new ArrayList<>());
-        List<IOException> closeFailures = new ArrayList<>();
+        List<Exception> closeFailures = new ArrayList<>();
         ServerSocket upstream = "https".equals(scheme)
                 ? serverContext(trustedServerKeyStore).getServerSocketFactory().createServerSocket(0)
                 : new ServerSocket(0);
         Thread server = new Thread(() -> answerThenStall(upstream, stall, requests, connections),
                 "stalled-box-upstream");
         server.setDaemon(true);
+        // Set once the client is built, and closed by the finally block below rather than by try-with-resources.
+        BoxApiClient clientToClose = null;
         try {
             server.start();
             // localhost is the name the https server key is for.
             String stalled = scheme + "://localhost:" + upstream.getLocalPort();
             BoxApiClient stalledClient = new BoxApiClient(
                     properties(stalled + TOKEN_PATH, stalled + "/2.0", trustStore.toString()));
+            clientToClose = stalledClient;
 
             long start = System.nanoTime();
             // The watchdog is independent of the client's own timeout, so a body read that never ends fails
@@ -675,11 +685,13 @@ class BoxApiClientTest {
             assertThat(requests).hasValue(1);
             assertThat(connections).as("connections opened").hasSize(1);
         } finally {
-            // The one owner of the sockets: runs whether the call returned, the watchdog gave up on it or the
-            // server thread failed to start. Closing the listening socket ends the accept loop, and closing each
-            // accepted connection ends any client read still blocked on it. Every close is attempted whatever the
-            // others do; failures are reported only after the cleanup, so none of them replaces the failure that
-            // brought the test here.
+            // The one owner of the sockets and the client: runs whether the call returned, the watchdog gave up on
+            // it, or starting the server thread or building the client failed. Closing the listening socket ends
+            // the accept loop, and closing each accepted connection ends any client read still blocked on it. The
+            // client is closed only after both, so its graceful close of a connection the watchdog left leased, TLS
+            // included, never waits on an upstream still open. Every close is attempted whatever the others do;
+            // failures are reported only after the cleanup, so none of them replaces the failure that brought the
+            // test here.
             try {
                 upstream.close();
             } catch (IOException ex) {
@@ -694,10 +706,17 @@ class BoxApiClientTest {
                     }
                 }
             }
+            if (clientToClose != null) {
+                try {
+                    clientToClose.close();
+                } catch (RuntimeException ex) {
+                    closeFailures.add(ex);
+                }
+            }
             // A thread that never started is not alive, so this returns at once if start() failed.
             server.join(Duration.ofSeconds(5).toMillis());
         }
-        assertThat(closeFailures).as("failures closing the stalled upstream's sockets").isEmpty();
+        assertThat(closeFailures).as("failures closing the stalled upstream's sockets and the client").isEmpty();
         assertThat(server.isAlive()).as("stalled upstream thread still running").isFalse();
     }
 
@@ -993,18 +1012,62 @@ class BoxApiClientTest {
                 "-storetype", "JKS", "-storepass", STORE_PASSWORD, "-keypass", STORE_PASSWORD);
     }
 
-    /** Runs the keytool of the JDK running the tests, failing with its output when it does not succeed. */
+    /** How long {@link #keytool} waits for keytool to finish. */
+    private static final Duration KEYTOOL_TIMEOUT = Duration.ofMinutes(1);
+
+    /** How long {@link #keytool} waits for a keytool it has killed to end. */
+    private static final Duration KEYTOOL_REAP_TIMEOUT = Duration.ofSeconds(10);
+
+    /**
+     * Runs the keytool of the JDK running the tests, failing with its output when it does not succeed. Its standard
+     * output and error go to a file under {@link #tlsDir} rather than a pipe, so keytool never blocks on a full pipe
+     * and the {@link #KEYTOOL_TIMEOUT} wait starts at once. A keytool still running when that wait ends is killed and
+     * reaped, for up to {@link #KEYTOOL_REAP_TIMEOUT}, and the test fails with its output; an interrupted wait kills
+     * and reaps it the same way, then restores the interrupt and rethrows.
+     */
     private static void keytool(String... arguments) throws IOException, InterruptedException {
         List<String> command = new ArrayList<>();
         command.add(Path.of(System.getProperty("java.home"), "bin", "keytool").toString());
         command.addAll(Arrays.asList(arguments));
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        String output = new String(process.getInputStream().readAllBytes(), UTF_8);
-        boolean exited = process.waitFor(1, TimeUnit.MINUTES);
-        if (!exited) {
-            process.destroyForcibly();
+        Path outputFile = Files.createTempFile(tlsDir, "keytool-", ".log");
+        Process process = new ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .redirectOutput(outputFile.toFile())
+                .start();
+        boolean exited;
+        boolean reaped = true;
+        try {
+            exited = process.waitFor(KEYTOOL_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
+            if (!exited) {
+                reaped = destroyAndReap(process);
+            }
+        } catch (InterruptedException interrupted) {
+            // Interrupted waiting for keytool, or for the killed keytool to end: it is killed and reaped all the same.
+            try {
+                destroyAndReap(process);
+            } catch (InterruptedException again) {
+                interrupted.addSuppressed(again);
+            }
+            Thread.currentThread().interrupt();
+            throw interrupted;
         }
-        assertThat(exited && process.exitValue() == 0).as("keytool %s: %s", arguments[0], output).isTrue();
+        String outcome = exited
+                ? "exit code " + process.exitValue()
+                : "still running after " + KEYTOOL_TIMEOUT.toSeconds() + " s, killed" + (reaped ? "" : ", not reaped");
+        // Decoded leniently, as Files.readString is not, so output that is not UTF-8 still reaches the message.
+        String output = new String(Files.readAllBytes(outputFile), UTF_8);
+        assertThat(exited && process.exitValue() == 0).as("keytool %s (%s): %s", arguments[0], outcome, output)
+                .isTrue();
+    }
+
+    /**
+     * Kills {@code process} and waits up to {@link #KEYTOOL_REAP_TIMEOUT} for it to end.
+     *
+     * @return whether it ended within that time
+     */
+    private static boolean destroyAndReap(Process process) throws InterruptedException {
+        process.destroyForcibly();
+        return process.waitFor(KEYTOOL_REAP_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     /** A started HTTPS-only WireMock server presenting the key in {@code keyStore}. */
@@ -1031,6 +1094,26 @@ class BoxApiClientTest {
         SSLContext context = SSLContext.getInstance("TLS");
         context.init(keyManagers.getKeyManagers(), null, null);
         return context;
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
     }
 
     /** A value made at run time, unique to the call, that a test looks for where it must never appear. */

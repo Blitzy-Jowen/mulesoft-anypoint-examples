@@ -49,6 +49,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.ws.client.WebServiceFaultException;
 import org.springframework.ws.client.WebServiceIOException;
 import org.springframework.ws.client.WebServiceTransportException;
 import org.springframework.ws.soap.client.SoapFaultClientException;
@@ -76,7 +77,8 @@ import com.mulesoft.examples.web_service_consumer.config.TshirtServiceProperties
  * the {@code ns0:AuthenticationHeader} with the configured key and refuses to send without one, while
  * {@code ListInventory} carries no header and needs no key. The response Body child comes back as its own document,
  * no response or an empty Body as {@code null}; a SOAP fault, an HTTP error without a fault, a read timeout and a
- * refused connection surface as the Spring WS exceptions, never retried. Requests go out byte for byte as SAAJ
+ * refused connection surface as the Spring WS exceptions, never retried, and a fault without a readable fault string
+ * as a {@code WebServiceFaultException} with a fixed message. Requests go out byte for byte as SAAJ
  * writes them, except that characters outside the BMP are sent as UTF-8 bytes rather than character references.
  *
  * <p>Plain JUnit 5: the client is built directly from {@link TshirtServiceProperties}; no Spring context is started.
@@ -90,6 +92,9 @@ class TshirtServiceClientTest {
     private static final String API_KEY = "abc12345";
 
     private static final String MISSING_API_KEY = "T-shirt service API key (tshirt.api-key) is not configured";
+
+    private static final String INCOMPLETE_FAULT =
+            "The T-shirt service returned a SOAP fault without a readable fault string";
 
     private static final String SOAP_ENVELOPE_NAMESPACE = "http://schemas.xmlsoap.org/soap/envelope/";
 
@@ -335,6 +340,12 @@ class TshirtServiceClientTest {
         properties.setConnectTimeout(DEFAULT_TIMEOUT);
         properties.setReadTimeout(readTimeout);
         return new TshirtServiceClient(properties);
+    }
+
+    /** A SOAP 1.1 envelope whose Body holds {@code fault} alone, without whitespace between the elements. */
+    private static String compactFaultEnvelope(String fault) {
+        return "<soap:Envelope xmlns:soap=\"" + SOAP_ENVELOPE_NAMESPACE + "\"><soap:Body>" + fault
+                + "</soap:Body></soap:Envelope>";
     }
 
     private static ResponseDefinitionBuilder soapResponse(int status, String envelope) {
@@ -637,6 +648,61 @@ class TshirtServiceClientTest {
         assertThat(fault.getFaultStringOrReason()).isEqualTo("Invalid API key");
         assertThat(fault.getMessage()).isEqualTo("Invalid API key");
         assertThat(fault.getFaultCode()).isEqualTo(new QName(SOAP_ENVELOPE_NAMESPACE, "Client"));
+        wm.verify(exactly(1), postRequestedFor(urlEqualTo(SERVICE_PATH)));
+    }
+
+    /** Faults whose fault string SAAJ can read, with the message the raised exception carries. */
+    static Stream<Arguments> faultsWithAReadableFaultString() {
+        List<Arguments> cases = new ArrayList<>();
+        for (Operation operation : Operation.values()) {
+            cases.add(Arguments.of(operation, "faultstring without a faultcode",
+                    "<soap:Fault><faultstring>Invalid API key</faultstring></soap:Fault>", "Invalid API key"));
+            cases.add(Arguments.of(operation, "empty faultstring",
+                    "<soap:Fault><faultcode>soap:Server</faultcode><faultstring/></soap:Fault>", null));
+        }
+        return cases.stream();
+    }
+
+    // A fault string that can be read is the message, however incomplete the rest of the fault is.
+    @ParameterizedTest(name = "{0}: {1}")
+    @MethodSource("faultsWithAReadableFaultString")
+    void faultWithAReadableFaultStringSurfacesAsSoapFaultClientExceptionAfterOneRequest(Operation operation,
+            String description, String fault, String expectedMessage) {
+        stubService(soapResponse(500, compactFaultEnvelope(fault)));
+        TshirtServiceClient client = newClient();
+
+        SoapFaultClientException failure = assertThrows(SoapFaultClientException.class, () -> operation.call(client));
+
+        assertThat(failure.getMessage()).isEqualTo(expectedMessage);
+        assertThat(failure.getFaultStringOrReason()).isEqualTo(expectedMessage);
+        wm.verify(exactly(1), postRequestedFor(urlEqualTo(SERVICE_PATH)));
+    }
+
+    /** Faults without the {@code faultstring} SOAP 1.1 requires, which SAAJ cannot read. */
+    static Stream<Arguments> faultsWithoutAFaultString() {
+        List<Arguments> cases = new ArrayList<>();
+        for (Operation operation : Operation.values()) {
+            cases.add(Arguments.of(operation, "empty Fault", "<soap:Fault/>"));
+            cases.add(Arguments.of(operation, "faultcode only",
+                    "<soap:Fault><faultcode>soap:Server</faultcode></soap:Fault>"));
+        }
+        return cases.stream();
+    }
+
+    // SAAJ's NullPointerException names its own interface and field; it stays the cause, never the message.
+    @ParameterizedTest(name = "{0}: {1}")
+    @MethodSource("faultsWithoutAFaultString")
+    void faultWithoutAFaultStringFailsWithAFixedMessageAfterOneRequest(Operation operation, String description,
+                                                                       String fault) {
+        stubService(soapResponse(500, compactFaultEnvelope(fault)));
+        TshirtServiceClient client = newClient();
+
+        WebServiceFaultException failure = assertThrows(WebServiceFaultException.class, () -> operation.call(client));
+
+        assertThat(failure).isExactlyInstanceOf(WebServiceFaultException.class).hasMessage(INCOMPLETE_FAULT);
+        assertThat(failure.getMessage()).doesNotContain("jakarta", "faultStringElement", "Cannot invoke");
+        assertThat(failure.getCause()).isExactlyInstanceOf(NullPointerException.class);
+        assertThat(failure.getWebServiceMessage()).isNull();
         wm.verify(exactly(1), postRequestedFor(urlEqualTo(SERVICE_PATH)));
     }
 

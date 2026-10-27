@@ -26,3 +26,10 @@ cmis:
   password: ${CMIS_PASSWORD:}
   connect-timeout: 10s  # Mule default response timeout (AAP 0.4.8)
   read-timeout: 10s
+logging:
+  level:
+    # Below INFO the JDK HTTP transport under CmisAtomPubClient (RestClient over SimpleClientHttpRequestFactory) writes
+    # every request's headers, including the cmis.username/cmis.password service account as an HTTP Basic
+    # Authorization header, and every response's headers. Pinned here because a named logger's level outranks a root
+    # DEBUG or TRACE.
+    sun.net.www.protocol.http.HttpURLConnection: INFO

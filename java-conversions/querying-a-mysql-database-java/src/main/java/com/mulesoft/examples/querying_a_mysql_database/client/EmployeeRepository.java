@@ -20,7 +20,8 @@ import org.springframework.stereotype.Repository;
  * <p>Replaces two elements of the original {@code database-to-json.xml}: the
  * {@code db:generic-config} of line 3, now Boot's auto-configured {@code DataSource} and
  * {@link JdbcTemplate} over {@code spring.datasource.url: ${jdbc.url}}, and the {@code db:select}
- * of lines 7-8.
+ * of lines 7-8. While {@code jdbc.url} is blank, {@code config.DataSourceConfig} supplies the
+ * {@code DataSource} instead, and every query fails with a connection error naming the key.
  *
  * <p>The original built its query by interpolating the {@code lastname} query parameter into a
  * double-quoted literal, which MySQL reads as a string literal. Here the value is a bind parameter:

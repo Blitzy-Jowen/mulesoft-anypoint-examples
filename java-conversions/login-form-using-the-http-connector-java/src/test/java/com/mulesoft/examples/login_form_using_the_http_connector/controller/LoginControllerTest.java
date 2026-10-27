@@ -36,12 +36,18 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
+import com.mulesoft.examples.login_form_using_the_http_connector.service.LoginService;
 import com.mulesoft.examples.login_form_using_the_http_connector.support.HttpTestClient;
 
 /**
@@ -54,7 +60,8 @@ import com.mulesoft.examples.login_form_using_the_http_connector.support.HttpTes
  * socket, so reason phrases, the exact spelling of each {@code Content-Type} header and the body bytes are asserted
  * as the listener writes them. Expected pages are computed from the {@code login/*.html} resources alone, never
  * hand-copied. Profile {@code test} supplies the original demo credentials {@code mule}/{@code mule}; the nested
- * {@link BlankCredentials} context blanks them to cover the fail-closed check and the requester's failure path.
+ * {@link BlankCredentials} context blanks them to cover the fail-closed check, its WARN and the requester's failure
+ * path.
  *
  * <p>The original {@code HttpLoginHtmlFormIT} assertions are ported separately in {@code HttpLoginHtmlFormTest}.
  */
@@ -373,6 +380,35 @@ class LoginControllerTest {
 
             assertEquals(403, response.status(), response::toString);
             assertFailurePage(response, renderedUsername);
+        }
+
+        /**
+         * A login checked against the blank configuration logs the original INFO line, then one WARN naming both
+         * blank keys and no value. The appender is read under its own lock, which every append on the listener's
+         * worker thread takes before the response is written.
+         */
+        @Test
+        void rejectionLogsOneWarningNamingTheBlankKeys() {
+            Logger serviceLogger = (Logger) LoggerFactory.getLogger(LoginService.class);
+            ListAppender<ILoggingEvent> appender = new ListAppender<>();
+            appender.start();
+            serviceLogger.addAppender(appender);
+            HttpTestClient.Response response;
+            try {
+                response = nestedClient().post(LOGIN_PATH, FORM, "username=mule&password=mule");
+            } finally {
+                serviceLogger.detachAppender(appender);
+                appender.stop();
+            }
+            List<String> lines;
+            synchronized (appender) {
+                lines = appender.list.stream().map(event -> event.getLevel() + " " + event.getFormattedMessage())
+                        .toList();
+            }
+
+            assertFailurePage(response, "mule");
+            assertEquals(List.of("INFO User mule is trying to login",
+                    "WARN Login rejected because login.username and login.password are not configured"), lines);
         }
 
         /** The requester's own call is rejected with 403, which it maps as a failure for the generic 500. */

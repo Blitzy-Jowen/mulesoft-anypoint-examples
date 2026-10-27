@@ -28,11 +28,13 @@ import javax.xml.transform.dom.DOMSource;
 
 import org.springframework.stereotype.Component;
 import org.springframework.ws.WebServiceMessage;
+import org.springframework.ws.client.WebServiceFaultException;
+import org.springframework.ws.client.core.FaultMessageResolver;
 import org.springframework.ws.client.core.WebServiceMessageCallback;
 import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.soap.SoapMessage;
 import org.springframework.ws.soap.SoapVersion;
-import org.springframework.ws.soap.client.core.SoapFaultMessageResolver;
+import org.springframework.ws.soap.client.SoapFaultClientException;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.springframework.ws.transport.WebServiceConnection;
 import org.springframework.ws.transport.http.HttpUrlConnection;
@@ -73,9 +75,13 @@ import com.mulesoft.examples.web_service_consumer.config.TshirtServiceProperties
  * ({@code encodeSupplementaryCharacterReferences}).
  *
  * <p>Failures reach the caller as the Spring WS runtime exceptions the template raises, unwrapped and never
- * retried: {@code SoapFaultClientException} for a SOAP fault, {@code WebServiceTransportException} for an
- * HTTP error without a fault, {@code WebServiceIOException} for a timeout or connection failure. The
- * original flows declare no exception strategy, so each one becomes the platform-default 500.
+ * retried: {@code SoapFaultClientException} for a SOAP fault, whose message is the fault string;
+ * {@code WebServiceFaultException} with the fixed message
+ * {@code The T-shirt service returned a SOAP fault without a readable fault string} for a SOAP fault whose fault
+ * string is missing or cannot be read ({@code FaultStringCheckingResolver});
+ * {@code WebServiceTransportException} for an HTTP error without a fault; {@code WebServiceIOException} for a
+ * timeout or connection failure. The original flows declare no exception strategy, so each one becomes the
+ * platform-default 500.
  *
  * <p>Thread-safe: every field is final and configured once, the template is safe for concurrent use, and
  * the non-thread-safe JAXP builders and transformers are created per call.
@@ -99,6 +105,10 @@ public class TshirtServiceClient {
 
     /** Mule's default response timeout, used when a timeout is not configured. */
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+
+    /** Message of the failure {@link FaultStringCheckingResolver} raises for a fault without a readable string. */
+    private static final String INCOMPLETE_FAULT_MESSAGE =
+            "The T-shirt service returned a SOAP fault without a readable fault string";
 
     /**
      * Opening and closing delimiters, in pairs, of the markup whose content the serializer writes verbatim:
@@ -139,7 +149,7 @@ public class TshirtServiceClient {
         WebServiceTemplate webServiceTemplate = new WebServiceTemplate(messageFactory);
         webServiceTemplate.setMessageSender(messageSender);
         webServiceTemplate.setDefaultUri(properties.getServiceAddress());
-        webServiceTemplate.setFaultMessageResolver(new SoapFaultMessageResolver());
+        webServiceTemplate.setFaultMessageResolver(new FaultStringCheckingResolver());
         this.template = webServiceTemplate;
 
         this.apiKey = properties.getApiKey() == null ? "" : properties.getApiKey();
@@ -237,6 +247,38 @@ public class TshirtServiceClient {
     private Transformer newTransformer() throws TransformerConfigurationException {
         synchronized (transformerFactory) {
             return transformerFactory.newTransformer();
+        }
+    }
+
+    /**
+     * {@link FaultMessageResolver} that raises the fault of a SOAP fault response, as Spring WS's
+     * {@link org.springframework.ws.soap.client.core.SoapFaultMessageResolver} does, except that a fault whose
+     * fault string cannot be read fails with a fixed message.
+     *
+     * <p>A fault whose fault string can be read raises the {@link SoapFaultClientException} that resolver raises,
+     * so its message is the fault string the service sent. SAAJ reads a SOAP 1.1 {@code faultstring} without
+     * checking that the element exists, so a {@code Fault} without one, such as an empty {@code <soap:Fault/>}
+     * or one carrying only a {@code faultcode}, makes the exception's constructor throw a
+     * {@link NullPointerException} whose JVM-generated message names a SAAJ interface and private field. That
+     * failure, and any other runtime exception raised while the fault is read, is replaced by a
+     * {@link WebServiceFaultException} with {@link #INCOMPLETE_FAULT_MESSAGE}, which names no Java type, member
+     * or address, and keeps the SAAJ failure as its cause. Either way the call fails: a fault is never taken as
+     * a response.
+     */
+    private static final class FaultStringCheckingResolver implements FaultMessageResolver {
+
+        @Override
+        public void resolveFault(WebServiceMessage message) {
+            SoapFaultClientException fault;
+            try {
+                fault = new SoapFaultClientException((SoapMessage) message);
+            }
+            catch (RuntimeException unreadable) {
+                WebServiceFaultException incomplete = new WebServiceFaultException(INCOMPLETE_FAULT_MESSAGE);
+                incomplete.initCause(unreadable);
+                throw incomplete;
+            }
+            throw fault;
         }
     }
 

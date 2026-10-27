@@ -79,7 +79,9 @@ import jakarta.mail.internet.MimeUtility;
  * by Mule's default strategy and the message stays consumed. Flagged messages are removed when the folder is closed
  * with expunge. Mule 3.8.0 abandoned the rest of a poll's messages after a construction failure; here every message
  * is handled on its own, so one unreadable mail never holds back the mails behind it. A mailbox that cannot be
- * reached or authenticated is logged at WARN and retried by the next poll.
+ * reached or authenticated is logged at WARN and retried by the next poll. A blank {@code pop3.host} disables
+ * polling: the first skipped poll is logged once at WARN naming {@code pop3.host (POP3_HOST)}, every skipped poll at
+ * DEBUG.
  *
  * <p>Diagnostics carry a fixed operation text, the message's ordinal in the poll, the configured mailbox or folder
  * where relevant, and the class names of the exception and its causes ({@code exceptionTypes}). They never
@@ -108,6 +110,12 @@ public class Pop3MailPoller {
     private final String folderName;
     private final int responseTimeout;
     private final String sslTrust;
+
+    /**
+     * Whether the one-time WARN about a blank {@code pop3.host} has been logged. Read and written only inside
+     * {@link #pollOnce()}, so this poller's monitor guards it.
+     */
+    private boolean missingHostWarned;
 
     /**
      * Creates the poller.
@@ -156,12 +164,20 @@ public class Pop3MailPoller {
      * demand; it is {@code synchronized}, so an on-demand run and a scheduled run never process the same mailbox at
      * the same time.
      *
+     * <p>A blank {@code pop3.host} skips the poll without opening a session. The first skipped poll of this poller
+     * logs one WARN naming the missing setting, {@code pop3.host (POP3_HOST)}, so the misconfiguration shows at the
+     * default level; every skipped poll, the first included, also logs a DEBUG line.
+     *
      * @return the number of messages consumed (flagged deleted), counting those whose processing failed with a
      *         handled exception but not those whose copy or attachment list could not be built, which stay in the
      *         mailbox; {@code 0} when {@code pop3.host} is blank or the mailbox cannot be opened
      */
     public synchronized int pollOnce() {
         if (host == null || host.isBlank()) {
+            if (!missingHostWarned) {
+                missingHostWarned = true;
+                log.warn("pop3.host (POP3_HOST) is not configured; POP3S polling is skipped");
+            }
             log.debug("pop3.host is not configured; POP3S poll skipped");
             return 0;
         }

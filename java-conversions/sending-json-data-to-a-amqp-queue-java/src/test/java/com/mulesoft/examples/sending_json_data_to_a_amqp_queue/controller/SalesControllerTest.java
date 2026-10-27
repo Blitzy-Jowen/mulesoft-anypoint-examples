@@ -13,13 +13,13 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.net.ConnectException;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
@@ -28,9 +28,7 @@ import org.springframework.amqp.AmqpConnectException;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
-import org.springframework.http.MediaType;
 
-import com.mulesoft.examples.sending_json_data_to_a_amqp_queue.exception.ErrorResponse;
 import com.mulesoft.examples.sending_json_data_to_a_amqp_queue.service.SalesPublisherService;
 import com.mulesoft.examples.sending_json_data_to_a_amqp_queue.support.HttpTestClient;
 
@@ -50,6 +48,8 @@ import com.mulesoft.examples.sending_json_data_to_a_amqp_queue.support.HttpTestC
 class SalesControllerTest {
 
     private static final String TEXT_PLAIN = "text/plain";
+
+    private static final String APPLICATION_JSON = "application/json";
 
     /** The body the original test posts ({@code REPLY_OK} in SendingJsonDataToAmqpQueueIT.java). */
     private static final String ORIGINAL_TEST_BODY = "test";
@@ -110,8 +110,7 @@ class SalesControllerTest {
         HttpTestClient.Response response = client().get("/");
 
         assertStatusLine(response, 405, "Method Not Allowed");
-        assertContentTypeCompatible(response, MediaType.TEXT_PLAIN);
-        assertEquals(METHOD_NOT_ALLOWED_ROOT, response.bodyAsString(), response::toString);
+        assertContentTypeAndBody(response, TEXT_PLAIN, METHOD_NOT_ALLOWED_ROOT);
         verifyNoInteractions(service);
     }
 
@@ -121,8 +120,7 @@ class SalesControllerTest {
         HttpTestClient.Response response = client().send("OPTIONS", "/", Map.of(), null);
 
         assertStatusLine(response, 405, "Method Not Allowed");
-        assertContentTypeCompatible(response, MediaType.TEXT_PLAIN);
-        assertEquals(METHOD_NOT_ALLOWED_ROOT, response.bodyAsString(), response::toString);
+        assertContentTypeAndBody(response, TEXT_PLAIN, METHOD_NOT_ALLOWED_ROOT);
         verifyNoInteractions(service);
     }
 
@@ -131,8 +129,7 @@ class SalesControllerTest {
         HttpTestClient.Response response = client().post("/sales", TEXT_PLAIN, ORIGINAL_TEST_BODY);
 
         assertStatusLine(response, 404, "Not Found");
-        assertContentTypeCompatible(response, MediaType.TEXT_PLAIN);
-        assertEquals("No listener for endpoint: /sales", response.bodyAsString(), response::toString);
+        assertContentTypeAndBody(response, TEXT_PLAIN, "No listener for endpoint: /sales");
         verifyNoInteractions(service);
     }
 
@@ -146,8 +143,8 @@ class SalesControllerTest {
         HttpTestClient.Response response = client().post("/", TEXT_PLAIN, ORIGINAL_TEST_BODY);
 
         assertStatusLine(response, 500, "Internal Server Error");
-        assertContentTypeCompatible(response, MediaType.APPLICATION_JSON);
-        assertEquals(ErrorResponse.json(ex.getMessage()), response.bodyAsString(), response::toString);
+        assertContentTypeAndBody(response, APPLICATION_JSON,
+                "{ \"message\": \"java.net.ConnectException: Connection refused\" }");
         verify(service).publish(any());
     }
 
@@ -160,10 +157,13 @@ class SalesControllerTest {
         assertEquals(reason, response.reason(), response::toString);
     }
 
-    private static void assertContentTypeCompatible(HttpTestClient.Response response, MediaType expected) {
-        String contentType = response.header("Content-Type");
-        assertNotNull(contentType, response::toString);
-        assertTrue(MediaType.parseMediaType(contentType).isCompatibleWith(expected),
-                () -> "Content-Type " + contentType + " is not compatible with " + expected + "\n" + response);
+    /**
+     * Asserts that the response carries exactly one {@code Content-Type} header, whose value is exactly
+     * {@code contentType} as the listener writes it (no added parameter such as a charset), and that the body bytes
+     * are exactly the UTF-8 encoding of {@code body}.
+     */
+    private static void assertContentTypeAndBody(HttpTestClient.Response response, String contentType, String body) {
+        assertEquals(List.of(contentType), response.headers("Content-Type"), response::toString);
+        assertArrayEquals(body.getBytes(UTF_8), response.body(), response::toString);
     }
 }

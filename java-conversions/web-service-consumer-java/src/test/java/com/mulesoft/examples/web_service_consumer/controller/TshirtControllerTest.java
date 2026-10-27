@@ -25,10 +25,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Stream;
 
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
 import org.junit.jupiter.api.Test;
@@ -46,6 +49,9 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
+import org.xml.sax.ErrorHandler;
+import org.xml.sax.SAXException;
+import org.xml.sax.SAXParseException;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -69,9 +75,11 @@ import com.mulesoft.examples.web_service_consumer.support.HttpTestClient;
  *
  * <p>Covered per endpoint: the happy path with the exact DataWeave 1.0 JSON, every method being accepted (neither
  * listener declares {@code allowedMethods}), a body sent with a form-urlencoded {@code Content-Type} reaching the
- * flow as the caller sent it, and the platform-default 500 for unreadable input, a SOAP fault and a
- * connectivity failure, none of which the flows catch or retry. Unserved paths get the no-listener 404. The
- * original {@code WebServiceConsumerIT} contains-assertions are ported separately in {@code WebServiceConsumerTest}.
+ * flow as the caller sent it, and the platform-default 500 for unreadable input, a SOAP fault, a SOAP fault without a
+ * readable fault string and a connectivity failure, none of which the flows catch or retry. Each response must carry
+ * exactly one {@code Content-Type}, equal to the value the listener writes, and exactly the expected UTF-8 body bytes.
+ * Unserved paths get the no-listener 404. The original {@code WebServiceConsumerIT} contains-assertions are ported
+ * separately in {@code WebServiceConsumerTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
@@ -87,6 +95,8 @@ class TshirtControllerTest {
     private static final String DEMO_API_KEY = "abc12345";
 
     private static final String JSON = "application/json";
+
+    private static final String TEXT_PLAIN = "text/plain";
 
     private static final String FORM = "application/x-www-form-urlencoded";
 
@@ -165,7 +175,9 @@ class TshirtControllerTest {
               }
             }""";
 
-    private static final String ERROR_BODY_PREFIX = "{ \"message\": ";
+    /** The 500 body for a SOAP fault without a readable fault string: a fixed text naming no Java type or member. */
+    private static final String INCOMPLETE_FAULT_BODY =
+            "{ \"message\": \"The T-shirt service returned a SOAP fault without a readable fault string\" }";
 
     @RegisterExtension
     static WireMockExtension upstream = WireMockExtension.newInstance()
@@ -180,7 +192,7 @@ class TshirtControllerTest {
         registry.add("tshirt.service-address", upstream::baseUrl);
     }
 
-    /** The two listeners, each with the operation it calls and the request the original test sent it. */
+    /** The two listeners, each with the operation it calls and the kind of request the original test sent it. */
     enum Endpoint {
 
         ORDERS("/orders", ORDER_ACTION, true),
@@ -188,7 +200,10 @@ class TshirtControllerTest {
 
         final String path;
         final String soapAction;
-        /** {@code true} when the original test posted {@code message.json}; the inventory call had no payload. */
+        /**
+         * {@code true} when the original test posted {@code message.json}; its inventory call was the same POST with
+         * the same {@code Content-Type: application/json} and a null payload.
+         */
         final boolean sendsOrder;
 
         Endpoint(String path, String soapAction, boolean sendsOrder) {
@@ -227,7 +242,8 @@ class TshirtControllerTest {
     void postInventoryWithoutBodyReturnsInventoryJson() {
         stub(INVENTORY_ACTION, 200, INVENTORY_RESPONSE);
 
-        // The original test sent a null payload: no body and no Content-Type.
+        // Additional coverage beyond the original request, which kept Content-Type: application/json with its null
+        // payload (sendOriginalRequest, WebServiceConsumerTest): here the POST has no body and no Content-Type at all.
         HttpTestClient.Response response = client().send("POST", "/inventory", null, null);
 
         assertJsonOk(response, INVENTORY_JSON);
@@ -305,22 +321,31 @@ class TshirtControllerTest {
                 new ObjectMapper().readValue(message(), new TypeReference<LinkedHashMap<String, String>>() { }));
     }
 
-    /** A truncated JSON order, and an unterminated XML element where {@code /inventory} expects a SOAP body. */
-    static Stream<Arguments> unreadableBodies() {
+    /**
+     * A truncated JSON order, and an unterminated XML element where {@code /inventory} expects a SOAP body, each with
+     * the 500 body carrying its reader's message. Jackson's message for the order is fixed English text, its line
+     * break JSON-escaped. The JDK XML parser words its message in the default locale's language (the JDK ships
+     * translations such as de, fr and ja), so the inventory's expected message is the one {@link #xmlParserMessage}
+     * obtains from this JVM's own parser for the same bytes, and the expected body is exact in every locale.
+     */
+    static Stream<Arguments> unreadableBodies() throws Exception {
+        String unterminatedInventory = "<ns0:ListInventory xmlns:ns0=\"http://mulesoft.org/tshirt-service\">";
         return Stream.of(
-                Arguments.of("/orders", JSON, "{\"email\":"),
-                Arguments.of("/inventory", "text/xml",
-                        "<ns0:ListInventory xmlns:ns0=\"http://mulesoft.org/tshirt-service\">"));
+                Arguments.of("/orders", JSON, "{\"email\":", "{ \"message\": \"Unexpected end-of-input within/between"
+                        + " Object entries\\n at [Source: UNKNOWN; line: 1, column: 10]\" }"),
+                Arguments.of("/inventory", "text/xml", unterminatedInventory,
+                        "{ \"message\": \"" + jsonEscaped(xmlParserMessage(unterminatedInventory)) + "\" }"));
     }
 
     // Each body is rejected by the flow's reader before the web service is called.
     @ParameterizedTest(name = "{0} with {2}")
     @MethodSource("unreadableBodies")
-    void unreadableBodyIsAnUnhandled500WithoutAnySoapCall(String path, String contentType, String body) {
+    void unreadableBodyIsAnUnhandled500WithoutAnySoapCall(String path, String contentType, String body,
+                                                          String expectedBody) {
         HttpTestClient.Response response = client().send("POST", path, Map.of("Content-Type", contentType),
                 body.getBytes(StandardCharsets.UTF_8));
 
-        assertUnhandled500(response);
+        assertUnhandled500(response, expectedBody);
         upstream.verify(0, postRequestedFor(anyUrl()));
     }
 
@@ -332,8 +357,32 @@ class TshirtControllerTest {
 
         HttpTestClient.Response response = sendOriginalRequest(endpoint);
 
-        assertUnhandled500(response);
-        assertThat(response.bodyAsString()).isEqualTo("{ \"message\": \"Invalid API key\" }");
+        assertUnhandled500(response, "{ \"message\": \"Invalid API key\" }");
+        upstream.verify(1, postRequestedFor(anyUrl()));
+    }
+
+    /** Each endpoint with a SOAP 1.1 fault lacking the {@code faultstring} SOAP 1.1 requires. */
+    static Stream<Arguments> faultsWithoutAFaultString() {
+        List<Arguments> cases = new ArrayList<>();
+        for (Endpoint endpoint : Endpoint.values()) {
+            cases.add(Arguments.of(endpoint, "empty Fault", "<soap:Fault/>"));
+            cases.add(Arguments.of(endpoint, "faultcode only",
+                    "<soap:Fault><faultcode>soap:Server</faultcode></soap:Fault>"));
+        }
+        return cases.stream();
+    }
+
+    // SAAJ cannot read such a fault; the 500 reports it without the runtime's class and field names.
+    @ParameterizedTest(name = "{0}: {1}")
+    @MethodSource("faultsWithoutAFaultString")
+    void faultWithoutAFaultStringIsAnUnhandled500WithAFixedMessage(Endpoint endpoint, String description,
+                                                                   String fault) {
+        stub(endpoint.soapAction, 500, fault);
+
+        HttpTestClient.Response response = sendOriginalRequest(endpoint);
+
+        assertUnhandled500(response, INCOMPLETE_FAULT_BODY);
+        assertThat(response.bodyAsString()).doesNotContain("jakarta", "faultStringElement", "Cannot invoke");
         upstream.verify(1, postRequestedFor(anyUrl()));
     }
 
@@ -347,7 +396,7 @@ class TshirtControllerTest {
 
         HttpTestClient.Response response = sendOriginalRequest(endpoint);
 
-        assertUnhandled500(response);
+        assertUnhandled500(response, "{ \"message\": \"I/O error: Connection reset\" }");
         upstream.verify(1, postRequestedFor(anyUrl()));
     }
 
@@ -360,8 +409,7 @@ class TshirtControllerTest {
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 404 Not Found");
         assertThat(response.status()).isEqualTo(404);
         assertThat(response.reason()).isEqualTo("Not Found");
-        assertThat(response.header("Content-Type")).startsWith("text/plain");
-        assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: " + path);
+        assertContent(response, TEXT_PLAIN, "No listener for endpoint: " + path);
         upstream.verify(0, postRequestedFor(anyUrl()));
     }
 
@@ -374,8 +422,16 @@ class TshirtControllerTest {
         return client().send(method, "/orders", Map.of("Content-Type", JSON), message());
     }
 
+    /**
+     * The request the original {@code WebServiceConsumerIT} sent to {@code endpoint}: a POST with
+     * {@code Content-Type: application/json} carrying {@code message.json} to {@code /orders} (the original also
+     * replaced the {@code ID} of its e-mail address with the current time, which no stubbed response depends on), and
+     * the same POST with a null payload, sent as an empty body as {@code WebServiceConsumerTest} sends it, to
+     * {@code /inventory}.
+     */
     private HttpTestClient.Response sendOriginalRequest(Endpoint endpoint) {
-        return endpoint.sendsOrder ? sendOrder("POST") : client().send("POST", endpoint.path, null, null);
+        return endpoint.sendsOrder ? sendOrder("POST")
+                : client().send("POST", endpoint.path, Map.of("Content-Type", JSON), new byte[0]);
     }
 
     /** The original test's order, {@code src/test/resources/message.json}, read from the classpath. */
@@ -446,16 +502,87 @@ class TshirtControllerTest {
                 + description + "</description><count>" + count + "</count></inventory>";
     }
 
-    private static void assertJsonOk(HttpTestClient.Response response, String expectedBody) {
-        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 200 OK");
-        assertThat(response.header("Content-Type")).startsWith(JSON);
-        assertThat(response.bodyAsString()).isEqualTo(expectedBody);
+    /**
+     * The message of the {@link SAXParseException} the JDK's built-in XML parser raises for the UTF-8 bytes of
+     * {@code xml}, configured as the {@code /inventory} reader configures it: namespace-aware, DOCTYPE declarations,
+     * external entities, external DTDs, XInclude and entity-reference expansion off, secure processing on, and every
+     * warning, error and fatal error raised. The text is in the default locale's language.
+     */
+    private static String xmlParserMessage(String xml) throws Exception {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newDefaultInstance();
+        factory.setNamespaceAware(true);
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+        factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+        factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
+        DocumentBuilder builder = factory.newDocumentBuilder();
+        builder.setErrorHandler(new ErrorHandler() {
+            @Override
+            public void warning(SAXParseException exception) throws SAXException {
+                throw exception;
+            }
+
+            @Override
+            public void error(SAXParseException exception) throws SAXException {
+                throw exception;
+            }
+
+            @Override
+            public void fatalError(SAXParseException exception) throws SAXException {
+                throw exception;
+            }
+        });
+        try {
+            builder.parse(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+        } catch (SAXParseException e) {
+            assertThat(e.getMessage()).as("JDK XML parser message for %s", xml).isNotBlank();
+            return e.getMessage();
+        }
+        throw new AssertionError("The JDK XML parser accepted " + xml);
     }
 
-    private static void assertUnhandled500(HttpTestClient.Response response) {
+    /**
+     * {@code text} escaped for a JSON string as the {@code { "message": ... }} body escapes it: quotation mark,
+     * reverse solidus, backspace, form feed, line feed, carriage return and tab in their two-character forms, every
+     * other character below U+0020, U+2028 and U+2029 as a six-character escape with four lower-case hex digits, and
+     * every other character unchanged.
+     */
+    private static String jsonEscaped(String text) {
+        StringBuilder out = new StringBuilder(text.length());
+        for (char c : text.toCharArray()) {
+            switch (c) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\b' -> out.append("\\b");
+                case '\f' -> out.append("\\f");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> out.append(c < 0x20 || c == '\u2028' || c == '\u2029'
+                        ? String.format(Locale.ROOT, "\\u%04x", (int) c) : String.valueOf(c));
+            }
+        }
+        return out.toString();
+    }
+
+    private static void assertJsonOk(HttpTestClient.Response response, String expectedBody) {
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 200 OK");
+        assertContent(response, JSON, expectedBody);
+    }
+
+    private static void assertUnhandled500(HttpTestClient.Response response, String expectedBody) {
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
         assertThat(response.status()).isEqualTo(500);
-        assertThat(response.header("Content-Type")).startsWith(JSON);
-        assertThat(response.bodyAsString()).startsWith(ERROR_BODY_PREFIX).endsWith(" }");
+        assertContent(response, JSON, expectedBody);
+    }
+
+    /** Exactly one {@code Content-Type}, equal to {@code contentType}, and exactly the expected body's UTF-8 bytes. */
+    private static void assertContent(HttpTestClient.Response response, String contentType, String expectedBody) {
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly(contentType);
+        assertThat(response.body()).as(response.toString()).isEqualTo(expectedBody.getBytes(StandardCharsets.UTF_8));
+        assertThat(response.bodyAsString()).isEqualTo(expectedBody);
     }
 }

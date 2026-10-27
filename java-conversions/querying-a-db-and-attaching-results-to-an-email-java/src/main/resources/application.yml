@@ -42,7 +42,8 @@ spring:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
   datasource:
     # original db:generic-config url key bound to Boot's DataSource (AAP 0.6.6); credentials stay inside the URL.
-    # An empty URL falls back to an embedded database where one is on the classpath (H2, tests only).
+    # An empty URL makes config/DataSourceConfig supply UnconfiguredDataSource: start-up succeeds, and each database
+    # call fails naming jdbc.url (JDBC_URL).
     url: ${jdbc.url}
   sql:
     init:

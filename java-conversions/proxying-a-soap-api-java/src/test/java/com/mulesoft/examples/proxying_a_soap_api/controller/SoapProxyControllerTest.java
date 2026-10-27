@@ -25,8 +25,8 @@ import static org.awaitility.Awaitility.await;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -44,11 +44,11 @@ import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -57,7 +57,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.http.MediaType;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.NestedTestConfiguration;
@@ -65,8 +65,8 @@ import org.xmlunit.builder.DiffBuilder;
 import org.xmlunit.builder.Input;
 import org.xmlunit.diff.Diff;
 
+import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.http.HttpHeader;
-import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 
 import com.mulesoft.examples.proxying_a_soap_api.service.SoapProxyService;
@@ -96,12 +96,19 @@ import com.mulesoft.examples.proxying_a_soap_api.support.HttpTestClient.Response
  *       400 or above failing the requester's success-status validator, an upstream slower than
  *       {@code proxy.response-timeout-ms} (never retried), an unreachable upstream, and a path no listener serves.</li>
  * </ul>
+ * Each Content-Type is asserted as the one header value the listener writes, character for character.
+ *
+ * <p>The outcome does not depend on how the class is selected: {@code -Dtest='SoapProxyControllerTest*'} also selects
+ * {@link UnreachableUpstream} as a class of its own, which then runs before the outer tests. The WireMock server lives
+ * exactly as long as the outer class container, and both classes discard their context after their last test, so no
+ * later run reuses a context bound to an upstream port that is no longer served or reserved.
  */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
                 "proxy.wsdl-location=" + SoapProxyControllerTest.WSDL_LOCATION,
                 "proxy.response-timeout-ms=" + SoapProxyControllerTest.RESPONSE_TIMEOUT_MS})
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class SoapProxyControllerTest {
 
     static final String WSDL_LOCATION = "classpath:upstream/ShopService.wsdl";
@@ -141,10 +148,13 @@ class SoapProxyControllerTest {
 
     private static final Pattern SCHEMA_LOCATION = Pattern.compile("schemaLocation=\"([^\"]+)\"");
 
-    @RegisterExtension
-    static WireMockExtension wm = WireMockExtension.newInstance()
-            .options(wireMockConfig().dynamicPort().gzipDisabled(true))
-            .build();
+    /**
+     * The WireMock server standing in for the upstream, on a dynamic port. It is started and stopped by this class's
+     * own {@code @BeforeAll} and {@code @AfterAll}, which JUnit runs for the outer class container alone. A
+     * {@code WireMockExtension} registered here would be inherited by {@link UnreachableUpstream} and would stop the
+     * server when that nested container ends, so every outer test running after it would proxy to a closed port.
+     */
+    private static WireMockServer wm;
 
     /** The bytes of the original test's request, {@code src/test/resources/message.xml}. */
     private static byte[] message;
@@ -160,9 +170,30 @@ class SoapProxyControllerTest {
     }
 
     @BeforeAll
+    static void startUpstream() {
+        wm = new WireMockServer(wireMockConfig().dynamicPort().gzipDisabled(true));
+        wm.start();
+    }
+
+    @BeforeAll
     static void loadMessage() throws IOException {
         message = new ClassPathResource("message.xml").getContentAsByteArray();
         assertThat(message).as("message.xml, a byte copy of the original").hasSize(248);
+    }
+
+    @AfterAll
+    static void stopUpstream() {
+        WireMockServer server = wm;
+        wm = null;
+        if (server != null) {
+            server.stop();
+        }
+    }
+
+    /** Forgets the previous test's stubs and journaled requests, the outer tests' and the nested test's alike. */
+    @BeforeEach
+    void resetUpstream() {
+        wm.resetAll();
     }
 
     @BeforeEach
@@ -286,9 +317,9 @@ class SoapProxyControllerTest {
         wm.verify(1, postRequestedFor(urlEqualTo(UPSTREAM_PATH))
                 .withoutHeader("MULE_CORRELATION_ID")
                 .withoutHeader("http.method")
-                .withHeader("Host", equalTo("localhost:" + wm.getPort())));
+                .withHeader("Host", equalTo("localhost:" + wm.port())));
         LoggedRequest upstream = singleForwarded();
-        assertThat(headerValues(upstream, "Host")).containsExactly("localhost:" + wm.getPort());
+        assertThat(headerValues(upstream, "Host")).containsExactly("localhost:" + wm.port());
         // The transport announces its own keep-alive, as it writes its own Host, so the header itself may be present;
         // the caller's close never is. The envelope is framed once, with its own length.
         assertThat(headerValues(upstream, "Connection"))
@@ -458,7 +489,8 @@ class SoapProxyControllerTest {
         Response schema = client.get(schemaUri.getRawPath() + "?" + schemaUri.getRawQuery());
 
         assertThat(schema.statusLine()).as("%s", schema).isEqualTo("HTTP/1.1 200 OK");
-        assertMediaType(schema, MediaType.TEXT_XML);
+        assertThat(schema.headers("Content-Type")).as("Content-Type of %s", schema)
+                .containsExactly("text/xml;charset=UTF-8");
         assertThat(schema.bodyAsString()).contains("createResponse");
         byte[] standIn = new ClassPathResource("upstream/ShopService.xsd").getContentAsByteArray();
         Diff diff = DiffBuilder.compare(Input.fromByteArray(schema.body()))
@@ -494,7 +526,8 @@ class SoapProxyControllerTest {
         Response response = client.send("POST", "/", Map.of("Content-Type", SOAP11_CONTENT_TYPE), message);
 
         assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 500 Internal Server Error");
-        assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertThat(response.headers("Content-Type")).as("Content-Type of %s", response)
+                .containsExactly("application/json");
         String expected = "{ \"message\": \""
                 + String.format(SoapProxyService.VALIDATOR_FAILURE_MESSAGE, upstreamStatus) + "\" }";
         assertThat(expected).isEqualTo("{ \"message\": \"Response code " + upstreamStatus
@@ -518,9 +551,12 @@ class SoapProxyControllerTest {
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
 
         assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 500 Internal Server Error");
-        assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertThat(response.headers("Content-Type")).as("Content-Type of %s", response)
+                .containsExactly("application/json");
         // The transport's own text for the timeout, never the upstream URL RestClient's message quotes.
-        assertThat(response.bodyAsString()).isEqualTo(ERROR_BODY_START + "\"I/O error: Read timed out\" }");
+        String expected = ERROR_BODY_START + "\"I/O error: Read timed out\" }";
+        assertThat(response.bodyAsString()).isEqualTo(expected);
+        assertThat(response.body()).as("body bytes of %s", response).isEqualTo(expected.getBytes(UTF_8));
         assertThat(elapsedMs).as("elapsed until the %d ms response timeout fired", RESPONSE_TIMEOUT_MS)
                 .isLessThan(SLOW_UPSTREAM_DELAY_MS - 500L);
         await().atMost(Duration.ofSeconds(5))
@@ -551,12 +587,21 @@ class SoapProxyControllerTest {
         Response response = client.send(method, path, headers, body);
 
         assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 404 Not Found");
-        assertMediaType(response, MediaType.TEXT_PLAIN);
-        assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: " + path);
+        assertThat(response.headers("Content-Type")).as("Content-Type of %s", response).containsExactly("text/plain");
+        String expected = "No listener for endpoint: " + path;
+        assertThat(response.bodyAsString()).isEqualTo(expected);
+        assertThat(response.body()).as("body bytes of %s", response).isEqualTo(expected.getBytes(UTF_8));
         assertThat(forwarded()).as("upstream calls").isEmpty();
     }
 
-    /** The upstream address points at a closed local port, so every post fails to connect. */
+    /**
+     * The upstream address points at a local port that refuses connections, so every post fails to connect.
+     *
+     * <p>The port is held for the whole class by a TCP socket bound to it without listening: connections to it are
+     * refused, and no other socket can bind it until the socket is closed, so neither another test nor another
+     * process can start answering on it before the request. The reservation is made before this class's context
+     * starts, released after its last test, and the context is discarded with it.
+     */
     @Nested
     @NestedTestConfiguration(NestedTestConfiguration.EnclosingConfiguration.OVERRIDE)
     @SpringBootTest(
@@ -564,16 +609,47 @@ class SoapProxyControllerTest {
             properties = {
                     "proxy.wsdl-location=" + SoapProxyControllerTest.WSDL_LOCATION,
                     "proxy.response-timeout-ms=" + SoapProxyControllerTest.RESPONSE_TIMEOUT_MS})
+    @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class UnreachableUpstream {
 
-        private static final int CLOSED_PORT = closedPort();
+        /**
+         * The address the reservation binds and the upstream URL names: an IPv4 literal rather than
+         * {@code localhost}, which can resolve to {@code ::1}, whose ports the reservation does not hold.
+         */
+        private static final String LOOPBACK = "127.0.0.1";
+
+        /** The bound, never listening socket holding the refusing port; {@code null} outside this class's run. */
+        private static Socket reservation;
 
         @LocalServerPort
         int proxyPort;
 
         @DynamicPropertySource
         static void unreachableUpstream(DynamicPropertyRegistry registry) {
-            registry.add("proxy.upstream-url", () -> "http://localhost:" + CLOSED_PORT + UPSTREAM_PATH);
+            registry.add("proxy.upstream-url", () -> "http://" + LOOPBACK + ":" + reservedPort() + UPSTREAM_PATH);
+        }
+
+        @BeforeAll
+        static void reserveRefusingPort() throws IOException {
+            reservation = bindWithoutListening(LOOPBACK);
+        }
+
+        @AfterAll
+        static void releaseRefusingPort() throws IOException {
+            Socket held = reservation;
+            reservation = null;
+            if (held != null) {
+                held.close();
+            }
+        }
+
+        /** The refusing port; fails when no reservation holds it, so no context is ever bound to a released port. */
+        private static int reservedPort() {
+            Socket held = reservation;
+            if (held == null || held.isClosed()) {
+                throw new IllegalStateException("No refusing port is reserved outside the run of UnreachableUpstream");
+            }
+            return held.getLocalPort();
         }
 
         @Test
@@ -582,9 +658,12 @@ class SoapProxyControllerTest {
                     .send("POST", "/", Map.of("Content-Type", SOAP11_CONTENT_TYPE), message);
 
             assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 500 Internal Server Error");
-            assertMediaType(response, MediaType.APPLICATION_JSON);
+            assertThat(response.headers("Content-Type")).as("Content-Type of %s", response)
+                    .containsExactly("application/json");
             // The transport's own text for the refused connection, never the upstream URL, host or address.
-            assertThat(response.bodyAsString()).isEqualTo(ERROR_BODY_START + "\"I/O error: Connection refused\" }");
+            String expected = ERROR_BODY_START + "\"I/O error: Connection refused\" }";
+            assertThat(response.bodyAsString()).isEqualTo(expected);
+            assertThat(response.body()).as("body bytes of %s", response).isEqualTo(expected.getBytes(UTF_8));
             assertThat(forwarded()).as("calls reaching the WireMock upstream").isEmpty();
         }
     }
@@ -615,13 +694,6 @@ class SoapProxyControllerTest {
         return header.isPresent() ? header.values() : List.of();
     }
 
-    /** The response's single {@code Content-Type} has the type and subtype of {@code expected}, parameters aside. */
-    private static void assertMediaType(Response response, MediaType expected) {
-        assertThat(response.headers("Content-Type")).as("Content-Type of %s", response).hasSize(1);
-        MediaType actual = MediaType.parseMediaType(response.header("Content-Type"));
-        assertThat(actual.equalsTypeAndSubtype(expected)).as("%s is %s", actual, expected).isTrue();
-    }
-
     private static byte[] gzip(byte[] bytes) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (GZIPOutputStream gzip = new GZIPOutputStream(out)) {
@@ -630,12 +702,19 @@ class SoapProxyControllerTest {
         return out.toByteArray();
     }
 
-    /** A local port that was free a moment ago and is closed now. */
-    private static int closedPort() {
-        try (ServerSocket socket = new ServerSocket(0)) {
-            return socket.getLocalPort();
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
+    /**
+     * A TCP socket bound to an ephemeral port of {@code address}, neither listening nor connected, with address reuse
+     * off: a connection to the port is refused, and no other socket can bind the port, until the socket is closed.
+     */
+    private static Socket bindWithoutListening(String address) throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(address, 0));
+            return socket;
+        } catch (IOException | RuntimeException e) {
+            socket.close();
+            throw e;
         }
     }
 }

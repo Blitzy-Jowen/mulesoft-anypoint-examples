@@ -29,7 +29,8 @@ import static org.junit.jupiter.api.Assertions.fail;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.ConnectException;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.Base64;
@@ -276,17 +277,18 @@ class CmisAtomPubClientTest {
 
     @Test
     void connectionRefusedRaisesFixedMessageWithoutUrl() throws IOException {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
+        // A bound socket that never listens refuses connections and keeps the port from being reused meanwhile, which a
+        // closed ServerSocket(0) cannot guarantee on a host where many builds open ports concurrently.
+        try (Socket reserved = reserveRefusingPort()) {
+            props.setBaseUrl("http://localhost:" + reserved.getLocalPort() + BASE_PATH);
+            CmisAtomPubClient unreachable = new CmisAtomPubClient(props);
+
+            ResourceAccessException e = assertThrows(ResourceAccessException.class,
+                    () -> createDocument(unreachable));
+
+            assertEquals("CMIS service document request failed with an I/O error", e.getMessage());
+            assertInstanceOf(ConnectException.class, e.getCause());
         }
-        props.setBaseUrl("http://localhost:" + closedPort + BASE_PATH);
-        CmisAtomPubClient unreachable = new CmisAtomPubClient(props);
-
-        ResourceAccessException e = assertThrows(ResourceAccessException.class, () -> createDocument(unreachable));
-
-        assertEquals("CMIS service document request failed with an I/O error", e.getMessage());
-        assertInstanceOf(ConnectException.class, e.getCause());
     }
 
     /**
@@ -430,6 +432,26 @@ class CmisAtomPubClientTest {
     /** {@code prefix} followed by {@code x} characters up to {@code length} characters in all. */
     private static String padded(String prefix, int length) {
         return prefix + "x".repeat(Math.max(0, length - prefix.length()));
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
     }
 
     private static void stubServiceDocument(boolean withObjectByPath) {

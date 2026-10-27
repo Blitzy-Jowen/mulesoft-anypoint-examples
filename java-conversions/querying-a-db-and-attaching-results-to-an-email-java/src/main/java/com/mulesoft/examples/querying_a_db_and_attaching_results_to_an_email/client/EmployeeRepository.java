@@ -24,6 +24,8 @@ import org.springframework.stereotype.Repository;
  * Boot's auto-configured {@code DataSource} and {@link JdbcTemplate} over
  * {@code spring.datasource.url: ${jdbc.url}}, and the {@code db:select} of lines 11-15, which the flow runs once per
  * split {@code <employee>} element. Splitting the employee text into first and last name belongs to the caller.
+ * While {@code jdbc.url} is blank, {@code config.DataSourceConfig} supplies the {@code DataSource} instead, and every
+ * query fails with a connection error naming the key.
  *
  * <p>The original built its query by interpolating both names into double-quoted literals, which MySQL's default
  * {@code sql_mode} reads as string literals. Here each name is a bind parameter: the comparison runs under the same

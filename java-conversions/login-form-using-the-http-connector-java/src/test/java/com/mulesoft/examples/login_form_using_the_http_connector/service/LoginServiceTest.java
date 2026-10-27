@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
@@ -63,7 +64,8 @@ import com.mulesoft.examples.login_form_using_the_http_connector.service.LoginSe
  *
  * <p>It covers {@code GetLoginPageFlow}'s page byte for byte; {@code DoLoginFlow}'s INFO log line, its credential
  * filter (exact, case-sensitive equality with the configured values, failing closed when they are empty, blank
- * or unset) and its catch strategy, reached by a filter rejection and by a rendering failure alike; and
+ * or unset, with one WARN naming only the blank keys) and its catch strategy, reached by a filter rejection and
+ * by a rendering failure alike; and
  * {@code CallLoginFlowUsingRequester}'s {@code HashMap} of the configured credentials and its unchanged relay of
  * the client's response or failure. No Spring context is started.
  */
@@ -213,6 +215,62 @@ class LoginServiceTest {
                 .isThrownBy(() -> failure.form().remove("password"));
         assertThatExceptionOfType(UnsupportedOperationException.class)
                 .isThrownBy(() -> failure.form().clear());
+        verifyNoInteractions(client);
+    }
+
+    static Stream<Arguments> blankConfiguredCredentials() {
+        String username = "Login rejected because login.username is not configured";
+        String password = "Login rejected because login.password is not configured";
+        String both = "Login rejected because login.username and login.password are not configured";
+        List<String> usernameKey = List.of("login.username");
+        List<String> passwordKey = List.of("login.password");
+        List<String> bothKeys = List.of("login.username", "login.password");
+        return Stream.of(
+                Arguments.of("empty username", new LoginProperties("", "s3cret", "localhost"), username, usernameKey),
+                Arguments.of("empty password", new LoginProperties("alice", "", "localhost"), password, passwordKey),
+                Arguments.of("empty username and password", new LoginProperties("", "", "localhost"), both, bothKeys),
+                Arguments.of("unset username", new LoginProperties(null, "s3cret", "localhost"), username,
+                        usernameKey),
+                Arguments.of("unset password", new LoginProperties("alice", null, "localhost"), password,
+                        passwordKey),
+                Arguments.of("unset username and password", new LoginProperties(null, null, "localhost"), both,
+                        bothKeys),
+                Arguments.of("whitespace username", new LoginProperties("  ", "s3cret", "localhost"), username,
+                        usernameKey),
+                Arguments.of("whitespace password", new LoginProperties("alice", "\t", "localhost"), password,
+                        passwordKey),
+                Arguments.of("whitespace username and password", new LoginProperties("  ", "\t", "localhost"), both,
+                        bothKeys));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("blankConfiguredCredentials")
+    void loginAgainstBlankConfigurationIsRejectedWithOneWarningNamingOnlyTheBlankKeys(String scenario,
+            LoginProperties properties, String expectedWarning, List<String> blankKeys) {
+        Map<String, String> form = form("username", "mule", "password", "mule");
+
+        LoginFailedException failure = catchThrowableOfType(
+                () -> service(properties, new ParseTemplateRenderer()).login(form), LoginFailedException.class);
+
+        assertThat(failure).isNotNull().hasMessage(FILTER_REJECTION).hasNoCause();
+        assertThat(failure.form()).isEqualTo(form);
+        assertThat(appender.list).satisfiesExactly(
+                info -> {
+                    assertThat(info.getLevel()).isEqualTo(Level.INFO);
+                    assertThat(info.getFormattedMessage()).isEqualTo("User mule is trying to login");
+                },
+                warning -> {
+                    assertThat(warning.getLevel()).isEqualTo(Level.WARN);
+                    assertThat(warning.getFormattedMessage()).isEqualTo(expectedWarning);
+                    assertThat(warning.getArgumentArray()).containsExactly(blankKeys.toArray());
+                    // Neither the submitted credentials nor a configured value, blank or set, reaches the warning.
+                    Stream.of("mule", properties.username(), properties.password())
+                            .filter(value -> value != null && !value.isEmpty())
+                            .forEach(value -> {
+                                assertThat(warning.getFormattedMessage()).doesNotContain(value);
+                                assertThat(Arrays.deepToString(warning.getArgumentArray())).doesNotContain(value);
+                            });
+                });
         verifyNoInteractions(client);
     }
 
