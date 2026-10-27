@@ -8,7 +8,11 @@
 
 package com.mulesoft.examples.xml_only_soap_webservice.config;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Collection;
@@ -38,6 +42,7 @@ import org.springframework.core.Ordered;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.util.Assert;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.ws.WebServiceMessage;
 import org.springframework.ws.WebServiceMessageFactory;
 import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.config.annotation.WsConfigurer;
@@ -46,9 +51,11 @@ import org.springframework.ws.server.EndpointInterceptor;
 import org.springframework.ws.server.endpoint.MethodEndpoint;
 import org.springframework.ws.server.endpoint.mapping.AbstractEndpointMapping;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
+import org.springframework.ws.transport.WebServiceConnection;
 import org.springframework.ws.transport.context.TransportContext;
 import org.springframework.ws.transport.context.TransportContextHolder;
 import org.springframework.ws.transport.http.HttpServletConnection;
+import org.springframework.ws.transport.http.HttpUrlConnection;
 import org.springframework.ws.transport.http.HttpUrlConnectionMessageSender;
 import org.w3c.dom.Element;
 
@@ -196,7 +203,8 @@ public class WebServiceConfig implements WsConfigurer {
      * {@code http.request.response-timeout}, Mule's default response timeout of 10000 ms, because the original
      * {@code http:request} declares none. No default URI is set: every call names its target. A SOAP fault answer
      * surfaces as {@code SoapFaultClientException} and any other HTTP error as {@code WebServiceTransportException},
-     * because both connection checks keep their defaults.
+     * because both connection checks keep their defaults. Every request is sent exactly once
+     * ({@link SingleAttemptMessageSender}).
      *
      * @param responseTimeoutMillis the response timeout in milliseconds; must be positive, because zero would mean
      *                              waiting forever
@@ -209,7 +217,7 @@ public class WebServiceConfig implements WsConfigurer {
                 () -> "http.request.response-timeout must be a positive number of milliseconds, but was "
                         + responseTimeoutMillis);
         Duration responseTimeout = Duration.ofMillis(responseTimeoutMillis);
-        HttpUrlConnectionMessageSender messageSender = new HttpUrlConnectionMessageSender();
+        HttpUrlConnectionMessageSender messageSender = new SingleAttemptMessageSender();
         messageSender.setConnectionTimeout(responseTimeout);
         messageSender.setReadTimeout(responseTimeout);
 
@@ -384,5 +392,53 @@ public class WebServiceConfig implements WsConfigurer {
             return bean;
         }
     }
+
+    /**
+     * {@link HttpUrlConnectionMessageSender} whose connections send every request exactly once.
+     * <p>
+     * A default {@link HttpURLConnection} buffers the POST body and, when the connection fails while the response is
+     * read (a reset, an end of stream before any response byte), silently sends the whole request a second time
+     * ({@code sun.net.http.retryPost}, on by default). The original {@code invokePatientService} and
+     * {@code invokeEHRService} sub-flows declare no retry, and a timeout or connectivity failure is never retried.
+     * In fixed-length streaming mode the JDK never re-sends, so each connection buffers the envelope Spring WS writes
+     * and then streams it with its exact length: {@code Content-Length} and the bytes on the wire are unchanged.
+     * A JVM-wide system property is not used, because it would change every other HTTP client in the process.
+     */
+    static final class SingleAttemptMessageSender extends HttpUrlConnectionMessageSender {
+
+        @Override
+        public WebServiceConnection createConnection(URI uri) throws IOException {
+            // The parent opens and prepares the HttpURLConnection (method, timeouts) without connecting it.
+            HttpUrlConnection prepared = (HttpUrlConnection) super.createConnection(uri);
+            return new FixedLengthHttpUrlConnection(prepared.getConnection());
+        }
+    }
+
+    /** Collects the request body, then sends it in fixed-length streaming mode ({@link SingleAttemptMessageSender}). */
+    static final class FixedLengthHttpUrlConnection extends HttpUrlConnection {
+
+        private final ByteArrayOutputStream requestBody = new ByteArrayOutputStream();
+
+        FixedLengthHttpUrlConnection(HttpURLConnection connection) {
+            super(connection);
+        }
+
+        @Override
+        protected OutputStream getRequestOutputStream() {
+            return requestBody;
+        }
+
+        @Override
+        protected void onSendAfterWrite(WebServiceMessage message) throws IOException {
+            byte[] body = requestBody.toByteArray();
+            HttpURLConnection connection = getConnection();
+            connection.setFixedLengthStreamingMode(body.length);
+            try (OutputStream out = connection.getOutputStream()) {
+                out.write(body);
+            }
+            super.onSendAfterWrite(message);
+        }
+    }
+
 }
 
