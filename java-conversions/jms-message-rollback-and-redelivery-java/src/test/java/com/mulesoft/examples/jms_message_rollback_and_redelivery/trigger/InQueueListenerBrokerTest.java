@@ -21,6 +21,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 import jakarta.jms.Connection;
 import jakarta.jms.Message;
@@ -71,6 +72,13 @@ import org.springframework.test.context.DynamicPropertySource;
  * receive timeouts of an idle consumer, so rollbacks keep drifting across the instants at which idle consumers'
  * receives time out, where the credit reset that ends a timed-out receive can strand a message dispatched at that
  * moment.
+ *
+ * <p>The broker, the application and this test share one JVM, and on a shared host that JVM can stop running as a
+ * whole for hundreds of milliseconds, at a garbage-collection safepoint or while its CPU quota is exhausted. A stall
+ * that covers the end of a pause delays every delivery then due by the same amount, on every consumer at once. A
+ * stall monitor therefore parks for 1 ms at a time and records every wake-up more than 20 ms late, and the stalled
+ * time within a gap is allowed above that gap's tolerance. A message stranded behind another consumer's pause is late
+ * with no stall to account for it, so it still fails the check.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE,
         // The listener container, a class of the config package, logs each rollback at WARN with its stack trace,
@@ -91,6 +99,12 @@ class InQueueListenerBrokerTest {
 
     /** Allowed deviation of a measured gap as a share of the expected one: 500 ms and 200 ms. */
     private static final double TOLERANCE = 0.4;
+
+    /** Lateness of a stall monitor wake-up from which the JVM counts as stalled; shorter delays fit the tolerance. */
+    private static final long STALL_THRESHOLD_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
+
+    /** How long the stall monitor parks between two checks. */
+    private static final long STALL_CHECK_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
 
     /** Messages per burst, sent in this order. */
     private static final int[] BURST_SIZES = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 6};
@@ -121,6 +135,11 @@ class InQueueListenerBrokerTest {
     /** Acknowledgements on queue {@code in} per message tag, in the order the broker received them. */
     private static final Map<String, List<Acknowledgement>> ACKNOWLEDGEMENTS = new ConcurrentHashMap<>();
 
+    /** Stalls of this JVM, in the order the stall monitor found them. */
+    private static final List<Stall> STALLS = new CopyOnWriteArrayList<>();
+
+    private static Thread stallMonitor;
+
     private static ActiveMQServer broker;
 
     private static String brokerUrl;
@@ -145,6 +164,67 @@ class InQueueListenerBrokerTest {
     private record Acknowledgement(String consumer, int deliveryCount) {
     }
 
+    /**
+     * An interval in which the stall monitor did not run although its park had ended: the JVM, with the broker and
+     * the listener in it, was stopped or starved of CPU for that long.
+     *
+     * @param dueNanos  {@link System#nanoTime()} at which the monitor's park ended
+     * @param wokeNanos {@link System#nanoTime()} at which the monitor ran again
+     */
+    private record Stall(long dueNanos, long wokeNanos) {
+
+        /**
+         * The part of this stall that lies within an interval.
+         *
+         * @param fromNanos {@link System#nanoTime()} at the start of the interval
+         * @param toNanos   {@link System#nanoTime()} at its end
+         * @return the overlap in nanoseconds, 0 when the stall lies outside the interval
+         */
+        long nanosWithin(long fromNanos, long toNanos) {
+            long start = Math.max(0, dueNanos - fromNanos);
+            long end = Math.min(toNanos - fromNanos, wokeNanos - fromNanos);
+            return Math.max(0, end - start);
+        }
+    }
+
+    /**
+     * Starts the daemon thread that records each {@link Stall}: it parks for {@link #STALL_CHECK_NANOS} at a time
+     * and, whenever it runs again more than {@link #STALL_THRESHOLD_NANOS} after its park ended, adds the interval
+     * to {@link #STALLS}. It runs until it is interrupted.
+     */
+    private static void startStallMonitor() {
+        stallMonitor = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                long due = System.nanoTime() + STALL_CHECK_NANOS;
+                LockSupport.parkNanos(STALL_CHECK_NANOS);
+                long woke = System.nanoTime();
+                if (woke - due > STALL_THRESHOLD_NANOS) {
+                    STALLS.add(new Stall(due, woke));
+                }
+            }
+        }, InQueueListenerBrokerTest.class.getSimpleName() + "-stall-monitor");
+        stallMonitor.setDaemon(true);
+        stallMonitor.start();
+    }
+
+    private static void stopStallMonitor() throws InterruptedException {
+        if (stallMonitor != null) {
+            stallMonitor.interrupt();
+            stallMonitor.join();
+        }
+    }
+
+    /**
+     * The time this JVM stalled within an interval, as the stall monitor recorded it.
+     *
+     * @param fromNanos {@link System#nanoTime()} at the start of the interval
+     * @param toNanos   {@link System#nanoTime()} at its end
+     * @return the stalled time in nanoseconds
+     */
+    private static long stalledNanos(long fromNanos, long toNanos) {
+        return STALLS.stream().mapToLong(stall -> stall.nanosWithin(fromNanos, toNanos)).sum();
+    }
+
     private static String consumerKey(ServerConsumer consumer) {
         return consumer == null ? "none" : consumer.getSessionID() + "/" + consumer.getID();
     }
@@ -156,6 +236,7 @@ class InQueueListenerBrokerTest {
 
     @BeforeAll
     static void startBroker() throws Exception {
+        startStallMonitor();
         Configuration configuration = new ConfigurationImpl()
                 .setPersistenceEnabled(false)
                 .setSecurityEnabled(false)
@@ -196,8 +277,12 @@ class InQueueListenerBrokerTest {
 
     @AfterAll
     static void stopBroker() throws Exception {
-        if (broker != null) {
-            broker.stop();
+        try {
+            if (broker != null) {
+                broker.stop();
+            }
+        } finally {
+            stopStallMonitor();
         }
     }
 
@@ -260,12 +345,18 @@ class InQueueListenerBrokerTest {
 
     /**
      * Checks the deliveries of one published message: the listener processed counts 1 to 5, once each and in order,
-     * and each processed delivery started within the tolerance of its delay after the previous one.
+     * and each processed delivery started within the tolerance of its delay after the previous one, or later than
+     * that by no more than the time the JVM stalled in between.
      *
      * <p>A processed delivery is the dispatch its consumer acknowledged. The broker may also dispatch a message to a
      * consumer that then returns it unprocessed, for example when the dispatch crosses the end of that consumer's
      * receive; the message goes back to the queue with its delivery count unchanged and is dispatched again. Such
      * returns are allowed, and the time one costs counts against the gap to the processed delivery.
+     *
+     * <p>A stall of the whole JVM delays the broker and every consumer alike, so the stalled time the stall monitor
+     * recorded within a gap widens that gap's upper bound only. A message stranded behind another consumer's pause
+     * comes with no such stall, and a gap can never be shorter than its pause, because the pause precedes the
+     * rollback that leads to the next delivery, so the lower bound takes no allowance.
      *
      * @param text     the message's text and tag
      * @param failures collects every deviation found
@@ -297,16 +388,21 @@ class InQueueListenerBrokerTest {
             starts.add(processed.nanoTime());
         }
         List<Long> gaps = new ArrayList<>();
+        List<Long> stalls = new ArrayList<>();
         for (int count = 1; count < DELIVERY_COUNTS.size(); count++) {
             long expected = count == 1 ? INITIAL_DELAY_MS : REDELIVERY_DELAY_MS;
             long gap = TimeUnit.NANOSECONDS.toMillis(starts.get(count) - starts.get(count - 1));
+            long stalled = TimeUnit.NANOSECONDS.toMillis(stalledNanos(starts.get(count - 1), starts.get(count)));
             gaps.add(gap);
-            if (Math.abs(gap - expected) > TOLERANCE * expected) {
+            stalls.add(stalled);
+            if (gap < expected - TOLERANCE * expected || gap > expected + TOLERANCE * expected + stalled) {
                 failures.add(text + ": delivery " + (count + 1) + " started " + gap + " ms after delivery " + count
-                        + ", expected " + expected + " ms ± " + Math.round(TOLERANCE * expected) + " ms");
+                        + ", expected " + expected + " ms ± " + Math.round(TOLERANCE * expected) + " ms"
+                        + ", later by at most the " + stalled + " ms the JVM stalled in between");
             }
         }
-        LOGGER.info("{}: dispatched with counts {}, processed deliveries {} ms apart", text, dispatchedCounts, gaps);
+        LOGGER.info("{}: dispatched with counts {}, processed deliveries {} ms apart, of which the JVM stalled {} ms",
+                text, dispatchedCounts, gaps, stalls);
     }
 
     private static int consumerCount() {
