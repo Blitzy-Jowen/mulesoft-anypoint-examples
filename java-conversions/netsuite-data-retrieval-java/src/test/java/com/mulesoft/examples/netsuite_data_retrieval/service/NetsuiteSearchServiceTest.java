@@ -22,13 +22,18 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.ConnectException;
+import java.nio.charset.StandardCharsets;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiFunction;
@@ -81,8 +86,10 @@ import ch.qos.logback.core.read.ListAppender;
  * service makes must be one the test arranged. The mappers are the real ones, so the JSON each search returns is the
  * JSON the controllers answer. REST records, metadata catalogs, SuiteQL rows and custom-field source IDs are built
  * in memory as {@code LinkedHashMap}s with integers as {@code Integer}/{@code Long} and decimals as
- * {@code BigDecimal}, as the client parses them. The success line of each flow is read from a Logback
- * {@link ListAppender} on the service's logger. No Spring context, network or file is used.
+ * {@code BigDecimal}, as the client parses them; the committed-response tests read them instead from the REST
+ * fixtures of {@code src/test/resources/netsuite}, parsed the same way, and compare the answers with the committed
+ * {@code api/*-response.json} files. The success line of each flow is read from a Logback {@link ListAppender} on the
+ * service's logger. No Spring context or network is used and no file is written.
  */
 @ExtendWith(MockitoExtension.class)
 class NetsuiteSearchServiceTest {
@@ -567,6 +574,107 @@ class NetsuiteSearchServiceTest {
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // Committed responses, from the REST fixtures of src/test/resources/netsuite
+    // ---------------------------------------------------------------------------------------------------------
+
+    /**
+     * REST customer -5 answers the committed customer byte for byte: the SuiteQL row's record is read, the sources
+     * of its four custom select fields are looked up in one call and their raw {@code fieldvaluetyperecord} values
+     * become the {@code typeId}s {@code 16}, {@code 17}, {@code -30} and {@code 15}, so the MUnit
+     * {@code "companyName": "<name>"} assertion holds.
+     */
+    @Test
+    void getCustomersAnswersTheCommittedCustomerFromTheRestFixtures() throws Exception {
+        Set<String> selectScriptIds =
+                Set.of("custentity6", "custentity7", "custentity8", "custentity_fmt_cur_sales_order");
+        when(client.suiteQl(anyString())).thenReturn(rows("rest-suiteql-customer-ids.json"));
+        when(client.getRecord("customer", "-5")).thenReturn(fixture("rest-customer.json"));
+        when(client.metadataCatalog("customer")).thenReturn(fixture("rest-customer-catalog.json"));
+        when(client.customFieldSourceIds(selectScriptIds)).thenReturn(sourceIds());
+
+        String json = service.getCustomers(RAMSEY);
+
+        ArgumentCaptor<String> query = ArgumentCaptor.forClass(String.class);
+        InOrder calls = inOrder(client);
+        calls.verify(client).suiteQl(query.capture());
+        calls.verify(client).getRecord("customer", "-5");
+        calls.verify(client).metadataCatalog("customer");
+        calls.verify(client).customFieldSourceIds(selectScriptIds);
+        verifyNoMoreInteractions(client);
+        assertEquals("SELECT id FROM customer WHERE companyname LIKE '" + RAMSEY + "%' ORDER BY id", query.getValue());
+        assertEquals(resource("api/customers-response.json"), json);
+        assertTrue(json.contains("\"companyName\": \"" + RAMSEY + "\""), json);
+        assertLoggedOnce(CUSTOMERS_LOGGED);
+    }
+
+    /**
+     * The listed REST plans 9 and 18, searched with the RAML defaults {@code quantity} 0 and {@code GREATER_THAN},
+     * answer the committed plans byte for byte: {@code units} only on plan 18, the {@code order} lines omitted.
+     */
+    @Test
+    void getItemsAnswersTheCommittedPlansFromTheRestFixtures() throws Exception {
+        when(client.listRecordIds("itemsupplyplan")).thenReturn(listedIds("rest-itemsupplyplan-list.json"));
+        when(client.getRecord("itemsupplyplan", "9")).thenReturn(fixture("rest-itemsupplyplan-9.json"));
+        when(client.getRecord("itemsupplyplan", "18")).thenReturn(fixture("rest-itemsupplyplan-18.json"));
+        when(client.metadataCatalog("itemsupplyplan")).thenReturn(fixture("rest-itemsupplyplan-catalog.json"));
+
+        String json = service.getItems(0, "GREATER_THAN");
+
+        InOrder calls = inOrder(client);
+        calls.verify(client).listRecordIds("itemsupplyplan");
+        calls.verify(client).getRecord("itemsupplyplan", "9");
+        calls.verify(client).getRecord("itemsupplyplan", "18");
+        calls.verify(client).metadataCatalog("itemsupplyplan");
+        verifyNoMoreInteractions(client);
+        assertEquals(resource("api/items-response.json"), json);
+        assertLoggedOnce(ITEMS_LOGGED);
+    }
+
+    /**
+     * REST opportunity 1271, which holds no custom field and so needs no source lookup, answers the committed
+     * opportunity. The committed file is not valid JSON: each {@code addrText} holds raw line breaks that a
+     * pretty-printer re-indented, while the writer escapes them as {@code \n}. Those two values are therefore
+     * compared with the REST {@code addrText}, and every other byte with the committed file.
+     */
+    @Test
+    void getOpportunitiesAnswersTheCommittedOpportunityFromTheRestFixtures() throws Exception {
+        when(client.suiteQl(anyString())).thenReturn(rows("rest-suiteql-opportunity-ids.json"));
+        when(client.getRecord("opportunity", "1271")).thenReturn(fixture("rest-opportunity.json"));
+        when(client.metadataCatalog("opportunity")).thenReturn(fixture("rest-opportunity-catalog.json"));
+
+        String json = service.getOpportunities("Short wave");
+
+        ArgumentCaptor<String> query = ArgumentCaptor.forClass(String.class);
+        InOrder calls = inOrder(client);
+        calls.verify(client).suiteQl(query.capture());
+        calls.verify(client).getRecord("opportunity", "1271");
+        calls.verify(client).metadataCatalog("opportunity");
+        verifyNoMoreInteractions(client);
+        assertEquals("SELECT id FROM transaction WHERE type = 'Opprtnty' AND title LIKE 'Short wave%' ORDER BY id",
+                query.getValue());
+
+        String independent =
+                new OpportunitySearchMapper(new NetsuiteRecordShapeMapper(LOS_ANGELES), new DwJsonWriter())
+                        .toJson(List.of(fixture("rest-opportunity.json")), fixture("rest-opportunity-catalog.json"),
+                                Map.of());
+        assertEquals(independent, json);
+        assertEquals(withoutAddrText(resource("api/opportunities-response.json")), withoutAddrText(json));
+        List<Map<String, Object>> opportunities = parseArray(json);
+        assertEquals(1, opportunities.size(), json);
+        Map<String, Object> opportunity = opportunities.get(0);
+        assertEquals("1271", opportunity.get("internalId"));
+        assertEquals("Short wave", opportunity.get("title"));
+        Map<String, Object> restRecord = fixture("rest-opportunity.json");
+        for (String address : List.of("billingAddress", "shippingAddress")) {
+            Map<String, Object> restAddress = cast(restRecord.get(address));
+            Map<String, Object> written = cast(opportunity.get(address));
+            assertEquals(restAddress.get("addrText"), written.get("addrText"), address);
+        }
+        assertTrue(json.contains("\"title\": \"Short wave\""), json);
+        assertLoggedOnce(OPPORTUNITIES_LOGGED);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // Every flow
     // ---------------------------------------------------------------------------------------------------------
 
@@ -910,6 +1018,54 @@ class NetsuiteSearchServiceTest {
         return record;
     }
 
+    /**
+     * A REST fixture of {@code src/test/resources/netsuite} parsed as the client parses NetSuite bodies
+     * ({@code LinkedHashMap}s, decimals as {@code BigDecimal}), a new copy on every call.
+     */
+    private static Map<String, Object> fixture(String file) {
+        String path = "netsuite/" + file;
+        try {
+            return JSON.readValue(resource(path), new TypeReference<LinkedHashMap<String, Object>>() { });
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException("Fixture " + path + " is not a JSON object", e);
+        }
+    }
+
+    /**
+     * The {@code items} of a SuiteQL or record-list page fixture, each without its {@code links}, as the client
+     * returns them.
+     */
+    private static List<Map<String, Object>> rows(String file) {
+        List<Map<String, Object>> items = cast(fixture(file).get("items"));
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (Map<String, Object> item : items) {
+            Map<String, Object> row = new LinkedHashMap<>(item);
+            row.remove("links");
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    /** The {@code id}s of a record-list page fixture as text, in listing order, as {@code listRecordIds} returns. */
+    private static List<String> listedIds(String file) {
+        List<String> ids = new ArrayList<>();
+        rows(file).forEach(row -> ids.add(String.valueOf(row.get("id"))));
+        return ids;
+    }
+
+    /**
+     * The {@code customfield} lookup fixture as {@code customFieldSourceIds} returns it: lower-cased script ID → the
+     * raw {@code fieldvaluetyperecord}.
+     */
+    private static Map<String, String> sourceIds() {
+        Map<String, String> sourceIds = new LinkedHashMap<>();
+        for (Map<String, Object> row : rows("rest-suiteql-customfield.json")) {
+            sourceIds.put(String.valueOf(row.get("scriptid")).toLowerCase(Locale.ROOT),
+                    String.valueOf(row.get("fieldvaluetyperecord")));
+        }
+        return sourceIds;
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // Assertions and helpers
     // ---------------------------------------------------------------------------------------------------------
@@ -952,6 +1108,23 @@ class NetsuiteSearchServiceTest {
         } catch (JsonProcessingException e) {
             throw new IllegalArgumentException("Service output does not parse as a JSON array: " + json, e);
         }
+    }
+
+    /** A UTF-8 classpath resource, from the main or the test resources. */
+    private static String resource(String path) {
+        try (InputStream in = NetsuiteSearchServiceTest.class.getClassLoader().getResourceAsStream(path)) {
+            if (in == null) {
+                throw new IllegalStateException("Classpath resource " + path + " is missing");
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** The text with every {@code addrText} string value emptied, raw line breaks inside the value included. */
+    private static String withoutAddrText(String json) {
+        return json.replaceAll("\"addrText\": \"(?:[^\"\\\\]|\\\\.)*\"", "\"addrText\": \"\"");
     }
 
     /** Runs a search whose checked exception the test does not expect to see, so it can serve as a function. */
