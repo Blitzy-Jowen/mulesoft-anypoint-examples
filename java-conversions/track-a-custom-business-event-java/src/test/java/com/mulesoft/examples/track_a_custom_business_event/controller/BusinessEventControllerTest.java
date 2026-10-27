@@ -34,9 +34,10 @@ import com.mulesoft.examples.track_a_custom_business_event.support.HttpTestClien
  * and reads the raw status line from the socket, so the reason phrase, every {@code Content-Type} value and the
  * body bytes are asserted exactly as the listener writes them. The happy paths cover the response media type the
  * request's {@code Content-Type} decides, the request's charset decoding the body, and every method, because the
- * original listener declares no {@code allowedMethods}; the error cases are the flow's own unpriced item and the
- * listener-level platform defaults of SC-1: the JSON 500 for a body the flow cannot read and the no-listener 404
- * for paths the flow does not serve.
+ * original listener declares no {@code allowedMethods}; the error cases are the flow's own script failures, an
+ * unpriced item and a price nested 20000 deep, whose message is rendered on the listener's worker thread without
+ * exhausting its stack, and the listener-level platform defaults of SC-1: the JSON 500 for a body the flow cannot
+ * read and the no-listener 404 for paths the flow does not serve.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class BusinessEventControllerTest {
@@ -138,8 +139,14 @@ class BusinessEventControllerTest {
 
     static Stream<Arguments> failingRequests() throws IOException {
         String hats = new String(message(), UTF_8).replace("\"shoes\"", "\"hats\"");
+        String nestedPrice = "[".repeat(20_000) + "0" + "]".repeat(20_000);
+        String nestedPriceBody = new String(message(), UTF_8)
+                .replace("\"item price per unit\": 10", "\"item price per unit\": " + nestedPrice);
         return Stream.of(
                 Arguments.of("unknown item hats", hats, "{ \"message\": \"nil can't be coerced into Fixnum\" }"),
+                // Rendered into the message without exhausting the stack of the listener's worker thread.
+                Arguments.of("array price nested 20000 deep", nestedPriceBody,
+                        "{ \"message\": \"undefined method `*' for " + nestedPrice + "\" }"),
                 Arguments.of("malformed JSON", "{\"item name\": ", "{ \"message\": \"Payload is not valid JSON\" }"));
     }
 

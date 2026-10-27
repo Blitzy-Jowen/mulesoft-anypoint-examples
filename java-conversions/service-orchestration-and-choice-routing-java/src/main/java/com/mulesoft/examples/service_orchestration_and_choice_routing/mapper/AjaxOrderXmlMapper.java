@@ -86,6 +86,11 @@ import com.fasterxml.jackson.databind.cfg.JsonNodeFeature;
  * DataWeave kept every occurrence; JSON writers, the order page's {@code JSON.stringify} among them, never emit
  * repeated names.
  *
+ * <p>Every member name the document copies, at any depth of {@code orderId}, {@code customer} and each selected
+ * {@code item}, becomes an element name, so it must be an XML NCName (an XML 1.0 {@code Name} without {@code ':'});
+ * any other name throws {@link IllegalArgumentException} with a message that does not quote it. Names of the members
+ * the script drops are not checked.
+ *
  * <p>Transformation only: no I/O, no configuration, no logging. Stateless and thread-safe.
  */
 @Component
@@ -100,6 +105,8 @@ public class AjaxOrderXmlMapper {
     private static final String ITEM = "item";
 
     private static final String EMPTY_BODY = "Order request body is empty";
+
+    private static final String INVALID_MEMBER_NAME = "Order request member name is not a valid XML element name";
 
     private final DwXmlWriter dwXmlWriter;
 
@@ -130,7 +137,8 @@ public class AjaxOrderXmlMapper {
      * @return the DataWeave XML document, declaration included, without a trailing line feed
      * @throws IllegalArgumentException when the body is {@code null} or blank ("Order request body is empty"), is
      *         not well-formed JSON or holds anything after its value (the parser's message, with the parser
-     *         exception as cause), is not a JSON object, or carries a member name that is not a usable element name
+     *         exception as cause), is not a JSON object, or carries a member name that is not an XML NCName
+     *         ("Order request member name is not a valid XML element name")
      */
     public String toXml(String json) {
         JsonNode payload = parse(json);
@@ -192,6 +200,9 @@ public class AjaxOrderXmlMapper {
             Map<String, Object> members = new LinkedHashMap<>();
             for (Iterator<Map.Entry<String, JsonNode>> fields = node.fields(); fields.hasNext();) {
                 Map.Entry<String, JsonNode> field = fields.next();
+                if (!isNcName(field.getKey())) {
+                    throw new IllegalArgumentException(INVALID_MEMBER_NAME);
+                }
                 members.put(field.getKey(), toValue(field.getValue()));
             }
             return members;
@@ -213,5 +224,43 @@ public class AjaxOrderXmlMapper {
             return node.booleanValue();
         }
         return node.asText();
+    }
+
+    /**
+     * Whether {@code name} is an {@code NCName} of Namespaces in XML 1.0: the XML 1.0 (Fifth Edition) {@code Name}
+     * production without {@code ':'}. The name is read by code point, so a supplementary character counts as one
+     * character and a lone surrogate matches no range.
+     */
+    private static boolean isNcName(String name) {
+        if (name.isEmpty()) {
+            return false;
+        }
+        int first = name.codePointAt(0);
+        if (!isNameStartChar(first)) {
+            return false;
+        }
+        for (int at = Character.charCount(first); at < name.length();) {
+            int codePoint = name.codePointAt(at);
+            if (!isNameChar(codePoint)) {
+                return false;
+            }
+            at += Character.charCount(codePoint);
+        }
+        return true;
+    }
+
+    /** XML 1.0 (Fifth Edition) {@code NameStartChar} without {@code ':'}. */
+    private static boolean isNameStartChar(int c) {
+        return (c >= 'A' && c <= 'Z') || c == '_' || (c >= 'a' && c <= 'z')
+                || (c >= 0xC0 && c <= 0xD6) || (c >= 0xD8 && c <= 0xF6) || (c >= 0xF8 && c <= 0x2FF)
+                || (c >= 0x370 && c <= 0x37D) || (c >= 0x37F && c <= 0x1FFF) || (c >= 0x200C && c <= 0x200D)
+                || (c >= 0x2070 && c <= 0x218F) || (c >= 0x2C00 && c <= 0x2FEF) || (c >= 0x3001 && c <= 0xD7FF)
+                || (c >= 0xF900 && c <= 0xFDCF) || (c >= 0xFDF0 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0xEFFFF);
+    }
+
+    /** XML 1.0 (Fifth Edition) {@code NameChar} without {@code ':'}. */
+    private static boolean isNameChar(int c) {
+        return isNameStartChar(c) || c == '-' || c == '.' || (c >= '0' && c <= '9') || c == 0xB7
+                || (c >= 0x300 && c <= 0x36F) || (c >= 0x203F && c <= 0x2040);
     }
 }

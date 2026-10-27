@@ -5,7 +5,11 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
 import java.nio.charset.Charset;
+import java.util.ArrayDeque;
+import java.util.Collection;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -44,7 +48,9 @@ import org.springframework.stereotype.Service;
  * <p>The body is read as the transformer read the message stream: decoded with the request's encoding through an
  * {@link InputStreamReader}, so malformed or unmappable bytes become U+FFFD instead of failing, and no byte-order
  * mark or UTF-16/UTF-32 layout is detected from the bytes themselves. The JSON reader sets no limit on nesting
- * depth, number length or string length, as the Jackson 1.x mapper behind the transformer set none.
+ * depth, number length or string length, as the Jackson 1.x mapper behind the transformer set none. The values
+ * the flow renders as text, in the event metadata and in the script's error message, are rendered without
+ * recursion, so a value nested to any depth the reader accepts renders as its {@code toString()} would.
  *
  * <p>Failures propagate unchanged, as the original flow declares no exception strategy: unparseable or non-object
  * JSON raises {@link IllegalArgumentException}, a script failure raises {@link IllegalStateException} carrying
@@ -195,9 +201,9 @@ public class PriceDiscountService {
      */
     private static Map<String, String> metaData(Map<String, Object> payload) {
         Map<String, String> metaData = new LinkedHashMap<>();
-        metaData.put(ITEM_NAME, String.valueOf(payload.get(ITEM_NAME)));
-        metaData.put(ITEM_UNITS, String.valueOf(payload.get(ITEM_UNITS)));
-        metaData.put(ITEM_PRICE_PER_UNIT, String.valueOf(payload.get(ITEM_PRICE_PER_UNIT)));
+        metaData.put(ITEM_NAME, render(payload.get(ITEM_NAME)));
+        metaData.put(ITEM_UNITS, render(payload.get(ITEM_UNITS)));
+        metaData.put(ITEM_PRICE_PER_UNIT, render(payload.get(ITEM_PRICE_PER_UNIT)));
         return metaData;
     }
 
@@ -237,6 +243,73 @@ public class PriceDiscountService {
         if (price == null) {
             throw new IllegalStateException(NO_MULTIPLY_METHOD_PREFIX + NIL_DESCRIPTION);
         }
-        throw new IllegalStateException(NO_MULTIPLY_METHOD_PREFIX + price);
+        throw new IllegalStateException(NO_MULTIPLY_METHOD_PREFIX + render(price));
+    }
+
+    /**
+     * Renders a parsed JSON value exactly as {@link String#valueOf(Object)} renders it, but without recursion, so
+     * no nesting depth a caller sends can exhaust the thread's stack: a {@link Collection} as {@code [e1, e2]}, as
+     * {@code AbstractCollection.toString()} does; a {@link Map} as {@code {k1=v1, k2=v2}} in its own iteration
+     * order, as {@code AbstractMap.toString()} does; {@code []} and {@code {}} when empty; every other value, and
+     * every key, as {@link String#valueOf(Object)}, so {@code null} is {@code null}.
+     *
+     * <p>Containers are walked with an explicit stack of the ones opened and not yet closed, and written into one
+     * builder. The value is a tree, as the JSON reader builds it, so no container holds itself.
+     */
+    private static String render(Object value) {
+        StringBuilder text = new StringBuilder();
+        Deque<OpenContainer> open = new ArrayDeque<>();
+        Object next = value;
+        for (;;) {
+            if (next instanceof Collection<?> collection) {
+                text.append('[');
+                open.push(new OpenContainer(collection.iterator(), ']'));
+            } else if (next instanceof Map<?, ?> map) {
+                text.append('{');
+                open.push(new OpenContainer(map.entrySet().iterator(), '}'));
+            } else {
+                text.append(String.valueOf(next));
+            }
+            // Close every container whose items are all written; the innermost one left holds the next item.
+            OpenContainer container = open.peek();
+            while (container != null && !container.items.hasNext()) {
+                text.append(container.close);
+                open.pop();
+                container = open.peek();
+            }
+            if (container == null) {
+                return text.toString();
+            }
+            if (container.separatorDue) {
+                text.append(", ");
+            }
+            container.separatorDue = true;
+            Object item = container.items.next();
+            if (container.close == '}') {
+                Map.Entry<?, ?> entry = (Map.Entry<?, ?>) item;
+                text.append(String.valueOf(entry.getKey())).append('=');
+                next = entry.getValue();
+            } else {
+                next = item;
+            }
+        }
+    }
+
+    /** A container {@link #render(Object)} has opened and not yet closed. */
+    private static final class OpenContainer {
+
+        /** The items not yet written: the elements of a collection, or the entries of a map. */
+        private final Iterator<?> items;
+
+        /** The closing bracket: ']' for a collection, '}' for a map, whose items are entries. */
+        private final char close;
+
+        /** Whether an item has been written, so the next one follows a {@code ", "} separator. */
+        private boolean separatorDue;
+
+        private OpenContainer(Iterator<?> items, char close) {
+            this.items = items;
+            this.close = close;
+        }
     }
 }

@@ -265,11 +265,76 @@ class AjaxOrderXmlMapperTest {
                 .hasMessage("Order request body is empty");
     }
 
-    @Test
-    void emptyMemberNameThrows() {
-        assertThatThrownBy(() -> mapper.toXml("{\"orderId\":\"1\",\"customer\":{\"\":\"x\"}}"))
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidMemberNames")
+    void copiedMemberNameThatIsNotAnNcNameThrows(String name, String json) {
+        assertThatThrownBy(() -> mapper.toXml(json))
                 .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("An XML element name must not be null or empty");
+                .hasMessage("Order request member name is not a valid XML element name");
+    }
+
+    static Stream<Arguments> invalidMemberNames() {
+        return Stream.of(
+                Arguments.of("markup that injects an element",
+                        "{\"customer\":{\"x/><firstName>Injected</firstName><x\":null}}"),
+                Arguments.of("an empty name", "{\"orderId\":\"1\",\"customer\":{\"\":\"x\"}}"),
+                Arguments.of("a space in an object nested in customer", "{\"customer\":{\"address\":{\"a b\":\"x\"}}}"),
+                Arguments.of("an object inside an array", "{\"customer\":{\"tags\":[{\"<x>\":1}]}}"),
+                Arguments.of("a selected item of an orderItems array",
+                        "{\"orderItems\":[{\"item\":{\"na me\":\"Galaxy\"}}]}"),
+                Arguments.of("the item of a single orderItems object",
+                        "{\"orderItems\":{\"item\":{\"na me\":\"Galaxy\"}}}"),
+                Arguments.of("an object orderId", "{\"orderId\":{\"a/b\":\"1\"}}"),
+                Arguments.of("a colon", "{\"customer\":{\"ns:foo\":\"x\"}}"),
+                Arguments.of("a leading digit", "{\"customer\":{\"1abc\":\"x\"}}"),
+                Arguments.of("a leading hyphen", "{\"customer\":{\"-x\":\"x\"}}"),
+                Arguments.of("a leading full stop", "{\"customer\":{\".x\":\"x\"}}"),
+                Arguments.of("an ampersand", "{\"customer\":{\"a&b\":\"x\"}}"),
+                Arguments.of("a quotation mark", "{\"customer\":{\"a\\\"b\":\"x\"}}"),
+                Arguments.of("a control character", "{\"customer\":{\"a\\u0001b\":\"x\"}}"),
+                Arguments.of("a lone surrogate", "{\"customer\":{\"x\\ud800\":\"x\"}}"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("ncNameMemberNames")
+    void writesEveryNcNameMemberNameAsItsElement(String name, String jsonName, String elementName) {
+        String json = "{\"orderId\":\"1\",\"customer\":{\"" + jsonName + "\":\"v\"}}";
+
+        assertThat(mapper.toXml(json)).isEqualTo(document("<order>",
+                "\t<orderId>1</orderId>",
+                "\t<customer>",
+                "\t\t<" + elementName + ">v</" + elementName + ">",
+                "\t</customer>",
+                "\t<orderItems/>",
+                "</order>"));
+    }
+
+    static Stream<Arguments> ncNameMemberNames() {
+        return Stream.of(
+                Arguments.of("Latin-1 letter", "ñame", "ñame"),
+                Arguments.of("CJK letters", "名前", "名前"),
+                Arguments.of("underscore start", "_x", "_x"),
+                Arguments.of("hyphen, full stop and digit after the start", "a-b.c9", "a-b.c9"),
+                Arguments.of("middle dot", "x\u00B7y", "x\u00B7y"),
+                Arguments.of("combining mark after the start", "e\u0301", "e\u0301"),
+                Arguments.of("supplementary-plane start", "\\ud800\\udc00x", "\ud800\udc00x"),
+                Arguments.of("xml prefix", "xmlData", "xmlData"));
+    }
+
+    @Test
+    void ignoresTheNamesOfDroppedMembers() {
+        String json = "{\"bad name\":\"x\",\"orderId\":\"1\",\"customer\":{\"firstName\":\"Ann\"},"
+                + "\"orderItems\":[{\"bad name\":\"skipped\"},{\"bad name\":1,\"item\":{\"name\":\"G\"}}]}";
+
+        assertThat(mapper.toXml(json)).isEqualTo(document("<order>",
+                "\t<orderId>1</orderId>",
+                "\t<customer>",
+                "\t\t<firstName>Ann</firstName>",
+                "\t</customer>",
+                "\t<orderItems>",
+                "\t\t<name>G</name>",
+                "\t</orderItems>",
+                "</order>"));
     }
 
     /** The DataWeave declaration, a line feed, then the given lines joined by line feeds with none at the end. */

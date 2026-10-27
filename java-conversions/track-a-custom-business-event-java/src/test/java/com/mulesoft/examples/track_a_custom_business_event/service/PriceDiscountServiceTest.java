@@ -62,7 +62,8 @@ import com.fasterxml.jackson.databind.exc.MismatchedInputException;
  * <p>Each body is decoded with the charset its row declares, UTF-8 unless the row shows how the declared charset
  * governs: Latin-1 bytes read as ISO-8859-1, malformed bytes replaced, a byte-order mark kept as a character.
  * Nesting depth, number length and string length beyond Jackson's default read constraints are accepted, as the
- * original transformer accepted them.
+ * original transformer accepted them; a used value nested 100000 deep reaches the metadata and the error message as
+ * its {@code toString()} renders it, without exhausting the stack, its expected text built from the request text.
  *
  * <p>The platform-default 500 returns the exception's message, so an unreadable body fails with a fixed text:
  * bodies carrying a marker show that no request bytes and no Java or Jackson type name reach it, and that the
@@ -162,6 +163,10 @@ class PriceDiscountServiceTest {
                         UTF_8, "8.5", List.of("shoes", "null", "10")),
                 Arguments.of("arrays nested 100000 deep under an extra key", shoesWithExtra(nestedArrays(100_000)),
                         UTF_8, "8.5", List.of("shoes", "null", "10")),
+                // A used value nested that deep is rendered as toString() renders it, without exhausting the stack.
+                Arguments.of("units in arrays nested 100000 deep",
+                        messageWith("\"item units\": 2", "\"item units\": " + nestedArrays(100_000, "0")), UTF_8,
+                        "8.5", List.of("shoes", nestedArrays(100_000, "0"), "10")),
                 Arguments.of("1001-digit integer price",
                         json("{\"item name\": \"shoes\", \"item price per unit\": " + "9".repeat(1_001) + "}"),
                         UTF_8, "Infinity", List.of("shoes", "null", "9".repeat(1_001))),
@@ -225,7 +230,27 @@ class PriceDiscountServiceTest {
                 Arguments.of("true price", messageWith(PRICE_10, "\"item price per unit\": true"), UTF_8,
                         "undefined method `*' for true", List.of("shoes", "2", "true")),
                 Arguments.of("false price", messageWith(PRICE_10, "\"item price per unit\": false"), UTF_8,
-                        "undefined method `*' for false", List.of("shoes", "2", "false")));
+                        "undefined method `*' for false", List.of("shoes", "2", "false")),
+                // Separators, leaf types, empty containers and each object's key order, as toString() renders them.
+                Arguments.of("composite price",
+                        messageWith(PRICE_10, "\"item price per unit\": [1, [2.5, {\"k\": [null, \"s\"]}], true, {}, "
+                                + "[], {\"b\": 1, \"a\": 2}, 3000000000, 100000000000000000000]"), UTF_8,
+                        "undefined method `*' for [1, [2.5, {k=[null, s]}], true, {}, [], {b=1, a=2}, 3000000000, "
+                                + "100000000000000000000]",
+                        List.of("shoes", "2", "[1, [2.5, {k=[null, s]}], true, {}, [], {b=1, a=2}, 3000000000, "
+                                + "100000000000000000000]")),
+                // Used values nested deeper than recursive rendering could reach, rendered without recursion.
+                Arguments.of("array price nested 100000 deep",
+                        messageWith(PRICE_10, "\"item price per unit\": " + nestedArrays(100_000, "0")), UTF_8,
+                        "undefined method `*' for " + nestedArrays(100_000, "0"),
+                        List.of("shoes", "2", nestedArrays(100_000, "0"))),
+                Arguments.of("object price nested 100000 deep",
+                        messageWith(PRICE_10, "\"item price per unit\": "
+                                + "{\"a\":".repeat(100_000) + "0" + "}".repeat(100_000)), UTF_8,
+                        "undefined method `*' for " + "{a=".repeat(100_000) + "0" + "}".repeat(100_000),
+                        List.of("shoes", "2", "{a=".repeat(100_000) + "0" + "}".repeat(100_000))),
+                Arguments.of("item name nested 100000 deep", messageWith(SHOES, nestedArrays(100_000, "0")), UTF_8,
+                        NIL_DISCOUNT, List.of(nestedArrays(100_000, "0"), "2", "10")));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -365,6 +390,14 @@ class PriceDiscountServiceTest {
     /** {@code depth} empty arrays nested in one another. */
     private static String nestedArrays(int depth) {
         return "[".repeat(depth) + "]".repeat(depth);
+    }
+
+    /**
+     * {@code depth} arrays nested in one another around the JSON value {@code innermost}; the text is also how
+     * {@code toString()} renders the parsed value when {@code innermost} renders as itself, as {@code 0} does.
+     */
+    private static String nestedArrays(int depth, String innermost) {
+        return "[".repeat(depth) + innermost + "]".repeat(depth);
     }
 
     private static byte[] concat(byte[] first, byte[] second) {
