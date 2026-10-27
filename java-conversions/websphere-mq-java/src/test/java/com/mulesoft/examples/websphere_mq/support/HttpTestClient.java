@@ -52,13 +52,16 @@ import javax.net.ssl.TrustManagerFactory;
  *   <li>Redirects are not followed and bodies are not decompressed.</li>
  *   <li>Every call opens and closes its own connection; instances are immutable and safe to share between
  *       threads.</li>
+ *   <li>Connecting times out after {@link #TIMEOUT_MILLIS}. Each read from the connection, the TLS handshake's
+ *       included, times out after the client's read budget: {@link #TIMEOUT_MILLIS} unless {@link #withReadTimeout}
+ *       made a copy with another one, for a server that itself waits about that long before it answers.</li>
  *   <li>HTTPS mode ({@link #https}) trusts only the supplied trust store and performs no hostname verification,
  *       because the carried demo certificates are not issued for {@code localhost}.</li>
  * </ul>
  */
 public final class HttpTestClient {
 
-    /** Connect timeout and socket read timeout, in milliseconds. */
+    /** Connect timeout, and the socket read timeout unless {@link #withReadTimeout} sets another, in milliseconds. */
     public static final int TIMEOUT_MILLIS = 10_000;
 
     private static final byte[] CRLF = {'\r', '\n'};
@@ -70,6 +73,8 @@ public final class HttpTestClient {
     private final int port;
     /** {@code null} in plain HTTP mode. */
     private final SSLSocketFactory sslSocketFactory;
+    /** The socket read timeout of every call, in milliseconds; positive. */
+    private final int readTimeoutMillis;
 
     /**
      * Creates a plain HTTP client for {@code host:port}.
@@ -77,14 +82,15 @@ public final class HttpTestClient {
      * @throws IllegalArgumentException if {@code host} is null or blank, or {@code port} is outside 1..65535
      */
     public HttpTestClient(String host, int port) {
-        this(host, port, null);
+        this(host, port, null, TIMEOUT_MILLIS);
     }
 
-    private HttpTestClient(String host, int port, SSLSocketFactory sslSocketFactory) {
+    private HttpTestClient(String host, int port, SSLSocketFactory sslSocketFactory, int readTimeoutMillis) {
         checkEndpoint(host, port);
         this.host = host;
         this.port = port;
         this.sslSocketFactory = sslSocketFactory;
+        this.readTimeoutMillis = readTimeoutMillis;
     }
 
     /** Plain HTTP client for {@code localhost:port}. */
@@ -141,11 +147,34 @@ public final class HttpTestClient {
             trustManagerFactory.init(trustStore);
             SSLContext context = SSLContext.getInstance("TLS");
             context.init(keyManagers, trustManagerFactory.getTrustManagers(), new SecureRandom());
-            return new HttpTestClient(host, port, context.getSocketFactory());
+            return new HttpTestClient(host, port, context.getSocketFactory(), TIMEOUT_MILLIS);
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException(
                     "Cannot build TLS context from trust store " + trustStorePath + ": " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * A copy of this client for the same endpoint, in the same mode and with the same TLS context, whose every read
+     * from the connection, the TLS handshake's included, times out after {@code readTimeoutMillis} instead of this
+     * client's budget. It is meant for a server that itself waits about {@link #TIMEOUT_MILLIS} or longer before it
+     * answers. Connecting still times out after {@link #TIMEOUT_MILLIS}, and this client is unchanged.
+     *
+     * @param readTimeoutMillis the longest wait for any one read, in milliseconds
+     * @return the copy
+     * @throws IllegalArgumentException if {@code readTimeoutMillis} is not positive
+     */
+    public HttpTestClient withReadTimeout(int readTimeoutMillis) {
+        if (readTimeoutMillis <= 0) {
+            throw new IllegalArgumentException(
+                    "read timeout must be a positive number of milliseconds: " + readTimeoutMillis);
+        }
+        return new HttpTestClient(host, port, sslSocketFactory, readTimeoutMillis);
+    }
+
+    /** The longest wait for any one read from the connection, in milliseconds; {@link #TIMEOUT_MILLIS} by default. */
+    public int readTimeoutMillis() {
+        return readTimeoutMillis;
     }
 
     /**
@@ -439,7 +468,7 @@ public final class HttpTestClient {
     private Response execute(String method, byte[] head, byte[] body) throws IOException {
         try (Socket plain = new Socket()) {
             plain.connect(new InetSocketAddress(host, port), TIMEOUT_MILLIS);
-            plain.setSoTimeout(TIMEOUT_MILLIS);
+            plain.setSoTimeout(readTimeoutMillis);
             if (sslSocketFactory == null) {
                 return exchange(plain, method, head, body);
             }
@@ -447,7 +476,7 @@ public final class HttpTestClient {
             // the test host, and trust is still restricted to the supplied trust store.
             try (SSLSocket tls = (SSLSocket) sslSocketFactory.createSocket(plain, host, port, true)) {
                 tls.setUseClientMode(true);
-                tls.setSoTimeout(TIMEOUT_MILLIS);
+                tls.setSoTimeout(readTimeoutMillis);
                 tls.startHandshake();
                 return exchange(tls, method, head, body);
             }

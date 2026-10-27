@@ -41,6 +41,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
@@ -71,9 +72,13 @@ import javax.xml.parsers.ParserConfigurationException;
 
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.JsonNodeType;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.MappingBuilder;
@@ -104,6 +109,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.beans.factory.support.BeanDefinitionRegistry;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationContextInitializer;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -202,6 +209,14 @@ class FixtureParityTest {
     private static final Pattern GREENMAIL_PORT =
             Pattern.compile("greenmail\\.(smtp|smtps|imap|imaps|pop3|pop3s)\\.port");
     private static final Pattern DIGIT_RUN = Pattern.compile("[0-9]+");
+    /**
+     * A canonical UUID inside a file name: hexadecimal digits of either case in groups of 8, 4, 4, 4 and 12 joined
+     * by hyphens, with no letter or digit run together with it on either side.
+     */
+    private static final Pattern CANONICAL_UUID = Pattern.compile(
+            "(?<![\\p{L}\\p{Nd}])[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}(?![\\p{L}\\p{Nd}])");
+    /** What each {@link #CANONICAL_UUID} of a file name becomes in its {@link #fileNameShape shape}. */
+    static final String UUID_TOKEN = "<uuid>";
     private static final Pattern BOUNDARY_PARAMETER =
             Pattern.compile(";\\s*boundary\\s*=\\s*(\"[^\"]*\"|[^;]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern FOLDED_LINE = Pattern.compile("\\r?\\n[ \\t]+");
@@ -2071,6 +2086,10 @@ class FixtureParityTest {
         private final JsonNode state;
         private final JsonNode response;
         private final long awaitMillis;
+        /** {@code state.clearCaches}: the application's caches are emptied before the prior requests and the input. */
+        private final boolean clearCaches;
+        /** {@code state.requests}, the prior requests sent before the input; their replies are discarded. */
+        private final List<JsonNode> priorRequests;
         private final List<DeliveredMail> deliveredMails = new ArrayList<>();
         /** {@code response.destinations}, the destinations the capture subscribed to or browsed, in capture order. */
         private List<BrokerDestination> inventory = List.of();
@@ -2106,13 +2125,96 @@ class FixtureParityTest {
             } else {
                 throw new IllegalStateException(at("request.awaitMillis must be a positive whole number"));
             }
+            readTimeoutMillis(request, at("request"));
+            this.clearCaches = clearsCaches(state, at("state.clearCaches"));
+            this.priorRequests = priorRequests(state, at("state.requests"));
         }
 
         /**
-         * Replays the scenario. It starts from a fresh reset, so nothing an earlier scenario, the context start or the
-         * application left behind is visible, and installs the upstream stubs before any input is exposed. With
-         * scheduling suppressed, the trigger runs only when the driver sends the input or calls the single-run
-         * method the fixture names.
+         * The {@code readTimeoutMillis} of a request-shaped object: ST-1's socket read budget for that request in
+         * milliseconds, or {@code null} when it is absent or null, so ST-1 keeps its own default.
+         *
+         * @param what the object's location in the fixture, for the message of an invalid value
+         */
+        static Integer readTimeoutMillis(JsonNode spec, String what) {
+            JsonNode budget = spec.path("readTimeoutMillis");
+            if (budget.isMissingNode() || budget.isNull()) {
+                return null;
+            }
+            if (budget.isIntegralNumber() && budget.canConvertToInt() && budget.intValue() > 0) {
+                return budget.intValue();
+            }
+            throw new IllegalStateException(what + ".readTimeoutMillis must be a positive whole number");
+        }
+
+        /** {@code state.clearCaches}: {@code false} when absent or null, otherwise a JSON boolean. */
+        static boolean clearsCaches(JsonNode state, String what) {
+            JsonNode clear = state.path("clearCaches");
+            if (clear.isMissingNode() || clear.isNull()) {
+                return false;
+            }
+            if (!clear.isBoolean()) {
+                throw new IllegalStateException(what + " must be true or false");
+            }
+            return clear.booleanValue();
+        }
+
+        /**
+         * {@code state.requests}, in order, each checked to have the shape of an {@code http} {@code request}:
+         * {@code method} and {@code path} strings, and, when present, a {@code query} string, {@code headers},
+         * {@code body} or {@code bodyBase64}, a {@code portProperty} string, a {@code tls} object with its
+         * {@code trustStore} and a {@code readTimeoutMillis}; empty when absent or null.
+         */
+        static List<JsonNode> priorRequests(JsonNode state, String what) {
+            List<JsonNode> requests = elements(state.get("requests"), what);
+            for (int i = 0; i < requests.size(); i++) {
+                String where = what + "[" + i + "]";
+                JsonNode prior = object(requests.get(i), where);
+                text(prior, "method", where + ".method");
+                text(prior, "path", where + ".path");
+                if (prior.hasNonNull("query")) {
+                    text(prior, "query", where + ".query");
+                }
+                headerPairs(prior.get("headers"), where + ".headers");
+                bodyBytes(prior, where);
+                if (prior.hasNonNull("portProperty")) {
+                    text(prior, "portProperty", where + ".portProperty");
+                }
+                if (prior.hasNonNull("tls")) {
+                    text(object(prior.get("tls"), where + ".tls"), "trustStore", where + ".tls.trustStore");
+                }
+                readTimeoutMillis(prior, where);
+            }
+            return List.copyOf(requests);
+        }
+
+        /**
+         * Empties every cache of every {@link CacheManager} bean of {@code context}, each at once, as the restart the
+         * capture made before a scenario left the original's in-memory stores empty.
+         *
+         * @return the number of cache managers found, {@code 0} when the context has none
+         */
+        static int clearCaches(ApplicationContext context) {
+            Collection<CacheManager> managers = context.getBeansOfType(CacheManager.class).values();
+            for (CacheManager manager : managers) {
+                for (String cacheName : manager.getCacheNames()) {
+                    Cache cache = manager.getCache(cacheName);
+                    if (cache != null) {
+                        cache.invalidate();
+                    }
+                }
+            }
+            return managers.size();
+        }
+
+        /**
+         * Replays the scenario. It starts from a fresh reset, so nothing an earlier scenario or the context start left
+         * in the shared servers and stores is visible, and installs the upstream stubs before any input is exposed.
+         * The application's own in-memory state carries over from the scenarios before it, in table order; only
+         * {@code state.clearCaches} empties the application's caches, once the state is seeded, as the capture's
+         * restart emptied the original's. The prior requests of {@code state.requests} are sent next, their replies
+         * discarded, and the input last. With scheduling suppressed, the trigger runs only when the driver sends the
+         * input or calls the single-run method the fixture names.
          */
         void execute() throws Exception {
             requireInvocation();
@@ -2122,6 +2224,10 @@ class FixtureParityTest {
             prepareMessages();
             registerUpstream();
             seedState();
+            if (clearCaches) {
+                clearCaches(context);
+            }
+            sendPriorRequests();
             try {
                 switch (row.trigger()) {
                     case "http", "soap" -> replayHttp();
@@ -2153,7 +2259,11 @@ class FixtureParityTest {
             }
         }
 
-        /** Returns every shared server and store to the state a scenario starts from; runs before and after each. */
+        /**
+         * Returns every shared server and store to the state a scenario starts from; runs before and after each. It
+         * clears no application cache and no other in-memory state of the application, so scenarios that build on one
+         * another in table order keep doing so; only a fixture's {@code state.clearCaches} empties the caches.
+         */
         void reset() throws Exception {
             List<Exception> failures = new ArrayList<>();
             attempt(failures, () -> {
@@ -2229,6 +2339,14 @@ class FixtureParityTest {
             }
             if (state.path("amqp").has("responders")) {
                 requireBean(requireClass(RABBIT_TEMPLATE_CLASS), RABBIT_TEMPLATE_CLASS);
+            }
+            if (clearCaches && context.getBeanNamesForType(CacheManager.class).length == 0) {
+                // Without a cache manager the replay cannot empty the caches the capture's restart emptied, so the
+                // cold start the fixture records cannot be re-created and its comparison would prove nothing.
+                missingDriver("a " + CacheManager.class.getName() + " bean, whose caches state.clearCaches empties");
+            }
+            if (!priorRequests.isEmpty()) {
+                requireClass(CLIENT_CLASS);
             }
         }
 
@@ -2611,36 +2729,82 @@ class FixtureParityTest {
 
         // ----- triggers --------------------------------------------------------------------------------------
 
+        /** A reply ST-1 read, with the response type its {@code send} declares and the replay port it was sent to. */
+        private record HttpExchange(Class<?> responseType, Object reply, int port) {
+        }
+
         private void replayHttp() throws Exception {
+            HttpExchange exchange = sendHttp(request, at("request"));
+            compareHttpResponse(exchange.responseType(), exchange.reply(), exchange.port());
+        }
+
+        /**
+         * Sends the prior requests of {@code state.requests} in order, as the capture sent them before the scenario's
+         * own; their replies are discarded, as the capture discarded them, so any status is accepted. A request that
+         * cannot be sent, or whose reply cannot be read, fails the scenario, whose starting state was not reached.
+         * Their log events are then dropped, since {@code response.logs} holds the events from the input on.
+         */
+        private void sendPriorRequests() throws Exception {
+            for (int i = 0; i < priorRequests.size(); i++) {
+                String what = at("state.requests[" + i + "]");
+                try {
+                    sendHttp(priorRequests.get(i), what);
+                } catch (UncheckedIOException e) {
+                    throw new IllegalStateException(what + " failed, so the scenario's starting state was not"
+                            + " reached: " + e.getMessage(), e);
+                }
+            }
+            if (!priorRequests.isEmpty()) {
+                clearAppender();
+            }
+        }
+
+        /**
+         * Sends one request-shaped object, the scenario's {@code request} or a prior request, through ST-1 to the
+         * listener its {@code portProperty} names, in TLS mode when it carries {@code tls} and with its
+         * {@code readTimeoutMillis} as the socket read budget when it carries one, and returns the complete reply.
+         * A project without ST-1, without the listener port or, for a read budget, without
+         * {@code HttpTestClient.withReadTimeout} reports the scenario {@code UNVERIFIED-missing-driver}.
+         *
+         * @param what the object's location in the fixture, such as {@code <scenario>: request}
+         */
+        private HttpExchange sendHttp(JsonNode spec, String what) throws Exception {
             Class<?> clientClass = requireClass(CLIENT_CLASS);
-            String portProperty = request.hasNonNull("portProperty")
-                    ? text(request, "portProperty", at("request.portProperty")) : DEFAULT_PORT_PROPERTY;
+            String portProperty = spec.hasNonNull("portProperty")
+                    ? text(spec, "portProperty", what + ".portProperty") : DEFAULT_PORT_PROPERTY;
             Integer port = context.getEnvironment().getProperty(portProperty, Integer.class);
             if (port == null) {
-                missingDriver("the listener port property " + portProperty);
-                return;
+                return missingDriver("the listener port property " + portProperty);
             }
-            Object client = request.hasNonNull("tls")
-                    ? httpsClient(clientClass, port, object(request.get("tls"), at("request.tls")))
+            Object client = spec.hasNonNull("tls")
+                    ? httpsClient(clientClass, port, object(spec.get("tls"), what + ".tls"), what + ".tls")
                     : Reflect.callStatic(clientClass, "localhost", port);
-            String method = text(request, "method", at("request.method"));
-            String path = text(request, "path", at("request.path"));
-            String query = request.hasNonNull("query") ? text(request, "query", at("request.query")) : "";
+            Integer readTimeout = readTimeoutMillis(spec, what);
+            if (readTimeout != null) {
+                if (!Reflect.hasMethod(clientClass, "withReadTimeout", 1)) {
+                    return missingDriver("ST-1 " + CLIENT_CLASS + ".withReadTimeout(int) for "
+                            + what + ".readTimeoutMillis");
+                }
+                client = Reflect.call(client, "withReadTimeout", readTimeout);
+            }
+            String method = text(spec, "method", what + ".method");
+            String path = text(spec, "path", what + ".path");
+            String query = spec.hasNonNull("query") ? text(spec, "query", what + ".query") : "";
             String target = query.isEmpty() ? path : path + "?" + query;
             List<Map.Entry<String, String>> headers = new ArrayList<>();
             boolean framed = false;
-            for (Map.Entry<String, String> header : headerPairs(request.get("headers"), at("request.headers"))) {
+            for (Map.Entry<String, String> header : headerPairs(spec.get("headers"), what + ".headers")) {
                 String headerName = lower(header.getKey());
                 framed |= headerName.equals("content-length") || headerName.equals("transfer-encoding");
                 if (!TRANSPORT_HEADERS.contains(headerName)) {
                     headers.add(header);
                 }
             }
-            byte[] body = bodyBytes(request, at("request"));
+            byte[] body = bodyBytes(spec, what);
             // An empty body goes out without Content-Length unless the captured request framed one, as curl did.
             Method send = Reflect.method(clientClass, "send", 4);
             Object reply = send(clientClass, client, method, target, headers, body.length == 0 && !framed ? null : body);
-            compareHttpResponse(send.getReturnType(), reply, port);
+            return new HttpExchange(send.getReturnType(), reply, port);
         }
 
         /** Sends the recorded header lines as recorded through ST-1; a client without header pairs gets them joined. */
@@ -2660,16 +2824,16 @@ class FixtureParityTest {
             return Reflect.call(client, "send", method, target, joined, body);
         }
 
-        private Object httpsClient(Class<?> clientClass, int port, JsonNode tls) throws Exception {
-            String trustStore = text(tls, "trustStore", at("request.tls.trustStore"));
-            String type = tls.hasNonNull("type") ? text(tls, "type", at("request.tls.type")) : "JKS";
-            String password = tls.hasNonNull("password") ? text(tls, "password", at("request.tls.password")) : null;
-            return Reflect.callStatic(clientClass, "https", "localhost", port, trustStorePath(trustStore), type,
+        private Object httpsClient(Class<?> clientClass, int port, JsonNode tls, String what) throws Exception {
+            String trustStore = text(tls, "trustStore", what + ".trustStore");
+            String type = tls.hasNonNull("type") ? text(tls, "type", what + ".type") : "JKS";
+            String password = tls.hasNonNull("password") ? text(tls, "password", what + ".password") : null;
+            return Reflect.callStatic(clientClass, "https", "localhost", port, trustStorePath(trustStore, what), type,
                     password);
         }
 
         /** The trust store resolved from the classpath first, then as a file, in the form ST-1 opens. */
-        private String trustStorePath(String trustStore) throws URISyntaxException {
+        private String trustStorePath(String trustStore, String what) throws URISyntaxException {
             URL resource = Reflect.loader().getResource(stripLeadingSlash(trustStore));
             if (resource != null) {
                 // ST-1 tries a file before the classpath, so a classpath store is handed over as its file path,
@@ -2681,8 +2845,8 @@ class FixtureParityTest {
             if (Files.isRegularFile(file)) {
                 return file.toAbsolutePath().toString();
             }
-            throw new IllegalStateException(at("request.tls.trustStore " + trustStore
-                    + " is neither on the test classpath nor a file"));
+            throw new IllegalStateException(what + ".trustStore " + trustStore
+                    + " is neither on the test classpath nor a file");
         }
 
         private void compareHttpResponse(Class<?> responseType, Object reply, int replayPort) throws Exception {
@@ -3554,7 +3718,7 @@ class FixtureParityTest {
                 awaitMatch("mailboxes", this::checkMailboxes);
             }
             if (response.has("logs")) {
-                awaitMatch("logs", this::checkLogs);
+                verifyLogs();
             }
             // Last, so the effects above have shown the flow finished before a destination is judged empty.
             if (response.has("destinations")) {
@@ -3613,34 +3777,12 @@ class FixtureParityTest {
             }
         }
 
-        /** Same-named files pair up; the rest pair in sorted order and must agree with digit runs read as {@code #}. */
+        /** Pairs the files by name as {@link #pairFileNames} does and compares each pair's content by structure. */
         private void compareFileStructure(String label, Map<String, byte[]> expected, Map<String, byte[]> actual) {
-            if (expected.size() != actual.size()) {
-                throw new AssertionError(name + ": " + label + " holds " + actual.keySet() + " but the original left "
-                        + expected.keySet());
-            }
-            List<String> unpairedExpected = new ArrayList<>();
-            for (Map.Entry<String, byte[]> file : expected.entrySet()) {
-                if (actual.containsKey(file.getKey())) {
-                    compareContent(label + "/" + file.getKey(), file.getValue(), actual.get(file.getKey()), null);
-                } else {
-                    unpairedExpected.add(file.getKey());
-                }
-            }
-            List<String> unpairedActual = new ArrayList<>();
-            for (String fileName : actual.keySet()) {
-                if (!expected.containsKey(fileName)) {
-                    unpairedActual.add(fileName);
-                }
-            }
-            for (int i = 0; i < unpairedExpected.size(); i++) {
-                String expectedName = unpairedExpected.get(i);
-                String actualName = unpairedActual.get(i);
-                if (!maskDigits(expectedName).equals(maskDigits(actualName))) {
-                    throw new AssertionError(name + ": " + label + " holds " + actualName + " where the original left "
-                            + expectedName + " (names compared with digit runs as #)");
-                }
-                compareContent(label + "/" + actualName, expected.get(expectedName), actual.get(actualName), null);
+            Map<String, String> pairs = pairFileNames(name + ": " + label, expected.keySet(), actual.keySet());
+            for (Map.Entry<String, String> pair : pairs.entrySet()) {
+                compareContent(label + "/" + pair.getValue(), expected.get(pair.getKey()), actual.get(pair.getValue()),
+                        null);
             }
         }
 
@@ -3851,40 +3993,136 @@ class FixtureParityTest {
             }
         }
 
-        private void checkLogs() {
-            List<JsonNode> expected = elements(response.get("logs"), at("response.logs"));
-            List<ILoggingEvent> events = loggedEvents();
-            int next = 0;
-            for (ILoggingEvent event : events) {
-                if (next < expected.size() && logMatches(expected.get(next), next, event)) {
-                    next++;
-                }
+        /**
+         * Compares the log stream with {@code response.logs} ({@link #logStreamDifference}). It polls until the
+         * stream matches or {@code awaitMillis} ends, so a stream still short of its entries keeps growing, then
+         * compares once more after {@link #NO_FURTHER_MESSAGE_MILLIS}, so a further event of those loggers that
+         * arrives late fails. {@code "logs": []} names no logger, so it constrains nothing and nothing is awaited.
+         */
+        private void verifyLogs() throws Exception {
+            List<LogEntry> expected = logEntries(response.get("logs"), at("response.logs"));
+            if (expected.isEmpty()) {
+                return;
             }
-            if (next < expected.size()) {
-                throw new AssertionError(name + ": the log does not hold, in order, entry " + (next + 1) + " of "
-                        + expected.size() + " " + expected.get(next) + "\n  logged: " + describeEvents(events));
+            Action check = () -> {
+                String difference = logStreamDifference(expected, loggedEvents(), row.deterministic());
+                if (difference != null) {
+                    throw new AssertionError(name + ": " + difference);
+                }
+            };
+            awaitMatch("logs", check);
+            Thread.sleep(NO_FURTHER_MESSAGE_MILLIS);
+            check.run();
+        }
+
+        /** A {@code response.logs} entry: logger category, level and message text, {@code ""} when absent. */
+        record LogEntry(String logger, String level, String message) {
+
+            @Override
+            public String toString() {
+                return level + " " + logger + " - " + message;
             }
         }
 
-        private boolean logMatches(JsonNode entry, int index, ILoggingEvent event) {
-            String what = at("response.logs[" + index + "]");
-            String message = entry.hasNonNull("message") ? text(entry, "message", what + ".message") : "";
+        /**
+         * The entries of {@code response.logs} in order: {@code logger} and {@code level} are required strings and
+         * {@code message} is a string read as {@code ""} when absent or null. A malformed entry fails the fixture.
+         */
+        static List<LogEntry> logEntries(JsonNode logs, String what) {
+            List<LogEntry> entries = new ArrayList<>();
+            List<JsonNode> elements = elements(logs, what);
+            for (int i = 0; i < elements.size(); i++) {
+                String entryWhat = what + "[" + i + "]";
+                JsonNode entry = object(elements.get(i), entryWhat);
+                String message = entry.hasNonNull("message") ? text(entry, "message", entryWhat + ".message") : "";
+                entries.add(new LogEntry(text(entry, "logger", entryWhat + ".logger"),
+                        text(entry, "level", entryWhat + ".level"), message));
+            }
+            return entries;
+        }
+
+        /**
+         * The stream {@code expected} is compared with: every event of {@code logged}, in logged order, whose logger
+         * is one an entry of {@code expected} names. Events of every other logger, the framework's included, are
+         * left out, so no entry has to account for them.
+         */
+        static List<ILoggingEvent> logStream(List<LogEntry> expected, List<ILoggingEvent> logged) {
+            Set<String> loggers = loggerNames(expected);
+            List<ILoggingEvent> stream = new ArrayList<>();
+            for (ILoggingEvent event : logged) {
+                if (loggers.contains(event.getLoggerName())) {
+                    stream.add(event);
+                }
+            }
+            return stream;
+        }
+
+        /** The loggers the entries name, in the order of their first entry. */
+        private static Set<String> loggerNames(List<LogEntry> entries) {
+            Set<String> loggers = new LinkedHashSet<>();
+            entries.forEach(entry -> loggers.add(entry.logger()));
+            return loggers;
+        }
+
+        /**
+         * Compares the stream of the loggers {@code expected} names ({@link #logStream}) with {@code expected}, entry
+         * for entry: the stream must hold exactly as many events, each with its entry's logger and level and, in a
+         * {@code deterministic} scenario, exactly its message, in a {@code nondeterministic} one only whether the
+         * message is empty. An extra, missing or reordered event is a difference, so a stream holding one rollback
+         * delivery more or fewer than the capture differs. With no entries no logger is named, so the stream is
+         * empty and matches.
+         *
+         * @return {@code null} when the stream matches; otherwise its first difference, then both streams
+         */
+        static String logStreamDifference(List<LogEntry> expected, List<ILoggingEvent> logged, boolean deterministic) {
+            List<ILoggingEvent> stream = logStream(expected, logged);
+            String difference = null;
+            for (int i = 0; i < stream.size() && difference == null; i++) {
+                if (i == expected.size()) {
+                    difference = "holds a further event after the " + expected.size() + " the original logged: "
+                            + describeEvent(stream.get(i));
+                } else if (!logMatches(expected.get(i), stream.get(i), deterministic)) {
+                    difference = "differs at event " + (i + 1) + ": expected " + expected.get(i) + ", logged "
+                            + describeEvent(stream.get(i));
+                }
+            }
+            if (difference == null && stream.size() < expected.size()) {
+                difference = "holds " + stream.size() + " of the " + expected.size() + " events the original"
+                        + " logged; the next is " + expected.get(stream.size());
+            }
+            return difference == null ? null : "the log stream of " + loggerNames(expected) + " " + difference
+                    + "\n  expected: " + describeEntries(expected) + "\n  logged:   " + describeEvents(stream);
+        }
+
+        private static boolean logMatches(LogEntry entry, ILoggingEvent event, boolean deterministic) {
             String formatted = event.getFormattedMessage() == null ? "" : event.getFormattedMessage();
-            boolean messageMatches = row.deterministic() ? message.equals(formatted)
-                    : message.isEmpty() == formatted.isEmpty();
+            boolean messageMatches = deterministic ? entry.message().equals(formatted)
+                    : entry.message().isEmpty() == formatted.isEmpty();
             return messageMatches
-                    && text(entry, "logger", what + ".logger").equals(event.getLoggerName())
-                    && text(entry, "level", what + ".level").equals(String.valueOf(event.getLevel()));
+                    && entry.logger().equals(event.getLoggerName())
+                    && entry.level().equals(String.valueOf(event.getLevel()));
+        }
+
+        private static String describeEntries(List<LogEntry> entries) {
+            StringBuilder described = new StringBuilder();
+            int first = Math.max(0, entries.size() - 50);
+            for (LogEntry entry : entries.subList(first, entries.size())) {
+                described.append("\n    ").append(entry);
+            }
+            return entries.isEmpty() ? "(nothing)" : described.toString();
         }
 
         private static String describeEvents(List<ILoggingEvent> events) {
             StringBuilder described = new StringBuilder();
             int first = Math.max(0, events.size() - 50);
             for (ILoggingEvent event : events.subList(first, events.size())) {
-                described.append("\n    ").append(event.getLevel()).append(' ').append(event.getLoggerName())
-                        .append(" - ").append(event.getFormattedMessage());
+                described.append("\n    ").append(describeEvent(event));
             }
             return events.isEmpty() ? "(nothing)" : described.toString();
+        }
+
+        private static String describeEvent(ILoggingEvent event) {
+            return event.getLevel() + " " + event.getLoggerName() + " - " + event.getFormattedMessage();
         }
 
         private void compareContent(String what, byte[] expected, byte[] actual, String contentType) {
@@ -4025,11 +4263,11 @@ class FixtureParityTest {
         static String structureDifference(byte[] expected, byte[] actual, String contentType) {
             Format format = detect(contentType, expected);
             if (format == Format.JSON) {
-                JsonNode expectedTree = parseJson(expected);
-                if (expectedTree != null) {
-                    JsonNode actualTree = parseJson(actual);
-                    return actualTree == null ? "the actual content is not JSON"
-                            : jsonDifference(expectedTree, actualTree, "$");
+                JsonShape expectedShape = parseJson(expected);
+                if (expectedShape != null) {
+                    JsonShape actualShape = parseJson(actual);
+                    return actualShape == null ? "the actual content is not JSON"
+                            : jsonDifference(expectedShape, actualShape, "$");
                 }
             } else if (format == Format.XML) {
                 Element expectedRoot = parseXml(expected);
@@ -4067,41 +4305,52 @@ class FixtureParityTest {
             return text.startsWith("<") ? Format.XML : Format.TEXT;
         }
 
-        private static JsonNode parseJson(byte[] content) {
+        /**
+         * The structure of the one JSON value {@code content} holds, or {@code null} when it holds none: empty,
+         * malformed, or followed by trailing tokens. It is read from the token stream rather than bound into a
+         * tree, whose objects keep only the last value of a repeated member name; DataWeave's XML-to-JSON writes
+         * repeated elements as repeated keys, so every occurrence is kept, in order.
+         */
+        private static JsonShape parseJson(byte[] content) {
             if (content.length == 0) {
                 return null;
             }
-            try {
-                JsonNode tree = JSON.readTree(content);
-                return tree == null || tree.isMissingNode() ? null : tree;
+            try (JsonParser parser = JSON.createParser(content)) {
+                JsonToken first = parser.nextToken();
+                if (first == null) {
+                    return null;
+                }
+                JsonShape shape = JsonShape.read(parser, first);
+                return parser.nextToken() == null ? shape : null;
             } catch (IOException notJson) {
                 return null;
             }
         }
 
-        /** Key names in order, value kinds and array lengths, recursively. */
-        private static String jsonDifference(JsonNode expected, JsonNode actual, String path) {
-            if (expected.getNodeType() != actual.getNodeType()) {
-                return path + ": expected " + expected.getNodeType() + " but was " + actual.getNodeType();
+        /** Member names in order with repeated names kept, value kinds and array lengths, recursively. */
+        private static String jsonDifference(JsonShape expected, JsonShape actual, String path) {
+            if (expected.kind() != actual.kind()) {
+                return path + ": expected " + expected.kind() + " but was " + actual.kind();
             }
-            if (expected.isObject()) {
-                List<String> expectedKeys = fieldNames(expected);
-                List<String> actualKeys = fieldNames(actual);
-                if (!expectedKeys.equals(actualKeys)) {
-                    return path + ": expected keys " + expectedKeys + " but was " + actualKeys;
+            if (expected.kind() == JsonNodeType.OBJECT) {
+                if (!expected.names().equals(actual.names())) {
+                    return path + ": expected keys " + expected.names() + " but was " + actual.names();
                 }
-                for (String key : expectedKeys) {
-                    String difference = jsonDifference(expected.get(key), actual.get(key), path + "." + key);
+                for (int i = 0; i < expected.names().size(); i++) {
+                    String difference = jsonDifference(expected.children().get(i), actual.children().get(i),
+                            path + "." + expected.names().get(i));
                     if (difference != null) {
                         return difference;
                     }
                 }
-            } else if (expected.isArray()) {
-                if (expected.size() != actual.size()) {
-                    return path + ": expected " + expected.size() + " elements but was " + actual.size();
+            } else if (expected.kind() == JsonNodeType.ARRAY) {
+                if (expected.children().size() != actual.children().size()) {
+                    return path + ": expected " + expected.children().size() + " elements but was "
+                            + actual.children().size();
                 }
-                for (int i = 0; i < expected.size(); i++) {
-                    String difference = jsonDifference(expected.get(i), actual.get(i), path + "[" + i + "]");
+                for (int i = 0; i < expected.children().size(); i++) {
+                    String difference = jsonDifference(expected.children().get(i), actual.children().get(i),
+                            path + "[" + i + "]");
                     if (difference != null) {
                         return difference;
                     }
@@ -4110,10 +4359,56 @@ class FixtureParityTest {
             return null;
         }
 
-        private static List<String> fieldNames(JsonNode node) {
-            List<String> names = new ArrayList<>();
-            node.fieldNames().forEachRemaining(names::add);
-            return names;
+        /**
+         * One JSON value reduced to its structure: its kind; for an object, its member names in document order,
+         * every occurrence of a repeated name kept, with the member values in the same order; for an array, its
+         * elements. Scalars keep their kind only.
+         */
+        private record JsonShape(JsonNodeType kind, List<String> names, List<JsonShape> children) {
+
+            /** Reads the value {@code token} starts, leaving the parser on the value's last token. */
+            static JsonShape read(JsonParser parser, JsonToken token) throws IOException {
+                return switch (token) {
+                    case START_OBJECT -> {
+                        List<String> names = new ArrayList<>();
+                        List<JsonShape> values = new ArrayList<>();
+                        for (JsonToken member = next(parser); member != JsonToken.END_OBJECT; member = next(parser)) {
+                            names.add(parser.currentName());
+                            values.add(read(parser, next(parser)));
+                        }
+                        yield new JsonShape(JsonNodeType.OBJECT, names, values);
+                    }
+                    case START_ARRAY -> {
+                        List<JsonShape> elements = new ArrayList<>();
+                        for (JsonToken element = next(parser); element != JsonToken.END_ARRAY; element = next(parser)) {
+                            elements.add(read(parser, element));
+                        }
+                        yield new JsonShape(JsonNodeType.ARRAY, List.of(), elements);
+                    }
+                    case VALUE_STRING -> {
+                        // Decoded in full, as tree binding does, so the parser's string-length limit still applies.
+                        parser.getText();
+                        yield scalar(JsonNodeType.STRING);
+                    }
+                    case VALUE_NUMBER_INT, VALUE_NUMBER_FLOAT -> scalar(JsonNodeType.NUMBER);
+                    case VALUE_TRUE, VALUE_FALSE -> scalar(JsonNodeType.BOOLEAN);
+                    case VALUE_NULL -> scalar(JsonNodeType.NULL);
+                    default -> throw new JsonParseException(parser, "Expected a JSON value but found " + token);
+                };
+            }
+
+            private static JsonShape scalar(JsonNodeType kind) {
+                return new JsonShape(kind, List.of(), List.of());
+            }
+
+            /** The next token; the end of content inside a value is a parse error, never a structure. */
+            private static JsonToken next(JsonParser parser) throws IOException {
+                JsonToken token = parser.nextToken();
+                if (token == null) {
+                    throw new JsonParseException(parser, "Unexpected end of content inside a JSON value");
+                }
+                return token;
+            }
         }
 
         private static synchronized Element parseXml(byte[] content) {
@@ -4663,6 +4958,76 @@ class FixtureParityTest {
             return true;
         }
         return expected.equals(actual);
+    }
+
+    /**
+     * Pairs the files a {@code nondeterministic} scenario produced with the files the original left, by name.
+     * Same-named files pair first. Every other name pairs by its {@link #fileNameShape shape}: both sides must hold
+     * each shape the same number of times, and the names of one shape pair in sorted order.
+     *
+     * @param what     the scenario and directory a mismatch names
+     * @param expected the names of the files the original left
+     * @param actual   the names of the files the replay produced
+     * @return each expected name with the actual name it pairs with, the same-named pairs first
+     * @throws AssertionError when the names not paired by name differ in their shapes or in how many names of a
+     *                        shape each side holds, naming both sides' files and the shapes of those names
+     */
+    static Map<String, String> pairFileNames(String what, Set<String> expected, Set<String> actual) {
+        Map<String, String> pairs = new LinkedHashMap<>();
+        Map<String, List<String>> expectedByShape = new TreeMap<>();
+        for (String fileName : new TreeSet<>(expected)) {
+            if (actual.contains(fileName)) {
+                pairs.put(fileName, fileName);
+            } else {
+                expectedByShape.computeIfAbsent(fileNameShape(fileName), shape -> new ArrayList<>()).add(fileName);
+            }
+        }
+        Map<String, List<String>> actualByShape = new TreeMap<>();
+        for (String fileName : new TreeSet<>(actual)) {
+            if (!expected.contains(fileName)) {
+                actualByShape.computeIfAbsent(fileNameShape(fileName), shape -> new ArrayList<>()).add(fileName);
+            }
+        }
+        boolean sameShapes = expectedByShape.keySet().equals(actualByShape.keySet());
+        for (Map.Entry<String, List<String>> shape : expectedByShape.entrySet()) {
+            List<String> actualNames = actualByShape.get(shape.getKey());
+            sameShapes = sameShapes && actualNames.size() == shape.getValue().size();
+        }
+        if (!sameShapes) {
+            throw new AssertionError(what + " holds " + new TreeSet<>(actual) + " but the original left "
+                    + new TreeSet<>(expected) + " (the names not paired by name, by shape: replay " + actualByShape
+                    + ", original " + expectedByShape + ")");
+        }
+        for (Map.Entry<String, List<String>> shape : expectedByShape.entrySet()) {
+            List<String> actualNames = actualByShape.get(shape.getKey());
+            for (int i = 0; i < actualNames.size(); i++) {
+                pairs.put(shape.getValue().get(i), actualNames.get(i));
+            }
+        }
+        return pairs;
+    }
+
+    /**
+     * The shape a file name pairs by in a {@code nondeterministic} scenario: each {@link #CANONICAL_UUID canonical
+     * UUID} becomes {@link #UUID_TOKEN}, then each remaining run of digits becomes {@code #}, and every other
+     * character stays as written, so prefixes, fixed segments and suffixes must match exactly. A {@code \},
+     * {@code #} or {@code <} of the name itself is written with a {@code \} before it, so no character of a name
+     * reads as a token.
+     */
+    static String fileNameShape(String fileName) {
+        StringBuilder shape = new StringBuilder();
+        Matcher uuid = CANONICAL_UUID.matcher(fileName);
+        int fixedStart = 0;
+        while (uuid.find()) {
+            shape.append(maskDigits(escapeShapeTokens(fileName.substring(fixedStart, uuid.start()))));
+            shape.append(UUID_TOKEN);
+            fixedStart = uuid.end();
+        }
+        return shape.append(maskDigits(escapeShapeTokens(fileName.substring(fixedStart)))).toString();
+    }
+
+    private static String escapeShapeTokens(String fixedPart) {
+        return fixedPart.replace("\\", "\\\\").replace("#", "\\#").replace("<", "\\<");
     }
 
     private static String maskDigits(String fileName) {

@@ -105,8 +105,12 @@ Hello World
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 | `FixtureParityBoundaryTest` | the replay's isolation: scheduled triggers suppressed, configured targets outside the replay refused before the context starts, table and collection state only in replay-owned stores, credentials masked in diagnostics |
 | `FixtureParityDirectoryTest` | the replay's directory containment: every seeded or named directory resolves inside the replay's temporary root |
+| `FixtureParityHttpReplayTest` | the replay's HTTP side: ST-1's read budget (`withReadTimeout`) against a delayed loopback server, the default `TIMEOUT_MILLIS` kept, and the validation of `request.readTimeoutMillis`, `state.clearCaches` and `state.requests`, with every cache of every `CacheManager` emptied |
+| `FixtureParityLogStreamTest` | the exact log stream: the events of the loggers `response.logs` names must match its entries one for one, so an extra, missing, reordered or late rollback event fails while other loggers' events are ignored |
+| `FixtureParityFileStructureTest` | nondeterministic file pairing by name shape: different valid UUIDs pair, while a changed prefix, suffix or fixed segment, a malformed UUID or a different file count fails |
+| `FixtureParityJsonStructureTest` | nondeterministic JSON structure: member names in order with every repeated name kept, value kinds and array lengths, so a removed or reordered duplicate member differs |
 
-`support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes, with an HTTPS mode for TLS listeners.
+`support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes, with an HTTPS mode for TLS listeners and a per-client read budget (`withReadTimeout`, default `TIMEOUT_MILLIS`).
 
 ## Fixture parity (ST-2 reference implementation)
 
