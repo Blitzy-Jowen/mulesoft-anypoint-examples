@@ -80,7 +80,8 @@ class AmqpConfigTest {
     }
 
     @Test
-    @DisplayName("defaults keep the original destination, a 10000 ms reply timeout and temporary reply queues")
+    @DisplayName("defaults keep the original destination, a 10000 ms reply timeout and temporary reply queues,"
+            + " on the correlating template")
     void defaultsKeepTheOriginalEndpointSettings() {
         contextRunner.run(context -> {
             assertThat(context).hasNotFailed();
@@ -88,6 +89,7 @@ class AmqpConfigTest {
                     .isEqualTo(new SalesDestination("sales_exchange", "sales_queue", "", 10000L));
 
             RabbitTemplate template = context.getBean(RabbitTemplate.class);
+            assertThat(template).isExactlyInstanceOf(CorrelatedReplyRabbitTemplate.class);
             assertThat(ReflectionTestUtils.getField(template, "replyTimeout")).isEqualTo(10000L);
             assertThat(ReflectionTestUtils.getField(template, "useTemporaryReplyQueues")).isEqualTo(true);
             assertThat(ReflectionTestUtils.getField(template, "retryTemplate")).isNull();

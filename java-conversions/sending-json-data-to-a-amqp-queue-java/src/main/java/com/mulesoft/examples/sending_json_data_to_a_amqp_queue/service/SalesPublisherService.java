@@ -56,8 +56,9 @@ public class SalesPublisherService {
     private final AmqpConfig.SalesDestination destination;
 
     /**
-     * @param rabbitTemplate Boot's template, configured by {@link AmqpConfig} with temporary reply queues and
-     *                       the endpoint's reply timeout
+     * @param rabbitTemplate the template {@link AmqpConfig} declares, with temporary reply queues, the endpoint's
+     *                       reply timeout and a correlation check that returns only the reply carrying the
+     *                       request's generated correlation id
      * @param destination    the exchange, queue and routing key every publish uses
      */
     public SalesPublisherService(RabbitTemplate rabbitTemplate, AmqpConfig.SalesDestination destination) {

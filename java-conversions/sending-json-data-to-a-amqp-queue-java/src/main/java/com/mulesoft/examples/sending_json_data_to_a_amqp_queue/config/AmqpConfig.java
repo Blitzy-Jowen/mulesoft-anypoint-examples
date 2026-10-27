@@ -10,9 +10,12 @@ package com.mulesoft.examples.sending_json_data_to_a_amqp_queue.config;
 
 import java.util.Objects;
 
+import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.amqp.ConnectionFactoryCustomizer;
+import org.springframework.boot.autoconfigure.amqp.RabbitTemplateConfigurer;
 import org.springframework.boot.autoconfigure.amqp.RabbitTemplateCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -28,6 +31,12 @@ import org.springframework.context.annotation.Configuration;
  * declares no exchange, queue or binding, so Boot's {@code RabbitAdmin} has nothing to declare: the
  * original only used {@code sales_exchange} and {@code sales_queue} passively, and its README has the
  * user create and bind both by hand.
+ *
+ * <p>The {@link RabbitTemplate} is a {@link CorrelatedReplyRabbitTemplate} declared here and configured exactly
+ * as Boot configures its auto-configured one, which backs off. It is declared for security: Spring AMQP's
+ * template returns the first message that reaches a temporary reply queue, so any client able to publish to the
+ * queue named in the request's {@code reply_to} could substitute the answer returned to the HTTP caller. The
+ * subclass gives every request an unpredictable correlation id and returns only the reply that carries it.
  *
  * <p>The connector's {@code validateConnections="true"} is deliberately not reproduced: the connection
  * opens lazily on the first publish so the application starts without a broker, a difference the
@@ -90,23 +99,51 @@ public class AmqpConfig {
     }
 
     /**
-     * Request-reply settings for Boot's {@link RabbitTemplate}. Boot applies template customizers after
-     * its own {@code spring.rabbitmq.template.*} configuration, so these two settings are authoritative;
-     * the exchange and routing key are left unset because the service passes both on every call.
+     * The application's template: a {@link CorrelatedReplyRabbitTemplate}, built the way Boot's
+     * {@code RabbitAutoConfiguration} builds its own {@link RabbitTemplate}, whose bean backs off because
+     * it is conditional on no {@code RabbitOperations} bean being present. Boot's configurer first applies
+     * {@code spring.rabbitmq.template.*}, the message converter and any retry settings, then every
+     * {@link RabbitTemplateCustomizer} runs in order, {@link #salesReplyTemplateCustomizer()} included.
+     * Creating the template opens no connection, so the application still starts without a broker.
+     *
+     * <p>Boot's template is replaced for security, not configuration: on a temporary reply queue it returns
+     * the first message that arrives, whoever published it, while this subclass sets a random correlation
+     * id on each request and returns only the reply that carries the same id. Any other message on the
+     * reply queue is discarded with a WARN line, and the wait goes on until the reply timeout.
+     *
+     * @param configurer        Boot's configurer of {@code spring.rabbitmq.template.*}
+     * @param connectionFactory Boot's auto-configured connection factory
+     * @param customizers       the template customizers, applied in order after the configurer
+     * @return the template every publish of {@code service/SalesPublisherService} goes through
+     */
+    @Bean
+    public CorrelatedReplyRabbitTemplate rabbitTemplate(RabbitTemplateConfigurer configurer,
+            ConnectionFactory connectionFactory, ObjectProvider<RabbitTemplateCustomizer> customizers) {
+        CorrelatedReplyRabbitTemplate template = new CorrelatedReplyRabbitTemplate();
+        configurer.configure(template, connectionFactory);
+        customizers.orderedStream().forEach(customizer -> customizer.customize(template));
+        return template;
+    }
+
+    /**
+     * Request-reply settings for the application's {@link RabbitTemplate}. {@link #rabbitTemplate} applies
+     * template customizers after Boot's {@code spring.rabbitmq.template.*} configuration, so these two
+     * settings are authoritative; the exchange and routing key are left unset because the service passes
+     * both on every call.
      *
      * <ul>
      *   <li>Temporary reply queues: every {@code sendAndReceive} declares a server-named, exclusive,
      *       auto-delete queue and sets it as {@code replyTo}, as Mule's request-response endpoint did
-     *       with {@code channel.queueDeclare()}. This also keeps the template from probing direct
-     *       reply-to ({@code amq.rabbitmq.reply-to}), which only RabbitMQ provides and the Qpid
-     *       Broker-J test broker lacks.</li>
+     *       with {@code channel.queueDeclare()}, together with the correlation id the reply must carry.
+     *       This also keeps the template from probing direct reply-to ({@code amq.rabbitmq.reply-to}),
+     *       which only RabbitMQ provides and the Qpid Broker-J test broker lacks.</li>
      *   <li>Reply timeout: the endpoint's {@code responseTimeout}, always positive because the
      *       constructor rejects zero and negative values. It starts once the request is published and
      *       bounds only the wait for the reply; when no reply arrives in time, {@code sendAndReceive}
      *       returns {@code null} instead of throwing.</li>
      * </ul>
      *
-     * @return the customizer Boot applies to its auto-configured template
+     * @return the customizer {@link #rabbitTemplate} applies to the template
      */
     @Bean
     public RabbitTemplateCustomizer salesReplyTemplateCustomizer() {

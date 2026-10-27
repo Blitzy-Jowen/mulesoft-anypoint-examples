@@ -21,8 +21,9 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * <ul>
  *   <li>{@code controller.SalesController}, the HTTP listener;</li>
  *   <li>{@code service.SalesPublisherService}, the logger and the request-response AMQP send;</li>
- *   <li>{@code config.AmqpConfig}, the endpoint's destination and reply timeout, applied to Boot's
- *       auto-configured {@code RabbitTemplate};</li>
+ *   <li>{@code config.AmqpConfig}, the endpoint's destination and reply timeout, applied to the
+ *       {@code RabbitTemplate} it declares, a {@code config.CorrelatedReplyRabbitTemplate} that returns only the
+ *       reply correlated with its request;</li>
  *   <li>{@code exception.GlobalExceptionHandler}, the listener's and runtime's default error responses.</li>
  * </ul>
  *
