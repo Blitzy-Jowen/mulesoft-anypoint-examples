@@ -9,8 +9,9 @@
 package com.mulesoft.examples.login_form_using_the_http_connector.controller;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.URLDecoder;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,13 +26,9 @@ import io.undertow.servlet.handlers.ServletRequestContext;
 import io.undertow.util.Headers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpInputMessage;
 import org.springframework.http.InvalidMediaTypeException;
 import org.springframework.http.MediaType;
-import org.springframework.http.converter.FormHttpMessageConverter;
-import org.springframework.http.converter.HttpMessageNotReadableException;
-import org.springframework.util.MultiValueMap;
+import org.springframework.util.StreamUtils;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -86,8 +83,11 @@ public class LoginController {
     /** The methods the two {@code /login} listeners accept together. */
     private static final List<String> LOGIN_METHODS = List.of("GET", "POST");
 
-    /** Stateless once built, so one instance serves every request; its default charset is UTF-8. */
-    private static final FormHttpMessageConverter FORM_CONVERTER = new FormHttpMessageConverter();
+    /** Separates the pairs of a form body. */
+    private static final String PAIR_SEPARATOR = "&";
+
+    /** Separates a pair's name from its value, at its first occurrence. */
+    private static final char NAME_VALUE_SEPARATOR = '=';
 
     private final LoginService loginService;
 
@@ -220,12 +220,25 @@ public class LoginController {
      *
      * <p>The body is a form only when the request's media type is exactly {@code application/x-www-form-urlencoded}
      * (any case, any parameters); otherwise, and when the Content-Type is missing or unparseable, the form is empty,
-     * which the service rejects. The body is decoded in the Content-Type's charset, or UTF-8 when it names none;
-     * pairs keep their order, a name without {@code =} maps to {@code null}, and a repeated name keeps its first
-     * position and its last value, because Mule 3.8's {@code ParameterMap#get} returned {@code values.getLast()}, so
-     * {@code password=mule&password} gives {@code password} the value {@code null}.
+     * which the service rejects. A form body is read as text in the Content-Type's charset, or UTF-8 when it names
+     * none, and decoded as the Mule 3.8 HTTP module's {@code HttpParser#decodeString} filled its {@code ParameterMap}:
+     * <ul>
+     *   <li>a blank text gives the empty form;</li>
+     *   <li>otherwise the text is split on {@code &} with {@link String#split} semantics, so a leading or interior
+     *       empty pair is kept as the name {@code ""} with the value {@code null} and trailing empty pairs are
+     *       dropped, and each pair is split at its first {@code =};</li>
+     *   <li>name and value are URL-decoded with the same charset ({@code +} becomes a space), and a pair without
+     *       {@code =} maps its decoded name to {@code null};</li>
+     *   <li>pairs keep their order, and a repeated name keeps its first position and its last value, because Mule
+     *       3.8's {@code ParameterMap#get} returned {@code values.getLast()}, so {@code password=mule&password} gives
+     *       {@code password} the value {@code null}.</li>
+     * </ul>
+     * Pairs are not trimmed: literal whitespace and percent-encoded or {@code +} whitespace both survive into the
+     * names and values, so {@code password=mule } reaches the exact credential check as {@code "mule "} and is
+     * rejected, as the original rejected it.
      *
      * @return the form, or {@link Optional#empty()} when a form body cannot be URL-decoded
+     * @throws IOException if the body cannot be read
      */
     private static Optional<Map<String, String>> readForm(HttpServletRequest request) throws IOException {
         Map<String, String> form = new LinkedHashMap<>();
@@ -245,29 +258,25 @@ public class LoginController {
         if (!MediaType.APPLICATION_FORM_URLENCODED.equalsTypeAndSubtype(mediaType)) {
             return Optional.of(form);
         }
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(mediaType);
-        HttpInputMessage message = new HttpInputMessage() {
-            @Override
-            public InputStream getBody() throws IOException {
-                return request.getInputStream();
-            }
-
-            @Override
-            public HttpHeaders getHeaders() {
-                return headers;
-            }
-        };
-        MultiValueMap<String, String> values;
+        Charset charset = mediaType.getCharset() != null ? mediaType.getCharset() : StandardCharsets.UTF_8;
+        String body = StreamUtils.copyToString(request.getInputStream(), charset);
+        if (body.isBlank()) {
+            return Optional.of(form);
+        }
         try {
-            values = FORM_CONVERTER.read(null, message);
-        } catch (IllegalArgumentException | HttpMessageNotReadableException e) {
-            // An invalid percent-encoding: URLDecoder's IllegalArgumentException, which Spring 6.1.15 lets through
-            // and later Spring versions wrap. An I/O failure stays an IOException for the generic 500.
+            for (String pair : body.split(PAIR_SEPARATOR)) {
+                int separator = pair.indexOf(NAME_VALUE_SEPARATOR);
+                if (separator < 0) {
+                    form.put(URLDecoder.decode(pair, charset), null);
+                } else {
+                    form.put(URLDecoder.decode(pair.substring(0, separator), charset),
+                            URLDecoder.decode(pair.substring(separator + 1), charset));
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            // An invalid percent-encoding. An I/O failure stays an IOException for the generic 500.
             return Optional.empty();
         }
-        // The converter returns a LinkedMultiValueMap, so each name keeps the position of its first pair.
-        values.forEach((name, list) -> form.put(name, list.isEmpty() ? null : list.get(list.size() - 1)));
         return Optional.of(form);
     }
 

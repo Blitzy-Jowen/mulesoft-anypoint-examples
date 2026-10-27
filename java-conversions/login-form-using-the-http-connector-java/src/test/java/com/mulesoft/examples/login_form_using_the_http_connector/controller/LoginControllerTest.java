@@ -27,11 +27,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -218,6 +221,56 @@ class LoginControllerTest {
         assertEquals("HTTP/1.1 400 Bad Request", response.statusLine(), response::toString);
         assertEquals(List.of(), response.headers(CONTENT_TYPE), response::toString);
         assertEquals("Cannot decode x-www-form-urlencoded payload", response.bodyAsString(), response::toString);
+    }
+
+    /**
+     * Form pairs are not trimmed, as the Mule 3.8 listener did not trim them: literal and percent-encoded or
+     * {@code +} whitespace in a name or value reaches the exact credential check and is rejected, whitespace before
+     * a name makes it another field, and a whitespace-only body is the empty form. The failure page shows the
+     * decoded {@code username}, whitespace included.
+     *
+     * @param form             the posted form body
+     * @param renderedUsername the username the failure page shows
+     */
+    @ParameterizedTest
+    @MethodSource("whitespaceMismatchedForms")
+    void whitespaceInFormIsKeptAndRejected(String form, String renderedUsername) {
+        HttpTestClient.Response response = client().post(LOGIN_PATH, FORM, form);
+
+        assertFailurePage(response, renderedUsername);
+    }
+
+    /** Forms whose untrimmed whitespace fails the demo credentials, each with the username its failure page shows. */
+    static Stream<Arguments> whitespaceMismatchedForms() {
+        return Stream.of(
+                Arguments.of("username=mule&password=mule ", "mule"),
+                Arguments.of("username=mule&password= mule", "mule"),
+                Arguments.of("username=mule &password=mule", "mule "),
+                Arguments.of("username=mule&password=mule\t", "mule"),
+                Arguments.of("username=mule&password=mule\r\n", "mule"),
+                Arguments.of("username=mule&password=mule%20", "mule"),
+                Arguments.of("username=mule&password=mule+", "mule"),
+                Arguments.of("username=mule%20&password=mule", "mule "),
+                Arguments.of(" username=mule&password=mule", "null"),
+                Arguments.of("username=mule& password=mule", "mule"),
+                Arguments.of("   ", "null"));
+    }
+
+    /**
+     * Names and values are still URL-decoded, and the empty pairs that splitting keeps, from a leading or doubled
+     * {@code &}, map the name {@code ""} without touching the credentials; a trailing {@code &} and the page's
+     * {@code Submit} field are harmless as well.
+     *
+     * @param form the posted form body, carrying the demo credentials
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"username=%6Dule&password=mul%65", "username=mule&&password=mule",
+            "&username=mule&password=mule", "username=mule&password=mule&",
+            "username=mule&password=mule&Submit=Submit"})
+    void decodedFormWithEmptyOrExtraPairsLogsIn(String form) {
+        HttpTestClient.Response response = client().post(LOGIN_PATH, FORM, form);
+
+        assertSuccessPage(response);
     }
 
     /**
