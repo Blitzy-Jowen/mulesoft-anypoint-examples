@@ -1,0 +1,247 @@
+# Parity scenarios — importing-a-CSV-file-into-Mongo-DB-java
+
+Scenarios for the fixture replay (ST-2) of `importing-a-CSV-file-into-Mongo-DB-java`. The original example is `importing-a-CSV-file-into-Mongo-DB` (folder `importing-a-CSV-file-into-Mongo-DB/`). Its single flow `csv-to-mongodbFlow1` polls `src/main/resources/input` every 1000 ms (the file connector's default), maps each CSV record to `{firstname, surname, phone, email}`, logs the mapped list at INFO, checks whether the MongoDB collection `customers` exists, creates it when it is absent or logs at INFO that it exists, and saves one document per record; the file endpoint declares no `moveToDirectory`, so each polled file is deleted. The two branches listed for the example in AAP 0.7.5 (the collection created when absent, then one insert per record) are the two scenarios below, and each scenario's captured fixture is `fixtures/<scenario>.json`.
+
+This file follows the reference format kept in `java-conversions/hello-world-java/src/test/resources/fixtures/SCENARIOS.md`: its headings, table header, cell notation and prose sections are copied from there and adapted to this project's file trigger and MongoDB state, and its rows come from AAP 0.7.5. The project has no HTTP listener.
+
+## Scenarios
+
+| Scenario | Trigger | State | Request | Seeded state | Branch | Source |
+|---|---|---|---|---|---|---|
+| `file-input-csv-collection-absent` | `file` | `deterministic` | file `input.csv` = the bytes of `input.csv` (`src/main/resources`; 72 bytes: header `firstname,surname,phone,email`, CRLF, one record `John,Doe,096548763,john.doe@texasComp.com`, no trailing newline), placed in the input directory `${csv-import.input-dir}`; the replay invokes `trigger.CsvFileTrigger.pollOnce()` | database `customers` without a collection `customers`; empty input directory | `when !flowVars['existsCollection']` → create collection `customers`, then one save per record (one document for this input); the file is deleted | `importing-a-CSV-file-into-Mongo-DB/src/main/app/csv-to-mongodb.xml:27-29,35-39` |
+| `file-input-csv-collection-exists` | `file` | `deterministic` | same input as `file-input-csv-collection-absent` | collection `customers` of database `customers` holding the one document `file-input-csv-collection-absent` stored (captured directly after it, Capture step 5); empty input directory | `otherwise` → INFO `Customer Collection already exists.`, then one save per record; the file is deleted | `importing-a-CSV-file-into-Mongo-DB/src/main/app/csv-to-mongodb.xml:31-33,35-39` |
+
+No scenario of this project is `unreachable` or `nondeterministic`: both branches of the flow's choice are reachable, and the flow reads no clock or random value and generates no name. The documents' `_id` values are assigned by the driver or the server, never read by the flow, and are not captured (AAP 0.8.4).
+
+Notes for this project:
+
+- Coverage: the two rows are the two branches of the choice at flow lines 27-34. Malformed input and MongoDB failures are not flow branches: the flow declares no exception strategy and no transaction, so they end in Mule's default exception strategy and SC-5 still consumes the file. They are covered by `trigger/CsvFileTriggerTest`, `trigger/FileInboundPollerTest` and `service/CustomerImportServiceTest`, not by fixtures.
+- Source facts behind the rows: line 4 is `mongo:config` with database `${database.name}`, username `${database.user}` and password `${database.password}` and no host, so the connector's default `localhost:27017` applies; line 9 is `file:inbound-endpoint path="src/main/resources/input"` with neither `moveToDirectory` nor `pollingFrequency`; lines 10-21 are the `%dw 1.0` script `payload map { firstname, surname, phone, email }`; line 23 is the INFO logger `saving objects: #[payload]`; lines 24-26 store `mongo:exists-collection customers` in `flowVars['existsCollection']`; lines 28-30 (`when !flowVars['existsCollection']`) create the collection at line 29, and lines 31-33 (`otherwise`) log `Customer Collection already exists.` at INFO at line 32; lines 35-39 save each record with `mongo:save-object-from-map collection="customers"`. The original IT drops `input.csv` into the input directory, waits 5000 ms and counts one document in collection `customers` of database `customers` (`importing-a-CSV-file-into-Mongo-DB/src/test/java/org/mule/examples/ImportCSVfileIntoMongoDBIT.java:94-110`). That assertion is ported in `ImportCSVfileIntoMongoDBTest`, not here.
+- Seeded state of `file-input-csv-collection-exists`: the fixture contract seeds a collection by dropping it and inserting the listed documents (`state.collections`), so an existing but empty collection cannot be seeded; an empty list leaves the collection absent, and the replay would take the `when` branch. The `otherwise` branch is therefore captured with the collection holding the document the first row stored, the state a second drop of the same file meets. Its `response.collections` then holds that document and the newly saved one.
+- Replay inputs: each fixture's `request.invoke` names the single-run method `{"type": "trigger.CsvFileTrigger", "method": "pollOnce"}`, which polls through the same SC-5 poller as the schedule, and `state.properties` points `csv-import.input-dir` at `${dir:input}` and `spring.data.mongodb.uri` at `${mongo.uri}`, the embedded `mongo-java-server`. `application.yml` also sets `spring.data.mongodb.host: localhost` and `spring.data.mongodb.port: 27017`. Spring Boot 3.2 ignores host, port and credentials once `spring.data.mongodb.uri` is set, but the replay boundary reads that host and port as a live target, so the fixtures override `spring.data.mongodb.port` with `${freePort:mongo-port}` (Capture step 9). Surefire runs the tests with profile `test`, whose `application-test.yml` supplies `database.name`, `database.user` and `database.password`; the embedded server checks no credentials, so the fixtures carry no user or password.
+- Log category: the flow's two `logger` elements declare no `category`. The capture records the category, level and text the runtime logged, and the captured values govern. `service/CustomerImportService` logs under its own class name, so a captured category that differs is a mismatch fixed in that class (Integrity rule).
+- Parity label: until fixtures are captured, this project carries `PARITY: UNVERIFIED — Mule runtime unavailable` (AAP 0.8.7) in its README and in its row of the root `SUMMARY.md`.
+
+Table rules, for every project that copies this format:
+
+- The header is exactly the seven columns above, with these names and in this order, followed by a separator row of `-` cells. `FixtureParityTest` fails the class on any other header, a missing separator row or an empty table.
+- Cells are split on unescaped `|`, so a `|` inside a cell is written `\|`. Each cell is trimmed and unescaped, and its surrounding backticks are stripped, so code spans are allowed. The table ends at the first line that does not start with `|`.
+- `Scenario` is kebab-case (`[a-z0-9]+(-[a-z0-9]+)*`), unique in the file, formed from the entry point and the branch (AAP 0.8.4), and equal to the fixture file name without `.json`.
+- `Trigger` is one of `http`, `soap`, `file`, `jms`, `amqp`, `mq`, `mail`, `scheduler`. It selects the replay driver.
+- `State` is one of `deterministic`, `nondeterministic`, `unreachable`. A `nondeterministic` row names in `Branch` what varies (the current time, random values, a generated name). An `unreachable` row states in `Branch` the proof that no input selects it (AAP 0.8.2).
+- `Request` is the exact input the capture sends, written as: `METHOD /path` (with `?query` when there is one); then each request header as header `Name: value`, in sending order; then the body as `empty body`, as an inline code span written byte for byte (body `ping`), or as body = the bytes of `<file>` (`src/test/resources`) for a file body, which is never inlined. Non-HTTP rows name the input file, message or mail, and the single-run method the replay invokes.
+- `Seeded state` is `none`, or a short description of what the fixture's `state` seeds (rows, files, messages, mailboxes, a watermark).
+- `Branch` names the flow path the request selects. Outcome words written there name the branch. They are never captured values; the captured fixture alone holds the response.
+- `Source` cites the original by file and line.
+- Every row of this file is captured by dropping its input file into the input directory of the original deployed as Capture sets out; the original has no HTTP listener, so no `http.port` is passed.
+
+## Fixture contract
+
+Fixtures are `fixtures/<scenario>.json` beside this file (`src/test/resources/fixtures/`), loaded from the classpath as `classpath*:fixtures/*.json`. With `-Dfixtures.dir=<dir>` set, the test reads `<dir>/SCENARIOS.md` when it exists and loads only `<dir>/*.json`; this override is for local engine checks. There is one fixture per row, and a fixture without a matching row fails the class. Each fixture is one JSON object with the four top-level sections of AAP 0.8.4: `request` and `response` are required, `state` and `upstream` are read when present, and any other top-level key is ignored. Every value is written unedited from the capture.
+
+`request`, for `http` and `soap`:
+
+- `method`: the request method as sent.
+- `path`: the request path, without the query.
+- `query`: the raw query string without `?`, appended as `?<query>` when non-empty; `""` when there is none.
+- `headers`: an ordered array of `[name, value]` pairs, in the order they were sent. `Host` is recorded as sent. Only transport fields are regenerated: the replay drops the recorded `Host`, `Content-Length`, `Connection` and `Transfer-Encoding` and writes its own `Host` for the replay port, and ST-1 writes `Content-Length` for the body and `Connection: close`. Every other recorded pair is sent as its own header line, in recorded order, through ST-1's `HttpTestClient.sendHeaderPairs`; a repeated name, such as two `Cookie` pairs, stays on separate lines and is never joined.
+- `body` (UTF-8 text) or `bodyBase64` (binary); an empty body is `""` or omitted.
+- `port`: the listener port the capture targeted. It is the port replaced inside `Location` on replay. This project has no HTTP listener, so its fixtures carry no `port`.
+- `portProperty`: optional; the Spring property that holds the replay port of the targeted listener, default `local.server.port`. Multi-port projects (SC-10) name the extra listener's port key here.
+- `tls`: optional object `{trustStore, type, password}` for HTTPS listeners, replayed through ST-1's TLS mode. `trustStore` resolves from the classpath first, then as a file.
+- `readTimeoutMillis`: optional; the replay's socket read budget for this request, a positive whole number of milliseconds, applied through ST-1's `HttpTestClient.withReadTimeout` to every read of the reply, the TLS handshake's included; default 10000, ST-1's `TIMEOUT_MILLIS`, which also stays the connect timeout. Like `awaitMillis`, it is a replay setting, not a captured value: a fixture sets it when the endpoint itself waits about 10000 ms or longer before it answers, so that the replay reads the captured answer instead of timing out before the comparison.
+
+`request`, for the other drivers:
+
+- `file`: `{directory, name, body}` or `{directory, name, bodyBase64}`; the input file placed in the trigger's input directory before the run. In this project `directory` is `input`, which `state.properties` also gives to `csv-import.input-dir` as `${dir:input}`, and `name` is the name of the dropped file.
+- `invoke`: `{bean, method}` or `{type, method}`; the single-run method the replay calls. `bean` is a bean name; `type` is a class name, fully qualified or relative to the test package (for example `{"type": "trigger.OrderFileTrigger", "method": "pollOnce"}`). It is required for the `file`, `scheduler` and `mail` triggers: scheduled triggers do not run during replay (see the replay boundary below), so such a fixture without `invoke` fails its scenario. In this project it is `{"type": "trigger.CsvFileTrigger", "method": "pollOnce"}`.
+- `awaitMillis`: how long the replay waits for asynchronous effects; default 10000.
+- `message`: for `jms` and `mq`, `{destination, pubSub, body or bodyBase64, properties}`; for `amqp`, `{exchange, routingKey, body or bodyBase64, properties}`. `body` is sent as a text message and `bodyBase64` as bytes.
+- `mail`: `{user, mimeBase64}`; the raw MIME message to deliver, Base64-encoded, and the email address of the receiving mailbox.
+
+`state`, seeded before the run:
+
+- `properties`: Spring property overrides `{key: value}`, registered before the application context starts. Values may use the placeholders below. The same key resolving to different values in two fixtures fails the class.
+- `notContacted`: an array of property keys, each a non-blank string, that the original never connected to, such as an OAuth authorization URL it only returned in a redirect, or a CORS origin. The replay boundary below does not check them; the keys of every fixture together apply to the one application context.
+- `directories`: `{<directory>: [{name, body or bodyBase64}]}`, the files seeded per named directory. A scheduler watermark is seeded here as the SC-8 store file.
+- `tables`: `{<table>: [{<column>: <value>}]}`, the rows inserted after the table is emptied. Table and column names match `[A-Za-z0-9_]+`.
+- `collections`: `{<collection>: [<document>]}`, MongoDB documents as Extended JSON.
+- `ldap`: `{baseDn, bindDn, bindPassword, ldif}`, where `ldif` is a classpath resource or inline LDIF text.
+- `amqp`: `{initialConfigurationResource, responders}`. `initialConfigurationResource` is the classpath Qpid Broker-J configuration that declares the broker objects and messages. `responders`, present when the capture ran a responder, is `[{queue, reply: {body or bodyBase64, properties}}]`, one entry per responder: it took one request off `queue` and published `reply`, with `properties` as its application headers and the request's correlation id, to the request's reply-to address. The replay starts each responder through the project's `RabbitTemplate` after the drain and before the input is sent, and joins it before comparing the effects; no request on `queue` within `awaitMillis`, a request without a reply-to address or a reply that cannot be sent fails the scenario.
+- `jms`: `{denySend: [{destination, pubSub}]}`, the destinations whose producer sends the capture's broker refused; `pubSub` is `true` for a topic and `false`, the default, for a queue. From before the input is sent until the reset, the application's embedded Artemis server refuses every send to them, the application's own included, as Artemis refuses a send its security settings deny: the send fails with a security exception, and a transacted session's transaction is marked rollback-only, so its commit fails. A project whose JMS connection factory does not reach an embedded Artemis server in-VM reports the scenario `UNVERIFIED-missing-driver`.
+- `mail`: `{users: [{email, login, password}]}`, the mailboxes.
+- `clearCaches`: optional, `true` or `false`, the default. `true` stands for the restart the capture made before the scenario, after which the original's in-memory stores were empty: once the `state` is seeded, and before the prior requests and the input, the replay empties every cache of every `org.springframework.cache.CacheManager` bean of the application context. A project without such a bean reports the scenario `UNVERIFIED-missing-driver`, since the replay cannot re-create the empty stores the capture started from. Without `clearCaches`, the application's caches and its other in-memory state carry over from the scenarios before, in table order.
+- `requests`: optional; the prior requests the capture sent before the scenario's own (Capture step 4 of the reference format), in the order sent, each an object of the `request` shape for `http` and `soap` above (`method`, `path`, `query`, `headers`, `body` or `bodyBase64`, `portProperty`, `tls`, `readTimeoutMillis`). The replay sends them through ST-1 after the `state` is seeded, its caches cleared and the `upstream` stubs installed, and before the input. Their replies are discarded, as the capture discarded them, whatever their status; one that cannot be sent, or whose reply cannot be read, fails the scenario. Everything else they cause belongs to the scenario: their outbound calls are recorded in `upstream`, in call order, and the effects read back after the run (files, messages, rows, documents, mails) include theirs. Only their log events are left out: the replay drops the events logged before the input, as `response.logs` holds the events from the input on.
+- For this project, `state` holds `properties` (Capture step 9) and `collections` with the row's MongoDB seeding for database `customers`: `{"customers": []}` for `file-input-csv-collection-absent`, which drops the collection so that it is absent, and `{"customers": [<the exported document>]}` for `file-input-csv-collection-exists`, which leaves the collection holding the document exported before the drop. No directory is seeded; the input file itself is placed by `request.file`, and the project has no move directory. The flow uses no cache and receives no prior request, so neither `clearCaches` nor `requests` appears.
+
+`upstream`, the recorded outbound calls:
+
+- An ordered array of `{request, response}` pairs, one per outbound call the original made, in call order. `request` holds `method`, `url`, `headers` and `body` or `bodyBase64`; `response` holds `status`, `headers` and `body` or `bodyBase64`. Headers are either `[[name, value]]` pairs or a `{name: value}` object. Each pair is converted from the request journal of the WireMock recording proxy (Capture step 2 of the reference format): `url` is the path and query relative to the WireMock base, so no live host is named, and bodies are the entity bytes exchanged, de-chunked, with a response `Content-Encoding` left encoded.
+- On replay WireMock serves the recording in order. Every recorded call must be made, in order, with the same method, URL, body and headers, and no other call may be made. `Host`, `Content-Length`, `Connection` and `Transfer-Encoding` are ignored; `User-Agent` and `Accept-Encoding` are compared only when the inbound `request.headers` carried the same header with the same value.
+- `"upstream": []` means the scenario was recorded and made no outbound calls. This is true of both scenarios of this project: the flow makes no HTTP or SOAP call, and its MongoDB operations go through the driver to the database, whose effects are read back into `response.collections`.
+- A missing `upstream` key means the recording is incomplete: the scenario is skipped and reported `UNVERIFIED-no-upstream`. Capture always writes `"upstream": []` for this project (step 9), as the explicit record that no outbound call happened, so neither scenario is reported `UNVERIFIED-no-upstream`.
+
+`response`, the captured result:
+
+- `status` and `reason`: the status code, as a JSON number, and the reason phrase of the final raw status line.
+- `headers`: `{Content-Type, Location}`, each only when the original sent it, with its value as received. An absent or null value means the Java response must not send that header. Other headers are not recorded.
+- `body` (UTF-8 text) or `bodyBase64` (binary): the entity bytes with only the transport framing removed (chunked coding de-chunked, a `Content-Length` body taken exactly) and any `Content-Encoding` left encoded, extracted from the raw capture as Capture step 6 of the reference format defines. This project's fixtures record no HTTP response.
+- Non-HTTP effects:
+  - `directories`: the exact final file set of each named directory, so a consumed input directory is `[]` (SC-5 disposition).
+  - `messages`: `[{destination, pubSub, body or bodyBase64, properties}]`, the messages the capture found on the destinations of `destinations`, each destination's in the order the capture received or browsed them; on an AMQP broker, `destination` is the queue. Bodies and the listed properties are compared, and every destination of `destinations` must hold exactly its entries, so one without entries must stay empty.
+  - `destinations`: `[{destination, pubSub}]`, every destination the capture subscribed to or browsed, in capture order, those it found empty included; `pubSub` is `true` for a topic and `false`, the default, for a queue. It is present exactly when `messages` is, lists each destination once and lists the destination of every `messages` entry; on an AMQP broker every entry is a queue. A fixture that breaks one of these rules fails its scenario. Before the input is sent, the replay subscribes to each topic and drains each queue, a JMS queue through a consumer it closes again at once, so the replay never takes a message the application consumes. After every other effect has matched, it compares each destination with its `messages` entries: a topic's and an AMQP queue's messages are received in order, each within `awaitMillis`, and no further one may arrive within 500 ms; a JMS queue is browsed, not consumed, until it holds exactly its entries within `awaitMillis`, and again 500 ms later.
+  - `tables`: the rows of every table the flow writes.
+  - `collections`: the stored documents, without `_id`.
+  - `mails`: `[{mimeBase64}]`, the mails the flow sent during the run, as raw MIME. The replay compares them with every mail GreenMail holds after the run, in any mailbox, except the input mail the replay delivered itself, which this comparison leaves out whether or not the flow removed it.
+  - `mailboxes`: `{<email>: [{mimeBase64}]}`, the final contents of each named mailbox after the run, keyed by an email of `state.mail.users`: one raw MIME entry per message still in the mailbox, in mailbox order, the delivered input mail included when the flow did not remove it, and `[]` for a mailbox the capture found empty. The replay compares the message count first, then each message; a message flagged deleted but not expunged still counts.
+  - `logs`: `[{logger, level, message}]`, every event the original's log shows, from the input to the end of the run, under each logger category an entry names, in logged order and whatever its level. The replay compares the events logged under those categories, and no others, with the entries one for one: the same number of events, each with its entry's `logger` and `level` and, in a `deterministic` scenario, exactly its `message` (an absent or null `message` reads as empty), so an extra, missing or reordered event fails the scenario. It waits up to `awaitMillis` for that stream to match and compares it again 500 ms later, so a further event arriving late fails too. `"logs": []` names no logger and constrains nothing.
+- For this project, `response` holds three effects, read back after the poll (Capture steps 7 and 8):
+  - `directories`: `{"input": [...]}`, the final file set of the input directory, which records the SC-5 disposition: without `moveToDirectory` the polled file is deleted, and the endpoint names no other directory, so no file is moved anywhere.
+  - `collections`: `{"customers": [...]}`, every document of collection `customers` in database `customers`, in natural order, as canonical Extended JSON without `_id`.
+  - `logs`: the events of the flow's two `logger` elements, in logged order: the event of `saving objects: #[payload]` (line 23) in both rows, then, in `file-input-csv-collection-exists` only, the event of `Customer Collection already exists.` (line 32). Each entry holds the category, level and message text the runtime logged.
+
+Placeholders, allowed in `state.properties` values, in `request.file.directory` and in directory keys, and resolved at replay:
+
+- `${wiremock.baseUrl}` (`http://localhost:<port>` of the WireMock server that serves `upstream`) and `${wiremock.port}`.
+- `${dir:<name>}`: a temporary directory `<name>`, created on first use. A directory key or value without `${` is read as `${dir:<value>}`. Every directory key, `request.file.directory` and directory-spec `state.properties` value (one that begins with `${dir:`) must resolve inside the replay's temporary root; `..` traversal, an absolute path outside it or a symbolic link out of it fails the fixture. Each directory a key or `request.file.directory` resolves to is created when used and emptied after every scenario; a `state.properties` value is checked but not created, since it may name a file.
+- `${freePort:<name>}`: a free port, the same one for every use of the same name.
+- `${greenmail.<proto>.port}`, where `<proto>` is `smtp`, `smtps`, `imap`, `imaps`, `pop3` or `pop3s`.
+- `${mongo.uri}` and `${ldap.port}`.
+
+Any other placeholder fails the class with a message naming the placeholder and the fixture.
+
+Replay boundary, applied to the application context before any of its beans exists, so replay never contacts a live service:
+
+- Scheduling is suppressed: Spring's `@Scheduled` processor is removed, so no `@Scheduled` method or `SchedulingConfigurer` task runs by itself. The only trigger executions are the single-run invocations the fixtures name in `request.invoke`; outside replay the application keeps its schedules.
+- Every key of the context's property sources, except the host's environment variables and system properties, is checked with its effective value. The Spring Boot connection keys Boot binds from those two sources as well are read through them whenever they resolve, under their relaxed names such as `SPRING_DATASOURCE_URL`: `spring.datasource.url`, `spring.datasource.hikari.jdbc-url`, `spring.r2dbc.url`, `spring.mail.host`, `spring.mail.port`, `spring.data.mongodb.uri`, `spring.data.mongodb.host`, `spring.data.mongodb.port`, `spring.ldap.urls`, and the Spring AMQP and Artemis keys whose defaults are checked below. A target the replay owns is a loopback host (`localhost`, `127.0.0.0/8`, `::1`, `0.0.0.0`) on the WireMock port, a `${freePort:<name>}` port or an embedded server's port, or an in-JVM address (`vm:`, `file:`, `classpath:`, `jar:`). The checks cover every `scheme://host[:port]` in a value, each host of a multi-host or failover list included, with the host read after any user information and the scheme's default port when none is given; a value starting with `jdbc:`, in any case, whose location before its `;` or `?` parameters has no `://`: without an `@` there, an `h2`, `derby`, `hsqldb` or `sqlite` URL such as `jdbc:h2:mem:<name>` is an embedded database and names no network target (the table-state rule below decides whether the replay may write to it), and any other subprotocol fails closed, since it names no address the replay can place on a replay-owned target; with an `@`, as in `jdbc:oracle:thin:@host:1521:sid`, `jdbc:oracle:thin:@//host:1521/service` or `jdbc:oracle:oci:@alias`, the `host[:port]` after the last `@`, read without a leading `//`, a `/service` or a `:sid`, must be a loopback host on a replay-owned port; a `host(port)` list; a key whose last segment ends with `host` or is `hostname`, read with its sibling `port`; a key ending with `url`, `uri` or `endpoint` whose value is empty, from which a client derives a default; and, when the client library is present, the Spring Boot defaults of Spring AMQP (`localhost:5672`), Artemis (`tcp://localhost:61616` unless it runs embedded), the MongoDB driver (`localhost:27017`) and Spring LDAP (`ldap://localhost:389`). A host is checked whatever characters it holds, so a pattern or template such as `http://localhost*` is a target the replay does not own; only port `0` on a loopback host, the application's own random listener, is skipped.
+- Any other target fails the class before the application context starts, with a message naming each key, its value, the target's `host:port` and the remedy: override the key through `state.properties` with a replay-owned value (`${wiremock.baseUrl}`, `${freePort:<name>}`, an in-memory URL), or list it in `state.notContacted`.
+- WireMock runs whenever a fixture is loaded, so an outbound HTTP call the recording lacks fails its scenario, `"upstream": []` included.
+- Table state is seeded, emptied and read only when the application's DataSource is connected to a database the replay owns: an in-memory database (`jdbc:h2:mem:`, `jdbc:derby:memory:`, `jdbc:hsqldb:mem:`); an embedded file database whose path lies inside the replay's temporary root (H2 `jdbc:h2:file:<path>` or `jdbc:h2:<path>`, Derby `jdbc:derby:<name or path>` or `jdbc:derby:directory:<path>`, HSQLDB `jdbc:hsqldb:file:<path>`), read without its `;` or `?` parameters, with `~` as `user.home`, a relative path against `h2.baseDir` or `derby.system.home` when set and `user.dir` otherwise, and no symbolic link leading out of the root; or a server whose every host is a loopback address on a replay-owned port. Any other URL, an unknown embedded form included, fails the scenario before any statement runs.
+- Collection state is dropped, seeded and read only when every `com.mongodb.client.MongoClient` bean of the context, the client the application's `MongoTemplate` works through, is configured solely for servers whose host is a loopback address on a replay-owned port, such as the embedded MongoDB server behind `${mongo.uri}`. Any other server address, a DNS seed list (`mongodb+srv://`), or a `MongoTemplate` without that client type or without a client bean fails the scenario before any collection is dropped, seeded or read.
+- Diagnostics mask credentials: a value whose key's last segment names a secret (a word such as `password`, `secret`, `token`, `key` or `auth`) is shown as `***`; otherwise URI user information (`scheme://***@host`), the user part before `@` of a JDBC URL (`jdbc:oracle:thin:***@host`) or an address-list entry, and parameters with such names (`password=***`) are masked. Keys, hosts and ports stay readable.
+- Each scenario starts from a reset (WireMock, the registered directories, the fixture's tables, the captured log events and the mailboxes) and gets its `upstream` stubs before its `state` and input are written. The reset clears no application cache and no other in-memory state of the application, so scenarios that build on one another in table order keep doing so; only a fixture's `state.clearCaches` empties the application's caches, once its `state` is seeded. Its `state.requests` are sent after that, and its input last. The reset after a scenario also stops its responders, drains the JMS queue it sent its input to and every queue of its `destinations`, closes its topic subscriptions and removes its send refusals, so the next scenario's broker holds none of them.
+- For this project the boundary reads `spring.data.mongodb.host: localhost` with its sibling `spring.data.mongodb.port: 27017` from `application.yml`, the connector default the original used, and fails the class unless the fixtures override the port; the collections are not reset between scenarios, but each fixture's `state.collections` drops and re-seeds `customers`, so neither row depends on the other's replay.
+
+Skeleton of this project's fixtures. Every `<captured>` value comes from the capture; the `request.invoke` target and the values of `state.properties` are those Capture step 9 sets:
+
+```json
+{
+  "request":  { "file": { "directory": "input", "name": "<captured>", "body": "<captured>" },
+                "invoke": { "type": "trigger.CsvFileTrigger", "method": "pollOnce" } },
+  "state":    { "properties": { "csv-import.input-dir": "${dir:input}",
+                                "spring.data.mongodb.uri": "${mongo.uri}",
+                                "spring.data.mongodb.port": "${freePort:mongo-port}",
+                                "database.name": "customers" },
+                "collections": { "customers": "<captured>" } },
+  "upstream": [],
+  "response": { "directories": { "input": "<captured>" },
+                "collections": { "customers": "<captured>" },
+                "logs": [ { "logger": "<captured>", "level": "<captured>", "message": "<captured>" } ] }
+}
+```
+
+## Comparison rules
+
+- `deterministic`: status, reason, `Content-Type`, `Location` and body bytes are compared byte for byte, with no trimming or normalization; produced files and message bodies are compared the same way. The only substitution is the replay port inside `Location` (`:<request.port>` becomes `:<replay port>`).
+- `file` trigger, the trigger of this project: the application context starts non-web, `mongo-java-server` holds the seeded `state`, and `spring.data.mongodb.uri` reaches it through `@DynamicPropertySource`. The replay places the captured file in `${dir:input}` under its temporary root, calls `CsvFileTrigger.pollOnce()`, then compares, under the rule of the row's state: the exact final file set of the input directory (the SC-5 disposition), the documents of collection `customers` in `findAll` order, each read as Extended JSON with `_id` removed on both sides, and the log events as `response.logs` defines. Any outbound HTTP call fails the scenario, since `upstream` is `[]`. Both rows are `deterministic`, so documents, disposition and log events are compared exactly, with no normalization. The project's `pom.xml` carries `spring-boot-starter-data-mongodb` and `mongo-java-server` 1.45.0 (test scope), the replay's MongoDB driver, so neither row can be reported `UNVERIFIED-missing-driver` for want of it.
+- `nondeterministic`: status, reason and the checked headers are compared exactly. Bodies, files and messages are compared for structure only: JSON by each object's member names in order, every occurrence of a repeated name kept, value kinds and array lengths; XML by child element names (namespace and local name) in order and attribute names as a set, with namespace declarations excluded and text ignored; any other body by empty versus non-empty. Produced files pair up by name: same-named files pair first, and every other name pairs with one of the same shape, which reads each canonical UUID (8-4-4-4-12 hexadecimal digits of either case joined by hyphens, not run together with another letter or digit) as `<uuid>` and then each remaining digit run as `#`, and keeps every other character, a literal `#` or `<` included, so prefixes, fixed segments and suffixes must match exactly, both sides must hold each shape equally often, and the names of one shape pair in sorted order; logs compare the same complete stream entry for entry, by logger and level and only by whether the message is empty; upstream request bodies are not matched. The scenario is reported `UNVERIFIED — nondeterministic output`.
+- `unreachable`: no fixture may exist; the proof belongs in the row (AAP 0.8.2). A fixture for an unreachable row fails the class, and the scenario is `FAILED`.
+
+Each run writes `target/fixture-parity/summary.properties` in the project directory: first the counts `verified=<n>`, `unverified=<n>` and `failed=<n>`, then one `scenario.<name>=<STATUS>` line per row, in row order. The statuses:
+
+- `VERIFIED`: a captured deterministic fixture matched.
+- `UNVERIFIED-nondeterministic`: a nondeterministic fixture matched in structure only.
+- `UNVERIFIED-no-upstream`: the fixture has no `upstream` key.
+- `UNVERIFIED-missing-driver`: the project has no replay driver (library, bean or port) for the row's trigger.
+- `UNVERIFIED-uncaptured`: the row has no fixture file.
+- `UNREACHABLE`: an unreachable row with no fixture.
+- `FAILED`: a mismatch, a fixture for an unreachable row, or a fixture with no matching row.
+
+`VERIFIED` counts as verified, every `UNVERIFIED-*` status as unverified and `FAILED` as failed; `UNREACHABLE` is counted in none.
+
+With no fixtures the test is reported skipped (`Assumptions.assumeTrue`, reason `no Tier 2A fixtures captured`), never failed. For this project the summary then lists `file-input-csv-collection-absent` and `file-input-csv-collection-exists` as `UNVERIFIED-uncaptured`.
+
+These statuses feed the parity label of the project README and of the root `SUMMARY.md` (AAP 0.8.7):
+
+- `PARITY: UNVERIFIED — Mule runtime unavailable` until fixtures are captured.
+- `PARITY: VERIFIED — Tier 2A fixtures` only when every scenario other than an `unreachable` one is `VERIFIED`; for this project, when both rows match byte for byte.
+- `PARITY: PARTIAL — Tier 2A fixtures: <v> verified, <u> unverified` when every captured deterministic scenario matches but some scenarios remain unverified; for this project, when one row is `VERIFIED` and the other stays unverified.
+- `PARITY: FAIL — Tier 2A fixtures` when any scenario is `FAILED`.
+
+The fallback never reports PASS. The README lists the unverified scenarios by name, and a scenario marked `ACCEPTED — structural comparison` (AAP 0.8.8) still counts as unverified.
+
+## Capture (Tier 2A)
+
+The capture output of each scenario is kept unedited as the evidence for its fixture and is committed with it in `src/test/capture/<scenario>/`, outside `fixtures/` and off the test classpath: `capture-notes.txt` names the MongoDB server version and the Mule runtime version; `collections-before.txt` and `documents-before.json` hold the collection names of database `customers` and the documents of `customers` before the drop; `input/` holds the byte copy of the file dropped; `input-after.txt` lists the input directory afterwards; `collections-after.txt` and `documents-after.json` hold the same exports afterwards; `mule.log` is the run's application log, and `log-events.txt` the log lines of the flow's two loggers copied from it. Working files stay under `target/fixture-capture/` and are never committed. The capture user's name and password are read from the environment variables `CAPTURE_MONGO_USER` and `CAPTURE_MONGO_PASSWORD` at capture time, never from a file. Every command after step 1 runs in the project directory (`java-conversions/importing-a-CSV-file-into-Mongo-DB-java/`).
+
+1. Build the unmodified original `importing-a-CSV-file-into-Mongo-DB` with `mvn -B package`, with the EE repository credentials in `settings.xml`. Never edit the original folder.
+2. Start a local MongoDB server on `localhost:27017`, the address the original reaches, because its `mongo:config` names no host (line 4). Use a server version the original's `mule-module-mongo` 3.6.1 driver supports; the original IT ran 2.0.5 (`importing-a-CSV-file-into-Mongo-DB/src/test/java/org/mule/examples/ImportCSVfileIntoMongoDBIT.java:65`). The server runs without access control, as that embedded server did, so the shell commands below connect without credentials, and it holds no database `customers` before the capture. Its `db.version()` and the runtime version go into `capture-notes.txt` of each scenario. The commands use `mongosh`; a server older than mongosh supports is driven with the legacy `mongo` shell of its own version, which runs the same queries and prints each document with `print(tojson(d, '', true))`. Both print the stored values unchanged.
+
+   ```sh
+   SH="mongosh --quiet mongodb://localhost:27017/customers"
+   collections() { $SH --eval 'print(JSON.stringify(db.getCollectionNames()))'; }
+   documents() { $SH --eval 'db.customers.find({}, {_id: 0}).forEach(d => print(EJSON.stringify(d, {relaxed: false})))'; }
+   ```
+
+3. Create a dedicated throwaway user in database `customers`, never a real account; the public demo user of `src/test/resources/application-test.yml` is suitable. On a server older than 2.6 the user is added with `db.addUser`, as the original IT does (`ImportCSVfileIntoMongoDBIT.java:69`):
+
+   ```sh
+   $SH --eval 'db.createUser({user: process.env.CAPTURE_MONGO_USER, pwd: process.env.CAPTURE_MONGO_PASSWORD, roles: [{role: "readWrite", db: "customers"}]})'
+   ```
+
+4. Deploy the archive to a licensed Mule 3.8 EE runtime. The original's `mule-app.properties` is empty, so its three placeholders are passed as runtime properties: `-M-Ddatabase.name=customers -M-Ddatabase.user="$CAPTURE_MONGO_USER" -M-Ddatabase.password="$CAPTURE_MONGO_PASSWORD"`. The original has no HTTP listener and reads no `http.port`. Its endpoint `path` is relative, so it resolves against the working directory of the runtime process, `R` below.
+5. Seed the row's state and export it. `file-input-csv-collection-absent` drops the collection first; `file-input-csv-collection-exists` is captured directly after it, against the same database and without any drop, so its collection holds the one document the first row stored (see the notes under the table):
+
+   ```sh
+   S=<scenario>; D="src/test/capture/$S"; R=<runtime working directory>; IN="$R/src/main/resources/input"
+   mkdir -p "$D/input" "$IN" target/fixture-capture
+   [ "$S" = file-input-csv-collection-absent ] && $SH --eval 'db.customers.drop()'
+   collections > "$D/collections-before.txt"; documents > "$D/documents-before.json"
+   test -z "$(ls -A "$IN")"
+   ```
+
+   The last command must succeed: the input directory is empty before the drop.
+6. The input is a byte copy of `importing-a-CSV-file-into-Mongo-DB/src/main/resources/input.csv`, the file the original README copies into the input folder (step 6 of `importing-a-CSV-file-into-Mongo-DB/README.md`). It is written beside the input directory and then moved in, so the poll never reads a partly written file. The flow polls every 1000 ms; the capture waits until the file has gone, then five seconds more, the original IT's wait:
+
+   ```sh
+   cp ../../importing-a-CSV-file-into-Mongo-DB/src/main/resources/input.csv "$D/input/input.csv"
+   cp "$D/input/input.csv" "$R/src/main/resources/input.csv.part"
+   mv "$R/src/main/resources/input.csv.part" "$IN/input.csv"
+   for i in $(seq 60); do [ -e "$IN/input.csv" ] || break; sleep 1; done; sleep 5
+   ```
+
+7. Read the effects back, unedited. A file still listed in `input-after.txt` is copied with its bytes into `$D/input-after/`:
+
+   ```sh
+   ls -A "$IN" > "$D/input-after.txt"
+   collections > "$D/collections-after.txt"; documents > "$D/documents-after.json"
+   ```
+
+8. Copy the run's application log from the runtime's `logs/` directory into `$D/mule.log`, and every line it holds from the drop on under the category of the flow's loggers (lines 23 and 32) into `log-events.txt`, unedited. Each event is then written as one `{logger, level, message}` object per line into `target/fixture-capture/$S-logs.jsonl`, with the logger category, the level and the complete message text, which may span several lines, its timestamp and thread name stripped and nothing else altered. A run that logs an ERROR event of Mule's default exception strategy has not completed the row's branch and gives no fixture: the cause is removed and the row captured again from step 5, and a failure that persists leaves the row uncaptured and escalated per AAP 0.8.8.
+9. Write `fixtures/<scenario>.json` from the evidence, every captured value as produced:
+
+   ```sh
+   jq -n --arg name input.csv --rawfile body "$D/input/input.csv" --rawfile listing "$D/input-after.txt" \
+     --slurpfile before "$D/documents-before.json" --slurpfile after "$D/documents-after.json" \
+     --slurpfile logs "target/fixture-capture/$S-logs.jsonl" '
+     if $listing != "" then error("input file kept: write response.directories.input from input-after/") else . end
+     | {request: {file: {directory: "input", name: $name, body: $body},
+                  invoke: {type: "trigger.CsvFileTrigger", method: "pollOnce"}},
+        state: {properties: {"csv-import.input-dir": "${dir:input}", "spring.data.mongodb.uri": "${mongo.uri}",
+                             "spring.data.mongodb.port": "${freePort:mongo-port}", "database.name": "customers"},
+                collections: {customers: $before}},
+        upstream: [],
+        response: {directories: {input: []}, collections: {customers: $after}, logs: $logs}}' \
+     > "src/test/resources/fixtures/$S.json"
+   ```
+
+   - `request.file.body` holds the dropped bytes, their CRLF kept; bytes that are not valid UTF-8 go into `bodyBase64` instead. `request.invoke` names the trigger's single-run method.
+   - `state.properties` points the input directory and the MongoDB connection at replay-owned targets and keeps the database the capture used; `spring.data.mongodb.port` only satisfies the replay boundary (see the notes under the table). `state.collections.customers` is the export of step 5: `[]` when the collection was absent, so the replay drops it, and the stored document for the second row.
+   - `upstream` is `[]`, the record that the original made no outbound call. `response.directories.input` is `[]` only when `input-after.txt` is empty, which the command checks; otherwise the command stops, and `response.directories.input` lists each kept file with the name and bytes copied from `input-after/`.
+10. Undeploy the original, then drop the capture user (`$SH --eval 'db.dropUser(process.env.CAPTURE_MONGO_USER)'`, or `db.removeUser` before 2.6; the original IT's teardown runs `dropUser`, `ImportCSVfileIntoMongoDBIT.java:81`) and the database `customers` of the capture server. Before committing, `grep -rF -e "$CAPTURE_MONGO_PASSWORD" -e "$CAPTURE_MONGO_USER" src/test/resources/fixtures src/test/capture` runs; a match of the password means the file holding it is not committed and its scenario gets no fixture until captured again, and a match of the user name is acceptable only for the public demo user. Captured values and file bytes are never adjusted afterwards, to match the Java output or for any other reason.
+
+## Integrity rule
+
+- A fixture is never hand-written and never edited to match the Java output. A mismatch is fixed in the Java code: for these rows, `service/CustomerImportService`, `mapper/CustomerDocumentMapper` or SC-4 `mapper/DwCsvReader` for the documents and the log events, or SC-5 `trigger/FileInboundPoller` for the file disposition. No expected value is written by hand, in this file or in a fixture (AAP 0.8.4).
+- A row whose capture cannot be made stays `UNVERIFIED-uncaptured`.
+- `DECISIONS.md` records the Tier 2A blocked state ("Mule EE licence and EE Maven repository credentials unconfirmed") and the escalation of AAP 0.8.8: once both are confirmed, a human is notified to begin capture and receives the list of scenarios left unverified.
