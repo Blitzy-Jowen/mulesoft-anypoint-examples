@@ -136,9 +136,10 @@ class LoanBrokerServiceTest {
 
         assertEquals(expected, service.quote("Muley", "1234", amount, "48"));
 
-        verify(creditAgencyClient).getCreditProfile(any(Customer.class));
-        verify(bankClient).getLoanQuote(eq(bankUri(firstBank)), any(LoanBrokerQuoteRequest.class));
-        verify(bankClient).getLoanQuote(eq(bankUri(secondBank)), any(LoanBrokerQuoteRequest.class));
+        InOrder order = inOrder(creditAgencyClient, bankClient);
+        order.verify(creditAgencyClient).getCreditProfile(any(Customer.class));
+        order.verify(bankClient).getLoanQuote(eq(bankUri(firstBank)), any(LoanBrokerQuoteRequest.class));
+        order.verify(bankClient).getLoanQuote(eq(bankUri(secondBank)), any(LoanBrokerQuoteRequest.class));
         verifyNoMoreInteractions(creditAgencyClient, bankClient);
     }
 
@@ -194,10 +195,14 @@ class LoanBrokerServiceTest {
     @ParameterizedTest(name = "ssn=''{1}'', amount=''{2}'', term=''{3}''")
     @CsvSource({
             "Muley, 'abc',   '20000',      '48'",
+            "Muley, '',      '20000',      '48'",
             "Muley, ' 1234', '20000',      '48'",
+            "Muley, '1234',  '',           '48'",
+            "Muley, '1234',  '1.5',        '48'",
             "Muley, '1234',  '20000.5',    '48'",
             "Muley, '1234',  '3000000000', '48'",
-            "Muley, '1234',  '20000',      ''"
+            "Muley, '1234',  '20000',      ''",
+            "Muley, '1234',  '20000',      'x'"
     })
     void quoteWithNonIntegerNumberThrowsNumberFormatException(String name, String ssn, String amount, String term) {
         assertThrows(NumberFormatException.class, () -> service.quote(name, ssn, amount, term));
@@ -288,9 +293,34 @@ class LoanBrokerServiceTest {
                 formattedMessages());
     }
 
+    /** A failure of a later bank propagates unwrapped although an earlier bank already answered; no lowest is chosen. */
+    @Test
+    void bankFailureAfterEarlierQuotePropagatesUnwrapped() {
+        WebServiceIOException failure = new WebServiceIOException("I/O error: Read timed out");
+        when(creditAgencyClient.getCreditProfile(any(Customer.class))).thenReturn(profile(650, 10));
+        when(bankClient.getLoanQuote(eq(BANK1_URI), any(LoanBrokerQuoteRequest.class)))
+                .thenReturn(quote("Bank #1", 3.5));
+        when(bankClient.getLoanQuote(eq(BANK2_URI), any(LoanBrokerQuoteRequest.class))).thenThrow(failure);
+
+        assertSame(failure, assertThrows(WebServiceIOException.class,
+                () -> service.quote("Muley", "1234", "20000", "48")));
+
+        InOrder order = inOrder(bankClient);
+        order.verify(bankClient).getLoanQuote(eq(BANK1_URI), any(LoanBrokerQuoteRequest.class));
+        order.verify(bankClient).getLoanQuote(eq(BANK2_URI), any(LoanBrokerQuoteRequest.class));
+        verifyNoMoreInteractions(bankClient);
+        assertEquals(List.of(
+                "Credit profile: creditScore: 650, creditHistory: 10",
+                "Banks to contact: [http://0.0.0.0:10080/mule/TheBank1, http://0.0.0.0:20080/mule/TheBank2]",
+                "LoanQuote from http://0.0.0.0:10080/mule/TheBank1: Bank #1, rate: 3.5"),
+                formattedMessages());
+    }
+
     /**
-     * The first when ({@code >= 20000}) selects Banks 1 and 2; the second ({@code >= 10000 || <= 19999}) holds for
-     * every other amount, so the otherwise (Bank 5) is never selected.
+     * The first when ({@code >= 20000}) selects Banks 1 and 2, and the second ({@code >= 10000 || <= 19999}) selects
+     * Banks 3 and 4 for every other amount. The otherwise (Bank 5) is unreachable: an amount that fails the first when
+     * is below 20000, and any amount below 10000 satisfies {@code <= 19999}, so the second when always matches. The
+     * boundary amounts -1, 0, 9999, 10000, 19999 and 20000 are asserted never to select Bank 5.
      */
     @ParameterizedTest(name = "amount {0} -> Banks {1} and {2}")
     @CsvSource({
@@ -302,6 +332,7 @@ class LoanBrokerServiceTest {
             "19999,       3, 4",
             "19999.99,    3, 4",
             "20000,       1, 2",
+            "250000,      1, 2",
             "2147483647,  1, 2"
     })
     void lookupBanksRoutesByAmountAndNeverSelectsBank5(double amount, int firstBank, int secondBank) {
@@ -338,6 +369,41 @@ class LoanBrokerServiceTest {
         assertEquals(List.of(BANK1_URI, BANK2_URI), second);
     }
 
+    @Test
+    void lookupCustomerCreditProfileReturnsAndLogsAgencyProfile() {
+        Customer customer = new Customer("Muley", 1234);
+        CreditProfile profile = profile(650, 10);
+        when(creditAgencyClient.getCreditProfile(customer)).thenReturn(profile);
+
+        assertSame(profile, service.lookupCustomerCreditProfile(customer));
+
+        ArgumentCaptor<Customer> sent = ArgumentCaptor.forClass(Customer.class);
+        verify(creditAgencyClient).getCreditProfile(sent.capture());
+        assertSame(customer, sent.getValue());
+        verifyNoInteractions(bankClient);
+        assertEquals(List.of("Credit profile: creditScore: 650, creditHistory: 10"), formattedMessages());
+        assertEquals(Level.INFO, appender.list.get(0).getLevel());
+    }
+
+    @Test
+    void lookupLoanQuoteSendsRequestWithOnlyCreditProfileAndReturnsBankQuote() {
+        CreditProfile profile = profile(650, 10);
+        LoanQuote bankQuote = quote("Bank #1", 3.5);
+        when(bankClient.getLoanQuote(eq(BANK1_URI), any(LoanBrokerQuoteRequest.class))).thenReturn(bankQuote);
+
+        assertSame(bankQuote, service.lookupLoanQuote(BANK1_URI, profile));
+
+        ArgumentCaptor<LoanBrokerQuoteRequest> request = ArgumentCaptor.forClass(LoanBrokerQuoteRequest.class);
+        verify(bankClient).getLoanQuote(eq(BANK1_URI), request.capture());
+        assertSame(profile, request.getValue().getCreditProfile());
+        assertNull(request.getValue().getCustomerRequest());
+        assertNull(request.getValue().getLoanQuote());
+        verifyNoInteractions(creditAgencyClient);
+        assertEquals(List.of("LoanQuote from http://0.0.0.0:10080/mule/TheBank1: Bank #1, rate: 3.5"),
+                formattedMessages());
+        assertEquals(Level.INFO, appender.list.get(0).getLevel());
+    }
+
     /** {@link BankClient} returns {@code null} for a reply without a {@code return} element. */
     @Test
     void lookupLoanQuoteReturnsAndLogsNullReply() {
@@ -358,6 +424,8 @@ class LoanBrokerServiceTest {
                 Arguments.of(new double[] {4.2, 1.5}, 1),
                 Arguments.of(new double[] {1.5, 4.2}, 0),
                 Arguments.of(new double[] {3.0, 3.0}, 0),
+                Arguments.of(new double[] {3.0, 2.0, 2.5}, 1),
+                Arguments.of(new double[] {5.0, 4.0, 1.0}, 2),
                 Arguments.of(new double[] {5.0, 2.0, 2.0}, 1),
                 Arguments.of(new double[] {9.99, 0.0}, 1),
                 Arguments.of(new double[] {7.25}, 0));

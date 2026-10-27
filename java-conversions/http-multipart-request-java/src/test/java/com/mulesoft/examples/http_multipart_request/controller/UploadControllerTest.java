@@ -24,7 +24,10 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -57,9 +60,12 @@ import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
  * request without a {@code file} part answered with the 500 of the failing file-name expression; a non-ASCII file name
  * stored with each header byte read as one ISO-8859-1 character, as Mule 3.8's JavaMail parser read it; a file name
  * joined to the upload directory as Mule's file connector joined them, a leading {@code /} included and missing
- * subdirectories created; and a failed write answered with the 500 of Mule's streaming failure, which names no
- * path. Uploads are stored in a {@link TempDir}, never in the {@code /tmp} the original fixed, and the directory is
- * emptied before each case.
+ * subdirectories created; a second upload under a stored name replacing the file; a failed write answered with the
+ * 500 of Mule's streaming failure, which names no path; an unserved path answered with the listeners' 404; and the
+ * upload's reason phrase confined to its own exchange. Bodies A and C of {@code fixtures/SCENARIOS.md} are sent byte
+ * for byte, so the scenarios {@code post-upload-file} and {@code post-upload-file-missing-part} run with the requests
+ * their capture sends. Uploads are stored in a {@link TempDir}, never in the {@code /tmp} the original fixed, and the
+ * directory is emptied before each case.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class UploadControllerTest {
@@ -72,11 +78,23 @@ class UploadControllerTest {
 
     private static final String MULTIPART_CONTENT_TYPE = "multipart/form-data; boundary=" + BOUNDARY;
 
+    /** Boundary of body A of {@code SCENARIOS.md}, sent by the scenario {@code post-upload-file}. */
+    private static final String BODY_A_BOUNDARY = "parity-boundary-0001";
+
+    /** Boundary of body C of {@code SCENARIOS.md}, sent by the scenario {@code post-upload-file-missing-part}. */
+    private static final String BODY_C_BOUNDARY = "parity-boundary-0003";
+
+    /** {@code reasonPhrase} of the upload listener's {@code http:response-builder} (xml:16). */
+    private static final String REASON = "File was uploaded.";
+
     /** {@code Content-Length} of the carried {@code uploadFile.html}, byte-equal to the original's template. */
     private static final int FORM_LENGTH = 348;
 
     private static final byte[] METHOD_NOT_ALLOWED_BODY =
             "Method not allowed for endpoint: /uploadFile".getBytes(StandardCharsets.UTF_8);
+
+    private static final byte[] NO_LISTENER_BODY =
+            "No listener for endpoint: /unknown".getBytes(StandardCharsets.UTF_8);
 
     private static final byte[] MISSING_PART_BODY =
             "{ \"message\": \"Multipart part 'file' is not present in the request\" }".getBytes(StandardCharsets.UTF_8);
@@ -119,6 +137,22 @@ class UploadControllerTest {
         assertEquals(uploadDir.toString(), uploadDirectory);
     }
 
+    /**
+     * Bodies A and C have the lengths {@code SCENARIOS.md} gives them, and the carried {@code test.txt} and
+     * {@code uploadFile.html} are the originals' files, whose MD5 digests these are.
+     */
+    @Test
+    void scenarioBodiesAndCarriedResourcesMatchTheOriginals() throws IOException {
+        assertEquals(159, bodyA().length);
+        assertEquals(118, bodyC().length);
+        byte[] testFile = classpathBytes("/test.txt");
+        assertArrayEquals(bytes("file uploaded"), testFile);
+        assertEquals("78c06ace828c8448f0878755ccad2d04", md5(testFile));
+        byte[] form = classpathBytes("/uploadFile.html");
+        assertEquals(FORM_LENGTH, form.length);
+        assertEquals("7e90d7849338a2574566425c2ef43f4b", md5(form));
+    }
+
     @ParameterizedTest(name = "{0} /uploadFile")
     @ValueSource(strings = {"GET", "get", "Get", "gEt"})
     void getInAnyLetterCaseRendersTheUploadForm(String method) throws IOException {
@@ -148,6 +182,46 @@ class UploadControllerTest {
         assertArrayEquals(content, response.body(), response::toString);
         assertEquals(List.of(fileName), storedFiles());
         assertArrayEquals(content, Files.readAllBytes(uploadDir.resolve(fileName)));
+    }
+
+    /**
+     * Scenario {@code post-upload-file}: body A, the original IT's {@code test.txt} as the part {@code file}, is
+     * stored as {@code test.txt} and echoed under the response builder's status line.
+     */
+    @Test
+    void bodyAStoresTestTxtAndEchoesItWithTheUploadReasonPhrase() throws IOException {
+        byte[] content = classpathBytes("/test.txt");
+
+        HttpTestClient.Response response = client().send("POST", PATH, multipartHeaders(BODY_A_BOUNDARY), bodyA());
+
+        assertEquals("HTTP/1.1 200 " + REASON, response.statusLine(), response::toString);
+        assertEquals(200, response.status(), response::toString);
+        assertEquals(REASON, response.reason(), response::toString);
+        assertNull(response.header("Content-Type"), response::toString);
+        assertArrayEquals(content, response.body(), response::toString);
+        assertEquals(List.of("test.txt"), storedFiles());
+        assertArrayEquals(content, Files.readAllBytes(uploadDir.resolve("test.txt")));
+    }
+
+    /**
+     * A second upload under a stored name replaces the file, as the {@code file:outbound-endpoint} overwrote it: the
+     * shorter second content leaves nothing of the first behind.
+     */
+    @Test
+    void uploadUnderAStoredNameReplacesTheFile() throws IOException {
+        HttpTestClient.Response first = client().send("POST", PATH, multipartHeaders(),
+                multipart(new BodyPart("file", "overwrite.txt", "text/plain", bytes("first version"))));
+        assertEquals("HTTP/1.1 200 " + REASON, first.statusLine(), first::toString);
+        assertArrayEquals(bytes("first version"), Files.readAllBytes(uploadDir.resolve("overwrite.txt")));
+
+        HttpTestClient.Response second = client().send("POST", PATH, multipartHeaders(),
+                multipart(new BodyPart("file", "overwrite.txt", "text/plain", bytes("second"))));
+
+        assertEquals("HTTP/1.1 200 " + REASON, second.statusLine(), second::toString);
+        assertNull(second.header("Content-Type"), second::toString);
+        assertArrayEquals(bytes("second"), second.body(), second::toString);
+        assertEquals(List.of("overwrite.txt"), storedFiles());
+        assertArrayEquals(bytes("second"), Files.readAllBytes(uploadDir.resolve("overwrite.txt")));
     }
 
     /**
@@ -276,12 +350,17 @@ class UploadControllerTest {
         assertArrayEquals(last.content(), Files.readAllBytes(uploadDir.resolve(last.fileName())));
     }
 
-    /** Requests without a {@code file} part: a multipart body of another part only, and a plain text body. */
+    /**
+     * Requests without a {@code file} part: body C of the scenario {@code post-upload-file-missing-part}, other
+     * multipart bodies of a text field only, and plain text bodies, which Spring resolves to no part at all.
+     */
     private static Stream<Arguments> requestsWithoutFilePart() {
         byte[] descriptionOnly = multipart(new BodyPart("description", null, null, bytes("no file here")));
         return Stream.of(
+                Arguments.of("POST", "multipart/form-data; boundary=" + BODY_C_BOUNDARY, bodyC()),
                 Arguments.of("POST", MULTIPART_CONTENT_TYPE, descriptionOnly),
                 Arguments.of("post", MULTIPART_CONTENT_TYPE, descriptionOnly),
+                Arguments.of("POST", "text/plain", bytes("x")),
                 Arguments.of("Post", "text/plain", bytes("file uploaded")));
     }
 
@@ -391,6 +470,32 @@ class UploadControllerTest {
         assertEquals(List.of(), storedFiles());
     }
 
+    /** Scenario {@code get-unknown-path}: no listener serves the path, so the listeners' 404 answers it. */
+    @Test
+    void unknownPathGetsTheNoListenerNotFound() throws IOException {
+        HttpTestClient.Response response = client().get("/unknown");
+
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+        assertEquals("text/plain", response.header("Content-Type"), response::toString);
+        assertArrayEquals(NO_LISTENER_BODY, response.body(), response::toString);
+        assertEquals(List.of(), storedFiles());
+    }
+
+    /**
+     * The upload's reason phrase belongs to its own exchange: the form request sent right after it gets the
+     * standard {@code OK}, whichever Undertow worker serves it.
+     */
+    @Test
+    void uploadReasonPhraseDoesNotReachTheNextResponse() throws IOException {
+        HttpTestClient.Response upload = client().send("POST", PATH, multipartHeaders(BODY_A_BOUNDARY), bodyA());
+        assertEquals("HTTP/1.1 200 " + REASON, upload.statusLine(), upload::toString);
+
+        HttpTestClient.Response form = client().get(PATH);
+
+        assertEquals("HTTP/1.1 200 OK", form.statusLine(), form::toString);
+        assertArrayEquals(classpathBytes("/uploadFile.html"), form.body(), form::toString);
+    }
+
     private HttpTestClient client() {
         return HttpTestClient.localhost(port);
     }
@@ -414,9 +519,44 @@ class UploadControllerTest {
     }
 
     private static Map<String, String> multipartHeaders() {
+        return multipartHeaders(BOUNDARY);
+    }
+
+    /** The request header {@code Content-Type: multipart/form-data; boundary=<boundary>}; ST-1 adds the rest. */
+    private static Map<String, String> multipartHeaders(String boundary) {
         Map<String, String> headers = new LinkedHashMap<>();
-        headers.put("Content-Type", MULTIPART_CONTENT_TYPE);
+        headers.put("Content-Type", "multipart/form-data; boundary=" + boundary);
         return headers;
+    }
+
+    /** Body A of {@code SCENARIOS.md}: the 13 bytes of {@code test.txt} as the part {@code file}, 159 bytes. */
+    private static byte[] bodyA() throws IOException {
+        return filePart(BODY_A_BOUNDARY, "test.txt", "text/plain", classpathBytes("/test.txt"));
+    }
+
+    /** Body C of {@code SCENARIOS.md}: the text field {@code description} and no {@code file} part, 118 bytes. */
+    private static byte[] bodyC() {
+        return bytes("--" + BODY_C_BOUNDARY + CRLF
+                + "Content-Disposition: form-data; name=\"description\"" + CRLF
+                + CRLF
+                + "no file part" + CRLF
+                + "--" + BODY_C_BOUNDARY + "--" + CRLF);
+    }
+
+    /**
+     * A multipart body of the one part {@code file} laid out as the bodies of {@code SCENARIOS.md}: the delimiter
+     * line, {@code Content-Disposition} with {@code filename}, {@code Content-Type}, a blank line, the content and the
+     * closing delimiter line, every line ended by CRLF.
+     */
+    private static byte[] filePart(String boundary, String fileName, String partContentType, byte[] content) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.writeBytes(bytes("--" + boundary + CRLF
+                + "Content-Disposition: form-data; name=\"file\"; filename=\"" + fileName + "\"" + CRLF
+                + "Content-Type: " + partContentType + CRLF
+                + CRLF));
+        out.writeBytes(content);
+        out.writeBytes(bytes(CRLF + "--" + boundary + "--" + CRLF));
+        return out.toByteArray();
     }
 
     /**
@@ -469,6 +609,15 @@ class UploadControllerTest {
         try (InputStream in = UploadControllerTest.class.getResourceAsStream(resource)) {
             assertNotNull(in, resource);
             return in.readAllBytes();
+        }
+    }
+
+    /** The MD5 digest of {@code bytes} as lower-case hexadecimal. */
+    private static String md5(byte[] bytes) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("MD5").digest(bytes));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5, which every Java platform provides, is unavailable", e);
         }
     }
 
