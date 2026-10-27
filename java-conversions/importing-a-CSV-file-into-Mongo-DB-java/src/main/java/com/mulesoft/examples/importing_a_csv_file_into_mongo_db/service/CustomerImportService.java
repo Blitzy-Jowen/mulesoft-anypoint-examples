@@ -67,8 +67,8 @@ public class CustomerImportService {
         List<Map<String, String>> rows = dwCsvReader.read(content);
         List<Map<String, Object>> records = customerDocumentMapper.map(rows);
 
-        // Concatenation renders the list exactly as MEL's #[payload] did: List.toString() over LinkedHashMaps.
-        log.info("saving objects: " + records);
+        // The {} argument renders the list exactly as MEL's #[payload] did: List.toString() over LinkedHashMaps.
+        log.info("saving objects: {}", records);
 
         // The enricher stored the check in flowVars['existsCollection'] and left the payload untouched.
         boolean existsCollection = mongoTemplate.collectionExists(COLLECTION);

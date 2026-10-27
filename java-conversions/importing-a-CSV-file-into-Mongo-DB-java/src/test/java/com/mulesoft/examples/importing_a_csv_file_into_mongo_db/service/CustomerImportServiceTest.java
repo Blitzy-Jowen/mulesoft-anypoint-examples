@@ -154,6 +154,35 @@ class CustomerImportServiceTest {
     }
 
     @Test
+    @DisplayName("The records log is a parameterized template whose one argument is the mapped records list")
+    void savingObjectsLog_isParameterizedWithRecordsArgument() throws IOException {
+        when(mongoTemplate.collectionExists(COLLECTION)).thenReturn(false);
+
+        service.importCsv(inputCsv());
+
+        ILoggingEvent event = null;
+        for (ILoggingEvent candidate : appender.list) {
+            if (candidate.getLevel() == Level.INFO) {
+                event = candidate;
+                break;
+            }
+        }
+        assertNotNull(event, "first INFO event");
+        assertEquals("saving objects: {}", event.getMessage());
+
+        Object[] arguments = event.getArgumentArray();
+        assertNotNull(arguments, "argument array");
+        assertEquals(1, arguments.length);
+        Map<String, Object> john = new LinkedHashMap<>();
+        john.put("firstname", "John");
+        john.put("surname", "Doe");
+        john.put("phone", "096548763");
+        john.put("email", "john.doe@texasComp.com");
+        assertEquals(List.of(john), arguments[0]);
+        assertEquals(SAVING_JOHN, event.getFormattedMessage());
+    }
+
+    @Test
     @DisplayName("Existing collection: the choice logs instead of creating, and the record is still saved")
     void collectionExists_logsAndDoesNotCreate() throws IOException {
         when(mongoTemplate.collectionExists(COLLECTION)).thenReturn(true);
