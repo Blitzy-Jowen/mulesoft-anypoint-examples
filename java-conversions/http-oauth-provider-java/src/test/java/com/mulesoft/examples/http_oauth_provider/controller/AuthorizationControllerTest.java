@@ -113,6 +113,7 @@ class AuthorizationControllerTest {
         assertThat(resp.reason()).isEqualTo("OK");
         assertMediaType(resp, MediaType.TEXT_HTML);
         assertThat(resp.bodyAsString()).contains(
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
                 "id=\"username\"", "name=\"username\"",
                 "id=\"password\"", "name=\"password\"",
                 "SampleAPI", "Login and Authorize",
