@@ -56,9 +56,6 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  *   <li>TRACE is forwarded like every other method, because {@code application.yml} sets
  *       {@code spring.mvc.dispatch-trace-request}; whether the Mule listener ran the flow for TRACE is
  *       unverified.</li>
- *   <li>A CORS preflight OPTIONS request (one carrying {@code Origin} and {@code Access-Control-Request-Method})
- *       is rejected by Spring's CORS handling with 403 {@code Invalid CORS request}, as no CORS configuration
- *       exists, and is not forwarded.</li>
  *   <li>A Content-Type that cannot be parsed ends in the 500 of {@code GlobalExceptionHandler} before the FIM
  *       server is called.</li>
  *   <li>An empty query ({@code /FIM/x?}) is forwarded without its {@code ?}, because the servlet API reports an
