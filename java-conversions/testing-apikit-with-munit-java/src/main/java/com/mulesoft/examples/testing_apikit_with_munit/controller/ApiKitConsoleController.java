@@ -44,7 +44,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.util.StreamUtils;
-import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -60,11 +59,11 @@ import org.springframework.web.util.UriUtils;
  * <p>Served under the API base path {@code apikit.base-path} (default {@code /api}) with the console path
  * {@code apikit.console-path} (default {@code console}):
  * <ul>
- *   <li>{@code GET <base>/console}: 301 to {@code <base>/console/};</li>
- *   <li>{@code GET <base>/console/} and {@code <base>/console/index.html}: the console page, its RAML source
- *       pointed at {@code ./?raml} and its attribute placeholder replaced by the handler's options;</li>
- *   <li>{@code GET <base>/console/<file>}: the console's scripts, styles, fonts and images from the classpath
- *       tree {@code apikit-console/};</li>
+ *   <li>{@code <base>/console}: 301 to {@code <base>/console/};</li>
+ *   <li>{@code <base>/console/} and {@code <base>/console/index.html}: the console page, its RAML source pointed
+ *       at {@code ./?raml} and its attribute placeholder replaced by the handler's options;</li>
+ *   <li>{@code <base>/console/<file>}: the console's scripts, styles, fonts and images from the classpath tree
+ *       {@code apikit-console/};</li>
  *   <li>{@code GET <base>/console?raml}, {@code GET <base>/console/?raml}, the same paths and {@code GET <base>/}
  *       with an {@code Accept} header naming {@code application/raml+yaml}: the RAML of {@code apikit.raml}
  *       with its {@code baseUri} set to the listener URL, whose host is the {@code Host} header's name only
@@ -73,9 +72,16 @@ import org.springframework.web.util.UriUtils;
  *   <li>{@code GET <base>/<include>} and {@code GET <base>/console/<include>}: each file the RAML
  *       {@code !include}s, so the console resolves includes relative to the RAML it loaded.</li>
  * </ul>
- * Every miss throws {@link ApiKitNotFoundException}, which SC-3 answers with APIkit's 404 body. The class maps
- * no pattern broader than these, so unknown resources and methods under the base path still reach the APIkit
- * 404 and 405 mappings of SC-3; a method other than GET or HEAD on a console path therefore receives the 405.
+ * The console paths answer every method alike, a non-standard one such as {@code PROPFIND} included, because
+ * the original listener declares no {@code allowedMethods} and {@code ConsoleHandler} never read the method;
+ * only {@code RamlDescriptorHandler} required a GET, so the RAML answers GET (and HEAD) alone and any other
+ * method on {@code <base>/console} or {@code <base>/console/} gets the redirect or the page. The console
+ * paths are mapped without a method, which Spring matches for every method but a plain OPTIONS request, so
+ * each also has an explicit OPTIONS mapping that gives that request the same response.
+ *
+ * <p>Every miss throws {@link ApiKitNotFoundException}, which SC-3 answers with APIkit's 404 body. The class
+ * maps no pattern broader than these, so unknown resources and methods under the base path still reach the
+ * APIkit 404 and 405 mappings of SC-3.
  *
  * <p>Tier 2A verification points, where the bytes are a plan decision rather than recorded original output:
  * <ul>
@@ -92,7 +98,10 @@ import org.springframework.web.util.UriUtils;
  *       request path;</li>
  *   <li>a {@code Host} header naming no legal DNS name, IPv4 address or IPv6 address gives the RAML's
  *       {@code baseUri} the local address of the listener socket, while APIkit copied the {@code Host} header
- *       into it unchanged.</li>
+ *       into it unchanged;</li>
+ *   <li>a HEAD request is answered as the GET without its body, the RAML included, while
+ *       {@code RamlDescriptorHandler} served the RAML to GET alone, so APIkit answered such a HEAD with the
+ *       redirect or the console page on the console paths and with its 404 on {@code <base>/}.</li>
  * </ul>
  *
  * <p>Every RAML-backed project carries a copy that differs from this one in the {@code package} line and the
@@ -247,15 +256,26 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     }
 
     /**
-     * The console path without its trailing slash: the RAML when asked for, otherwise a 301 whose
-     * {@code Location} is the relative path {@code <base>/console/}, preceded by the servlet context path and
-     * followed by the query string when there is one. The path is built from the configured console path
-     * alone, so neither the {@code Host} header nor the raw request path reaches the header.
+     * The console path without its trailing slash, for every method: the RAML when a GET (or HEAD) asks for
+     * it, otherwise a 301 whose {@code Location} is the relative path {@code <base>/console/}, preceded by the
+     * servlet context path and followed by the query string when there is one. The path is built from the
+     * configured console path alone, so neither the {@code Host} header nor the raw request path reaches the
+     * header.
+     *
+     * <p>Written to the servlet response and committed before the method returns, because the 301 has no
+     * body to commit it: the servlet fills a response still open after an OPTIONS request with an
+     * {@code Allow} header and one after a TRACE request with a {@code message/http} echo of the request, and
+     * {@code ConsoleHandler} sent neither.
+     *
+     * @param request the request, whose method, {@code Accept} header and query string select the response
+     * @param response the response the RAML or the 301 is written to
+     * @throws IOException if the response cannot be written
      */
-    @GetMapping("${apikit.base-path:/api}/${apikit.console-path:console}")
-    public ResponseEntity<byte[]> consoleNoSlash(HttpServletRequest request) {
-        if (hasRamlQuery(request) || wantsRaml(request)) {
-            return raml(request);
+    @RequestMapping("${apikit.base-path:/api}/${apikit.console-path:console}")
+    public void consoleNoSlash(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        if (isGetOrHead(request) && (hasRamlQuery(request) || wantsRaml(request))) {
+            send(raml(request), response);
+            return;
         }
         String contextPath = request.getContextPath();
         StringBuilder location = new StringBuilder(contextPath == null ? "" : contextPath)
@@ -264,40 +284,102 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
         if (query != null && !query.isEmpty()) {
             location.append('?').append(query);
         }
-        return ResponseEntity.status(HttpStatus.MOVED_PERMANENTLY)
+        send(ResponseEntity.status(HttpStatus.MOVED_PERMANENTLY)
                 .header(HttpHeaders.LOCATION, location.toString())
                 .header(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .contentLength(0)
-                .build();
+                .build(), response);
     }
 
-    /** The console root: the RAML when asked for, otherwise the console page. */
-    @GetMapping("${apikit.base-path:/api}/${apikit.console-path:console}/")
+    /**
+     * OPTIONS on the console path without its trailing slash, answered as {@link #consoleNoSlash} answers every
+     * method other than GET or HEAD. The explicit mapping is needed because Spring leaves a plain OPTIONS
+     * request out of a mapping that declares no method and would otherwise answer it itself with 200 and an
+     * {@code Allow} header.
+     *
+     * @param request the OPTIONS request
+     * @param response the response the 301 is written to
+     * @throws IOException if the response cannot be written
+     */
+    @RequestMapping(value = "${apikit.base-path:/api}/${apikit.console-path:console}",
+            method = RequestMethod.OPTIONS)
+    public void consoleNoSlashOptions(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        consoleNoSlash(request, response);
+    }
+
+    /**
+     * The console root, for every method: the RAML when a GET (or HEAD) asks for it, otherwise the console page.
+     *
+     * @param request the request, whose method, {@code Accept} header and query string select the response
+     * @return the RAML or the console page
+     */
+    @RequestMapping("${apikit.base-path:/api}/${apikit.console-path:console}/")
     public ResponseEntity<byte[]> consoleRoot(HttpServletRequest request) {
-        if (hasRamlQuery(request) || wantsRaml(request)) {
+        if (isGetOrHead(request) && (hasRamlQuery(request) || wantsRaml(request))) {
             return raml(request);
         }
         return consoleIndex();
     }
 
-    /** The console page, rendered once from {@code apikit-console/index.html}. */
-    @GetMapping("${apikit.base-path:/api}/${apikit.console-path:console}/index.html")
+    /**
+     * OPTIONS on the console root: the console page, as {@link #consoleRoot} gives every method other than GET
+     * or HEAD, written to the servlet response and committed so that the servlet adds no {@code Allow} header.
+     * The explicit mapping is needed because Spring leaves a plain OPTIONS request out of a mapping that
+     * declares no method.
+     *
+     * @param request the OPTIONS request
+     * @param response the response the console page is written to
+     * @throws IOException if the response cannot be written
+     */
+    @RequestMapping(value = "${apikit.base-path:/api}/${apikit.console-path:console}/",
+            method = RequestMethod.OPTIONS)
+    public void consoleRootOptions(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        send(consoleRoot(request), response);
+    }
+
+    /**
+     * The console page, rendered once from {@code apikit-console/index.html}, for every method.
+     *
+     * @return the console page
+     */
+    @RequestMapping("${apikit.base-path:/api}/${apikit.console-path:console}/index.html")
     public ResponseEntity<byte[]> consoleIndex() {
         return ok(renderedIndex(), HTML_CONTENT_TYPE, true);
     }
 
     /**
-     * Any other file of the console tree, typed by its extension. Paths that are not a canonical relative
-     * path (an empty, {@code .} or {@code ..} segment, a reverse solidus, or a {@code %} left after decoding)
-     * are rejected before the classpath is consulted, so nothing outside {@code apikit-console/} is reachable.
+     * OPTIONS on the console page, written to the servlet response and committed so that the servlet adds no
+     * {@code Allow} header. The explicit mapping is needed because Spring leaves a plain OPTIONS request out of
+     * a mapping that declares no method, such as {@link #consoleIndex}.
+     *
+     * @param response the response the console page is written to
+     * @throws IOException if the response cannot be written
+     */
+    @RequestMapping(value = "${apikit.base-path:/api}/${apikit.console-path:console}/index.html",
+            method = RequestMethod.OPTIONS)
+    public void consoleIndexOptions(HttpServletResponse response) throws IOException {
+        send(consoleIndex(), response);
+    }
+
+    /**
+     * Any other file of the console tree, typed by its extension, for every method. Paths that are not a
+     * canonical relative path (an empty, {@code .} or {@code ..} segment, a reverse solidus, or a {@code %}
+     * left after decoding) are rejected before the classpath is consulted, so nothing outside
+     * {@code apikit-console/} is reachable. A RAML include requested below the console path with a method
+     * other than GET or HEAD lands here too and, being no console file, gets the 404.
      *
      * <p>Written straight to the servlet response rather than returned as a {@code ResponseEntity}, unlike
      * the other console responses: for a 2xx body written by a message converter, Spring MVC's
      * reflected-file-download guard adds {@code Content-Disposition: inline;filename=f.txt} whenever the
      * path's extension ({@code js}, {@code css}, {@code woff2}, {@code html}) is not matched literally by the
-     * mapping pattern, and {@code ConsoleHandler} sent no such header.
+     * mapping pattern, and {@code ConsoleHandler} sent no such header. The response is committed before the
+     * method returns, so the servlet adds nothing to it after an OPTIONS or TRACE request.
+     *
+     * @param request the request naming the file
+     * @param response the response the file is written to
+     * @throws IOException if the response cannot be written
      */
-    @GetMapping("${apikit.base-path:/api}/${apikit.console-path:console}/**")
+    @RequestMapping("${apikit.base-path:/api}/${apikit.console-path:console}/**")
     public void consoleFile(HttpServletRequest request, HttpServletResponse response) throws IOException {
         String path = pathWithinApplication(request);
         String prefix = consolePrefix + "/";
@@ -327,6 +409,21 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
         }
         response.getOutputStream().write(bytes);
         response.flushBuffer();
+    }
+
+    /**
+     * OPTIONS on a file of the console tree, answered as {@link #consoleFile} answers every other method. The
+     * explicit mapping is needed because Spring leaves a plain OPTIONS request out of a mapping that declares no
+     * method and would otherwise answer it itself with 200 and an {@code Allow} header.
+     *
+     * @param request the OPTIONS request naming the file
+     * @param response the response the file is written to
+     * @throws IOException if the response cannot be written
+     */
+    @RequestMapping(value = "${apikit.base-path:/api}/${apikit.console-path:console}/**",
+            method = RequestMethod.OPTIONS)
+    public void consoleFileOptions(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        consoleFile(request, response);
     }
 
     /**
@@ -467,6 +564,31 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
             response.header(HttpHeaders.EXPIRES, "-1");
         }
         return response.body(body);
+    }
+
+    /**
+     * Writes {@code entity}'s status, headers and body bytes to {@code response} and commits it, so nothing the
+     * servlet adds once the handler has returned reaches the client. Content-Type and Content-Length go through
+     * their own setters, so the type carries no charset parameter and the container frames the body by that
+     * length, as for the responses Spring writes.
+     */
+    private static void send(ResponseEntity<byte[]> entity, HttpServletResponse response) throws IOException {
+        HttpHeaders headers = entity.getHeaders();
+        response.setStatus(entity.getStatusCode().value());
+        headers.forEach((name, values) -> {
+            if (!HttpHeaders.CONTENT_TYPE.equalsIgnoreCase(name)
+                    && !HttpHeaders.CONTENT_LENGTH.equalsIgnoreCase(name)) {
+                values.forEach(value -> response.addHeader(name, value));
+            }
+        });
+        MediaType contentType = headers.getContentType();
+        if (contentType != null) {
+            response.setContentType(contentType.toString());
+        }
+        byte[] body = entity.getBody() == null ? new byte[0] : entity.getBody();
+        response.setContentLength(body.length);
+        response.getOutputStream().write(body);
+        response.flushBuffer();
     }
 
     /**
