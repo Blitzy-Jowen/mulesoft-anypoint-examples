@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Set;
 
+import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 
 import org.slf4j.Logger;
@@ -35,7 +36,9 @@ import org.springframework.web.servlet.resource.NoResourceFoundException;
  *   <li>a path no handler serves: 404, {@code text/plain}, {@code No listener for endpoint: <path>};</li>
  *   <li>a method the handler does not accept: 405, {@code text/plain},
  *       {@code Method not allowed for endpoint: <path>};</li>
- *   <li>any other exception: 500, {@code application/json}, {@code { "message": "<exception message>" }}.</li>
+ *   <li>any other exception: 500, {@code application/json}, {@code { "message": "<exception message>" }}; an
+ *       {@link Error} escaping a handler is reported with its own message, never with the text of the
+ *       dispatcher's wrapper, which names the error's class.</li>
  * </ul>
  * These bytes are platform defaults rather than flow output, so a captured fixture of the original
  * application overrides them.
@@ -129,10 +132,18 @@ public class GlobalExceptionHandler {
      * length, and its control, line-separator, format and unpaired surrogate characters and reverse
      * solidus are escaped, so the event stays on one unambiguous line.
      *
+     * <p>The {@code DispatcherServlet} hands an {@link Error} thrown by a handler, such as an
+     * {@link OutOfMemoryError} or a {@link StackOverflowError}, to this method wrapped in a
+     * {@link ServletException} whose message is {@code Handler dispatch failed: } followed by the error's
+     * class name and message. The body reports the error's own message instead, so it never names a Java
+     * class: {@code { "message": "Java heap space" }} for an {@code OutOfMemoryError("Java heap space")}.
+     * The log line still names the wrapper and, as its cause, the error's class.
+     *
      * @param ex the unhandled exception
      * @param request the failed request, whose method and path are logged
-     * @return 500 {@code application/json} {@code { "message": "<exception message>" }}, with
-     *         {@code { "message": null }} when the exception carries no message
+     * @return 500 {@code application/json} {@code { "message": "<exception message>" }}, carrying the
+     *         {@link Error}'s own message when the exception is the dispatcher's wrapper of one, with
+     *         {@code { "message": null }} when that message is absent
      */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<String> handleUnhandled(Exception ex, HttpServletRequest request) {
@@ -142,7 +153,21 @@ public class GlobalExceptionHandler {
                 describe(ex));
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .contentType(ErrorResponse.MEDIA_TYPE)
-                .body(ErrorResponse.json(ex.getMessage()));
+                .body(ErrorResponse.json(responseMessage(ex)));
+    }
+
+    /**
+     * Returns the message the 500 body reports for {@code ex}: the cause's message when {@code ex} is a
+     * {@link ServletException} wrapping a {@link Throwable} that is not an {@link Exception}, which is how
+     * the {@code DispatcherServlet} passes on an {@link Error} a handler threw, and otherwise the message
+     * of {@code ex} itself. Either may be {@code null}.
+     */
+    private static String responseMessage(Exception ex) {
+        Throwable cause = ex.getCause();
+        if (ex instanceof ServletException && cause != null && !(cause instanceof Exception)) {
+            return cause.getMessage();
+        }
+        return ex.getMessage();
     }
 
     /**
