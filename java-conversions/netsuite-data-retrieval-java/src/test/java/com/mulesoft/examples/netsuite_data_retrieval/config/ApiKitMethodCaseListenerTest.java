@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -136,8 +137,8 @@ class ApiKitMethodCaseListenerTest {
 
     /** The UTF-8 text of the classpath resource {@code location}. */
     private static String classpathText(String location) {
-        try {
-            return StreamUtils.copyToString(new ClassPathResource(location).getInputStream(), StandardCharsets.UTF_8);
+        try (InputStream in = new ClassPathResource(location).getInputStream()) {
+            return StreamUtils.copyToString(in, StandardCharsets.UTF_8);
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot read classpath resource " + location, e);
         }

@@ -23,8 +23,10 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
+import java.net.ConnectException;
 import java.net.InetAddress;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -111,17 +113,19 @@ class CurrencyClientTest {
     @Test
     void localServerPortTakesPrecedenceOverHttpPort() throws IOException {
         stubCurrencies();
-        MockEnvironment env = new MockEnvironment()
-                .withProperty("local.server.port", String.valueOf(wm.getPort()))
-                .withProperty("http.port", String.valueOf(closedPort()));
-        CurrencyClient client = clientFor(env);
+        try (Socket reserved = reserveRefusingPort()) {
+            MockEnvironment env = new MockEnvironment()
+                    .withProperty("local.server.port", String.valueOf(wm.getPort()))
+                    .withProperty("http.port", String.valueOf(reserved.getLocalPort()));
+            CurrencyClient client = clientFor(env);
 
-        assertEquals(wm.getPort(), client.resolvePort());
+            assertEquals(wm.getPort(), client.resolvePort());
 
-        JsonNode result = client.getCurrencies();
+            JsonNode result = client.getCurrencies();
 
-        assertEquals(3, result.get("USD").size());
-        wm.verify(1, getRequestedFor(urlEqualTo(CURRENCIES_PATH)));
+            assertEquals(3, result.get("USD").size());
+            wm.verify(1, getRequestedFor(urlEqualTo(CURRENCIES_PATH)));
+        }
     }
 
     @Test
@@ -145,9 +149,14 @@ class CurrencyClientTest {
 
     @Test
     void connectionRefusedPropagatesResourceAccessException() throws IOException {
-        CurrencyClient client = clientFor(envWithHttpPort(closedPort()));
+        try (Socket reserved = reserveRefusingPort()) {
+            CurrencyClient client = clientFor(envWithHttpPort(reserved.getLocalPort()));
 
-        assertThrows(ResourceAccessException.class, client::getCurrencies);
+            ResourceAccessException thrown = assertThrows(ResourceAccessException.class, client::getCurrencies);
+
+            assertTrue(thrown.contains(ConnectException.class),
+                    () -> "expected a ConnectException in the cause chain of " + thrown);
+        }
     }
 
     @Test
@@ -188,10 +197,24 @@ class CurrencyClientTest {
         }
     }
 
-    /** A loopback port nothing listens on, so a connection is refused at once rather than after the 10 s timeout. */
-    private static int closedPort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
+    /**
+     * A loopback socket bound to an ephemeral port that never listens or connects: while it stays open a connection to
+     * that port is refused at once rather than after the 10 s timeout, and with SO_REUSEADDR off no other socket can
+     * bind the port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
         }
     }
 }

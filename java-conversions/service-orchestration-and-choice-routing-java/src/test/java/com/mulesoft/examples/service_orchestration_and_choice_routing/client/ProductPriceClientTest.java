@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -73,6 +74,13 @@ class ProductPriceClientTest {
         client = clientWithTimeout(TIMEOUT_MS);
     }
 
+    @AfterEach
+    void closeClient() {
+        if (client != null) {
+            client.close();
+        }
+    }
+
     @Test
     void getPriceReturnsBodyText() {
         wm.stubFor(get(urlEqualTo(PRICE_PATH))
@@ -122,14 +130,14 @@ class ProductPriceClientTest {
                 .willReturn(ok("159")
                         .withHeader("Content-Type", "text/plain")
                         .withFixedDelay(RESPONSE_DELAY_MS)));
-        ProductPriceClient shortTimeoutClient = clientWithTimeout(SHORT_TIMEOUT_MS);
+        try (ProductPriceClient shortTimeoutClient = clientWithTimeout(SHORT_TIMEOUT_MS)) {
+            ResourceAccessException thrown =
+                    assertThrows(ResourceAccessException.class, () -> shortTimeoutClient.getPrice(PRODUCT_ID));
 
-        ResourceAccessException thrown =
-                assertThrows(ResourceAccessException.class, () -> shortTimeoutClient.getPrice(PRODUCT_ID));
-
-        assertTrue(thrown.contains(SocketTimeoutException.class),
-                () -> "expected a SocketTimeoutException in the cause chain of " + thrown);
-        assertSingleRequest();
+            assertTrue(thrown.contains(SocketTimeoutException.class),
+                    () -> "expected a SocketTimeoutException in the cause chain of " + thrown);
+            assertSingleRequest();
+        }
     }
 
     @ParameterizedTest

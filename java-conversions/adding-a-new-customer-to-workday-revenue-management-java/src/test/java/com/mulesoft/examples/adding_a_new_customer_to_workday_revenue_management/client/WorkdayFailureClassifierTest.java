@@ -39,7 +39,7 @@ import java.util.stream.Stream;
 
 import javax.xml.namespace.QName;
 
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -145,10 +145,14 @@ class WorkdayFailureClassifierTest {
             .options(wireMockConfig().dynamicPort())
             .build();
 
-    private static final WorkdayProperties PROPERTIES = new WorkdayProperties();
+    /** This case's own {@code wday.*} settings, built before each case; the client reads its endpoint at call time. */
+    private WorkdayProperties properties;
 
-    /** Shared by the end-to-end cases: its JAXB context, created on first use, spans ~900 generated classes. */
-    private static WorkdayRevenueManagementClient client;
+    /**
+     * This case's own client over {@link #properties}, built before each case, so neither an endpoint nor a
+     * re-authenticated security interceptor carries over from another case.
+     */
+    private WorkdayRevenueManagementClient client;
 
     private final WorkdayFailureClassifier classifier = new WorkdayFailureClassifier();
 
@@ -158,15 +162,16 @@ class WorkdayFailureClassifierTest {
 
     private final AtomicInteger reauthentications = new AtomicInteger();
 
-    @BeforeAll
-    static void createClient() {
-        PROPERTIES.setHostname("localhost");
-        PROPERTIES.setTenant("test_pt1");
-        PROPERTIES.setUser("testuser");
-        PROPERTIES.setPassword("test-password");
-        PROPERTIES.setConnectTimeout(Duration.ofSeconds(2));
-        PROPERTIES.setReadTimeout(READ_TIMEOUT);
-        client = new WorkdayRevenueManagementClient(PROPERTIES,
+    @BeforeEach
+    void createClient() {
+        properties = new WorkdayProperties();
+        properties.setHostname("localhost");
+        properties.setTenant("test_pt1");
+        properties.setUser("testuser");
+        properties.setPassword("test-password");
+        properties.setConnectTimeout(Duration.ofSeconds(2));
+        properties.setReadTimeout(READ_TIMEOUT);
+        client = new WorkdayRevenueManagementClient(properties,
                 new UpstreamCallExecutor(List.of(new WorkdayFailureClassifier())));
     }
 
@@ -420,7 +425,7 @@ class WorkdayFailureClassifierTest {
                 .willSetStateTo("re-authenticated"));
         WORKDAY.stubFor(post(urlEqualTo(PATH)).inScenario("reauthentication").whenScenarioStateIs("re-authenticated")
                 .willReturn(soapResponse(200, PUT_CUSTOMER_RESPONSE)));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         PutCustomerResponseType response = client.putCustomer(putCustomerRequest());
 
@@ -432,7 +437,7 @@ class WorkdayFailureClassifierTest {
     void putCustomerRejectedByWsSecurityIsSentTwiceThenFails() {
         WORKDAY.stubFor(post(urlEqualTo(PATH)).willReturn(soapResponse(500,
                 faultEnvelope(WSSE_DECLARATION, "wsse:FailedAuthentication", FAILED_AUTHENTICATION_STRING))));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         Throwable thrown = catchThrowable(() -> client.putCustomer(putCustomerRequest()));
 
@@ -447,7 +452,7 @@ class WorkdayFailureClassifierTest {
         WORKDAY.stubFor(post(urlEqualTo(PATH)).willReturn(aResponse().withStatus(429)
                 .withHeader("Content-Type", "text/plain").withHeader("Retry-After", "30")
                 .withBody("Too Many Requests")));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         Throwable thrown = catchThrowable(() -> client.putCustomer(putCustomerRequest()));
 
@@ -460,7 +465,7 @@ class WorkdayFailureClassifierTest {
     void putCustomerThatTimesOutIsSentOnce() {
         WORKDAY.stubFor(post(urlEqualTo(PATH)).willReturn(soapResponse(200, PUT_CUSTOMER_RESPONSE)
                 .withFixedDelay((int) READ_TIMEOUT.multipliedBy(3).toMillis())));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         Throwable thrown = catchThrowable(() -> client.putCustomer(putCustomerRequest()));
 
@@ -474,7 +479,7 @@ class WorkdayFailureClassifierTest {
     void putCustomerRejectedWithAValidationFaultIsSentOnceAndRethrown() {
         WORKDAY.stubFor(post(urlEqualTo(PATH)).willReturn(soapResponse(500,
                 faultEnvelope("", "SOAP-ENV:Client.validationError", VALIDATION_FAULT_STRING))));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         Throwable thrown = catchThrowable(() -> client.putCustomer(putCustomerRequest()));
 

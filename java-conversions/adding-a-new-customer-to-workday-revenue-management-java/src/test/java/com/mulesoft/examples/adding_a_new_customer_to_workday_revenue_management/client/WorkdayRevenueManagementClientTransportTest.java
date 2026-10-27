@@ -39,7 +39,7 @@ import java.util.stream.Stream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 
-import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -138,21 +138,28 @@ final class WorkdayRevenueManagementClientTransportTest {
             .options(wireMockConfig().dynamicPort())
             .build();
 
-    /** Read by the client at call time, so each case points the shared client at its own server. */
-    private static final WorkdayProperties PROPERTIES = new WorkdayProperties();
+    /**
+     * This case's own {@code wday.*} settings, built before each case; the client reads the endpoint at call time, so
+     * each case points it at its own server.
+     */
+    private WorkdayProperties properties;
 
-    /** Shared by every case: its JAXB context, created on first use, spans ~900 generated classes. */
-    private static WorkdayRevenueManagementClient client;
+    /**
+     * This case's own client over {@link #properties}, built before each case, so neither an endpoint nor a
+     * re-authenticated security interceptor carries over from another case.
+     */
+    private WorkdayRevenueManagementClient client;
 
-    @BeforeAll
-    static void createClient() {
-        PROPERTIES.setHostname("localhost");
-        PROPERTIES.setTenant(TENANT);
-        PROPERTIES.setUser(USER);
-        PROPERTIES.setPassword(PASSWORD);
-        PROPERTIES.setConnectTimeout(CONNECT_TIMEOUT);
-        PROPERTIES.setReadTimeout(READ_TIMEOUT);
-        client = new WorkdayRevenueManagementClient(PROPERTIES,
+    @BeforeEach
+    void createClient() {
+        properties = new WorkdayProperties();
+        properties.setHostname("localhost");
+        properties.setTenant(TENANT);
+        properties.setUser(USER);
+        properties.setPassword(PASSWORD);
+        properties.setConnectTimeout(CONNECT_TIMEOUT);
+        properties.setReadTimeout(READ_TIMEOUT);
+        client = new WorkdayRevenueManagementClient(properties,
                 new UpstreamCallExecutor(List.of(new UnavailableOrOtherClassifier())));
     }
 
@@ -162,7 +169,7 @@ final class WorkdayRevenueManagementClientTransportTest {
         List<ReceivedRequest> received;
         UpstreamUnavailableException failure;
         try (UnansweringServer server = new UnansweringServer(hangUp)) {
-            PROPERTIES.setEndpoint(server.endpoint());
+            properties.setEndpoint(server.endpoint());
 
             failure = assertThrows(UpstreamUnavailableException.class, () -> client.putCustomer(putCustomerRequest()));
 
@@ -188,7 +195,7 @@ final class WorkdayRevenueManagementClientTransportTest {
                 .withStatus(200)
                 .withHeader("Content-Type", "text/xml;charset=UTF-8")
                 .withBody(PUT_CUSTOMER_RESPONSE)));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         PutCustomerResponseType response = client.putCustomer(putCustomerRequest());
 
@@ -233,7 +240,7 @@ final class WorkdayRevenueManagementClientTransportTest {
             answer = answer.withHeader("Retry-After", retryAfter);
         }
         WORKDAY.stubFor(post(urlEqualTo(PATH)).willReturn(answer));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         WorkdayRevenueManagementClient.HttpStatusException failure =
                 assertThrows(WorkdayRevenueManagementClient.HttpStatusException.class,
@@ -251,7 +258,7 @@ final class WorkdayRevenueManagementClientTransportTest {
                 .withStatus(500)
                 .withHeader("Content-Type", "text/xml;charset=UTF-8")
                 .withBody(VALIDATION_FAULT)));
-        PROPERTIES.setEndpoint(WORKDAY.baseUrl() + PATH);
+        properties.setEndpoint(WORKDAY.baseUrl() + PATH);
 
         SoapFaultClientException failure =
                 assertThrows(SoapFaultClientException.class, () -> client.putCustomer(putCustomerRequest()));
