@@ -23,6 +23,8 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -54,6 +56,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -95,10 +98,21 @@ import org.opentest4j.TestAbortedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
+import org.springframework.beans.factory.support.BeanDefinitionRegistry;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.ApplicationContextInitializer;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.core.convert.ConversionException;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.core.env.EnumerablePropertySource;
+import org.springframework.core.env.PropertySource;
+import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import org.springframework.scheduling.config.TaskManagementConfigUtils;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.w3c.dom.Document;
@@ -127,6 +141,23 @@ import org.w3c.dom.NodeList;
  * messages by structure only, and are reported {@code UNVERIFIED — nondeterministic output}. A fixture is never
  * adjusted to the Java output: a mismatch fails its scenario.
  *
+ * <p>{@link ReplayContextInitializer} holds the application context to that boundary before any bean exists. It
+ * removes Spring's {@code @Scheduled} processor, so in replay the only trigger executions are the single-run
+ * invocations the fixtures name in {@code request.invoke}, which every {@code file}, {@code scheduler} and
+ * {@code mail} fixture must carry. It also fails the class, before any client or store connects, when the
+ * effective configuration names a target the replay does not own ({@link #boundaryViolations}), a JDBC URL that
+ * names its server without {@code ://} (such as {@code jdbc:oracle:thin:@host:1521:sid}) or no address at all
+ * included, and a Spring Boot connection key set only in the host's environment variables or system properties
+ * ({@link #effectiveProperties}) included; a fixture overrides such a key through {@code state.properties}, or lists
+ * in {@code state.notContacted} a key the original never connected to. WireMock runs whenever a fixture is loaded,
+ * so an outbound HTTP call that matches no recording fails its scenario, {@code "upstream": []} included. Table
+ * state is seeded, emptied and read only in a database the replay owns ({@link #replayOwnedDatabase}): an in-memory
+ * one, an embedded file database inside the replay's temporary root, or a server on a replay-owned loopback port.
+ * Collection state is dropped, seeded and read only through MongoDB clients configured solely for the embedded
+ * server or another replay-owned loopback port ({@link #replayOwnedStore}). Each scenario starts from a fresh reset
+ * and gets its upstream stubs before any of its input becomes visible. The boundary's diagnostics mask the
+ * credentials a configured value may carry ({@link #redact}).
+ *
  * <p>With no fixtures the class is reported skipped, never failed. Every run writes
  * {@code target/fixture-parity/summary.properties} with each scenario's status, which feeds the {@code PARITY:}
  * labels of the README and of {@code SUMMARY.md} (AAP 0.8.7). {@code -Dfixtures.dir=<dir>} replaces the classpath
@@ -134,6 +165,7 @@ import org.w3c.dom.NodeList;
  */
 @ExtendWith(FixtureParityTest.FixtureGate.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(initializers = FixtureParityTest.ReplayContextInitializer.class)
 class FixtureParityTest {
 
     static final String NO_FIXTURES = "no Tier 2A fixtures captured";
@@ -153,6 +185,8 @@ class FixtureParityTest {
     private static final Set<String> TRIGGERS =
             Set.of("http", "soap", "file", "scheduler", "jms", "mq", "amqp", "mail");
     private static final Set<String> STATES = Set.of("deterministic", "nondeterministic", "unreachable");
+    /** Triggers the original ran by polling; replay runs them only through {@code request.invoke}. */
+    private static final Set<String> INVOKED_TRIGGERS = Set.of("file", "scheduler", "mail");
     private static final List<String> MAIL_PROTOCOLS = List.of("smtp", "smtps", "imap", "imaps", "pop3", "pop3s");
 
     private static final Pattern KEBAB_CASE = Pattern.compile("[a-z0-9]+(-[a-z0-9]+)*");
@@ -165,6 +199,48 @@ class FixtureParityTest {
     private static final Pattern BOUNDARY_PARAMETER =
             Pattern.compile(";\\s*boundary\\s*=\\s*(\"[^\"]*\"|[^;]*)", Pattern.CASE_INSENSITIVE);
     private static final Pattern FOLDED_LINE = Pattern.compile("\\r?\\n[ \\t]+");
+    private static final Pattern LOOPBACK_IPV4 = Pattern.compile("127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}");
+    /** A whole value of {@code host(port)} items, as an IBM MQ {@code connName} lists its queue managers. */
+    private static final Pattern HOST_PORT_LIST =
+            Pattern.compile("\\s*[^\\s(),]+\\(\\s*[0-9]+\\s*\\)(\\s*,\\s*[^\\s(),]+\\(\\s*[0-9]+\\s*\\))*\\s*");
+    private static final Pattern HOST_PORT_ITEM = Pattern.compile("([^\\s(),]+)\\(\\s*([0-9]+)\\s*\\)");
+    /** A {@code name=value} parameter of a URL query, a {@code ;} list or a property list, with its separator. */
+    private static final Pattern PARAMETER = Pattern.compile("(^|[?&;,(\\s])([^=?&;,()\\s\"']+)=([^&;\\s\"']*)");
+    /** Word boundaries of a name: punctuation, and a change from a lower-case letter or digit to an upper-case one. */
+    private static final Pattern NAME_WORD_BOUNDARY = Pattern.compile("[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])");
+    /**
+     * The words that mark a property key or parameter name as holding a secret, compared ignoring case; compound
+     * names such as {@code access_token}, {@code api_key}, {@code api-key} or {@code securityToken} hold one of them.
+     */
+    private static final Set<String> SECRET_WORDS = Set.of("password", "passwd", "pass", "pwd", "secret", "token",
+            "apikey", "key", "credential", "credentials", "auth", "signature", "sig");
+    private static final String MASK = "***";
+
+    /** Property sources the replay boundary does not enumerate: the host's own settings and Boot's attached view. */
+    private static final Set<String> UNSCANNED_PROPERTY_SOURCES = Set.of(
+            StandardEnvironment.SYSTEM_ENVIRONMENT_PROPERTY_SOURCE_NAME,
+            StandardEnvironment.SYSTEM_PROPERTIES_PROPERTY_SOURCE_NAME, "configurationProperties");
+    /** Address schemes that never leave the JVM or the local file system. */
+    private static final Set<String> IN_JVM_SCHEMES = Set.of("vm", "file", "classpath", "jar");
+    /** JDBC subprotocols whose URL without {@code ://} and without {@code @} names an embedded database. */
+    private static final Set<String> EMBEDDED_JDBC_SUBPROTOCOLS = Set.of("h2", "derby", "hsqldb", "sqlite");
+    /** The port a client of the scheme uses when an address names none. */
+    private static final Map<String, Integer> DEFAULT_PORTS = Map.ofEntries(Map.entry("http", 80),
+            Map.entry("https", 443), Map.entry("tcp", 61616), Map.entry("ssl", 61616), Map.entry("amqp", 5672),
+            Map.entry("amqps", 5671), Map.entry("mongodb", 27017), Map.entry("ldap", 389), Map.entry("ldaps", 636),
+            Map.entry("smtp", 25), Map.entry("smtps", 465), Map.entry("imap", 143), Map.entry("imaps", 993),
+            Map.entry("pop3", 110), Map.entry("pop3s", 995), Map.entry("ftp", 21));
+    /** Spring Boot connection keys whose defaults the boundary checks when the client library is present. */
+    private static final List<String> CLIENT_DEFAULT_KEYS = List.of("spring.rabbitmq.addresses",
+            "spring.rabbitmq.host", "spring.rabbitmq.port", "spring.artemis.mode", "spring.artemis.broker-url",
+            "spring.artemis.embedded.enabled", "spring.data.mongodb.uri", "spring.data.mongodb.host",
+            "spring.data.mongodb.port", "spring.ldap.urls");
+    /**
+     * Spring Boot connection keys the boundary looks up besides {@link #CLIENT_DEFAULT_KEYS}, because Boot binds them
+     * from the host's environment variables and system properties too, which the boundary does not enumerate.
+     */
+    private static final List<String> BOOT_CONNECTION_KEYS = List.of("spring.datasource.url",
+            "spring.datasource.hikari.jdbc-url", "spring.r2dbc.url", "spring.mail.host", "spring.mail.port");
 
     /** Transport fields the replay never sends or compares: the client regenerates them for the replay port. */
     private static final Set<String> TRANSPORT_HEADERS =
@@ -204,6 +280,19 @@ class FixtureParityTest {
     private static final String LDAP_CONFIG_CLASS = "com.unboundid.ldap.listener.InMemoryDirectoryServerConfig";
     private static final String LDAP_LISTENER_CLASS = "com.unboundid.ldap.listener.InMemoryListenerConfig";
     private static final String SAX_ERROR_HANDLER_CLASS = "org.xml.sax.ErrorHandler";
+    private static final String RABBIT_FACTORY_CLASS =
+            "org.springframework.amqp.rabbit.connection.CachingConnectionFactory";
+    private static final String ARTEMIS_FACTORY_CLASS =
+            "org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory";
+    /** The classes whose presence makes Spring Boot start Artemis embedded when no mode is set. */
+    private static final List<String> ARTEMIS_EMBEDDED_CLASSES = List.of(
+            "org.apache.activemq.artemis.jms.server.embedded.EmbeddedJMS",
+            "org.apache.activemq.artemis.core.server.embedded.EmbeddedActiveMQ");
+    /** The synchronous MongoDB client, the one a {@code MongoTemplate} works through. */
+    private static final String MONGO_SYNC_CLIENT_CLASS = "com.mongodb.client.MongoClient";
+    private static final List<String> MONGO_CLIENT_CLASSES =
+            List.of(MONGO_SYNC_CLIENT_CLASS, "com.mongodb.reactivestreams.client.MongoClient");
+    private static final String LDAP_TEMPLATE_CLASS = "org.springframework.ldap.core.LdapTemplate";
 
     private static final Path SUMMARY_FILE = Path.of("target", "fixture-parity", "summary.properties");
 
@@ -218,7 +307,7 @@ class FixtureParityTest {
     private static final Map<String, String> STATUSES = Collections.synchronizedMap(new LinkedHashMap<>());
     /** Ports by name; {@code ${freePort:<name>}} and the embedded servers share these names. */
     private static final Map<String, Integer> FREE_PORTS = new HashMap<>();
-    /** Every {@code ${dir:<name>}} directory, emptied after each scenario. */
+    /** Every {@code ${dir:<name>}} and every directory a fixture's directory spec resolves to, emptied per scenario. */
     private static final Set<Path> DIRECTORIES = new LinkedHashSet<>();
     /** Server key to the class whose absence kept that embedded server from starting. */
     private static final Map<String, String> MISSING_SERVER_CLASSES = new HashMap<>();
@@ -305,6 +394,29 @@ class FixtureParityTest {
         }
     }
 
+    /**
+     * Prepares the replay's application context before it refreshes.
+     *
+     * <p>The post-processor it adds runs once the configuration classes are parsed and before any application
+     * singleton exists. It removes Spring's {@code @Scheduled} processor ({@link #suppressScheduledTriggers}), so in
+     * replay the only trigger executions are the single-run invocations the fixtures name in {@code request.invoke};
+     * production code keeps its schedules. It then fails the context, so no client or store bean is ever created,
+     * when the effective configuration reaches a target the replay does not own ({@link #enforceReplayBoundary}).
+     */
+    static final class ReplayContextInitializer
+            implements ApplicationContextInitializer<ConfigurableApplicationContext> {
+
+        @Override
+        public void initialize(ConfigurableApplicationContext applicationContext) {
+            ConfigurableEnvironment environment = applicationContext.getEnvironment();
+            applicationContext.addBeanFactoryPostProcessor(beanFactory -> {
+                suppressScheduledTriggers(beanFactory);
+                enforceReplayBoundary(environment);
+            });
+        }
+    }
+
+
     /** One row of the {@code ## Scenarios} table; only the columns the replay reads are kept. */
     record Row(String scenario, String trigger, String state) {
 
@@ -325,14 +437,14 @@ class FixtureParityTest {
     record Fixture(String name, String location, JsonNode json, Needs needs) {
     }
 
-    /** The embedded servers a replay talks to. */
-    record Needs(boolean wireMock, boolean greenMail, boolean qpid, boolean mongo, boolean ldap) {
+    /** The embedded servers a replay talks to besides WireMock, which every replay uses. */
+    record Needs(boolean greenMail, boolean qpid, boolean mongo, boolean ldap) {
 
-        static final Needs NONE = new Needs(false, false, false, false, false);
+        static final Needs NONE = new Needs(false, false, false, false);
 
         Needs or(Needs other) {
-            return new Needs(wireMock || other.wireMock, greenMail || other.greenMail, qpid || other.qpid,
-                    mongo || other.mongo, ldap || other.ldap);
+            return new Needs(greenMail || other.greenMail, qpid || other.qpid, mongo || other.mongo,
+                    ldap || other.ldap);
         }
     }
 
@@ -519,6 +631,13 @@ class FixtureParityTest {
             if (json.has("upstream") && !json.get("upstream").isArray()) {
                 throw new IllegalStateException("Fixture " + source.location() + ": 'upstream' must be an array");
             }
+            for (JsonNode key : elements(json.path("state").get("notContacted"),
+                    "Fixture " + source.location() + ": state.notContacted")) {
+                if (!key.isTextual() || key.textValue().isBlank()) {
+                    throw new IllegalStateException("Fixture " + source.location()
+                            + ": state.notContacted must hold property keys, each a non-blank string, but holds " + key);
+                }
+            }
             List<String> placeholders = placeholderNames(source.name(), json);
             parsed.put(source.name(), new Fixture(source.name(), source.location(), json,
                     needs(row, json, placeholders)));
@@ -568,14 +687,12 @@ class FixtureParityTest {
     private static Needs needs(Row row, JsonNode json, List<String> placeholders) {
         JsonNode state = json.path("state");
         JsonNode response = json.path("response");
-        boolean wire = json.path("upstream").size() > 0
-                || placeholders.stream().anyMatch(name -> name.startsWith("wiremock."));
         boolean mail = row.trigger().equals("mail") || state.has("mail") || response.has("mails")
                 || placeholders.stream().anyMatch(name -> name.startsWith("greenmail."));
         boolean amqp = row.trigger().equals("amqp") || state.has("amqp");
         boolean mongo = state.has("collections") || response.has("collections") || placeholders.contains("mongo.uri");
         boolean ldap = state.has("ldap") || placeholders.contains("ldap.port");
-        return new Needs(wire, mail, amqp, mongo, ldap);
+        return new Needs(mail, amqp, mongo, ldap);
     }
 
     /** A {@code state.properties} value as Spring receives it: scalars only. */
@@ -619,6 +736,10 @@ class FixtureParityTest {
             matcher.appendReplacement(result, Matcher.quoteReplacement(placeholderValue(matcher.group(1), fixture)));
         }
         matcher.appendTail(result);
+        if (value.startsWith("${dir:")) {
+            // A value led by a replay directory names a path below it: checked, never created, as it may be a file.
+            requireInsideRoot(result.toString(), "Fixture " + fixture + ": " + value);
+        }
         return result.toString();
     }
 
@@ -631,7 +752,9 @@ class FixtureParityTest {
             return name.equals("wiremock.port") ? String.valueOf(wireMock.port()) : "http://localhost:" + wireMock.port();
         }
         if (name.startsWith("dir:") && name.length() > "dir:".length()) {
-            return directory(name.substring("dir:".length()), true).toString();
+            String directory = name.substring("dir:".length());
+            return replayDirectory(Path.of(directory), "Fixture " + fixture + ": ${dir:" + directory + "}", true)
+                    .toString();
         }
         if (name.startsWith("freePort:") && name.length() > "freePort:".length()) {
             return String.valueOf(freePort(name.substring("freePort:".length())));
@@ -650,27 +773,78 @@ class FixtureParityTest {
         throw new IllegalStateException("Fixture " + fixture + " uses the unsupported placeholder ${" + name + "}");
     }
 
-    /** A directory key or {@code request.file.directory}: a value without {@code ${} means {@code ${dir:<value>}}. */
+    /**
+     * A directory key or {@code request.file.directory}: a value without {@code ${} means {@code ${dir:<value>}}.
+     * The directory it resolves to must lie inside the temporary root; it is created and emptied per scenario.
+     */
     static Path resolveDirectory(String spec, String fixture) {
-        return spec.contains("${") ? Path.of(resolve(spec, fixture)) : directory(spec, true);
+        String path = spec.contains("${") ? resolve(spec, fixture) : spec;
+        return replayDirectory(Path.of(path), "Fixture " + fixture + ": directory " + spec, true);
     }
 
     /** {@code <temporary root>/<name>}, created; {@code register} adds it to the directories emptied per scenario. */
-    static synchronized Path directory(String name, boolean register) {
+    static Path directory(String name, boolean register) {
+        return replayDirectory(Path.of(name), "${dir:" + name + "}", register);
+    }
+
+    /**
+     * {@code candidate} confined to the temporary root and created; {@code register} adds it to the directories
+     * emptied per scenario. It is confined again once created, so no symbolic link on its path leaves the root.
+     */
+    private static synchronized Path replayDirectory(Path candidate, String what, boolean register) {
         try {
             Path root = tempRoot();
-            Path directory = root.resolve(name).normalize();
-            if (!directory.startsWith(root) || directory.equals(root)) {
-                throw new IllegalStateException("${dir:" + name + "} must name a directory inside " + root);
-            }
+            Path directory = confine(root, candidate, what);
             Files.createDirectories(directory);
+            confine(root, directory, what);
             if (register) {
                 DIRECTORIES.add(directory);
             }
             return directory;
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot create the replay directory " + name, e);
+            throw new UncheckedIOException(what + ": cannot create the replay directory " + candidate, e);
         }
+    }
+
+    /** Fails unless {@code path} lies inside the temporary root, as {@link #confine} decides; nothing is created. */
+    private static synchronized void requireInsideRoot(String path, String what) {
+        try {
+            confine(tempRoot(), Path.of(path), what);
+        } catch (IOException e) {
+            throw new UncheckedIOException(what + ": cannot check the replay path " + path, e);
+        }
+    }
+
+    /**
+     * {@code candidate}, read against {@code root} when relative and normalized, provided it lies strictly inside
+     * {@code root}: lexically, and through the real path of its deepest existing part, so neither {@code ..}, an
+     * absolute path elsewhere nor a symbolic link leads out of the root, and a directory created there afterwards
+     * stays inside it. Nothing is created. {@code what} names the spec and its fixture in the failure.
+     */
+    static Path confine(Path root, Path candidate, String what) throws IOException {
+        Path base = root.toAbsolutePath().normalize();
+        Path path = base.resolve(candidate).normalize();
+        if (!path.startsWith(base) || path.equals(base)) {
+            throw new IllegalStateException(what + " resolves to " + path
+                    + ", which is not a directory inside the replay root " + base);
+        }
+        Path realBase = base.toRealPath();
+        Path existing = path;
+        while (!existing.equals(base) && !Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
+            existing = existing.getParent();
+        }
+        Path real;
+        try {
+            real = existing.toRealPath();
+        } catch (NoSuchFileException broken) {
+            throw new IllegalStateException(what + " resolves to " + path + " through the broken symbolic link "
+                    + existing + ", so it is not a directory known to lie inside the replay root " + base, broken);
+        }
+        if (!real.startsWith(realBase) || (existing.equals(path) && real.equals(realBase))) {
+            throw new IllegalStateException(what + " resolves to " + path + ", but " + existing + " leads to " + real
+                    + ", which is not a directory inside the replay root " + realBase);
+        }
+        return path;
     }
 
     private static synchronized Path tempRoot() throws IOException {
@@ -709,7 +883,9 @@ class FixtureParityTest {
         for (Fixture fixture : fixtures.values()) {
             union = union.or(fixture.needs());
         }
-        if (union.wireMock()) {
+        if (!fixtures.isEmpty()) {
+            // Every replay checks its outbound HTTP calls here, an "upstream": [] scenario included, so a call the
+            // recording lacks fails as unmatched instead of going unseen.
             // Gzip stays off, as in the capture's --disable-gzip, so recorded bodies and Content-Encoding pass as-is.
             WireMockServer server =
                     new WireMockServer(WireMockConfiguration.options().dynamicPort().gzipDisabled(true));
@@ -951,6 +1127,729 @@ class FixtureParityTest {
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // Replay boundary: no trigger runs by itself, and every target the configuration names belongs to replay.
+    // ---------------------------------------------------------------------------------------------------------
+
+    /**
+     * Removes Spring's {@code @Scheduled} processor from {@code beanFactory} before it is instantiated, so neither a
+     * {@code @Scheduled} method nor a {@code SchedulingConfigurer} task runs by itself. It is called after the
+     * configuration classes are parsed and before any singleton is created.
+     *
+     * @return whether the context declared the processor
+     */
+    static boolean suppressScheduledTriggers(ConfigurableListableBeanFactory beanFactory) {
+        String processor = TaskManagementConfigUtils.SCHEDULED_ANNOTATION_PROCESSOR_BEAN_NAME;
+        if (!beanFactory.containsBeanDefinition(processor)) {
+            return false;
+        }
+        if (!(beanFactory instanceof BeanDefinitionRegistry registry)) {
+            throw new IllegalStateException("Fixture replay cannot suppress scheduled triggers: the bean factory "
+                    + beanFactory.getClass().getName() + " cannot remove " + processor);
+        }
+        registry.removeBeanDefinition(processor);
+        LOG.info("Fixture replay: scheduled triggers suppressed; each trigger runs only through request.invoke");
+        return true;
+    }
+
+    /**
+     * Fails the application context, before any bean is created, when its effective configuration reaches a
+     * target the replay does not own, so a missing or mistyped fixture override can never reach a live system.
+     */
+    static void enforceReplayBoundary(ConfigurableEnvironment environment) {
+        load();
+        List<String> violations = boundaryViolations(effectiveProperties(environment), ownedPorts(),
+                notContactedKeys(), className -> Reflect.optionalClass(className) != null);
+        if (!violations.isEmpty()) {
+            throw new IllegalStateException(boundaryMessage(violations));
+        }
+    }
+
+    /**
+     * The failure for {@code violations}: each key with its value, credentials masked, and reason, and how a fixture
+     * resolves them.
+     */
+    static String boundaryMessage(List<String> violations) {
+        return "Fixture replay does not start the application context: its configuration reaches targets the replay"
+                + " does not own, and replay never contacts a live service.\n  " + String.join("\n  ", violations)
+                + "\nOverride each key through state.properties with a replay-owned value (${wiremock.baseUrl},"
+                + " ${freePort:<name>}, an in-memory URL such as jdbc:h2:mem:<name> or vm://0), or list it in"
+                + " state.notContacted when the original never connected to it.";
+    }
+
+    /**
+     * Every key of the context's enumerable property sources but the host's own, with its value as the application
+     * reads it, plus the Spring Boot connection keys of {@link #CLIENT_DEFAULT_KEYS} and {@link #BOOT_CONNECTION_KEYS}
+     * that resolve. Those are looked up through {@code environment}, so a value set only in the host's environment
+     * variables or system properties counts too, under its relaxed name ({@code SPRING_DATASOURCE_URL} for
+     * {@code spring.datasource.url}), as Boot binds it. A key enters the map only when it resolves, or with an empty
+     * value when a scanned source declares it without one.
+     */
+    static Map<String, String> effectiveProperties(ConfigurableEnvironment environment) {
+        Set<String> keys = new TreeSet<>(properties.keySet());
+        for (PropertySource<?> source : environment.getPropertySources()) {
+            if (source instanceof EnumerablePropertySource<?> enumerable
+                    && !UNSCANNED_PROPERTY_SOURCES.contains(source.getName())) {
+                keys.addAll(Arrays.asList(enumerable.getPropertyNames()));
+            }
+        }
+        Set<String> lookups = new LinkedHashSet<>(keys);
+        lookups.addAll(CLIENT_DEFAULT_KEYS);
+        lookups.addAll(BOOT_CONNECTION_KEYS);
+        Map<String, String> effective = new TreeMap<>();
+        for (String key : lookups) {
+            String value;
+            try {
+                value = environment.getProperty(key);
+            } catch (IllegalArgumentException unresolvable) {
+                // A placeholder nothing resolves: no client can be configured from the key, so it names no target.
+                continue;
+            } catch (ConversionException notText) {
+                // A value that is no text, such as the empty map of a YAML "key: {}", names no address.
+                continue;
+            }
+            if (value != null) {
+                effective.put(key, value);
+            } else if (keys.contains(key)) {
+                effective.put(key, "");
+            }
+        }
+        return effective;
+    }
+
+    /** The loopback ports replay servers listen on: WireMock, every named free port and the embedded MongoDB. */
+    static synchronized Set<Integer> ownedPorts() {
+        Set<Integer> owned = new TreeSet<>(FREE_PORTS.values());
+        if (wireMock != null) {
+            owned.add(wireMock.port());
+        }
+        if (mongoUri != null) {
+            owned.add(Integer.parseInt(mongoUri.substring(mongoUri.lastIndexOf(':') + 1)));
+        }
+        return owned;
+    }
+
+    /** The keys every fixture's {@code state.notContacted} names together: keys the original never connected to. */
+    private static Set<String> notContactedKeys() {
+        Set<String> keys = new TreeSet<>();
+        for (Fixture fixture : fixtures.values()) {
+            for (JsonNode key : elements(fixture.json().path("state").get("notContacted"),
+                    fixture.name() + ": state.notContacted")) {
+                keys.add(key.textValue());
+            }
+        }
+        return keys;
+    }
+
+    /** A host and the port a client reaches it on; {@code port} is -1 when the address and its scheme give none. */
+    record Address(String host, int port) {
+    }
+
+    /**
+     * The targets {@code properties} reach that the replay does not own, one entry per key naming its value and the
+     * reason; empty when the replay owns every one.
+     *
+     * <p>A target is owned when it is a loopback host ({@code localhost}, {@code 127.0.0.0/8}, {@code ::1},
+     * {@code 0.0.0.0}) on one of {@code ownedPorts}, or an in-JVM address: the schemes {@code vm}, {@code file},
+     * {@code classpath} and {@code jar}. Whether table state may be written to the database a JDBC URL names is
+     * decided later, by {@link #replayOwnedDatabase}, and whether collection state may be written through a MongoDB
+     * client by {@link #replayOwnedStore}. The replay passes the map {@link #effectiveProperties} reads, so a Spring
+     * Boot connection key set only in the host's environment variables or system properties is checked as well.
+     * The checks are:
+     * <ul>
+     *   <li>every {@code scheme://authority} of a value, each host of a multi-host authority or failover list, with
+     *       the scheme's default port when none is given. The host is read after the user information, and a
+     *       pattern or template such as {@code localhost*} is a host like any other, so it is not owned. Only port
+     *       {@code 0} of a loopback host, the application's own random listener, names no target;</li>
+     *   <li>a value starting with {@code jdbc:}, in any case, whose location before its {@code ;} or {@code ?}
+     *       parameters holds no {@code ://} ({@link #jdbcViolation}): without an {@code @} there, an {@code h2},
+     *       {@code derby}, {@code hsqldb} or {@code sqlite} URL is an embedded database and names no network
+     *       target, and any other subprotocol fails closed; with an {@code @}, the {@code host[:port]} after the
+     *       last one, read without a leading {@code //}, a {@code /service} or a {@code :sid}, must be a loopback
+     *       host on an owned port. Every {@code scheme://} address among its parameters is checked as well;</li>
+     *   <li>a value of {@code host(port)} items, as an IBM MQ {@code connName} lists them;</li>
+     *   <li>a key whose last segment ends with {@code host} or is {@code hostname}: its value must be a loopback
+     *       host, on an owned port when it or its sibling {@code <prefix>.port} gives a port other than 0;</li>
+     *   <li>a key whose last segment ends with {@code url}, {@code uri} or {@code endpoint} with an empty value, from
+     *       which a client derives a default address;</li>
+     *   <li>where Spring AMQP, Artemis, the MongoDB driver or Spring LDAP is on the classpath, the address Spring
+     *       Boot connects it to when its keys are unset (an embedded Artemis server is owned).</li>
+     * </ul>
+     *
+     * @param properties   property keys and their effective values, as {@link #effectiveProperties} reads them
+     * @param ownedPorts   the loopback ports replay servers listen on
+     * @param exemptKeys   the keys the original never connected to, which are not checked
+     * @param classPresent whether a class is on the classpath
+     * @return one {@code key = "value": reason} entry per violating key, keys in order, client defaults last; the
+     *         value is shown with its credentials masked ({@link #redact}) and the reason names the target by
+     *         {@code host:port}
+     */
+    static List<String> boundaryViolations(Map<String, String> properties, Set<Integer> ownedPorts,
+            Set<String> exemptKeys, Predicate<String> classPresent) {
+        Map<String, String> violations = new LinkedHashMap<>();
+        for (Map.Entry<String, String> property : new TreeMap<>(properties).entrySet()) {
+            String key = property.getKey();
+            String value = property.getValue() == null ? "" : property.getValue();
+            String problem = exemptKeys.contains(key) ? null : propertyViolation(key, value, properties, ownedPorts);
+            if (problem != null) {
+                violations.put(key, violation(key, value, problem));
+            }
+        }
+        if (classPresent.test(RABBIT_FACTORY_CLASS)) {
+            String addresses = properties.getOrDefault("spring.rabbitmq.addresses", "");
+            if (!addresses.isBlank()) {
+                clientDefault(violations, exemptKeys, "spring.rabbitmq.addresses", addresses,
+                        brokerAddressesViolation(addresses, ownedPorts), "Spring AMQP");
+            } else {
+                String host = properties.getOrDefault("spring.rabbitmq.host", "localhost");
+                String port = properties.getOrDefault("spring.rabbitmq.port", "5672");
+                clientDefault(violations, exemptKeys, "spring.rabbitmq.host", host + ":" + port,
+                        hostPortViolation(host, parsePort(port, 5672), ownedPorts), "Spring AMQP");
+            }
+        }
+        if (classPresent.test(ARTEMIS_FACTORY_CLASS)) {
+            String mode = properties.getOrDefault("spring.artemis.mode", "").strip();
+            boolean embedded = mode.isEmpty()
+                    ? !"false".equalsIgnoreCase(properties.getOrDefault("spring.artemis.embedded.enabled", "").strip())
+                            && ARTEMIS_EMBEDDED_CLASSES.stream().anyMatch(classPresent)
+                    : mode.equalsIgnoreCase("embedded");
+            if (!embedded) {
+                String url = properties.getOrDefault("spring.artemis.broker-url", "");
+                url = url.isBlank() ? "tcp://localhost:61616" : url;
+                clientDefault(violations, exemptKeys, "spring.artemis.broker-url", url,
+                        url.contains("://") ? urlViolation(url, ownedPorts) : "it is not a broker URL", "Artemis");
+            }
+        }
+        if (MONGO_CLIENT_CLASSES.stream().anyMatch(classPresent)) {
+            String uri = properties.getOrDefault("spring.data.mongodb.uri", "");
+            if (!uri.isBlank()) {
+                clientDefault(violations, exemptKeys, "spring.data.mongodb.uri", uri,
+                        uri.contains("://") ? urlViolation(uri, ownedPorts) : "it is not a MongoDB connection string",
+                        "the MongoDB driver");
+            } else {
+                String host = properties.getOrDefault("spring.data.mongodb.host", "localhost");
+                String port = properties.getOrDefault("spring.data.mongodb.port", "27017");
+                clientDefault(violations, exemptKeys, "spring.data.mongodb.host", host + ":" + port,
+                        hostPortViolation(host, parsePort(port, 27017), ownedPorts), "the MongoDB driver");
+            }
+        }
+        if (classPresent.test(LDAP_TEMPLATE_CLASS) && properties.entrySet().stream().noneMatch(property ->
+                (property.getKey().equals("spring.ldap.urls") || property.getKey().startsWith("spring.ldap.urls["))
+                        && property.getValue() != null && !property.getValue().isBlank())) {
+            String url = "ldap://localhost:389";
+            clientDefault(violations, exemptKeys, "spring.ldap.urls", url, urlViolation(url, ownedPorts),
+                    "Spring LDAP");
+        }
+        return List.copyOf(violations.values());
+    }
+
+    /** The reason one key's value reaches a target the replay does not own, or {@code null}. */
+    private static String propertyViolation(String key, String value, Map<String, String> properties,
+            Set<Integer> ownedPorts) {
+        int dot = key.lastIndexOf('.');
+        String segment = lower(key.substring(dot + 1)).replaceFirst("\\[[^\\]]*\\]$", "");
+        boolean hostKey = segment.endsWith("host") || segment.equals("hostname");
+        if (value.isBlank()) {
+            if (segment.endsWith("url") || segment.endsWith("uri") || segment.endsWith("endpoint")) {
+                return "the value is empty, so the client derives a default address";
+            }
+            return hostKey ? "the value is empty, so the client falls back to a default host" : null;
+        }
+        if (value.strip().regionMatches(true, 0, "jdbc:", 0, "jdbc:".length())
+                && !withoutParameters(value).contains("://")) {
+            // A parameter's URL is checked too, but never stands in for the database address of the location.
+            String problem = value.contains("://") ? urlViolation(value, ownedPorts) : null;
+            return problem != null ? problem : jdbcViolation(value, ownedPorts);
+        }
+        if (value.contains("://")) {
+            return urlViolation(value, ownedPorts);
+        }
+        if (HOST_PORT_LIST.matcher(value).matches()) {
+            Matcher item = HOST_PORT_ITEM.matcher(value);
+            while (item.find()) {
+                String problem = targetProblem(new Address(item.group(1), parsePort(item.group(2), -1)), ownedPorts);
+                if (problem != null) {
+                    return problem;
+                }
+            }
+            return null;
+        }
+        if (!hostKey) {
+            return null;
+        }
+        Address address = address(value, -1);
+        if (!isLoopback(address.host())) {
+            return address.host() + " is not a loopback host";
+        }
+        int port = address.port() >= 0 ? address.port()
+                : parsePort(properties.get(key.substring(0, dot + 1) + "port"), -1);
+        return port > 0 && !ownedPorts.contains(port)
+                ? "the port of " + endpoint(new Address(address.host(), port)) + " belongs to no replay server" : null;
+    }
+
+    /**
+     * The reason {@code url}, a JDBC URL whose location (the text before its first {@code ;} or {@code ?}) holds no
+     * {@code ://}, reaches a target the replay does not own, or {@code null}. Without an {@code @} in the location,
+     * an {@code h2}, {@code derby}, {@code hsqldb} or {@code sqlite} URL names an embedded database and no network
+     * target, and the table-state check decides whether the replay owns it ({@link #replayOwnedDatabase}); any other
+     * subprotocol names an address the replay cannot read, such as {@code jdbc:postgresql:<database>} on the
+     * driver's default host, so it fails closed. With an {@code @}, as {@code jdbc:oracle:thin:@host:1521:sid},
+     * {@code jdbc:oracle:thin:@//host:1521/service} or {@code jdbc:oracle:oci:@alias} name their server, the target
+     * is the {@code host[:port]} after the last {@code @} ({@link #jdbcAddress}), owned only as a loopback host on
+     * one of {@code ownedPorts}.
+     */
+    private static String jdbcViolation(String url, Set<Integer> ownedPorts) {
+        String location = withoutParameters(url);
+        int at = location.lastIndexOf('@');
+        if (at < 0) {
+            int end = location.indexOf(':', "jdbc:".length());
+            String subprotocol = lower(location.substring("jdbc:".length(), end < 0 ? location.length() : end));
+            return EMBEDDED_JDBC_SUBPROTOCOLS.contains(subprotocol) ? null
+                    : "the JDBC URL names no address the replay can place on a replay-owned target";
+        }
+        Address address = jdbcAddress(location.substring(at + 1));
+        if (isLoopback(address.host()) && ownedPorts.contains(address.port())) {
+            return null;
+        }
+        // targetProblem accepts port 0 of a loopback host as the application's own listener; no database is there.
+        String problem = targetProblem(address, ownedPorts);
+        return problem != null ? problem : "the port of " + endpoint(address) + " belongs to no replay server";
+    }
+
+    /**
+     * The {@code host[:port]} of the JDBC address {@code target}, the text after the URL's last {@code @}: without a
+     * leading {@code //}, a {@code /service} or a {@code :sid}; the port is -1 when it names none. Any other form,
+     * such as a TNS descriptor in parentheses, is read as one host, which is no loopback host.
+     */
+    private static Address jdbcAddress(String target) {
+        String text = target.strip();
+        if (text.startsWith("//")) {
+            text = text.substring("//".length());
+        }
+        int slash = text.indexOf('/');
+        if (slash >= 0) {
+            text = text.substring(0, slash);
+        }
+        int portColon = text.indexOf(':', text.startsWith("[") ? Math.max(text.indexOf(']'), 0) : 0);
+        int sidColon = portColon < 0 ? -1 : text.indexOf(':', portColon + 1);
+        return address(sidColon < 0 ? text : text.substring(0, sidColon), -1);
+    }
+
+    /** Records the violation of a client's effective address under {@code key}, unless exempt or already recorded. */
+    private static void clientDefault(Map<String, String> violations, Set<String> exemptKeys, String key, String value,
+            String problem, String client) {
+        if (problem != null && !exemptKeys.contains(key)) {
+            violations.putIfAbsent(key, violation(key, value, problem + "; " + client
+                    + " is on the classpath and connects there"));
+        }
+    }
+
+    private static String violation(String key, String value, String problem) {
+        return key + " = " + quote(redact(key, value)) + ": " + problem;
+    }
+
+    /**
+     * {@code value} as a diagnostic may print it, its credentials masked as {@code ***}: the whole value when the
+     * last segment of {@code key} names a secret; otherwise the user information of every {@code scheme://}
+     * authority ({@code scheme://***@host}), of a JDBC URL that names its user before an {@code @} without
+     * {@code ://} ({@code jdbc:oracle:thin:***@host}) and of each entry of an address list without a scheme
+     * ({@code ***@host:5672}), and the value of every {@code ?}, {@code &}, {@code ;} or list parameter whose name
+     * names a secret ({@code password=***}). A name names a secret when one of its words, split at punctuation and
+     * at a lower-to-upper case change, is one of {@link #SECRET_WORDS}. Keys, hosts and ports stay readable, so the
+     * diagnostic still names the target it is about.
+     *
+     * @param key   the property key the value belongs to, or {@code null} for a value without one, such as the URL a
+     *              DataSource reports
+     * @param value the configured value or URL; {@code null} stays {@code null}
+     */
+    static String redact(String key, String value) {
+        if (value == null || value.isEmpty()) {
+            return value;
+        }
+        if (key != null && secretName(key.substring(key.lastIndexOf('.') + 1).replaceFirst("\\[[^\\]]*\\]$", ""))) {
+            return MASK;
+        }
+        String masked = PARAMETER.matcher(value).replaceAll(parameter -> Matcher.quoteReplacement(
+                secretName(parameter.group(2)) ? parameter.group(1) + parameter.group(2) + "=" + MASK
+                        : parameter.group()));
+        return masked.contains("://") ? maskAuthorityUserInfo(masked)
+                : masked.startsWith("jdbc:") ? maskJdbcUserInfo(masked) : maskAddressUserInfo(masked);
+    }
+
+    /** Whether one word of {@code name} is a {@link #SECRET_WORDS secret word}. */
+    private static boolean secretName(String name) {
+        return Arrays.stream(NAME_WORD_BOUNDARY.split(name)).anyMatch(word -> SECRET_WORDS.contains(lower(word)));
+    }
+
+    /**
+     * {@code value} with the user information of each {@code scheme://} authority masked. The authority runs to the
+     * first {@code /}, {@code ?}, {@code #}, parenthesis, quote, white space or next scheme, so a {@code ;} or a
+     * {@code ,} inside it never shortens what is masked.
+     */
+    private static String maskAuthorityUserInfo(String value) {
+        StringBuilder masked = new StringBuilder(value.length());
+        int copied = 0;
+        int separator = value.indexOf("://");
+        while (separator >= 0) {
+            int authorityStart = separator + "://".length();
+            int next = value.indexOf("://", authorityStart);
+            int end = authorityStart;
+            while (end < value.length() && !isUriAuthorityEnd(value.charAt(end))) {
+                end++;
+            }
+            if (next >= 0 && next < end) {
+                end = Math.max(authorityStart, schemeStart(value, next));
+            }
+            int at = value.lastIndexOf('@', end - 1);
+            if (at >= authorityStart) {
+                masked.append(value, copied, authorityStart).append(MASK);
+                copied = at;
+            }
+            separator = next;
+        }
+        return masked.append(value, copied, value.length()).toString();
+    }
+
+    private static boolean isUriAuthorityEnd(char c) {
+        return c == '/' || c == '?' || c == '#' || c == '(' || c == ')' || c == '"' || c == '\''
+                || Character.isWhitespace(c);
+    }
+
+    /**
+     * {@code value}, a JDBC URL without {@code ://}, with the user information it names before its last {@code @}
+     * masked, as {@code jdbc:oracle:thin:user/password@host} does: from the {@code :} that precedes its first
+     * {@code /} or {@code @}, so a {@code :}, {@code /} or {@code @} inside the password is masked too.
+     */
+    private static String maskJdbcUserInfo(String value) {
+        int lastAt = value.lastIndexOf('@');
+        if (lastAt < 0) {
+            return value;
+        }
+        int slash = value.indexOf('/');
+        int firstAt = value.indexOf('@');
+        int start = value.lastIndexOf(':', (slash >= 0 ? Math.min(slash, firstAt) : firstAt) - 1) + 1;
+        return start < lastAt ? value.substring(0, start) + MASK + value.substring(lastAt) : value;
+    }
+
+    /**
+     * {@code value}, a list of addresses without a scheme such as {@code spring.rabbitmq.addresses}, with the user
+     * information of each {@code user:password@host:port} entry masked: the text before an entry's last {@code @}.
+     */
+    private static String maskAddressUserInfo(String value) {
+        StringBuilder masked = new StringBuilder(value.length());
+        int entryStart = 0;
+        for (int i = 0; i <= value.length(); i++) {
+            if (i == value.length() || value.charAt(i) == ',' || Character.isWhitespace(value.charAt(i))) {
+                String entry = value.substring(entryStart, i);
+                int at = entry.lastIndexOf('@');
+                masked.append(at > 0 ? MASK + entry.substring(at) : entry);
+                if (i < value.length()) {
+                    masked.append(value.charAt(i));
+                }
+                entryStart = i + 1;
+            }
+        }
+        return masked.toString();
+    }
+
+    /**
+     * {@code spring.rabbitmq.addresses}: comma-separated {@code [user:password@]host[:port]} or {@code amqp[s]://}
+     * addresses; the host is read after the user information.
+     */
+    private static String brokerAddressesViolation(String addresses, Set<Integer> ownedPorts) {
+        for (String entry : addresses.split(",")) {
+            if (entry.isBlank()) {
+                continue;
+            }
+            String problem = entry.contains("://") ? urlViolation(entry, ownedPorts)
+                    : hostPortViolation(entry.substring(entry.lastIndexOf('@') + 1), 5672, ownedPorts);
+            if (problem != null) {
+                return problem;
+            }
+        }
+        return null;
+    }
+
+    /** A client's host and port: the replay owns it only as a loopback host on an owned port. */
+    private static String hostPortViolation(String host, int defaultPort, Set<Integer> ownedPorts) {
+        if (host.isBlank()) {
+            return "the host is empty, so the client falls back to a default host";
+        }
+        return targetProblem(address(host, defaultPort), ownedPorts);
+    }
+
+    /** The first {@code scheme://authority} of {@code value} the replay does not own, or {@code null}. */
+    private static String urlViolation(String value, Set<Integer> ownedPorts) {
+        for (Address address : urlAddresses(value)) {
+            String problem = targetProblem(address, ownedPorts);
+            if (problem != null) {
+                return problem;
+            }
+        }
+        return null;
+    }
+
+    private static String targetProblem(Address address, Set<Integer> ownedPorts) {
+        boolean loopback = isLoopback(address.host());
+        if (loopback && address.port() == 0) {
+            // Port 0 of a loopback host is the application's own random listener (RANDOM_PORT), never a service.
+            return null;
+        }
+        if (!loopback) {
+            return address.host().isEmpty() ? "the address names no host"
+                    : endpoint(address) + " is not a loopback host";
+        }
+        if (address.port() < 0) {
+            return address.host() + " is given without a port, and its scheme has no default";
+        }
+        return ownedPorts.contains(address.port()) ? null
+                : "the port of " + endpoint(address) + " belongs to no replay server";
+    }
+
+    /**
+     * {@code host:port}, an IPv6 host in brackets, or the host alone without a port: the target a diagnostic names,
+     * which stays readable when {@link #redact} masks the value it came from.
+     */
+    private static String endpoint(Address address) {
+        String host = address.host().contains(":") && !address.host().startsWith("[")
+                ? "[" + address.host() + "]" : address.host();
+        return address.port() < 0 ? host : host + ":" + address.port();
+    }
+
+    /**
+     * Every host the {@code scheme://authority} occurrences of {@code value} name, with the scheme's default port
+     * when the authority gives none, including each host of a multi-host authority ({@code mongodb://a:1,b:2/db})
+     * and of a failover list ({@code failover:(tcp://a:1,tcp://b:2)}). The host is read after the last {@code @} of
+     * the authority, so no user information hides it, and whatever characters it holds: a pattern or template such
+     * as {@code localhost*} is a host like any other. Only addresses of an in-JVM scheme name no target.
+     */
+    static List<Address> urlAddresses(String value) {
+        List<Address> addresses = new ArrayList<>();
+        int separator = value.indexOf("://");
+        while (separator >= 0) {
+            int authorityStart = separator + "://".length();
+            int next = value.indexOf("://", authorityStart);
+            int end = authorityStart;
+            while (end < value.length() && !isAuthorityEnd(value.charAt(end))) {
+                end++;
+            }
+            if (next >= 0 && next < end) {
+                // A list such as failover:(tcp://a:1,tcp://b:2): this authority ends where the next scheme starts.
+                end = Math.max(authorityStart, schemeStart(value, next));
+            }
+            String scheme = lower(value.substring(schemeStart(value, separator), separator));
+            String authority = value.substring(authorityStart, end);
+            if (!scheme.isEmpty() && !IN_JVM_SCHEMES.contains(scheme)) {
+                int defaultPort = DEFAULT_PORTS.getOrDefault(scheme, -1);
+                List<Address> hosts = new ArrayList<>();
+                for (String host : authority.substring(authority.lastIndexOf('@') + 1).split(",")) {
+                    if (!host.isBlank()) {
+                        hosts.add(address(host, defaultPort));
+                    }
+                }
+                addresses.addAll(hosts.isEmpty() ? List.of(new Address("", defaultPort)) : hosts);
+            }
+            separator = next;
+        }
+        return addresses;
+    }
+
+    private static boolean isAuthorityEnd(char c) {
+        return c == '/' || c == '?' || c == '#' || c == '(' || c == ')' || c == ';' || c == '"' || c == '\''
+                || Character.isWhitespace(c);
+    }
+
+    /** The start of the URI scheme that ends at {@code separator}, the index of its {@code ://}. */
+    private static int schemeStart(String value, int separator) {
+        int start = separator;
+        while (start > 0 && isSchemeChar(value.charAt(start - 1))) {
+            start--;
+        }
+        while (start < separator && !isAsciiLetter(value.charAt(start))) {
+            start++;
+        }
+        return start;
+    }
+
+    private static boolean isSchemeChar(char c) {
+        return isAsciiLetter(c) || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.';
+    }
+
+    private static boolean isAsciiLetter(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+
+    /** {@code host}, {@code host:port} or {@code [v6]:port}, with {@code defaultPort} when it gives no port. */
+    static Address address(String hostPort, int defaultPort) {
+        String text = hostPort.strip();
+        if (text.startsWith("[")) {
+            int close = text.indexOf(']');
+            if (close > 0) {
+                String rest = text.substring(close + 1);
+                return new Address(text.substring(1, close),
+                        rest.startsWith(":") ? parsePort(rest.substring(1), defaultPort) : defaultPort);
+            }
+            return new Address(text, defaultPort);
+        }
+        int colon = text.indexOf(':');
+        if (colon >= 0 && colon == text.lastIndexOf(':')) {
+            return new Address(text.substring(0, colon), parsePort(text.substring(colon + 1), defaultPort));
+        }
+        // A bare IPv6 literal such as ::1 holds several colons and no port.
+        return new Address(text, defaultPort);
+    }
+
+    /** A TCP port number; {@code defaultPort} when {@code text} is absent or blank, -1 when it is no port. */
+    private static int parsePort(String text, int defaultPort) {
+        if (text == null || text.isBlank()) {
+            return defaultPort;
+        }
+        String digits = text.strip();
+        if (!DIGIT_RUN.matcher(digits).matches() || digits.length() > 5) {
+            return -1;
+        }
+        int port = Integer.parseInt(digits);
+        return port <= 65_535 ? port : -1;
+    }
+
+    static boolean isLoopback(String host) {
+        String name = lower(host.strip());
+        if (name.startsWith("[") && name.endsWith("]")) {
+            name = name.substring(1, name.length() - 1);
+        }
+        return name.equals("localhost") || name.equals("::1") || name.equals("0:0:0:0:0:0:0:1")
+                || name.equals("0.0.0.0") || LOOPBACK_IPV4.matcher(name).matches();
+    }
+
+    /**
+     * Whether a JDBC URL names a database the replay owns, so its table state may be seeded, emptied and read. A
+     * database is owned through its identity or its location:
+     * <ul>
+     *   <li>an in-memory database: {@code jdbc:h2:mem:}, {@code jdbc:derby:memory:}, {@code jdbc:hsqldb:mem:};</li>
+     *   <li>an embedded file database whose path lies strictly inside {@code replayRoot}, as {@link #confine}
+     *       decides, so neither {@code ..} nor a symbolic link leads out of it: H2 {@code jdbc:h2:file:<path>} and
+     *       {@code jdbc:h2:<path>}, Derby {@code jdbc:derby:<name or path>} and {@code jdbc:derby:directory:<path>},
+     *       and HSQLDB {@code jdbc:hsqldb:file:<path>}. The path is read without its {@code ;} or {@code ?}
+     *       parameters; a leading {@code ~} stands for {@code user.home} (H2, HSQLDB), and a relative path is read
+     *       against {@code h2.baseDir} (H2) or {@code derby.system.home} (Derby) when that system property is set,
+     *       else against {@code user.dir};</li>
+     *   <li>a network database, the URL's location before its parameters holding {@code ://}, whose every host is
+     *       a loopback address on one of {@code ownedPorts}.</li>
+     * </ul>
+     * Every {@code scheme://} address elsewhere in the URL, such as a script its parameters load, must be owned in the
+     * same way. Every other URL is not owned, an embedded form not listed here included (H2 {@code zip:},
+     * {@code nio:} or {@code split:}, Derby {@code classpath:} or {@code jar:}, HSQLDB {@code res:}, SQLite, ...),
+     * so the check fails closed.
+     *
+     * @param url        the URL the application's DataSource reports
+     * @param ownedPorts the loopback ports replay servers listen on
+     * @param replayRoot the temporary directory the replay owns
+     */
+    static boolean replayOwnedDatabase(String url, Set<Integer> ownedPorts, Path replayRoot) {
+        if (url == null || !url.startsWith("jdbc:")) {
+            return false;
+        }
+        List<Address> addresses = urlAddresses(url);
+        if (!addresses.stream().allMatch(address -> isLoopback(address.host())
+                && ownedPorts.contains(address.port()))) {
+            return false;
+        }
+        String location = withoutParameters(url);
+        if (location.contains("://")) {
+            return !addresses.isEmpty();
+        }
+        String name = location.substring(location.indexOf(':', "jdbc:".length()) + 1);
+        if (url.startsWith("jdbc:h2:")) {
+            if (name.startsWith("mem:")) {
+                return true;
+            }
+            String path = name.startsWith("file:") ? name.substring("file:".length()) : name;
+            return embeddedFileInside(path, System.getProperty("h2.baseDir"), true, replayRoot);
+        }
+        if (url.startsWith("jdbc:derby:")) {
+            if (name.startsWith("memory:")) {
+                return true;
+            }
+            String path = name.startsWith("directory:") ? name.substring("directory:".length()) : name;
+            return embeddedFileInside(path, System.getProperty("derby.system.home"), false, replayRoot);
+        }
+        if (url.startsWith("jdbc:hsqldb:")) {
+            if (name.startsWith("mem:")) {
+                return true;
+            }
+            return name.startsWith("file:")
+                    && embeddedFileInside(name.substring("file:".length()), null, true, replayRoot);
+        }
+        return false;
+    }
+
+    /**
+     * Whether a MongoDB client reaches only servers the replay owns, so collection state may be dropped, seeded and
+     * read through it: {@code hosts}, the server addresses the client is configured for, is not empty and each is a
+     * loopback host on one of {@code ownedPorts}, such as the embedded MongoDB server on its bind port. Any other
+     * list, an entry without a port or on port {@code 0} included, is not owned, so the check fails closed.
+     *
+     * @param hosts      every server address of the client as {@code host:port}, an IPv6 host in brackets
+     * @param ownedPorts the loopback ports replay servers listen on
+     */
+    static boolean replayOwnedStore(List<String> hosts, Set<Integer> ownedPorts) {
+        return !hosts.isEmpty() && hosts.stream().map(host -> address(host, -1))
+                .allMatch(address -> isLoopback(address.host()) && ownedPorts.contains(address.port()));
+    }
+
+    /** A JDBC URL's location: the text before its first {@code ;} or {@code ?} parameter. */
+    private static String withoutParameters(String url) {
+        int end = url.length();
+        for (char separator : new char[] {';', '?'}) {
+            int index = url.indexOf(separator);
+            if (index >= 0 && index < end) {
+                end = index;
+            }
+        }
+        return url.substring(0, end).strip();
+    }
+
+    /**
+     * Whether the embedded database at {@code path} lies inside {@code replayRoot}: {@code ~} expanded when the
+     * driver expands it, a relative path read against {@code baseDirectory} when set, else against {@code user.dir}.
+     * A path that starts with another file-system prefix ({@code zip:}, {@code classpath:}, ...) is not owned.
+     */
+    private static boolean embeddedFileInside(String path, String baseDirectory, boolean expandsHome,
+            Path replayRoot) {
+        if (path.isEmpty() || hasFileSystemPrefix(path)) {
+            return false;
+        }
+        try {
+            Path file;
+            if (expandsHome && (path.equals("~") || path.startsWith("~/") || path.startsWith("~\\"))) {
+                file = Path.of(System.getProperty("user.home"), path.substring(1).replaceFirst("^[/\\\\]+", ""));
+            } else {
+                Path given = Path.of(path);
+                String base = baseDirectory == null || baseDirectory.isBlank()
+                        ? System.getProperty("user.dir") : baseDirectory;
+                file = given.isAbsolute() ? given : Path.of(base).resolve(given);
+            }
+            confine(replayRoot, file.toAbsolutePath().normalize(), "the embedded database " + path);
+            return true;
+        } catch (InvalidPathException | IllegalStateException | IOException notInside) {
+            return false;
+        }
+    }
+
+    /** Whether {@code path} starts with a {@code prefix:} before its first separator, other than a drive letter. */
+    private static boolean hasFileSystemPrefix(String path) {
+        int colon = path.indexOf(':');
+        if (colon < 0) {
+            return false;
+        }
+        int slash = path.indexOf('/');
+        int backslash = path.indexOf('\\');
+        int separator = slash < 0 ? backslash : backslash < 0 ? slash : Math.min(slash, backslash);
+        boolean driveLetter = colon == 1 && isAsciiLetter(path.charAt(0));
+        return !driveLetter && (separator < 0 || colon < separator);
+    }
+
+
+    // ---------------------------------------------------------------------------------------------------------
     // Summary: target/fixture-parity/summary.properties, written without timestamp so reruns compare equal.
     // ---------------------------------------------------------------------------------------------------------
 
@@ -1124,7 +2023,10 @@ class FixtureParityTest {
     // Replay of one scenario.
     // ---------------------------------------------------------------------------------------------------------
 
-    /** One scenario's replay: seeds its state, drives its trigger, compares every captured effect, then resets. */
+    /**
+     * One scenario's replay: resets, installs its upstream stubs, seeds its state, drives its trigger, compares every
+     * captured effect, then resets again.
+     */
     static final class Replay {
 
         private enum Broker { NONE, JMS, AMQP }
@@ -1164,13 +2066,20 @@ class FixtureParityTest {
             }
         }
 
+        /**
+         * Replays the scenario. It starts from a fresh reset, so nothing an earlier scenario, the context start or the
+         * application left behind is visible, and installs the upstream stubs before any input is exposed. With
+         * scheduling suppressed, the trigger runs only when the driver sends the input or calls the single-run
+         * method the fixture names.
+         */
         void execute() throws Exception {
+            requireInvocation();
             requireDrivers();
             ensureAppender();
-            clearAppender();
+            reset();
             prepareMessages();
-            seedState();
             registerUpstream();
+            seedState();
             try {
                 switch (row.trigger()) {
                     case "http", "soap" -> replayHttp();
@@ -1201,7 +2110,7 @@ class FixtureParityTest {
             }
         }
 
-        /** Returns every shared server and store to the state the next scenario expects. */
+        /** Returns every shared server and store to the state a scenario starts from; runs before and after each. */
         void reset() throws Exception {
             List<Exception> failures = new ArrayList<>();
             attempt(failures, () -> {
@@ -1236,6 +2145,20 @@ class FixtureParityTest {
         }
 
         // ----- drivers and servers the fixture needs -------------------------------------------------------
+
+        /**
+         * A polled trigger replays only through the single-run method its fixture names: scheduling is suppressed, so
+         * without {@code request.invoke} nothing would process the input, and replay never waits on a schedule.
+         */
+        private void requireInvocation() {
+            JsonNode invoke = request.get("invoke");
+            if (INVOKED_TRIGGERS.contains(row.trigger()) && (invoke == null || invoke.isNull())) {
+                throw new IllegalStateException(at("request.invoke is required for a " + row.trigger() + " trigger:"
+                        + " scheduled triggers do not run during replay, so the fixture must name the single-run"
+                        + " method that processes its input, for example {\"type\": \"trigger.<Trigger>\","
+                        + " \"method\": \"pollOnce\"}"));
+            }
+        }
 
         private void requireDrivers() {
             Needs needs = fixture.needs();
@@ -1314,8 +2237,13 @@ class FixtureParityTest {
             if (!target.startsWith(directory) || target.equals(directory)) {
                 throw new IllegalStateException(what + ": file name " + fileName + " leaves its directory");
             }
+            // Confined before and after it is created, so no symbolic link below the directory leads out of the root.
+            Path root = tempRoot();
+            String where = what + ": file " + fileName;
+            confine(root, target.getParent(), where);
             Files.createDirectories(target.getParent());
-            Path staged = Files.createTempFile(tempRoot(), "staged-", ".tmp");
+            confine(root, target.getParent(), where);
+            Path staged = Files.createTempFile(root, "staged-", ".tmp");
             Files.write(staged, bodyBytes(file, what + "." + fileName));
             try {
                 Files.move(staged, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
@@ -1327,6 +2255,7 @@ class FixtureParityTest {
         private void seedTables() throws Exception {
             DataSource dataSource = (DataSource) requireBean(DataSource.class, DataSource.class.getName());
             try (Connection connection = dataSource.getConnection()) {
+                confirmReplayDatabase(connection);
                 for (Map.Entry<String, JsonNode> table : entries(state.get("tables"), at("state.tables"))) {
                     String tableName = identifier(table.getKey());
                     try (Statement statement = connection.createStatement()) {
@@ -1376,9 +2305,12 @@ class FixtureParityTest {
             if (dataSource == null) {
                 return;
             }
-            try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
-                for (String table : tables) {
-                    statement.executeUpdate("DELETE FROM " + table);
+            try (Connection connection = dataSource.getConnection()) {
+                confirmReplayDatabase(connection);
+                try (Statement statement = connection.createStatement()) {
+                    for (String table : tables) {
+                        statement.executeUpdate("DELETE FROM " + table);
+                    }
                 }
                 if (!connection.getAutoCommit()) {
                     connection.commit();
@@ -1386,9 +2318,68 @@ class FixtureParityTest {
             }
         }
 
+        /**
+         * Fails the scenario before any statement runs unless the application's DataSource is connected to a
+         * database the replay owns ({@link #replayOwnedDatabase}): an in-memory one, an embedded file database
+         * inside the replay's temporary root, or a server on a replay-owned loopback port. So table state is never
+         * seeded, emptied or read in another database, a pre-existing file database outside the root included.
+         */
+        private void confirmReplayDatabase(Connection connection) throws SQLException, IOException {
+            String url = connection.getMetaData().getURL();
+            Path root = tempRoot();
+            if (!replayOwnedDatabase(url, ownedPorts(), root)) {
+                throw new IllegalStateException(at("the application's DataSource is connected to " + redact(null, url)
+                        + ", which is not a database the replay owns; table state is seeded, emptied and read only in"
+                        + " an in-memory database, an embedded file database inside the replay root " + root
+                        + " or a server on a replay-owned port, so override its URL through state.properties (for"
+                        + " example jdbc:h2:mem:<name>)"));
+            }
+        }
+
+        /**
+         * Fails the scenario before any collection is dropped, seeded or read unless every
+         * {@code com.mongodb.client.MongoClient} bean of the context, the client the application's MongoTemplate
+         * works through, is configured only for servers the replay owns ({@link #replayOwnedStore}): the embedded
+         * MongoDB server on its loopback port. A context with a MongoTemplate but without that client type or without
+         * a client bean is refused too, since the store the template writes to cannot be confirmed. The driver is
+         * reached by reflection; reading its cluster settings opens no connection.
+         */
+        private void confirmReplayStore() throws Exception {
+            String remedy = "; collection state is dropped, seeded and read only in the embedded MongoDB server on a"
+                    + " replay-owned loopback port, so override spring.data.mongodb.uri through state.properties with"
+                    + " ${mongo.uri}";
+            Class<?> clientType = Reflect.optionalClass(MONGO_SYNC_CLIENT_CLASS);
+            if (clientType == null) {
+                throw new IllegalStateException(at("the application has a MongoTemplate but the test classpath lacks "
+                        + MONGO_SYNC_CLIENT_CLASS + ", so the store it reaches cannot be confirmed" + remedy));
+            }
+            List<?> clients = context.getBeanProvider(clientType).orderedStream().toList();
+            if (clients.isEmpty()) {
+                throw new IllegalStateException(at("the application has a MongoTemplate but no "
+                        + MONGO_SYNC_CLIENT_CLASS + " bean, so the store it reaches cannot be confirmed" + remedy));
+            }
+            Set<Integer> owned = ownedPorts();
+            for (Object client : clients) {
+                Object settings = Reflect.call(Reflect.call(client, "getClusterDescription"), "getClusterSettings");
+                List<String> hosts = new ArrayList<>();
+                for (Object server : (List<?>) Reflect.call(settings, "getHosts")) {
+                    hosts.add(endpoint(new Address((String) Reflect.call(server, "getHost"),
+                            (Integer) Reflect.call(server, "getPort"))));
+                }
+                Object srvHost = Reflect.hasMethod(settings.getClass(), "getSrvHost", 0)
+                        ? Reflect.call(settings, "getSrvHost") : null;
+                if (srvHost != null || !replayOwnedStore(hosts, owned)) {
+                    String target = srvHost != null ? "the DNS seed list of " + srvHost : String.join(",", hosts);
+                    throw new IllegalStateException(at("the application's MongoDB client is configured for "
+                            + redact(null, target) + ", which is not a store the replay owns" + remedy));
+                }
+            }
+        }
+
         private void seedCollections() throws Exception {
             Object template = requireBean(requireClass(MONGO_TEMPLATE_CLASS), MONGO_TEMPLATE_CLASS);
             Class<?> document = requireClass(BSON_DOCUMENT_CLASS);
+            confirmReplayStore();
             for (Map.Entry<String, JsonNode> collection : entries(state.get("collections"), at("state.collections"))) {
                 Reflect.call(template, "dropCollection", collection.getKey());
                 for (JsonNode stored : elements(collection.getValue(), at("state.collections." + collection.getKey()))) {
@@ -1464,7 +2455,8 @@ class FixtureParityTest {
 
         private void verifyUpstream() throws Exception {
             if (wireMock == null) {
-                return;
+                // load() starts WireMock for every loaded fixture; without it no outbound call could be checked.
+                throw new IllegalStateException(at("WireMock is not running, so the outbound calls cannot be checked"));
             }
             List<JsonNode> exchanges = elements(fixture.json().get("upstream"), at("upstream"));
             if (!exchanges.isEmpty()) {
@@ -2145,6 +3137,7 @@ class FixtureParityTest {
         private void checkTables() throws Exception {
             DataSource dataSource = (DataSource) requireBean(DataSource.class, DataSource.class.getName());
             try (Connection connection = dataSource.getConnection()) {
+                confirmReplayDatabase(connection);
                 for (Map.Entry<String, JsonNode> table : entries(response.get("tables"), at("response.tables"))) {
                     String tableName = identifier(table.getKey());
                     List<JsonNode> expectedRows = elements(table.getValue(), at("response.tables." + tableName));
@@ -2196,6 +3189,7 @@ class FixtureParityTest {
         private void checkCollections() throws Exception {
             Object template = requireBean(requireClass(MONGO_TEMPLATE_CLASS), MONGO_TEMPLATE_CLASS);
             Class<?> document = requireClass(BSON_DOCUMENT_CLASS);
+            confirmReplayStore();
             for (Map.Entry<String, JsonNode> collection : entries(response.get("collections"),
                     at("response.collections"))) {
                 List<JsonNode> expected = new ArrayList<>();
