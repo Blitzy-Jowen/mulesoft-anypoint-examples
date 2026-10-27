@@ -37,7 +37,8 @@ import com.mulesoft.examples.track_a_custom_business_event.support.HttpTestClien
  * original listener declares no {@code allowedMethods}; the error cases are the flow's own script failures, an
  * unpriced item and a price nested 20000 deep, whose message is rendered on the listener's worker thread without
  * exhausting its stack, and the listener-level platform defaults of SC-1: the JSON 500 for a body the flow cannot
- * read and the no-listener 404 for paths the flow does not serve.
+ * read or a {@code Content-Type} whose charset Spring cannot parse, and the no-listener 404 for paths the flow does
+ * not serve, an illegal request charset included.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class BusinessEventControllerTest {
@@ -150,6 +151,43 @@ class BusinessEventControllerTest {
                 Arguments.of("malformed JSON", "{\"item name\": ", "{ \"message\": \"Payload is not valid JSON\" }"));
     }
 
+    /**
+     * Spring rejects the request's {@code Content-Type} while binding the body, and the 500 carries its message;
+     * a charset name that is illegal, the empty name included, or that Undertow cannot read ({@code charset=} at the
+     * end of the header) does not turn that answer into a container page.
+     */
+    @ParameterizedTest(name = "Content-Type {0}")
+    @MethodSource("unparseableCharsetRequests")
+    void unparseableCharsetReturns500JsonMessage(String requestContentType, String expectedBody) throws IOException {
+        HttpTestClient.Response response =
+                client().send("POST", PATH, Map.of("Content-Type", requestContentType), message());
+
+        assertEquals(500, response.status(), response::toString);
+        assertEquals("Internal Server Error", response.reason(), response::toString);
+        assertEquals(1, response.headers("Content-Type").size(), response::toString);
+        assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertEquals(expectedBody, response.bodyAsString(), response::toString);
+    }
+
+    static Stream<Arguments> unparseableCharsetRequests() {
+        return Stream.of(
+                Arguments.of("application/json; charset=bad[charset]",
+                        "{ \"message\": \"Invalid mime type \\\"application/json; charset=bad[charset]\\\": "
+                                + "bad[charset]\" }"),
+                Arguments.of("application/json;charset=",
+                        "{ \"message\": \"Invalid mime type \\\"application/json;charset=\\\": "
+                                + "'value' must not be empty\" }"),
+                Arguments.of("application/json; charset=\"bad[x]\"",
+                        "{ \"message\": \"Invalid mime type \\\"application/json; charset=\\\"bad[x]\\\"\\\": "
+                                + "bad[x]\" }"),
+                Arguments.of("application/json; charset=\"\"",
+                        "{ \"message\": \"Invalid mime type \\\"application/json; charset=\\\"\\\"\\\": \" }"),
+                // A legal name of a charset the JVM lacks.
+                Arguments.of("application/json; charset=foo",
+                        "{ \"message\": \"Invalid mime type \\\"application/json; charset=foo\\\": "
+                                + "unsupported charset 'foo'\" }"));
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"/", "/customBusinessEvents/x", "/customBusinessEventsX", "/unknown"})
     void unservedPathReturnsNoListener404(String path) throws IOException {
@@ -160,6 +198,28 @@ class BusinessEventControllerTest {
         assertEquals("Not Found", response.reason(), response::toString);
         assertMediaType(response, MediaType.TEXT_PLAIN);
         assertEquals("No listener for endpoint: " + path, response.bodyAsString(), response::toString);
+    }
+
+    /** The no-listener 404 is answered whatever charset name the request declares. */
+    @ParameterizedTest(name = "{0} with Content-Type {1}")
+    @MethodSource("unservedPathsWithIllegalCharset")
+    void unservedPathWithIllegalCharsetReturnsNoListener404(String path, String requestContentType)
+            throws IOException {
+        HttpTestClient.Response response =
+                client().send("POST", path, Map.of("Content-Type", requestContentType), message());
+
+        assertEquals(404, response.status(), response::toString);
+        assertEquals("Not Found", response.reason(), response::toString);
+        assertEquals(1, response.headers("Content-Type").size(), response::toString);
+        assertMediaType(response, MediaType.TEXT_PLAIN);
+        assertEquals("No listener for endpoint: " + path, response.bodyAsString(), response::toString);
+    }
+
+    static Stream<Arguments> unservedPathsWithIllegalCharset() {
+        return Stream.of(
+                Arguments.of("/unknown", "application/json; charset=bad[charset]"),
+                Arguments.of("/customBusinessEvents/x", "application/json;charset="),
+                Arguments.of("/", "text/plain; charset=\"bad[x]\""));
     }
 
     /** Asserts the 200 of shoes at 10: the text {@code 8.5} with its {@code Content-Length}. */
