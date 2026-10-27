@@ -22,7 +22,9 @@ import jakarta.mail.internet.MimeMultipart;
 import jakarta.mail.util.ByteArrayDataSource;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.MailAuthenticationException;
 import org.springframework.mail.MailPreparationException;
+import org.springframework.mail.MailSendException;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.stereotype.Component;
 
@@ -45,8 +47,13 @@ import org.springframework.stereotype.Component;
  * attachment, described and named {@value #ATTACHMENT_NAME}. The order matters: the original integration test reads
  * the first part that is neither an attachment nor named, and expects the CSV rows in it.
  *
- * <p>Send failures ({@link org.springframework.mail.MailException}) propagate unchanged and are never retried: the
- * original flow has no exception strategy, so the platform default answers them.
+ * <p>Send failures are never retried: the original flow has no exception strategy, so the platform default answers
+ * them with the exception's message. A {@link MailSendException} (connection refused or timed out, message
+ * rejected) is therefore rethrown as a {@code MailSendException} whose message is only {@value #SEND_FAILURE_MESSAGE},
+ * with the original as its cause: Spring composes the original's message from the failed messages' exceptions,
+ * naming mail and network classes and the SMTP host, port and timeout. An authentication rejection
+ * ({@link MailAuthenticationException}, whose message is Spring's fixed {@code Authentication failed}) propagates
+ * unchanged.
  */
 @Component
 public class ReportMailSender {
@@ -62,6 +69,9 @@ public class ReportMailSender {
 
     /** Encoding of the payload part, the subject and the CSV bytes; Mule's default output encoding. */
     static final String CHARSET = StandardCharsets.UTF_8.name();
+
+    /** Message of the {@link MailSendException} a failed send is rethrown as, the text the caller receives. */
+    public static final String SEND_FAILURE_MESSAGE = "Could not send the employees report mail";
 
     private final JavaMailSender mailSender;
 
@@ -88,7 +98,9 @@ public class ReportMailSender {
      * @param csv the rendered employees CSV
      * @throws NullPointerException when {@code csv} is null
      * @throws MailPreparationException when the message cannot be built, for example from an invalid address
-     * @throws org.springframework.mail.MailException when the send fails (authentication, connection, rejection)
+     * @throws MailAuthenticationException unchanged, when the server rejects the configured account
+     * @throws MailSendException with the message {@value #SEND_FAILURE_MESSAGE} and the original failure as its
+     *         cause, when the server cannot be reached or does not accept the message; never retried
      */
     public void send(String csv) {
         Objects.requireNonNull(csv, "csv");
@@ -117,7 +129,13 @@ public class ReportMailSender {
         } catch (MessagingException e) {
             throw new MailPreparationException("Could not prepare the employees report mail", e);
         }
-        mailSender.send(message);
+        try {
+            mailSender.send(message);
+        } catch (MailSendException e) {
+            // Spring appends each failed message's exception text to the message, which the platform-default 500
+            // reports to the caller; only the fixed text goes on, and the failure stays on the cause chain.
+            throw new MailSendException(SEND_FAILURE_MESSAGE, e);
+        }
     }
 
     /**

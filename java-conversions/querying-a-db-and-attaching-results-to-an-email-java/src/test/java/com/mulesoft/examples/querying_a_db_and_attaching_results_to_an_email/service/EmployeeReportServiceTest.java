@@ -20,20 +20,32 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
+import java.io.UncheckedIOException;
 import java.io.UnsupportedEncodingException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.LocalDate;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -66,7 +78,9 @@ import com.mulesoft.examples.querying_a_db_and_attaching_results_to_an_email.map
  * written from it and mailed, and the CSV returned; the splitter's no-result warning, after which nothing is looked up
  * or mailed; and the failures the flow declares no exception strategy for (a body that is not well-formed XML, an
  * employee text without a space, a failed lookup, an undatable value, a failed send), each reaching the caller
- * unchanged and leaving every later step unexecuted. No Spring context is started.
+ * unchanged and leaving every later step unexecuted. Bodies naming external entities or DTDs, by file or over HTTP,
+ * are parsed without reading or fetching them, and an entity expansion beyond the JDK's limit fails the parse. No
+ * Spring context is started.
  */
 @ExtendWith(MockitoExtension.class)
 class EmployeeReportServiceTest {
@@ -278,7 +292,9 @@ class EmployeeReportServiceTest {
                         SAXParseException.class),
                 Arguments.of("unsupported declared encoding",
                         "<?xml version=\"1.0\" encoding=\"bogus-enc\"?><root/>".getBytes(UTF_8),
-                        UnsupportedEncodingException.class));
+                        UnsupportedEncodingException.class),
+                Arguments.of("entity expansion beyond the JDK limit", billionLaughs().getBytes(UTF_8),
+                        SAXParseException.class));
     }
 
     // 6
@@ -354,6 +370,73 @@ class EmployeeReportServiceTest {
         verifyNoMoreInteractions(mailSender);
     }
 
+    /**
+     * Bodies whose DOCTYPE names external resources, with the names each yields when none of them is read. In the
+     * bodies, {@code ${dir}} is the {@code file:} URI of a directory holding {@code name.txt} (content
+     * {@code Chava}), {@code names.dtd} (declaring the entity {@code first} as {@code Chava}) and
+     * {@code chain.dtd} (reading {@code name.txt} into the path of a file that does not exist), and {@code ${http}}
+     * is the base URI of a local listener. Read, the resources would change the names or fail the parse with a
+     * message naming a path or the file's content; unread, an external entity contributes no text.
+     */
+    static Stream<Arguments> bodiesNamingExternalResources() {
+        return Stream.of(
+                Arguments.of("external general entity reading a file",
+                        "<!DOCTYPE root [<!ENTITY e SYSTEM \"${dir}name.txt\">]>"
+                                + "<root><employee>&e; Puckett</employee></root>", "", "Puckett"),
+                Arguments.of("external general entity naming a missing file",
+                        "<!DOCTYPE root [<!ENTITY e SYSTEM \"${dir}missing.txt\">]>"
+                                + "<root><employee>&e; Other</employee></root>", "", "Other"),
+                Arguments.of("external general entity over HTTP",
+                        "<!DOCTYPE root [<!ENTITY e SYSTEM \"${http}/name.txt\">]>"
+                                + "<root><employee>&e; Puckett</employee></root>", "", "Puckett"),
+                Arguments.of("external DTD declaring the first name",
+                        "<!DOCTYPE root SYSTEM \"${dir}names.dtd\">"
+                                + "<root><employee>&first; Puckett</employee></root>", "", "Puckett"),
+                Arguments.of("external DTD over HTTP",
+                        "<!DOCTYPE root SYSTEM \"${http}/names.dtd\">"
+                                + "<root><employee>Chava Puckett</employee></root>", "Chava", "Puckett"),
+                Arguments.of("external parameter entity whose first-name declaration would take precedence",
+                        "<!DOCTYPE root [<!ENTITY % names SYSTEM \"${dir}names.dtd\">%names;"
+                                + "<!ENTITY first \"Other\">]><root><employee>&first; Puckett</employee></root>",
+                        "Other", "Puckett"),
+                Arguments.of("external parameter entity chaining a file into a missing path",
+                        "<!DOCTYPE root [<!ENTITY % chain SYSTEM \"${dir}chain.dtd\">%chain;]>"
+                                + "<root><employee>Chava Puckett</employee></root>", "Chava", "Puckett"),
+                Arguments.of("external parameter entity naming a missing file",
+                        "<!DOCTYPE root [<!ENTITY % missing SYSTEM \"${dir}missing.dtd\">%missing;]>"
+                                + "<root><employee>Chava Puckett</employee></root>", "Chava", "Puckett"),
+                Arguments.of("external parameter entity over HTTP",
+                        "<!DOCTYPE root [<!ENTITY % names SYSTEM \"${http}/names.dtd\">%names;]>"
+                                + "<root><employee>Chava Puckett</employee></root>", "Chava", "Puckett"));
+    }
+
+    // 11
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("bodiesNamingExternalResources")
+    void externalEntitiesAndDtdsAreNeverLoaded(String scenario, String body, String firstName, String lastName,
+                                               @TempDir Path resources) throws Exception {
+        String dir = resources.toUri().toString();
+        Files.writeString(resources.resolve("name.txt"), "Chava", UTF_8);
+        Files.writeString(resources.resolve("names.dtd"), "<!ENTITY first \"Chava\">", UTF_8);
+        Files.writeString(resources.resolve("chain.dtd"), "<!ENTITY % name SYSTEM \"" + dir + "name.txt\">"
+                + "<!ENTITY % define \"<!ENTITY &#x25; leak SYSTEM 'file:///nonexistent/%name;'>\">%define;%leak;",
+                UTF_8);
+        when(repository.findByFirstNameAndLastName(firstName, lastName)).thenReturn(List.of(CHAVA));
+        ConnectionCountingListener listener = new ConnectionCountingListener();
+        byte[] xml = body.replace("${dir}", dir).replace("${http}", listener.baseUri()).getBytes(UTF_8);
+
+        Optional<String> result;
+        try (listener) {
+            result = service.generateAndSend(xml);
+        }
+
+        assertThat(listener.connections()).as("connections to " + listener.baseUri()).isZero();
+        assertThat(result).hasValue(HEADER + CHAVA_LINE);
+        verify(repository).findByFirstNameAndLastName(firstName, lastName);
+        verify(mailSender).send(HEADER + CHAVA_LINE);
+        verifyNoMoreInteractions(repository, mailSender);
+    }
+
     private List<String> logged(Level level) {
         return appender.list.stream()
                 .filter(event -> event.getLevel() == level)
@@ -368,6 +451,20 @@ class EmployeeReportServiceTest {
         }
     }
 
+    /**
+     * Nine levels of internal entities, each referencing the previous one ten times: 10^9 expansions of
+     * {@code lol}, which secure processing stops at the JDK's limit of 64000 before any employee is read.
+     */
+    private static String billionLaughs() {
+        StringBuilder xml = new StringBuilder("<!DOCTYPE root [<!ENTITY lol0 \"lol\">");
+        for (int level = 1; level <= 9; level++) {
+            xml.append("<!ENTITY lol").append(level).append(" \"");
+            xml.append(("&lol" + (level - 1) + ";").repeat(10));
+            xml.append("\">");
+        }
+        return xml.append("]><root><employee>&lol9; Puckett</employee></root>").toString();
+    }
+
     /** A row keyed in the select list's order, as {@link EmployeeRepository} returns it. */
     private static Map<String, Object> row(String firstName, String lastName, String gender, Object dob,
                                            Object hireDate) {
@@ -378,5 +475,73 @@ class EmployeeReportServiceTest {
         row.put(EmployeeRepository.DOB, dob);
         row.put(EmployeeRepository.HIRE_DATE, hireDate);
         return Collections.unmodifiableMap(row);
+    }
+
+    /**
+     * A loopback listener on a free port that accepts, counts and at once closes every connection made to it, so a
+     * fetch the parser attempted would fail the parse rather than wait for a reply. Closing it stops the acceptor
+     * thread and waits for it, after which {@link #connections()} is final.
+     */
+    private static final class ConnectionCountingListener implements AutoCloseable {
+
+        private static final long ACCEPTOR_STOP_TIMEOUT_MS = 5000;
+
+        private final ServerSocket socket;
+
+        private final String baseUri;
+
+        private final AtomicInteger connections = new AtomicInteger();
+
+        private final Thread acceptor;
+
+        ConnectionCountingListener() throws IOException {
+            socket = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+            try {
+                // The URI constructor brackets an IPv6 loopback address.
+                baseUri = new URI("http", null, socket.getInetAddress().getHostAddress(), socket.getLocalPort(),
+                        null, null, null).toString();
+            } catch (URISyntaxException failure) {
+                socket.close();
+                throw new IOException("Cannot address the external-resource listener", failure);
+            }
+            acceptor = new Thread(this::acceptUntilClosed, "external-resource-listener");
+            acceptor.setDaemon(true);
+            acceptor.start();
+        }
+
+        /** The listener's {@code http:} base URI, without a trailing slash. */
+        String baseUri() {
+            return baseUri;
+        }
+
+        int connections() {
+            return connections.get();
+        }
+
+        /** Runs on the acceptor thread until {@link #close()} closes the socket, which makes accept() fail. */
+        private void acceptUntilClosed() {
+            while (!socket.isClosed()) {
+                try {
+                    Socket connection = socket.accept();
+                    connections.incrementAndGet();
+                    connection.close();
+                } catch (IOException failure) {
+                    if (!socket.isClosed()) {
+                        throw new UncheckedIOException("The external-resource listener failed", failure);
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            socket.close();
+            try {
+                acceptor.join(ACCEPTOR_STOP_TIMEOUT_MS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new InterruptedIOException("Interrupted while stopping the external-resource listener");
+            }
+        }
     }
 }

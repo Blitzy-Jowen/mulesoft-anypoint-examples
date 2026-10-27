@@ -60,7 +60,8 @@ import org.springframework.web.util.UriUtils;
  * {@code apikit.console-path} (default {@code console}):
  * <ul>
  *   <li>{@code <base>/console}: 301 to the absolute URL of {@code <base>/console/}, built from the request's
- *       scheme and {@code Host} header and followed by its query string;</li>
+ *       scheme and {@code Host} header and followed by its query string, with an empty body and, unlike the
+ *       responses below, no {@code Access-Control-Allow-Origin};</li>
  *   <li>{@code <base>/console/} and {@code <base>/console/index.html}: the console page, its RAML source pointed
  *       at {@code ./?raml} and its attribute placeholder replaced by the handler's options;</li>
  *   <li>{@code <base>/console/<file>}: the console's scripts, styles, fonts and images from the classpath tree
@@ -270,7 +271,9 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
      * scheme, the {@link #requestAuthority authority} the {@code Host} header names, the servlet context path,
      * {@code <base>/console/} and the query string when there is one. The path is built from the configured
      * console path alone and the authority from a validated host and port, so neither the raw request path nor
-     * any other byte of the {@code Host} header reaches the header.
+     * any other byte of the {@code Host} header reaches the header. The 301 sends that {@code Location} with an
+     * empty body and without {@code Access-Control-Allow-Origin}, because {@code ConsoleHandler} returned from
+     * its redirect before setting that header, which only its successful console responses carry.
      *
      * <p>Written to the servlet response and committed before the method returns, because the 301 has no
      * body to commit it: the servlet fills a response still open after an OPTIONS request with an
@@ -298,7 +301,6 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
         }
         send(ResponseEntity.status(HttpStatus.MOVED_PERMANENTLY)
                 .header(HttpHeaders.LOCATION, location.toString())
-                .header(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .contentLength(0)
                 .build(), response);
     }

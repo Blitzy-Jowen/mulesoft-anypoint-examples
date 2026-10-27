@@ -10,15 +10,19 @@ package com.mulesoft.examples.querying_a_db_and_attaching_results_to_an_email.co
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.stream.Stream;
 
 import com.icegreen.greenmail.configuration.GreenMailConfiguration;
@@ -45,6 +49,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mail.MailSendException;
+import org.springframework.mail.javamail.JavaMailSenderImpl;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -61,8 +66,9 @@ import org.springframework.test.context.DynamicPropertySource;
  * {@code employees.csv} part of the reply and as one mail; GET and PUT are answered alike because the listener
  * declares no {@code allowedMethods}. A body without {@code employee} elements ends the flow at the splitter with an
  * empty 200 and no mail. The error cases are the platform defaults of SC-1, since the flow declares no exception
- * strategy: the JSON 500 for a one-word employee name, malformed XML and a failed SMTP send, and the no-listener
- * 404 for any other path.
+ * strategy: the JSON 500 for a one-word employee name, malformed XML and a failed SMTP send (a refused connection and
+ * a rejected account each with a fixed message that names no class, host or port), and the no-listener 404 for any
+ * other path.
  *
  * <p>{@code TRACE}, {@code OPTIONS} and CORS pre-flights run the flow as well and get exactly the {@code POST} reply,
  * complete with its {@code Content-Length}: no {@code message/http} echo of the request headers, its
@@ -81,6 +87,9 @@ class EmployeeReportControllerTest {
     private static final String SMTP_USER = "test@localhost";
 
     private static final String SMTP_PASSWORD = "secret";
+
+    /** {@code mail.subject} of profile {@code test}. */
+    private static final String SUBJECT = "Mule flow completed!";
 
     private static final long DELIVERY_TIMEOUT_MS = 5000;
 
@@ -218,6 +227,45 @@ class EmployeeReportControllerTest {
         assertThat(response.bodyAsString()).as(response::toString).isEqualTo("{ \"message\": \"SMTP unavailable\" }");
         verify(reportMailSender).send(CSV);
         assertThat(greenMail.getReceivedMessages()).isEmpty();
+    }
+
+    /**
+     * SMTP failures of a real send, whether its sender is aimed at a port that refuses connections, and the password
+     * it presents to GreenMail, with the message the JSON 500 carries for each.
+     */
+    private static Stream<Arguments> realSmtpFailures() {
+        return Stream.of(
+                Arguments.of("connection refused", true, SMTP_PASSWORD, "Could not send the employees report mail"),
+                Arguments.of("authentication rejected", false, "not-" + SMTP_PASSWORD, "Authentication failed"));
+    }
+
+    /**
+     * The mail sender's real failures reach the caller as the JSON 500 with a fixed message: no mail or network
+     * class, SMTP host or port, which Spring's own message for a refused connection names.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("realSmtpFailures")
+    void realSmtpFailureAnswersJson500WithoutTransportDetails(String scenario, boolean refuseConnection,
+                                                              String password, String message) throws Exception {
+        try (Socket refusing = refuseConnection ? reserveRefusingPort() : null) {
+            int smtpPort = refusing != null ? refusing.getLocalPort() : greenMail.getSmtp().getPort();
+            ReportMailSender failingSender =
+                    new ReportMailSender(mailSenderOn(smtpPort, password), SMTP_USER, SMTP_USER, SUBJECT);
+            doAnswer(invocation -> {
+                failingSender.send(invocation.getArgument(0));
+                return null;
+            }).when(reportMailSender).send(anyString());
+
+            HttpTestClient.Response response = client.send("POST", "/", XML, MESSAGE);
+
+            assertStatus(response, 500, "Internal Server Error");
+            assertContentTypeStartsWith(response, "application/json");
+            assertThat(response.bodyAsString()).as(response::toString)
+                    .isEqualTo("{ \"message\": \"" + message + "\" }")
+                    .doesNotContain("org.", "java.", Integer.toString(smtpPort), "localhost", "127.0.0.1");
+            verify(reportMailSender).send(CSV);
+            assertThat(greenMail.getReceivedMessages()).isEmpty();
+        }
     }
 
     /**
@@ -361,6 +409,47 @@ class EmployeeReportControllerTest {
 
     private static byte[] utf8(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * A sender set up as profile {@code test} sets up the application's, aimed at the given port and presenting the
+     * given password, with 2000 ms timeouts so that a failing send cannot hold the request.
+     */
+    private static JavaMailSenderImpl mailSenderOn(int smtpPort, String password) {
+        JavaMailSenderImpl mailSender = new JavaMailSenderImpl();
+        mailSender.setHost("localhost");
+        mailSender.setPort(smtpPort);
+        mailSender.setUsername(SMTP_USER);
+        mailSender.setPassword(password);
+        mailSender.setDefaultEncoding(StandardCharsets.UTF_8.name());
+        Properties properties = new Properties();
+        properties.setProperty("mail.smtp.auth", "true");
+        properties.setProperty("mail.smtp.starttls.enable", "false");
+        properties.setProperty("mail.smtp.connectiontimeout", "2000");
+        properties.setProperty("mail.smtp.timeout", "2000");
+        properties.setProperty("mail.smtp.writetimeout", "2000");
+        mailSender.setJavaMailProperties(properties);
+        return mailSender;
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
     }
 
     private static byte[] classpathBytes(String location) {

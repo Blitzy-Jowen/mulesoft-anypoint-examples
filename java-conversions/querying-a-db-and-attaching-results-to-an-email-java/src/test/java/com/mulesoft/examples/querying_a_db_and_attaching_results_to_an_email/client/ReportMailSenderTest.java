@@ -37,8 +37,9 @@ import jakarta.mail.internet.MimeMultipart;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
-import org.springframework.mail.MailException;
+import org.springframework.mail.MailAuthenticationException;
 import org.springframework.mail.MailPreparationException;
+import org.springframework.mail.MailSendException;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
 
 /**
@@ -163,8 +164,12 @@ class ReportMailSenderTest {
         }
     }
 
+    /**
+     * Spring's own message for a refused connection names the mail and network exception classes and the SMTP host,
+     * port and timeout; the caller-facing message is the fixed text alone, and the refusal stays on the cause chain.
+     */
     @Test
-    void unreachableSmtpServerFailsWithMailException() throws Exception {
+    void unreachableSmtpServerFailsWithTheFixedSendFailureMessage() throws Exception {
         try (Socket reserved = reserveRefusingPort()) {
             JavaMailSenderImpl unreachable = mailSenderOn(reserved.getLocalPort());
             unreachable.getJavaMailProperties().setProperty("mail.smtp.connectiontimeout", "2000");
@@ -173,12 +178,31 @@ class ReportMailSenderTest {
 
             // A MessagingException returns its nested exception from getCause(), so the refusal is on the chain.
             assertThatThrownBy(() -> failingSender.send(CSV))
-                    .isInstanceOf(MailException.class)
+                    .isInstanceOf(MailSendException.class)
+                    .hasMessage(ReportMailSender.SEND_FAILURE_MESSAGE)
+                    .satisfies(failure -> assertThat(failure.getMessage()).doesNotContain("org.", "java.",
+                            "Exception", Integer.toString(reserved.getLocalPort()), "localhost", "127.0.0.1"))
                     .satisfies(failure -> assertThat(Stream.iterate(failure, Objects::nonNull, Throwable::getCause))
                             .anyMatch(ConnectException.class::isInstance));
 
             assertThat(greenMail.getReceivedMessages()).isEmpty();
         }
+    }
+
+    /** A rejected account fails with Spring's fixed message, which names no class, host or port, and is not retried. */
+    @Test
+    void rejectedCredentialsFailWithAuthenticationFailedUnchanged() {
+        JavaMailSenderImpl rejected = mailSenderOn(greenMail.getSmtp().getPort());
+        rejected.setPassword("not-" + PASSWORD);
+        ReportMailSender rejectedSender = new ReportMailSender(rejected, ACCOUNT, ACCOUNT, SUBJECT);
+
+        assertThatThrownBy(() -> rejectedSender.send(CSV))
+                .isInstanceOf(MailAuthenticationException.class)
+                .hasMessage("Authentication failed")
+                .satisfies(failure -> assertThat(failure.getMessage()).doesNotContain("org.", "java.",
+                        Integer.toString(greenMail.getSmtp().getPort()), "localhost", "127.0.0.1"));
+
+        assertThat(greenMail.getReceivedMessages()).isEmpty();
     }
 
     @Test

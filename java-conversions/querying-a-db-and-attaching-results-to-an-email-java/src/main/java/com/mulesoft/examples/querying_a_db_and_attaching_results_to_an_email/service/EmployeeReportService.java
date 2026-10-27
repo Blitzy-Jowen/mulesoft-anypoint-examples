@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.xpath.XPath;
@@ -52,6 +53,11 @@ import com.mulesoft.examples.querying_a_db_and_attaching_results_to_an_email.map
  * platform-default 500 of the global exception handler unchanged, and a failing step leaves every later step
  * unexecuted.
  *
+ * <p>The body is parsed as Mule 3.8's XML handling parsed it, accepting no external entities: DOCTYPE declarations
+ * and internal entities are processed, while external entities, external DTDs and XInclude are never loaded, so a
+ * body cannot make the service read a file or fetch a URL; entity expansion stays within the JDK's secure-processing
+ * limits.
+ *
  * <p>Instances hold only their thread-safe collaborators; the XML parser and XPath objects, which are not
  * thread-safe, are created per call.
  */
@@ -66,6 +72,16 @@ public class EmployeeReportService {
 
     /** The splitter expression of the original flow (attachments.xml:10). */
     static final String EMPLOYEE_XPATH = "//employee";
+
+    /** SAX feature that, set to false, leaves every external general entity unread. */
+    private static final String EXTERNAL_GENERAL_ENTITIES = "http://xml.org/sax/features/external-general-entities";
+
+    /** SAX feature that, set to false, leaves every external parameter entity unread. */
+    private static final String EXTERNAL_PARAMETER_ENTITIES =
+            "http://xml.org/sax/features/external-parameter-entities";
+
+    /** Parser feature that, set to false, keeps the non-validating parser from loading an external DTD. */
+    private static final String LOAD_EXTERNAL_DTD = "http://apache.org/xml/features/nonvalidating/load-external-dtd";
 
     /*
      * Parse errors propagate as the parser reports them. Without a handler the JDK's default one also prints
@@ -110,7 +126,8 @@ public class EmployeeReportService {
      * @return the CSV that was mailed, which the original flow left as its response payload; empty when the body
      *         holds no {@code employee} element, in which case nothing is queried, logged at INFO or mailed, as
      *         Mule's splitter ended the flow there
-     * @throws SAXParseException when the body is empty or not well-formed XML
+     * @throws SAXParseException when the body is empty or not well-formed XML, or expands entities beyond the JDK's
+     *         secure-processing limits
      * @throws ArrayIndexOutOfBoundsException when an employee's text contains no space, as the original's
      *         {@code split(" ")[1]} did
      * @throws org.springframework.dao.DataAccessException when a lookup fails
@@ -121,9 +138,19 @@ public class EmployeeReportService {
     public Optional<String> generateAndSend(byte[] xml) throws Exception {
         byte[] body = xml == null ? new byte[0] : xml;
 
-        // No secure-processing or entity features are changed: the original Mule parser used the same defaults.
-        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        // External entities, external DTDs and XInclude are never loaded, as Mule 3.8's XML transformers ran with
+        // acceptExternalEntities=false, so no file or URL a body names is read or fetched; secure processing bounds
+        // entity expansion. DOCTYPE declarations and internal entities stay allowed, so legitimate documents parse
+        // as before. The JDK's built-in factory supports every feature set here, whatever is on the classpath.
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newDefaultInstance();
         factory.setNamespaceAware(true);
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        factory.setFeature(EXTERNAL_GENERAL_ENTITIES, false);
+        factory.setFeature(EXTERNAL_PARAMETER_ENTITIES, false);
+        factory.setFeature(LOAD_EXTERNAL_DTD, false);
+        factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+        factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+        factory.setXIncludeAware(false);
         DocumentBuilder builder = factory.newDocumentBuilder();
         builder.setErrorHandler(RETHROWING_ERROR_HANDLER);
         Document doc = builder.parse(new ByteArrayInputStream(body));

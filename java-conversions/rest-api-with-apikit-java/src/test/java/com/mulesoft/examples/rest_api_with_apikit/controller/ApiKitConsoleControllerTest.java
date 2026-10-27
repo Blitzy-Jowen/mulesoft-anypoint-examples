@@ -86,6 +86,15 @@ class ApiKitConsoleControllerTest {
 
     private static final Pattern LINE_BREAK = Pattern.compile("\\R");
 
+    /** A top-level {@code baseUri:} line of the RAML, up to its line terminator. */
+    private static final Pattern TOP_LEVEL_BASE_URI = Pattern.compile("^baseUri:[^\\r\\n]*", Pattern.MULTILINE);
+
+    /** A top-level {@code title:} line of the RAML, up to its line terminator. */
+    private static final Pattern TOP_LEVEL_TITLE = Pattern.compile("^title:[^\\r\\n]*", Pattern.MULTILINE);
+
+    /** The first line of the RAML, up to its line terminator. */
+    private static final Pattern FIRST_LINE = Pattern.compile("\\A[^\\r\\n]*");
+
     /** Shortest {@code application.yml} line whose presence in a response counts as a leak of that file. */
     private static final int LEAK_LINE_MIN_LENGTH = 10;
 
@@ -118,7 +127,9 @@ class ApiKitConsoleControllerTest {
 
     /**
      * {@code ConsoleHandler} redirects the console path without its trailing slash to the absolute URL of the
-     * console root, built from the scheme and the {@code Host} header.
+     * console root, built from the scheme and the {@code Host} header, with an empty body and no
+     * {@code Access-Control-Allow-Origin}, since it returned from the redirect before setting that header; the
+     * console root it redirects to, a successful console response, carries it.
      */
     @Test
     void consoleWithoutTrailingSlashRedirects() {
@@ -128,6 +139,13 @@ class ApiKitConsoleControllerTest {
         assertEquals("Moved Permanently", response.reason(), response::toString);
         assertEquals("http://localhost:" + port + consoleRoot + "/", response.header("Location"),
                 response::toString);
+        assertEquals(List.of(), response.headers("Access-Control-Allow-Origin"), response::toString);
+        assertEquals("0", response.header("Content-Length"), response::toString);
+        assertEquals(0, response.body().length, response::toString);
+
+        HttpTestClient.Response page = client.get(consoleRoot + "/");
+        assertEquals(200, page.status(), page::toString);
+        assertEquals(List.of("*"), page.headers("Access-Control-Allow-Origin"), page::toString);
     }
 
     /**
@@ -338,19 +356,44 @@ class ApiKitConsoleControllerTest {
     }
 
     /**
-     * The RAML descriptor: 200 as {@code application/raml+yaml} for any origin, the classpath RAML from its
-     * version line on, with its {@code baseUri} set to this listener's URL.
+     * The RAML descriptor: 200 as {@code application/raml+yaml} for any origin, carrying the whole classpath
+     * RAML, every resource, method, schema and include line and every line terminator, with only its
+     * {@code baseUri} line set to this listener's URL.
      */
     private void assertRamlDescriptor(HttpTestClient.Response response) throws IOException {
         assertEquals(200, response.status(), response::toString);
         assertEquals("OK", response.reason(), response::toString);
         assertContentType(response, RAML_MEDIA_TYPE);
         assertEquals("*", response.header("Access-Control-Allow-Origin"), response::toString);
-        String body = response.bodyAsString();
-        String baseUri = "baseUri: http://localhost:" + port + basePath;
-        assertTrue(LINE_BREAK.splitAsStream(body).anyMatch(baseUri::equals),
-                () -> "no line '" + baseUri + "' in the RAML\n" + response);
-        assertEquals(firstLine(ramlText()), firstLine(body), response::toString);
+        String expected = expectedRaml(ramlText(), "baseUri: http://localhost:" + port + basePath);
+        assertEquals(expected, response.bodyAsString(),
+                () -> "the descriptor is not the classpath RAML with only its baseUri line set\n" + response);
+    }
+
+    /**
+     * {@code raml} as the descriptor must carry it, derived from the RAML text alone: its first top-level
+     * {@code baseUri:} line replaced by {@code baseUriLine}; without one, {@code baseUriLine} and the anchor
+     * line's own terminator inserted after the first top-level {@code title:} line, or after the first line when
+     * there is no title, and appended after a {@code \n} when that line ends the text unterminated. Every other
+     * character, line terminators and trailing blanks included, is kept.
+     */
+    private static String expectedRaml(String raml, String baseUriLine) {
+        Matcher baseUri = TOP_LEVEL_BASE_URI.matcher(raml);
+        if (baseUri.find()) {
+            return raml.substring(0, baseUri.start()) + baseUriLine + raml.substring(baseUri.end());
+        }
+        Matcher anchor = TOP_LEVEL_TITLE.matcher(raml);
+        if (!anchor.find()) {
+            anchor = FIRST_LINE.matcher(raml);
+            assertTrue(anchor.find(), "the RAML has no first line");
+        }
+        int lineEnd = anchor.end();
+        if (lineEnd == raml.length()) {
+            return raml + "\n" + baseUriLine;
+        }
+        String terminator = raml.startsWith("\r\n", lineEnd) ? "\r\n" : raml.substring(lineEnd, lineEnd + 1);
+        int insertAt = lineEnd + terminator.length();
+        return raml.substring(0, insertAt) + baseUriLine + terminator + raml.substring(insertAt);
     }
 
     /** The value of the RAML's first {@code baseUri:} line. */
@@ -419,9 +462,5 @@ class ApiKitConsoleControllerTest {
 
     private String ramlText() throws IOException {
         return new String(classpathBytes(ramlLocation), StandardCharsets.UTF_8);
-    }
-
-    private static String firstLine(String text) {
-        return LINE_BREAK.split(text, 2)[0];
     }
 }
