@@ -141,8 +141,17 @@ public class BoxProxyClient implements AutoCloseable {
     /** Exchange attribute set once a redirect has left the original request's origin. */
     private static final String LEFT_ORIGIN_ATTRIBUTE = BoxProxyClient.class.getName() + ".leftOrigin";
 
-    /** The methods Spring's request factory builds itself; any other method token is sent as given. */
+    /**
+     * The methods Spring's request factory builds itself, and the only method names a log line carries; any other
+     * method token is sent as given.
+     */
     private static final Set<HttpMethod> STANDARD_METHODS = Set.of(HttpMethod.values());
+
+    /** The proxy operation every log line names: the original flow's name, the same for every request. */
+    private static final String PROXY_OPERATION = "rest-api-proxy";
+
+    /** Stands in a log line for a method outside {@link #STANDARD_METHODS}, whose token the caller chose. */
+    private static final String EXTENSION_METHOD = "extension-method";
 
     private final CloseableHttpClient httpClient;
 
@@ -384,8 +393,11 @@ public class BoxProxyClient implements AutoCloseable {
         Objects.requireNonNull(method, "method");
         Objects.requireNonNull(rawPath, "rawPath");
         URI uri = upstreamUri(rawPath, rawQuery);
-        // Path only: the query may carry tokens, and headers and bodies carry the caller's credentials.
-        LOG.debug("Proxying {} {}", method, uri.getRawPath());
+        // Fixed text only: the operation and a standard method name. The caller's path segments and query may carry
+        // personal data or tokens, its headers and body its credentials, and an extension method's token is text
+        // the caller chose, so none of them is logged.
+        LOG.debug("Proxying {} request through {}",
+                STANDARD_METHODS.contains(method) ? method.name() : EXTENSION_METHOD, PROXY_OPERATION);
 
         RestClient.RequestBodySpec spec = restClient.method(method).uri(uri);
         if (headers != null) {

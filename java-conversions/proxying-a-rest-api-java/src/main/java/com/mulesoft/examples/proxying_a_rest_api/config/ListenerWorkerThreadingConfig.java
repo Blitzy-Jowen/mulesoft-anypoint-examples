@@ -8,9 +8,7 @@
 
 package com.mulesoft.examples.proxying_a_rest_api.config;
 
-import org.springframework.boot.web.embedded.undertow.UndertowBuilderCustomizer;
-import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
+import org.xnio.OptionMap;
 import org.xnio.Options;
 
 /**
@@ -27,15 +25,16 @@ import org.xnio.Options;
  * concurrent request up to the maximum and retires each thread above the first after 60 s idle.
  *
  * <p>Undertow instead creates its XNIO worker pool with as many core threads as maximum threads, so a worker, once
- * started, is never retired. The customizer registered here sets the pool's core size to 1 and its keep-alive to
- * 60000 ms, the original's values. The worker pool still starts a new thread for each request that finds every
- * existing worker busy, up to its maximum, before it queues any request, so concurrency is unchanged. The maximum
- * stays at Undertow's own default; this class does not set it. Undertow applies builder worker options after its
- * own core and maximum values, so these take precedence. When several idle workers time out at the same moment the
- * pool may retire the last one as well; the next request then starts a worker, as it would above the core.
+ * started, is never retired. {@link #workerOptions()} sets the pool's core size to 1 and its keep-alive to 60000 ms,
+ * the original's values. The worker pool still starts a new thread for each request that finds every existing worker
+ * busy, up to its maximum, before it queues any request, so concurrency is unchanged. The maximum stays at Undertow's
+ * own default; this class does not set it. The listener runs on the worker {@link RequestFramingGuardConfig} creates
+ * with Undertow's own option map, and Undertow ignores worker options set on its builder once a worker is given, so
+ * that class applies these options to the worker it creates, after Undertow's core and maximum values, which they
+ * override. When several idle workers time out at the same moment the pool may retire the last one as well; the next
+ * request then starts a worker, as it would above the core.
  */
-@Configuration(proxyBeanMethods = false)
-public class ListenerWorkerThreadingConfig {
+public final class ListenerWorkerThreadingConfig {
 
     /** Worker threads kept while idle: the original listener's {@code maxThreadsIdle}. */
     public static final int CORE_WORKER_THREADS = 1;
@@ -46,16 +45,19 @@ public class ListenerWorkerThreadingConfig {
      */
     public static final int WORKER_KEEP_ALIVE_MILLIS = 60_000;
 
+    private ListenerWorkerThreadingConfig() {
+    }
+
     /**
-     * Sets the XNIO worker options {@link Options#WORKER_TASK_CORE_THREADS} to {@link #CORE_WORKER_THREADS} and
-     * {@link Options#WORKER_TASK_KEEPALIVE} to {@link #WORKER_KEEP_ALIVE_MILLIS} on the Undertow builder.
+     * The XNIO worker options {@link Options#WORKER_TASK_CORE_THREADS} set to {@link #CORE_WORKER_THREADS} and
+     * {@link Options#WORKER_TASK_KEEPALIVE} set to {@link #WORKER_KEEP_ALIVE_MILLIS}.
      *
-     * @return the customizer Spring Boot applies to the Undertow builder of the embedded web server
+     * @return the options {@link RequestFramingGuardConfig} adds last to the option map of the listener's worker
      */
-    @Bean
-    public UndertowBuilderCustomizer listenerWorkerThreadingCustomizer() {
-        return builder -> builder
-                .setWorkerOption(Options.WORKER_TASK_CORE_THREADS, CORE_WORKER_THREADS)
-                .setWorkerOption(Options.WORKER_TASK_KEEPALIVE, WORKER_KEEP_ALIVE_MILLIS);
+    public static OptionMap workerOptions() {
+        return OptionMap.builder()
+                .set(Options.WORKER_TASK_CORE_THREADS, CORE_WORKER_THREADS)
+                .set(Options.WORKER_TASK_KEEPALIVE, WORKER_KEEP_ALIVE_MILLIS)
+                .getMap();
     }
 }

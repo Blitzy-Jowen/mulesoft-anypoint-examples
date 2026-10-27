@@ -21,12 +21,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import io.undertow.server.HandlerWrapper;
+import io.undertow.server.HttpHandler;
+import io.undertow.servlet.api.DeploymentInfo;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.boot.web.embedded.undertow.UndertowServletWebServerFactory;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -37,17 +43,21 @@ import com.mulesoft.examples.proxying_a_rest_api.ProxyingARestApiApplication;
 import com.mulesoft.examples.proxying_a_rest_api.support.HttpTestClient;
 
 /**
- * Tests {@link OriginFormTargetGuard} on the wire: every request target not in origin form gets a listener-level
- * answer and never reaches the upstream, and origin-form and absolute-form targets are forwarded to the configured
- * upstream as before.
+ * Tests {@link OriginFormTargetGuard} on the wire: every request target Undertow hands over without a leading
+ * {@code /} gets the no-listener 404 and never reaches the upstream, and origin-form and absolute-form targets are
+ * forwarded to the configured upstream as before.
  *
  * <ul>
- *   <li>A target whose path Undertow hands over without a leading {@code /} (asterisk form, {@code CONNECT}'s
- *       authority form, an absolute form whose authority runs into its path) gets the no-listener 404 with the bytes
- *       the generic error handling writes for a path no handler serves: status line {@code HTTP/1.1 404 Not Found},
- *       the single {@code Content-Type: text/plain} and the body {@code No listener for endpoint: <path>}.</li>
- *   <li>Every other target not in origin form is answered by Undertow's own parser or {@code Host} check with an
- *       empty 400 before any handler runs; those answers are pinned here so that a change of the listener shows.</li>
+ *   <li>A target that is neither in origin form nor an absolute URI with {@code //} and an authority (asterisk form
+ *       with any method, {@code CONNECT}'s authority form, {@code @host/x}, {@code http:@host/x} and the like) gets
+ *       the no-listener 404 with the bytes the generic error handling writes for a path no handler serves: status
+ *       line {@code HTTP/1.1 404 Not Found}, the single {@code Content-Type: text/plain} and the body
+ *       {@code No listener for endpoint: <path>}, the query left out.</li>
+ *   <li>An absolute-form target reaches the configured upstream as its path and query only, whatever authority,
+ *       user information or {@code Host} it names; those answers are pinned here so that a change of the listener
+ *       shows.</li>
+ *   <li>The guard runs inside the handler of {@link RequestFramingGuardConfig} that attaches each request's header
+ *       fields as sent, whatever order the deployment customizer beans are created in.</li>
  * </ul>
  *
  * <p>The application boots with its own {@code application.yml} on Undertow (random port on IPv4 loopback) in front
@@ -78,6 +88,9 @@ class OriginFormTargetGuardTest {
     @LocalServerPort
     int port;
 
+    @Autowired
+    UndertowServletWebServerFactory webServerFactory;
+
     @DynamicPropertySource
     static void upstreamUrl(DynamicPropertyRegistry registry) {
         registry.add("proxy.upstream-url", () -> "http://" + LOOPBACK + ":" + upstream.getPort());
@@ -88,14 +101,21 @@ class OriginFormTargetGuardTest {
         return Stream.of(
                 Arguments.of("OPTIONS", "*", null, null, "*"),
                 Arguments.of("PRI", "*", null, null, "*"),
+                Arguments.of("GET", "*", null, null, "*"),
+                Arguments.of("OPTIONS", "*?x", null, null, "*"),
                 Arguments.of("CONNECT", AUTHORITY, null, null, AUTHORITY),
                 Arguments.of("CONNECT", "evil.example:8443", "evil.example:8443", null, "evil.example:8443"),
-                Arguments.of("GET", "http://" + AUTHORITY + "@evil.example/x", null, null, "@evil.example/x"),
-                Arguments.of("GET", "http://" + AUTHORITY + "evil", null, null, "evil"),
-                Arguments.of("POST", "http://" + AUTHORITY + "@evil.example/x", null, "data", "@evil.example/x"),
+                // A target naming a host the Host header does not.
+                Arguments.of("CONNECT", "evil.example:8443", null, null, "evil.example:8443"),
+                Arguments.of("CONNECT", "@evil.example:8443", null, null, "@evil.example:8443"),
+                Arguments.of("GET", "@evil.example:8443/x", null, null, "@evil.example:8443/x"),
+                Arguments.of("GET", "http:@evil.example:8443/x", null, null, "http:@evil.example:8443/x"),
+                Arguments.of("GET", ".evil/x", null, null, ".evil/x"),
+                Arguments.of("GET", ":8443/x", null, null, ":8443/x"),
+                Arguments.of("GET", "x@evil.example:8443/x", null, null, "x@evil.example:8443/x"),
+                Arguments.of("POST", "@evil.example/x", null, "data", "@evil.example/x"),
                 // Reported as the escaping filter would hand the path on: the raw | becomes %7C.
-                Arguments.of("DELETE", "http://" + AUTHORITY + "@evil.example/a|b", null, null,
-                        "@evil.example/a%7Cb"));
+                Arguments.of("DELETE", "@evil.example/a|b", null, null, "@evil.example/a%7Cb"));
     }
 
     @ParameterizedTest(name = "{0} {1}")
@@ -116,57 +136,38 @@ class OriginFormTargetGuardTest {
         assertThat(upstream.getAllServeEvents()).isEmpty();
     }
 
-    /** Method, target, {@code Host} or {@code null} for ST-1's, status line Undertow answers with. */
-    private static Stream<Arguments> targetsUndertowRejects() {
-        return Stream.of(
-                Arguments.of("GET", "@evil.example:8443/x", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("GET", "http:@evil.example:8443/x", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("GET", ".evil/x", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("GET", "*", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("GET", ":8443/x", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("GET", "x@evil.example:8443/x", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("OPTIONS", "*?x", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("CONNECT", "@evil.example:8443", null, "HTTP/1.1 400 Bad Request"),
-                Arguments.of("GET", "http://u:p@evil.example:8443/x", "evil.example:8443", "HTTP/1.1 400 Bad Request"),
-                // A target naming a host the Host header does not.
-                Arguments.of("CONNECT", "evil.example:8443", null, "HTTP/1.1 400 URI Host Header NO MATCH"),
-                Arguments.of("GET", "http://evil.example/x", null, "HTTP/1.1 400 URI Host Header NO MATCH"));
-    }
-
-    @ParameterizedTest(name = "{0} {1}")
-    @MethodSource("targetsUndertowRejects")
-    void targetUndertowRejectsIsAnsweredWithAnEmpty400AndNotForwarded(String method, String target, String host,
-                                                                      String statusLine) {
-        upstream.stubFor(any(anyUrl()).willReturn(aResponse().withStatus(200).withBody(UPSTREAM_BODY)));
-
-        HttpTestClient.Response response = send(method, target, host, null);
-
-        assertThat(response.statusLine()).as(response::toString).isEqualTo(statusLine);
-        assertThat(response.body()).as(response::toString).isEmpty();
-        assertThat(upstream.getAllServeEvents()).isEmpty();
-    }
-
-    /** Method, target, {@code Host} or {@code null} for ST-1's, URL the configured upstream must receive. */
+    /**
+     * Method, target, {@code Host} or {@code null} for ST-1's, request body or {@code null}, URL the configured
+     * upstream must receive.
+     */
     private static Stream<Arguments> forwardedTargets() {
         return Stream.of(
-                Arguments.of("GET", "/x", null, "/x"),
-                Arguments.of("OPTIONS", "/x", null, "/x"),
-                Arguments.of("PROPFIND", "/dav/folder", null, "/dav/folder"),
-                Arguments.of("GET", "//evil.example/x", null, "//evil.example/x"),
-                Arguments.of("GET", "/@evil.example:8443/x", null, "/@evil.example:8443/x"),
+                Arguments.of("GET", "/x", null, null, "/x"),
+                Arguments.of("OPTIONS", "/x", null, null, "/x"),
+                Arguments.of("PROPFIND", "/dav/folder", null, null, "/dav/folder"),
+                Arguments.of("GET", "//evil.example/x", null, null, "//evil.example/x"),
+                Arguments.of("GET", "/@evil.example:8443/x", null, null, "/@evil.example:8443/x"),
                 // Absolute form: the authority is dropped, only the path and query travel.
-                Arguments.of("GET", "http://evil.example/x", "evil.example", "/x"),
-                Arguments.of("GET", "https://evil.example/x?q=1", "evil.example", "/x?q=1"),
-                Arguments.of("GET", "http://" + AUTHORITY, null, "/"));
+                Arguments.of("GET", "http://evil.example/x", "evil.example", null, "/x"),
+                Arguments.of("GET", "https://evil.example/x?q=1", "evil.example", null, "/x?q=1"),
+                Arguments.of("GET", "http://" + AUTHORITY, null, null, "/"),
+                // A target naming a host the Host header does not.
+                Arguments.of("GET", "http://evil.example/x", null, null, "/x"),
+                Arguments.of("GET", "http://u:p@evil.example:8443/x", "evil.example:8443", null, "/x"),
+                // An authority that runs into its path or into another host is dropped the same way.
+                Arguments.of("GET", "http://" + AUTHORITY + "@evil.example/x", null, null, "/x"),
+                Arguments.of("GET", "http://" + AUTHORITY + "evil", null, null, "/"),
+                Arguments.of("POST", "http://" + AUTHORITY + "@evil.example/x", null, "data", "/x"),
+                Arguments.of("DELETE", "http://" + AUTHORITY + "@evil.example/a|b", null, null, "/a%7Cb"));
     }
 
     @ParameterizedTest(name = "{0} {1}")
     @MethodSource("forwardedTargets")
     void originAndAbsoluteFormTargetsReachOnlyTheConfiguredUpstream(String method, String target, String host,
-                                                                     String upstreamUrl) {
+                                                                     String body, String upstreamUrl) {
         upstream.stubFor(any(anyUrl()).willReturn(aResponse().withStatus(200).withBody(UPSTREAM_BODY)));
 
-        HttpTestClient.Response response = send(method, target, host, null);
+        HttpTestClient.Response response = send(method, target, host, body);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 200 OK");
         assertThat(response.bodyAsString()).as(response::toString).isEqualTo(UPSTREAM_BODY);
@@ -174,6 +175,27 @@ class OriginFormTargetGuardTest {
         assertThat(received).hasSize(1);
         assertThat(received.get(0).getRequest().getMethod().getName()).isEqualTo(method);
         assertThat(received.get(0).getRequest().getUrl()).isEqualTo(upstreamUrl);
+        assertThat(received.get(0).getRequest().getBodyAsString()).isEqualTo(body == null ? "" : body);
+    }
+
+    /**
+     * The deployment customizers, applied in the order Spring Boot applies them, register the guard first and the
+     * handler that attaches each request's header fields as sent last, so that handler wraps the guard and also runs
+     * for every request the guard answers.
+     */
+    @Test
+    void guardRunsInsideTheHandlerThatAttachesEachRequestsFieldsAsSent() {
+        DeploymentInfo deployment = new DeploymentInfo();
+        HttpHandler servletHandler = exchange -> { };
+
+        webServerFactory.getDeploymentInfoCustomizers().forEach(customizer -> customizer.customize(deployment));
+
+        List<HandlerWrapper> wrappers = deployment.getInitialHandlerChainWrappers();
+        assertThat(wrappers).hasSize(2);
+        assertThat(wrappers.get(0).wrap(servletHandler))
+                .isInstanceOf(OriginFormTargetGuard.NonOriginFormPathHandler.class);
+        assertThat(wrappers.get(1).wrap(servletHandler))
+                .isInstanceOf(RequestFramingGuardConfig.SentHeaderFieldsHandler.class);
     }
 
     /**

@@ -15,8 +15,9 @@ server:
         # The original Grizzly listener accepted targets with raw | { } ^ " < > ` \ and the like and forwarded them;
         # Undertow answers them with a bare 400 unless this option is on.
         ALLOW_UNESCAPED_CHARACTERS_IN_URL: true
-        # No request body size limit, as the original listener had none. Undertow 2.3.25 caps a body at 2 MB by
-        # default and server.undertow.max-http-post-size only passes positive values, so -1 is set here.
+        # No request body size limit, as the original listener had none. Undertow 2.3.17 sets none by default, later
+        # releases (2.3.25 among them) cap a body at 2 MB, and server.undertow.max-http-post-size only passes positive
+        # values, so -1 is set here explicitly.
         MAX_ENTITY_SIZE: -1
 spring:
   application:

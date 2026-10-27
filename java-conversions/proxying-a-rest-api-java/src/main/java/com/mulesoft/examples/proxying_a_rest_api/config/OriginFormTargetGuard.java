@@ -18,6 +18,7 @@ import io.undertow.util.StatusCodes;
 import org.springframework.boot.web.embedded.undertow.UndertowDeploymentInfoCustomizer;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.annotation.Order;
 
 import com.mulesoft.examples.proxying_a_rest_api.config.RequestTargetEscapingFilter.TargetComponent;
 
@@ -27,12 +28,16 @@ import com.mulesoft.examples.proxying_a_rest_api.config.RequestTargetEscapingFil
  * handler serves. Nothing is forwarded.
  *
  * <p>The original listener served {@code path="/*"} ({@code proxying-a-rest-api.xml:12}), which no such path
- * matches. Undertow's HTTP/1.1 parser hands one over for the asterisk form ({@code OPTIONS *}, {@code PRI *}), for
- * the authority form of {@code CONNECT} ({@code CONNECT host:port}) and for an absolute-form target whose authority
- * runs straight into its path ({@code http://host:port@x/y}, {@code http://host:portx}); it answers every other
- * target not in origin form with 400 itself. Undertow's servlet path matching then fails on such a path with
- * {@code UT000068}, before any filter, servlet or advice runs, and the caller would receive a bare 500 with an empty
- * body. The handler registered here runs ahead of that matching, so the request never reaches the servlet layer.
+ * matches. Undertow's HTTP/1.1 parser hands one over for every target that is neither in origin form nor an absolute
+ * URI with {@code //} and an authority: the asterisk form with any method ({@code OPTIONS *}, {@code GET *}), the
+ * authority form of {@code CONNECT} ({@code CONNECT host:port}) and targets such as {@code @host/x},
+ * {@code http:@host/x} or {@code .host/x}. An absolute-form target reaches the proxy as its path, which starts with
+ * {@code /}, whatever authority it names. Undertow's servlet path matching fails on a path without a leading
+ * {@code /} with {@code UT000068}, before any filter, servlet or advice runs, and the caller would receive a bare 500
+ * with an empty body. The handler registered here runs ahead of that matching, so the request never reaches the
+ * servlet layer. It runs inside the handler {@link RequestFramingGuardConfig} registers ({@link #ORDER}), which first
+ * gives the exchange its own request's header fields as sent, so a request answered here still takes its fields and
+ * the next request on the connection receives its own.
  *
  * <p>The reported path is the one the proxy would have used, with every character RFC 3986 does not allow in a path
  * percent-encoded by {@link RequestTargetEscapingFilter#escape}, as that filter hands paths to the dispatcher, so the
@@ -49,12 +54,20 @@ public class OriginFormTargetGuard {
     static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
 
     /**
+     * Order of {@link #originFormTargetGuardCustomizer()}: just before the customizer of
+     * {@link RequestFramingGuardConfig}, so the handler that attaches the request's header fields as sent wraps
+     * this one and also runs for the requests answered here.
+     */
+    static final int ORDER = RequestFramingGuardConfig.SENT_HEADER_FIELDS_ORDER - 1;
+
+    /**
      * Wraps Undertow's servlet initial handler in a {@link NonOriginFormPathHandler}, so it runs after the HTTP/1.1
      * parser and before servlet path matching.
      *
      * @return the customizer Spring Boot applies to the deployment of the embedded Undertow server
      */
     @Bean
+    @Order(ORDER)
     public UndertowDeploymentInfoCustomizer originFormTargetGuardCustomizer() {
         return deploymentInfo -> deploymentInfo.addInitialHandlerChainWrapper(NonOriginFormPathHandler::new);
     }

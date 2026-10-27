@@ -9,7 +9,6 @@
 package com.mulesoft.examples.proxying_a_rest_api.controller;
 
 import java.io.IOException;
-import java.util.Collections;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -23,6 +22,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.mulesoft.examples.proxying_a_rest_api.config.ForwardedRequestHeaders;
 import com.mulesoft.examples.proxying_a_rest_api.service.RestProxyService;
 
 /**
@@ -30,8 +30,9 @@ import com.mulesoft.examples.proxying_a_rest_api.service.RestProxyService;
  * {@code allowedMethods} ({@code proxying-a-rest-api.xml:12}) on {@code http:listener-config host="0.0.0.0"
  * port="${http.port}"} ({@code :3}), so every path and every method is accepted.
  *
- * <p>The class only binds the caller's request and writes the answer back. Header copying, the upstream call and
- * the treatment of the upstream status belong to {@link RestProxyService}. The request is read raw, never as
+ * <p>The class only binds the caller's request and writes the answer back. Reading the caller's headers as sent
+ * belongs to {@link ForwardedRequestHeaders}; header copying, the upstream call and the treatment of the upstream
+ * status belong to {@link RestProxyService}. The request is read raw, never as
  * parameters or parts, so form and multipart bodies, the percent-encoding of path and query, and the caller's
  * {@code Authorization} header reach the service exactly as sent. The body is handed over unread, as the request's
  * input stream with its declared length, so it reaches the upstream as a stream, as the Mule listener's stream
@@ -52,14 +53,17 @@ import com.mulesoft.examples.proxying_a_rest_api.service.RestProxyService;
  * <ul>
  *   <li>the response is written with a fixed {@code Content-Length}, never chunked;</li>
  *   <li>multipart forwarding is a Tier 2A verification point;</li>
- *   <li>Undertow's parser drops the leading and trailing whitespace of a request header value and keeps only the
- *       first SP or HTAB of every run inside it, with no option to turn that off, so a Digest
- *       {@code username="John  Smith"} reaches the upstream as {@code username="John Smith"} and the upstream may
- *       reject the credential; the Mule listener kept the value as sent (Tier 2A verification point);</li>
- *   <li>a request whose header value holds a CR, an LF or another control character except HTAB, one whose target
- *       holds a {@code %} followed by neither two hexadecimal digits nor another {@code %}, and an absolute-form
- *       target whose host the {@code Host} header does not name are answered with an empty 400 before any handler
- *       runs, so none of them is forwarded (Tier 2A verification point).</li>
+ *   <li>a request header value reaches the upstream without its leading and trailing SP and HTAB, and an obs-fold
+ *       in it as one SP. Every other byte arrives as sent, inner runs of SP and HTAB included, so a Digest
+ *       {@code username="John  Smith"} or a value {@code a<HTAB>b} is forwarded unchanged:
+ *       {@link ForwardedRequestHeaders} puts back the values the request-framing guard recorded before Undertow's
+ *       parser turned every such run into one SP. Several {@code Cookie} lines are forwarded as the one
+ *       {@code Cookie} value Undertow joins them into, with {@code ; } (Tier 2A verification point);</li>
+ *   <li>a request whose head holds a CR not followed by LF, an LF not preceded by CR, a control character other
+ *       than HTAB in a header value, whitespace before a header colon, or more than one or conflicting body framing
+ *       headers is answered with an empty 400 by
+ *       {@link com.mulesoft.examples.proxying_a_rest_api.config.RequestFramingGuardConfig}'s guard before Undertow
+ *       parses it, so none of them is forwarded (Tier 2A verification point).</li>
  * </ul>
  */
 @RestController
@@ -90,12 +94,7 @@ public class RestProxyController {
         HttpMethod method = HttpMethod.valueOf(request.getMethod());
         String rawPath = request.getRequestURI();
         String rawQuery = request.getQueryString();
-        HttpHeaders headers = new HttpHeaders();
-        for (String name : Collections.list(request.getHeaderNames())) {
-            for (String value : Collections.list(request.getHeaders(name))) {
-                headers.add(name, value);
-            }
-        }
+        HttpHeaders headers = ForwardedRequestHeaders.from(request);
 
         ResponseEntity<byte[]> result = restProxyService.forward(method, rawPath, rawQuery, headers,
                 request.getInputStream(), request.getContentLengthLong());

@@ -18,6 +18,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.awaitility.Awaitility.await;
 
 import java.nio.charset.StandardCharsets;
@@ -58,6 +59,7 @@ import org.springframework.test.context.TestPropertySource;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.proxying_a_rest_api.ProxyingARestApiApplication;
+import com.mulesoft.examples.proxying_a_rest_api.client.BoxProxyClient;
 import com.mulesoft.examples.proxying_a_rest_api.support.HttpTestClient;
 
 /**
@@ -69,8 +71,11 @@ import com.mulesoft.examples.proxying_a_rest_api.support.HttpTestClient;
  * with {@code spring.mvc.log-request-details=true}. Each sends the caller's bearer token, cookie, query token and
  * body through the proxy, asserts the upstream received them unchanged, and asserts that the captured console output
  * holds none of them while it does hold a {@code DEBUG} line of an unguarded logger, so the capture is known to see
- * the levels configured. Each scenario restores the logger levels it found and closes its context, so later test
- * classes see the logging configuration they would have seen without it.
+ * the levels configured. A path whose segments are an e-mail address and a token, sent with a standard and with an
+ * extension method, reaches the upstream unchanged while {@code BoxProxyClient} logs only its fixed line, which
+ * names the method or, for an extension method, a fixed word in its place. Each scenario restores the logger levels
+ * it found and closes its context, so later test classes see the logging configuration they would have seen without
+ * it.
  */
 class SensitiveLogGuardTest {
 
@@ -220,6 +225,11 @@ class SensitiveLogGuardTest {
         private static final String JSON_BODY = "{\"secret\":\"SENTINEL_BODY\"}";
         private static final String FORM_BODY = "grant_type=password&password=SENTINEL_FORM";
 
+        /** Path segments a caller may send that are personal data or a secret: an e-mail address and a token. */
+        private static final String PATH_EMAIL = "sentinel.person@example.com";
+        private static final String PATH_TOKEN = "SENTINEL_PATH_TOKEN";
+        private static final String SENTINEL_PATH = "/2.0/users/" + PATH_EMAIL + "/tokens/" + PATH_TOKEN;
+
         /** Every sentinel the caller or the upstream sends; none may reach the log. */
         private static final List<String> SENTINELS = List.of("SENTINEL_TOKEN", "SENTINEL_COOKIE",
                 "SENTINEL_QUERY", "SENTINEL_BODY", "SENTINEL_FORM", "SENTINEL_SET_COOKIE",
@@ -287,6 +297,9 @@ class SensitiveLogGuardTest {
             upstream.stubFor(any(urlPathEqualTo("/2.0/broken")).willReturn(aResponse()
                     .withStatus(500)
                     .withBody("SENTINEL_UPSTREAM_ERROR")));
+            upstream.stubFor(any(urlPathEqualTo(SENTINEL_PATH)).willReturn(aResponse()
+                    .withStatus(200)
+                    .withBody("user-tokens")));
         }
 
         @Test
@@ -301,7 +314,45 @@ class SensitiveLogGuardTest {
                     .withHeader("Cookie", equalTo(COOKIE)));
             assertLogHoldsNoSentinel(output);
             assertThat(output.getAll()).as("the unguarded BoxProxyClient DEBUG line is captured")
-                    .contains("Proxying GET /2.0/folders/0");
+                    .contains("Proxying GET request through rest-api-proxy");
+        }
+
+        // Asserted on BoxProxyClient's own events: which other loggers write the request path under root TRACE is
+        // not this case's concern. PROPFIND stands for the extension methods, whose token the caller chose.
+        @ParameterizedTest(name = "{0}")
+        @CsvSource({"GET, GET", "PROPFIND, extension-method"})
+        void personalAndTokenPathSegmentsReachUpstreamWhileTheClientLogsOnlyItsFixedLine(String method,
+                                                                                          String loggedMethod,
+                                                                                          CapturedOutput output) {
+            Logger clientLogger = loggerContext().getLogger(BoxProxyClient.class);
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.setContext(loggerContext());
+            events.start();
+            clientLogger.addAppender(events);
+            try {
+                HttpTestClient.Response response =
+                        client().send(method, SENTINEL_PATH + "?" + QUERY, credentials(), null);
+
+                assertThat(response.status()).as(response::toString).isEqualTo(200);
+                assertThat(response.bodyAsString()).isEqualTo("user-tokens");
+                upstream.verify(requestedFor(method, urlEqualTo(SENTINEL_PATH + "?" + QUERY))
+                        .withHeader("Authorization", equalTo(TOKEN))
+                        .withHeader("Cookie", equalTo(COOKIE)));
+            } finally {
+                clientLogger.detachAppender(events);
+                events.stop();
+            }
+            // The appender appends under its own lock, so reading under it sees every event the request thread wrote.
+            List<ILoggingEvent> logged;
+            synchronized (events) {
+                logged = List.copyOf(events.list);
+            }
+            assertThat(logged).extracting(ILoggingEvent::getLevel, ILoggingEvent::getFormattedMessage)
+                    .containsExactly(tuple(Level.DEBUG,
+                            "Proxying " + loggedMethod + " request through rest-api-proxy"));
+            assertThat(logged).extracting(ILoggingEvent::getFormattedMessage)
+                    .noneMatch(line -> line.contains(PATH_EMAIL) || line.contains(PATH_TOKEN));
+            assertLogHoldsNoSentinel(output);
         }
 
         @Test

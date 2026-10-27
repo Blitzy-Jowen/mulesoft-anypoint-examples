@@ -26,7 +26,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.mock.web.MockFilterChain;
@@ -45,8 +44,7 @@ import com.mulesoft.examples.proxying_a_rest_api.support.HttpTestClient;
 /**
  * Tests {@link RequestTargetEscapingFilter}: a request target the original {@code /*} listener accepted although
  * RFC 3986 does not allow it reaches the upstream with only the disallowed characters percent-encoded, and a valid
- * target reaches it byte for byte. A target holding a {@code %} followed by neither two hexadecimal digits nor another
- * {@code %} never reaches the filter on the wire: Undertow's parser answers it with 400 first.
+ * target reaches it byte for byte.
  *
  * <p>The escaping cases call the encoding directly for every character class of each component. The filter cases
  * check on a mock request which requests are wrapped and what the wrapper returns. The wire cases boot the
@@ -191,13 +189,18 @@ class RequestTargetEscapingFilterTest {
                 Arguments.of("/a|b", "/a%7Cb"),
                 Arguments.of("/a{b}", "/a%7Bb%7D"),
                 Arguments.of("/a^b", "/a%5Eb"),
-                // The parser takes the second % as the start of the escape %41, so the first reaches the filter.
+                Arguments.of("/a%zz", "/a%25zz"),
+                Arguments.of("/a%", "/a%25"),
+                Arguments.of("/a%2", "/a%252"),
+                // Only the first % starts no valid escape; the second starts %41.
                 Arguments.of("/a%%41", "/a%25%41"),
                 Arguments.of("/qtest?k={x}", "/qtest?k=%7Bx%7D"),
                 Arguments.of("/qtest?k=a\"b", "/qtest?k=a%22b"),
                 Arguments.of("/qtest?k=<x>", "/qtest?k=%3Cx%3E"),
                 Arguments.of("/qtest?k=a`b", "/qtest?k=a%60b"),
                 Arguments.of("/qtest?k=a\\b", "/qtest?k=a%5Cb"),
+                Arguments.of("/qtest?k=%zz", "/qtest?k=%25zz"),
+                Arguments.of("/qtest?k=a%2", "/qtest?k=a%252"),
                 Arguments.of("/a[b]", "/a%5Bb%5D"),
                 Arguments.of("/a#b", "/a%23b"),
                 Arguments.of("/qtest?k=a#b", "/qtest?k=a%23b"),
@@ -223,20 +226,6 @@ class RequestTargetEscapingFilterTest {
         List<ServeEvent> received = upstream.getAllServeEvents();
         assertThat(received).hasSize(1);
         assertThat(received.get(0).getRequest().getUrl()).isEqualTo(upstreamUrl);
-    }
-
-    // Undertow's HTTP/1.1 parser refuses a % followed by neither two hexadecimal digits nor another %, whatever its
-    // options, before any filter runs; the filter escapes such a % only for requests that bypass that parser.
-    @ParameterizedTest(name = "{0}")
-    @ValueSource(strings = {"/a%zz", "/a%", "/a%2", "/qtest?k=%zz", "/qtest?k=a%2"})
-    void targetWithAnInvalidEscapeIsAnsweredByTheListenerWith400AndNotForwarded(String target) {
-        upstream.stubFor(any(anyUrl()).willReturn(aResponse().withStatus(200).withBody(UPSTREAM_BODY)));
-
-        HttpTestClient.Response response = new HttpTestClient(LOOPBACK, port).get(target);
-
-        assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 400 Bad Request");
-        assertThat(response.body()).as(response::toString).isEmpty();
-        assertThat(upstream.getAllServeEvents()).isEmpty();
     }
 
     private static MockHttpServletRequest request(String requestUri, String queryString) {
