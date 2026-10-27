@@ -1,0 +1,91 @@
+{
+  "type": "object",
+  "properties": {
+    "id": {
+      "title": "Internal ID",
+      "type": "string",
+      "nullable": true
+    },
+    "item": {
+      "title": "Item",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "location": {
+      "title": "Location",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "units": {
+      "title": "Units",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "subsidiary": {
+      "title": "Subsidiary",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "order": {
+      "title": "Order",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "quantity": {
+                "title": "Quantity",
+                "type": "number",
+                "format": "double",
+                "nullable": true
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
