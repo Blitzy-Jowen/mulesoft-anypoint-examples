@@ -13,16 +13,25 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import jakarta.jms.ConnectionFactory;
 import jakarta.jms.DeliveryMode;
@@ -31,6 +40,9 @@ import jakarta.jms.TextMessage;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockReset;
@@ -47,7 +59,9 @@ import com.mulesoft.examples.sending_json_data_to_a_jms_queue.support.HttpTestCl
  * Wire-level test of {@link SalesController}, the {@code http:listener path="sales" allowedMethods="POST"} of flow
  * {@code json-to-jmsFlow} (sending-json-data-to-a-jms-queue/src/main/app/json-to-jms.xml:6-10): a {@code POST} body
  * is sent to queue {@code sales} as a {@code TextMessage} and echoed with 200, while other methods, unserved paths
- * and a failed send get the listener's and runtime's default error responses.
+ * and a failed send get the listener's and runtime's default error responses. A form-urlencoded entity is queued and
+ * echoed as the rendering of the parameter map the listener decoded from it, and one whose {@code Content-Type} or
+ * body the listener rejected gets the listener's 400 or 500.
  *
  * <p>The whole application runs on Undertow (random port) with its embedded, non-persistent Artemis broker, and
  * requests go through ST-1 {@link HttpTestClient}, so the raw status line with its reason phrase, the headers and
@@ -75,6 +89,12 @@ class SalesControllerTest {
     private static final String PATH = "/sales";
 
     private static final String QUEUE = "sales";
+
+    /** The media type curl's {@code -d} sends, which the Mule listener decoded into a parameter map. */
+    private static final String FORM = "application/x-www-form-urlencoded";
+
+    /** Separator of the head lines, and of the head from the body, on the HTTP/1.1 wire. */
+    private static final String CRLF = "\r\n";
 
     /** How long the original test waited for the message on {@code jms://sales}. */
     private static final long EXPECTED_MESSAGE_TIMEOUT_MILLIS = 1_500L;
@@ -215,6 +235,114 @@ class SalesControllerTest {
         assertNothingQueued();
     }
 
+    /**
+     * The Mule 3.8 listener decoded a form-urlencoded entity into a parameter map, which the
+     * {@code byte-array-to-string-transformer} rendered as text in the map's entry-set hash order; that rendering,
+     * the output of the real Mule 3.8.0 classes for this body, is what is queued and echoed. The response keeps the
+     * request's type with the JVM's default charset, which also encodes the body.
+     */
+    @Test
+    void formBodyIsQueuedAndEchoedAsParameterMapRendering() throws Exception {
+        String rendering = "{QTY=1, ITEM_ID=001, PRICE=20, ITEM_NAME=Shirt}";
+        byte[] expectedBody = rendering.getBytes(Charset.defaultCharset());
+
+        HttpTestClient.Response response = post(PATH, FORM,
+                "ITEM_ID=001&ITEM_NAME=Shirt&QTY=1&PRICE=20".getBytes(StandardCharsets.US_ASCII));
+
+        assertStatusLine(response, 200, "OK");
+        assertArrayEquals(expectedBody, response.body(), response::toString);
+        assertMediaType(singleContentType(response),
+                new MediaType("application", "x-www-form-urlencoded", Charset.defaultCharset()));
+        assertEquals(String.valueOf(expectedBody.length), response.header("Content-Length"), response::toString);
+        assertEquals(rendering, receiveExpected().getText());
+        assertNothingQueued();
+    }
+
+    /**
+     * A form entity the Mule listener rejected before the flow ran, with the status, reason phrase and body of its
+     * response, as the real Guava 18.0 {@code MediaType} and Mule 3.8.0 classes answer: a malformed percent escape
+     * and a {@code Content-Type} the listener could not parse or whose one charset it could not use give 400 with
+     * the failure's message, empty for {@code charset=""}; two different charsets give 500
+     * {@code Server encountered a problem}.
+     */
+    static Stream<Arguments> formsTheListenerRejected() {
+        String pairs = "a=1&b=2";
+        return Stream.of(
+                Arguments.of(FORM, "a=%zz", 400, "Bad Request", "Cannot decode x-www-form-urlencoded payload"),
+                Arguments.of(FORM + "; charset=bogus", pairs, 400, "Bad Request", "bogus"),
+                Arguments.of(FORM + "; bad", pairs, 400, "Bad Request",
+                        "Could not parse 'application/x-www-form-urlencoded; bad'"),
+                Arguments.of(FORM + "; charset=\"\"", pairs, 400, "Bad Request", ""),
+                Arguments.of(FORM + "; charset=utf-8; charset=iso-8859-1", pairs, 500, "Internal Server Error",
+                        "Server encountered a problem"));
+    }
+
+    /**
+     * The listener's rejection carries no {@code Content-Type} and is written before the flow runs, so nothing
+     * reaches the transformer, the queue or the logger.
+     */
+    @ParameterizedTest(name = "{index}: [{1}] with Content-Type [{0}]")
+    @MethodSource("formsTheListenerRejected")
+    void formTheListenerRejectedIsAnsweredBeforeTheFlowRuns(String contentType, String body, int status,
+            String reason, String expectedBody) {
+        HttpTestClient.Response response = post(PATH, contentType, body.getBytes(StandardCharsets.US_ASCII));
+
+        assertStatusLine(response, status, reason);
+        assertArrayEquals(expectedBody.getBytes(StandardCharsets.US_ASCII), response.body(), response::toString);
+        assertEquals(String.valueOf(expectedBody.length()), response.header("Content-Length"), response::toString);
+        assertEquals(List.of(), response.headers("Content-Type"), response::toString);
+        verify(salesQueueService, never()).send(any(String.class));
+        assertNothingQueued();
+    }
+
+    /**
+     * A form {@code Content-Type} and the charset of the response {@code Content-Type}: the JVM's default charset
+     * for a header naming none, and UTF-8, the byte path's plan default, for an unusable one.
+     */
+    static Stream<Arguments> emptyFormContentTypes() {
+        return Stream.of(
+                Arguments.of(FORM, Charset.defaultCharset()),
+                Arguments.of(FORM + "; charset=bogus", StandardCharsets.UTF_8));
+    }
+
+    /**
+     * A form with {@code Content-Length: 0} had no entity in the Mule listener, which therefore never parsed its
+     * {@code Content-Type}, so it keeps the empty payload even when its charset is unusable.
+     */
+    @ParameterizedTest(name = "{index}: Content-Type [{0}]")
+    @MethodSource("emptyFormContentTypes")
+    void emptyFormBodyIsQueuedAsEmptyText(String contentType, Charset responseCharset) throws Exception {
+        HttpTestClient.Response response = post(PATH, contentType, new byte[0]);
+
+        assertStatusLine(response, 200, "OK");
+        assertEquals(0, response.body().length, response::toString);
+        assertEquals("0", response.header("Content-Length"), response::toString);
+        assertMediaType(singleContentType(response),
+                new MediaType("application", "x-www-form-urlencoded", responseCharset));
+        assertEquals("", receiveExpected().getText());
+        verify(salesQueueService, never()).sendForm(any(), any());
+        assertNothingQueued();
+    }
+
+    /**
+     * A chunked form body was an entity in the Mule listener even with no byte in it, so it decoded to the empty
+     * parameter map, rendered <code>{}</code>.
+     */
+    @Test
+    void chunkedEmptyFormBodyIsQueuedAsEmptyMapRendering() throws Exception {
+        RawResponse response = postChunkedEmptyBody(FORM);
+
+        assertEquals(200, response.status(), response::toString);
+        assertEquals("OK", response.reason(), response::toString);
+        assertArrayEquals("{}".getBytes(Charset.defaultCharset()), response.body(), response::toString);
+        List<String> contentTypes = response.headers("Content-Type");
+        assertEquals(1, contentTypes.size(), response::toString);
+        assertMediaType(contentTypes.get(0),
+                new MediaType("application", "x-www-form-urlencoded", Charset.defaultCharset()));
+        assertEquals("{}", receiveExpected().getText());
+        assertNothingQueued();
+    }
+
     private HttpTestClient client() {
         return new HttpTestClient(LOOPBACK, port);
     }
@@ -226,6 +354,33 @@ class SalesControllerTest {
     private HttpTestClient.Response post(String path, String contentType, byte[] body) {
         Map<String, String> headers = contentType == null ? Map.of() : Map.of("Content-Type", contentType);
         return client().send("POST", path, headers, body);
+    }
+
+    /**
+     * {@code POST /sales} with {@code contentType} and a zero-byte chunked body (only the last chunk
+     * {@code 0\r\n\r\n}), written on a plain socket: ST-1 frames every body it sends with {@code Content-Length},
+     * which would make the body a non-chunked empty one. The request asks for {@code Connection: close}, so the
+     * response is read to the end of the stream; its body is the {@code Content-Length} bytes after the head, and
+     * any other framing fails the test.
+     */
+    private RawResponse postChunkedEmptyBody(String contentType) throws IOException {
+        String request = "POST " + PATH + " HTTP/1.1" + CRLF
+                + "Host: " + LOOPBACK + ":" + port + CRLF
+                + "Content-Type: " + contentType + CRLF
+                + "Transfer-Encoding: chunked" + CRLF
+                + "Connection: close" + CRLF
+                + CRLF
+                + "0" + CRLF + CRLF;
+        byte[] raw;
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(LOOPBACK, port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            OutputStream out = socket.getOutputStream();
+            out.write(request.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            raw = socket.getInputStream().readAllBytes();
+        }
+        return RawResponse.parse(raw);
     }
 
     private JmsTemplate newTemplate(long receiveTimeoutMillis) {
@@ -278,6 +433,63 @@ class SalesControllerTest {
             byte[] bytes = in.readAllBytes();
             assertEquals(MESSAGE_JSON_LENGTH, bytes.length);
             return bytes;
+        }
+    }
+
+    /**
+     * A response read from a raw socket by {@link #postChunkedEmptyBody(String)}: the code and reason phrase of its
+     * status line, its header lines in arrival order, and its {@code Content-Length} body.
+     */
+    private record RawResponse(int status, String reason, List<Map.Entry<String, String>> headerLines, byte[] body) {
+
+        private static final byte[] HEAD_END = (CRLF + CRLF).getBytes(StandardCharsets.US_ASCII);
+
+        /** Parses a complete response framed by {@code Content-Length}; any other shape fails the test. */
+        static RawResponse parse(byte[] raw) {
+            String text = new String(raw, StandardCharsets.ISO_8859_1);
+            int headEnd = indexOf(raw, HEAD_END);
+            assertTrue(headEnd >= 0, () -> "response has no end of head: " + text);
+            String[] lines = new String(raw, 0, headEnd, StandardCharsets.ISO_8859_1).split(CRLF, -1);
+            String[] statusLine = lines[0].split(" ", 3);
+            assertEquals(3, statusLine.length, () -> "malformed status line: " + lines[0]);
+            List<Map.Entry<String, String>> headers = new ArrayList<>();
+            for (int i = 1; i < lines.length; i++) {
+                String line = lines[i];
+                int colon = line.indexOf(':');
+                assertTrue(colon > 0, () -> "malformed header line: " + line);
+                headers.add(Map.entry(line.substring(0, colon), line.substring(colon + 1).trim()));
+            }
+            List<String> lengths = values(headers, "Content-Length");
+            assertEquals(1, lengths.size(), () -> "response not framed by one Content-Length: " + text);
+            int bodyStart = headEnd + HEAD_END.length;
+            assertEquals(bodyStart + Integer.parseInt(lengths.get(0)), raw.length,
+                    () -> "body length differs from Content-Length: " + text);
+            return new RawResponse(Integer.parseInt(statusLine[1]), statusLine[2], List.copyOf(headers),
+                    Arrays.copyOfRange(raw, bodyStart, raw.length));
+        }
+
+        /** The values of every header line named {@code name}, ignoring letter case, in arrival order. */
+        List<String> headers(String name) {
+            return values(headerLines, name);
+        }
+
+        @Override
+        public String toString() {
+            return status + " " + reason + " " + headerLines + " " + new String(body, StandardCharsets.ISO_8859_1);
+        }
+
+        private static List<String> values(List<Map.Entry<String, String>> headers, String name) {
+            return headers.stream().filter(header -> header.getKey().equalsIgnoreCase(name))
+                    .map(Map.Entry::getValue).toList();
+        }
+
+        private static int indexOf(byte[] data, byte[] target) {
+            for (int start = 0; start + target.length <= data.length; start++) {
+                if (Arrays.equals(data, start, start + target.length, target, 0, target.length)) {
+                    return start;
+                }
+            }
+            return -1;
         }
     }
 }

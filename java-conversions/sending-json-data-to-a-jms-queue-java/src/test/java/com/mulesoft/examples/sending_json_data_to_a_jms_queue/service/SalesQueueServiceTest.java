@@ -31,6 +31,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentMatchers;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -39,6 +40,8 @@ import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.jms.JmsException;
 import org.springframework.jms.UncategorizedJmsException;
 import org.springframework.jms.core.JmsTemplate;
+
+import com.mulesoft.examples.sending_json_data_to_a_jms_queue.exception.UndecodableFormException;
 
 /**
  * Unit test of {@link SalesQueueService}, which replaces the {@code byte-array-to-string-transformer}, the one-way
@@ -51,6 +54,12 @@ import org.springframework.jms.core.JmsTemplate;
  * UTF-8 is taken instead, assert the text queued and the bytes returned, and assert that a failed send or an
  * absent body logs nothing. {@link SalesQueueService#responseContentType(String)} is checked against the
  * {@code Content-Type} the original listener derived from each of those headers.
+ *
+ * <p>The form path, {@link SalesQueueService#sendForm(byte[], String)}, is the listener's parameter map handed to
+ * the transformer: its expected texts are the output of the real Mule 3.8.0 classes for the same bodies, and a
+ * {@code Content-Type} the listener's Guava 18.0 parser rejected and an undecodable body are each asserted to fail
+ * with the listener's status and message before anything is sent or logged.
+ * {@link SalesQueueService#isFormUrlEncoded} is checked against the headers the listener decoded as a form.
  *
  * <p>The original logger declares no message, so it logged Mule's description of the message, which names the
  * payload's class and never the body. The log tests therefore assert that description and the body's absence
@@ -291,6 +300,213 @@ class SalesQueueServiceTest {
 
         verifyNoInteractions(jmsTemplate);
         assertThat(descriptionCount(output)).as("descriptions logged for an absent body").isEqualTo(descriptionsBefore);
+    }
+
+    /**
+     * A form request's {@code Content-Type}, its raw body, the text the Mule 3.8 listener and transformer queued
+     * for it, and the charset the response bytes are encoded with. Each expected text is the output of the real
+     * Mule 3.8.0 classes ({@code HttpParser.decodeString} into a {@code ParameterMap}, rendered by
+     * {@code ObjectToString}): entries in the hash order of the map's entry set, not the body's; a repeated name
+     * with its last value; {@code null} for a pair without {@code =}; {@code password} masked. A header without a
+     * charset URL-decodes with the JVM's default charset; those bodies are ASCII, so their text does not depend on
+     * it. The last rows are headers the listener's Guava 18.0 {@code MediaType} parser accepted, as the real Guava
+     * 18.0 and Mule 3.8.0 classes answer for them: whitespace after a {@code ;}, a quoted value with an escaped
+     * quote, a repeated charset that names one charset, and parameters other than {@code charset}. The two final
+     * rows are headers Guava accepted and Spring's parser rejects, a brace in a token and a backslash escape in a
+     * quoted charset: the listener resolved ISO-8859-1 from each and URL-decoded with it, while the response bytes
+     * follow the UTF-8 the response's {@code Content-Type} names for a header Spring cannot parse.
+     */
+    static Stream<Arguments> formBodies() {
+        String form = "application/x-www-form-urlencoded";
+        Charset jvmDefault = Charset.defaultCharset();
+        String pairs = "a=1&b=2";
+        String rendering = "{a=1, b=2}";
+        return Stream.of(
+                Arguments.of(form, "a=1&b=2", "{a=1, b=2}", jvmDefault),
+                Arguments.of(form, "b=2&a=1", "{b=2, a=1}", jvmDefault),
+                Arguments.of(form, "z=1&a=1", "{a=1, z=1}", jvmDefault),
+                Arguments.of(form, "a=1&a=2", "{a=2}", jvmDefault),
+                Arguments.of(form, "a", "{a=null}", jvmDefault),
+                Arguments.of(form, "a=1&a", "{a=null}", jvmDefault),
+                Arguments.of(form, "&a=1", "{=null, a=1}", jvmDefault),
+                Arguments.of(form, "a=1&", "{a=1}", jvmDefault),
+                Arguments.of(form, "&&", "{}", jvmDefault),
+                Arguments.of(form, "   ", "{}", jvmDefault),
+                Arguments.of(form, "user=mule&password=secret", "{password=*****, user=mule}", jvmDefault),
+                Arguments.of(form, "password", "{password=null}", jvmDefault),
+                Arguments.of(form, "a=b+c%20d", "{a=b c d}", jvmDefault),
+                Arguments.of(form, "=1", "{=1}", jvmDefault),
+                Arguments.of(form, "ITEM_ID=001&ITEM_NAME=Shirt&QTY=1&PRICE=20",
+                        "{QTY=1, ITEM_ID=001, PRICE=20, ITEM_NAME=Shirt}", jvmDefault),
+                Arguments.of(form, "{\"ITEM_ID\"= 001}", "{{\"ITEM_ID\"= 001}}", jvmDefault),
+                Arguments.of(form + "; charset=UTF-8", "x=%E2%82%AC", "{x=\u20ac}", StandardCharsets.UTF_8),
+                Arguments.of(form + "; charset=ISO-8859-1", "name=caf%E9", "{name=caf\u00e9}",
+                        StandardCharsets.ISO_8859_1),
+                Arguments.of("Application/X-WWW-Form-URLEncoded", pairs, rendering, jvmDefault),
+                Arguments.of(form + ";charset=ISO-8859-1", pairs, rendering, StandardCharsets.ISO_8859_1),
+                Arguments.of(form + ";  charset=utf-8", pairs, rendering, StandardCharsets.UTF_8),
+                Arguments.of(form + ";\tcharset=utf-8", pairs, rendering, StandardCharsets.UTF_8),
+                Arguments.of(form + "; charset=\"utf-8\"", pairs, rendering, StandardCharsets.UTF_8),
+                Arguments.of(form + "; foo=\"a\\\"b\"", pairs, rendering, jvmDefault),
+                Arguments.of(form + "; charset=utf-8; charset=UTF-8", pairs, rendering, StandardCharsets.UTF_8),
+                Arguments.of(form + "; foo=bar", pairs, rendering, jvmDefault),
+                Arguments.of(form + "; foo=\"a b\"", pairs, rendering, jvmDefault),
+                Arguments.of(form + "; charset=iso-8859-1; x={y}", "name=caf%E9", "{name=caf\u00e9}",
+                        StandardCharsets.UTF_8),
+                Arguments.of(form + "; charset=\"iso\\-8859-1\"", "name=caf%E9", "{name=caf\u00e9}",
+                        StandardCharsets.UTF_8));
+    }
+
+    @ParameterizedTest(name = "{index}: [{1}] with Content-Type [{0}]")
+    @MethodSource("formBodies")
+    void formPathQueuesParameterMapRenderingAndReturnsItsBytes(String contentType, String body, String expectedText,
+            Charset responseCharset) throws UndecodableFormException {
+        byte[] result = new SalesQueueService(jmsTemplate, SALES)
+                .sendForm(body.getBytes(StandardCharsets.US_ASCII), contentType);
+
+        verify(jmsTemplate).convertAndSend(eq(SALES), eq(expectedText));
+        verifyNoMoreInteractions(jmsTemplate);
+        assertThat(result).containsExactly(expectedText.getBytes(responseCharset));
+    }
+
+    @ParameterizedTest(name = "{index}: [{0}]")
+    @ValueSource(strings = {"a=%zz", "a=%2", "a=%-1"})
+    void formPathRejectsMalformedEscapeWithoutSendingOrLogging(String body, CapturedOutput output) {
+        SalesQueueService service = new SalesQueueService(jmsTemplate, SALES);
+        long descriptionsBefore = descriptionCount(output);
+
+        UndecodableFormException thrown = assertThrows(UndecodableFormException.class,
+                () -> service.sendForm(body.getBytes(StandardCharsets.US_ASCII), "application/x-www-form-urlencoded"));
+
+        assertThat(thrown).hasMessage("Cannot decode x-www-form-urlencoded payload")
+                .hasCauseInstanceOf(IllegalArgumentException.class);
+        assertThat(thrown.getStatus()).isEqualTo(400);
+        verifyNoInteractions(jmsTemplate);
+        assertThat(descriptionCount(output)).as("descriptions logged for an undecodable form")
+                .isEqualTo(descriptionsBefore);
+    }
+
+    /**
+     * A form entity's {@code Content-Type} that the Mule 3.8 listener rejected before decoding the body, with the
+     * status and message its response carried, as the real Guava 18.0 {@code MediaType} and Mule 3.8.0 classes
+     * answer for each header: a header the grammar rejects gives 400 {@code Could not parse '<header>'}; a single
+     * charset the JVM cannot use gives 400 with its lower-cased name, empty for {@code charset=""}; two different
+     * charsets give 500 {@code Server encountered a problem}.
+     */
+    static Stream<Arguments> rejectedFormContentTypes() {
+        String form = "application/x-www-form-urlencoded";
+        return Stream.of(
+                Arguments.of(form + "; charset=bogus", 400, "bogus"),
+                Arguments.of(form + "; charset=BOGUS", 400, "bogus"),
+                Arguments.of(form + "; Charset=Bogus", 400, "bogus"),
+                Arguments.of(form + "; charset=x*y", 400, "x*y"),
+                Arguments.of(form + "; charset=\"\"", 400, ""),
+                unparseable(form + "; bad"),
+                unparseable(form + ";"),
+                unparseable(form + ";charset=utf-8;"),
+                unparseable(form + " ; charset=utf-8"),
+                unparseable(form + "; charset = utf-8"),
+                unparseable(form + "; charset=utf-8 "),
+                unparseable(form + " "),
+                unparseable(" " + form),
+                unparseable(form + ";;charset=utf-8"),
+                unparseable(form + "; =a"),
+                unparseable(form + "; foo="),
+                unparseable(form + "; foo=a b"),
+                unparseable(form + "; foo=\"unterminated"),
+                unparseable(form + "; charset=\"utf\\"),
+                unparseable(form + "; foo=\u00e9"),
+                unparseable(form + "; foo=\"\u00e9\""),
+                unparseable(form + "; foo=\"a\\\u00e9\""),
+                Arguments.of(form + "; charset=utf-8; charset=iso-8859-1", 500, "Server encountered a problem"));
+    }
+
+    @ParameterizedTest(name = "{index}: Content-Type [{0}]")
+    @MethodSource("rejectedFormContentTypes")
+    void formPathRejectsContentTypeTheListenerRejectedWithoutSendingOrLogging(String contentType, int status,
+            String message, CapturedOutput output) {
+        SalesQueueService service = new SalesQueueService(jmsTemplate, SALES);
+        long descriptionsBefore = descriptionCount(output);
+
+        UndecodableFormException thrown = assertThrows(UndecodableFormException.class,
+                () -> service.sendForm("a=1&b=2".getBytes(StandardCharsets.US_ASCII), contentType));
+
+        assertThat(thrown.getStatus()).isEqualTo(status);
+        assertThat(thrown).hasMessage(message);
+        verifyNoInteractions(jmsTemplate);
+        assertThat(descriptionCount(output)).as("descriptions logged for a rejected Content-Type")
+                .isEqualTo(descriptionsBefore);
+    }
+
+    /**
+     * A request's {@code Content-Type} and whether the Mule 3.8 listener decoded its entity as a form: the
+     * {@code type/subtype} is {@code application/x-www-form-urlencoded} in any letter case, whatever the parameters,
+     * unless the header contains {@code multipart}; an absent, blank or unparseable header is not a form.
+     */
+    static Stream<Arguments> formContentTypes() {
+        return Stream.of(
+                Arguments.of("application/x-www-form-urlencoded", true),
+                Arguments.of("APPLICATION/X-WWW-FORM-URLENCODED; charset=UTF-8", true),
+                Arguments.of("application/x-www-form-urlencoded;charset=ISO-8859-1", true),
+                Arguments.of("application/x-www-form-urlencoded; charset=bogus", true),
+                Arguments.of(null, false),
+                Arguments.of("   ", false),
+                Arguments.of(";;;", false),
+                Arguments.of("application/json", false),
+                Arguments.of("text/plain", false),
+                Arguments.of("multipart/form-data; boundary=x", false),
+                Arguments.of("application/x-www-form-urlencoded; boundary=multipart", false));
+    }
+
+    @ParameterizedTest(name = "{index}: Content-Type [{0}]")
+    @MethodSource("formContentTypes")
+    void isFormUrlEncodedMatchesTheListenersFormTypes(String contentType, boolean expected) {
+        assertThat(new SalesQueueService(jmsTemplate, SALES).isFormUrlEncoded(contentType)).isEqualTo(expected);
+        verifyNoInteractions(jmsTemplate);
+    }
+
+    @Test
+    void formPathLogsStringPayloadDescriptionAfterSendAndNeverTheBody(CapturedOutput output)
+            throws UndecodableFormException {
+        String body = "case=form-logged-17&password=form-secret-18";
+        SalesQueueService service = new SalesQueueService(jmsTemplate, SALES);
+        long descriptionsBefore = descriptionCount(output);
+
+        service.sendForm(body.getBytes(StandardCharsets.US_ASCII), "application/x-www-form-urlencoded");
+
+        verify(jmsTemplate).convertAndSend(SALES, "{case=form-logged-17, password=*****}");
+        assertThat(descriptionCount(output)).as("descriptions logged by the form send")
+                .isEqualTo(descriptionsBefore + 1);
+        List<String> lines = output.getOut().lines().toList();
+        int header = lines.lastIndexOf(DESCRIPTION_HEADER);
+        assertThat(lines.get(header + 3)).isEqualTo("  payload=java.lang.String");
+        assertThat(output.getAll()).as("form body and rendering kept out of the log")
+                .doesNotContain("form-logged-17").doesNotContain("form-secret-18");
+    }
+
+    /** An absent body with a form header, and a body with an absent header, which Guava's parser also refused. */
+    static Stream<Arguments> absentFormArguments() {
+        return Stream.of(
+                Arguments.of(null, "application/x-www-form-urlencoded"),
+                Arguments.of("a=1".getBytes(StandardCharsets.US_ASCII), null));
+    }
+
+    @ParameterizedTest(name = "{index}: Content-Type [{1}]")
+    @MethodSource("absentFormArguments")
+    void formPathRejectsNullArgumentWithoutSendingOrLogging(byte[] body, String contentType, CapturedOutput output) {
+        SalesQueueService service = new SalesQueueService(jmsTemplate, SALES);
+        long descriptionsBefore = descriptionCount(output);
+
+        assertThrows(NullPointerException.class, () -> service.sendForm(body, contentType));
+
+        verifyNoInteractions(jmsTemplate);
+        assertThat(descriptionCount(output)).as("descriptions logged for an absent argument")
+                .isEqualTo(descriptionsBefore);
+    }
+
+    /** A header the listener's Guava 18.0 parser rejected: 400 with Guava's message naming the whole header. */
+    private static Arguments unparseable(String contentType) {
+        return Arguments.of(contentType, 400, "Could not parse '" + contentType + "'");
     }
 
     private static byte[] utf8(String text) {

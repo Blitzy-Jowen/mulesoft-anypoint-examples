@@ -7,6 +7,8 @@ import java.io.UncheckedIOException;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Executable;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -42,6 +44,7 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -136,7 +139,10 @@ import org.w3c.dom.NodeList;
  *
  * <p>Replay never contacts a live service: WireMock serves the recorded {@code upstream} exchanges in order,
  * embedded servers hold the seeded {@code state}, and their addresses reach the application through
- * {@link DynamicPropertySource}. {@code deterministic} scenarios are compared byte for byte without
+ * {@link DynamicPropertySource}. The broker reproduces the behaviour the capture seeded as well: it refuses the sends
+ * {@code state.jms} names, and the responders of {@code state.amqp.responders} answer requests. Messages are compared
+ * on every destination of {@code response.destinations}, one the capture found empty included, which must stay empty.
+ * {@code deterministic} scenarios are compared byte for byte without
  * normalization; {@code nondeterministic} ones compare status, reason and headers exactly and bodies, files and
  * messages by structure only, and are reported {@code UNVERIFIED — nondeterministic output}. A fixture is never
  * adjusted to the Java output: a mismatch fails its scenario.
@@ -288,6 +294,19 @@ class FixtureParityTest {
     private static final List<String> ARTEMIS_EMBEDDED_CLASSES = List.of(
             "org.apache.activemq.artemis.jms.server.embedded.EmbeddedJMS",
             "org.apache.activemq.artemis.core.server.embedded.EmbeddedActiveMQ");
+    /** The Artemis server Spring Boot embeds, whose broker plugins reproduce the refused sends of {@code state.jms}. */
+    private static final String ARTEMIS_EMBEDDED_SERVER_CLASS =
+            "org.apache.activemq.artemis.core.server.embedded.EmbeddedActiveMQ";
+    private static final String ARTEMIS_MESSAGE_PLUGIN_CLASS =
+            "org.apache.activemq.artemis.core.server.plugin.ActiveMQServerMessagePlugin";
+    private static final String ARTEMIS_SECURITY_EXCEPTION_CLASS =
+            "org.apache.activemq.artemis.api.core.ActiveMQSecurityException";
+    private static final String ARTEMIS_SERVER_SESSION_CLASS =
+            "org.apache.activemq.artemis.core.server.impl.ServerSessionImpl";
+    private static final String ARTEMIS_IN_VM_CONNECTOR_CLASS =
+            "org.apache.activemq.artemis.core.remoting.impl.invm.InVMConnectorFactory";
+    private static final String ARTEMIS_IN_VM_ACCEPTOR_CLASS =
+            "org.apache.activemq.artemis.core.remoting.impl.invm.InVMAcceptorFactory";
     /** The synchronous MongoDB client, the one a {@code MongoTemplate} works through. */
     private static final String MONGO_SYNC_CLIENT_CLASS = "com.mongodb.client.MongoClient";
     private static final List<String> MONGO_CLIENT_CLASSES =
@@ -688,7 +707,7 @@ class FixtureParityTest {
         JsonNode state = json.path("state");
         JsonNode response = json.path("response");
         boolean mail = row.trigger().equals("mail") || state.has("mail") || response.has("mails")
-                || placeholders.stream().anyMatch(name -> name.startsWith("greenmail."));
+                || response.has("mailboxes") || placeholders.stream().anyMatch(name -> name.startsWith("greenmail."));
         boolean amqp = row.trigger().equals("amqp") || state.has("amqp");
         boolean mongo = state.has("collections") || response.has("collections") || placeholders.contains("mongo.uri");
         boolean ldap = state.has("ldap") || placeholders.contains("ldap.port");
@@ -2031,6 +2050,19 @@ class FixtureParityTest {
 
         private enum Broker { NONE, JMS, AMQP }
 
+        /** A destination a fixture names: a topic when {@code pubSub}, otherwise a queue. */
+        private record BrokerDestination(String name, boolean pubSub) {
+
+            @Override
+            public String toString() {
+                return (pubSub ? "topic " : "queue ") + name;
+            }
+        }
+
+        /** An input mail this replay delivered, with the email address of the mailbox it was delivered to. */
+        private record DeliveredMail(String mailbox, MailView view) {
+        }
+
         private final ApplicationContext context;
         private final Row row;
         private final Fixture fixture;
@@ -2039,14 +2071,24 @@ class FixtureParityTest {
         private final JsonNode state;
         private final JsonNode response;
         private final long awaitMillis;
-        private final List<Object> deliveredMails = new ArrayList<>();
-        private final Map<String, Object> jmsConsumers = new LinkedHashMap<>();
+        private final List<DeliveredMail> deliveredMails = new ArrayList<>();
+        /** {@code response.destinations}, the destinations the capture subscribed to or browsed, in capture order. */
+        private List<BrokerDestination> inventory = List.of();
+        /** A subscriber per topic of the inventory, open from before the trigger until the reset. */
+        private final Map<BrokerDestination, Object> topicSubscribers = new LinkedHashMap<>();
+        /** The JMS queues of the inventory: drained before the trigger and at the reset, browsed when compared. */
+        private final Set<String> jmsQueues = new LinkedHashSet<>();
         private final Set<String> jmsRequestQueues = new LinkedHashSet<>();
         private final Set<String> amqpQueues = new LinkedHashSet<>();
+        /** The responders of {@code state.amqp.responders}, started before the trigger and stopped by the reset. */
+        private final List<Responder> responders = new ArrayList<>();
         private Broker broker = Broker.NONE;
         private Object jmsConnection;
         private Object jmsSession;
         private Object rabbitTemplate;
+        /** The embedded Artemis server and its plugin refusing the sends of {@code state.jms}, until the reset. */
+        private Object artemisServer;
+        private Object sendDenial;
 
         Replay(ApplicationContext context, Row row, Fixture fixture) {
             this.context = context;
@@ -2089,6 +2131,7 @@ class FixtureParityTest {
                     case "mail" -> replayMail();
                     default -> throw new IllegalStateException(at("no replay driver for trigger " + row.trigger()));
                 }
+                awaitResponders();
                 verifySideEffects();
             } catch (AssertionError mismatch) {
                 // An upstream call that matched no recording usually explains the mismatch; report it alongside.
@@ -2128,7 +2171,9 @@ class FixtureParityTest {
                     Reflect.call(greenMail, "purgeEmailFromAllMailboxes");
                 }
             });
+            attempt(failures, this::stopResponders);
             attempt(failures, this::drainQueues);
+            attempt(failures, this::removeSendDenial);
             if (!failures.isEmpty()) {
                 Exception first = failures.get(0);
                 failures.subList(1, failures.size()).forEach(first::addSuppressed);
@@ -2166,7 +2211,7 @@ class FixtureParityTest {
             requireServer(needs.qpid(), "qpid", qpid);
             requireServer(needs.mongo(), "mongo", mongoServer);
             requireServer(needs.ldap(), "ldap", ldapServer);
-            if (row.trigger().equals("mail") || response.has("mails")) {
+            if (row.trigger().equals("mail") || response.has("mails") || response.has("mailboxes")) {
                 requireClass(MIME_MESSAGE_CLASS);
             }
             if (state.has("tables") || response.has("tables")) {
@@ -2178,6 +2223,12 @@ class FixtureParityTest {
             }
             if (response.has("logs") && appender == null) {
                 missingDriver("Logback (ch.qos.logback.classic.Logger) as the SLF4J binding");
+            }
+            if (state.has("jms")) {
+                requireBean(requireClass(ARTEMIS_EMBEDDED_SERVER_CLASS), ARTEMIS_EMBEDDED_SERVER_CLASS);
+            }
+            if (state.path("amqp").has("responders")) {
+                requireBean(requireClass(RABBIT_TEMPLATE_CLASS), RABBIT_TEMPLATE_CLASS);
             }
         }
 
@@ -2228,6 +2279,9 @@ class FixtureParityTest {
                 seedLdap();
             }
             registerMailUsers(fixture);
+            // After prepareMessages has subscribed and drained, before the trigger sends any input.
+            installSendDenial();
+            startResponders();
         }
 
         /** Writes the file beside the target first and moves it in, so a poller never reads it half-written. */
@@ -2801,35 +2855,56 @@ class FixtureParityTest {
                 throw new IllegalStateException(what + ".user " + user + " is not a mailbox of state.mail.users");
             }
             Reflect.call(mailbox, "deliver", message);
-            deliveredMails.add(message);
+            deliveredMails.add(new DeliveredMail(user, MailView.of(message)));
             invokeIfPresent();
         }
 
         // ----- messages --------------------------------------------------------------------------------------
 
         /**
-         * Opens the broker side before the trigger runs: expected queues are drained and topic subscribers
-         * created, so only messages the scenario produces are compared. HTTP- or file-triggered flows that
-         * publish use the project's RabbitTemplate when it has one, otherwise its JMS connection factory.
+         * Opens the broker side before the trigger runs, for every destination of {@code response.destinations},
+         * those the capture found empty included, so only messages the scenario produces are compared: a topic gets
+         * a subscriber kept until the reset, and a queue is drained, a JMS queue through a consumer closed again at
+         * once, so no replay consumer competes with the application for a queue it consumes. HTTP- or file-triggered
+         * flows that publish use the project's RabbitTemplate when it has one, otherwise its JMS connection factory;
+         * {@code state.jms} needs the JMS broker and {@code state.amqp.responders} the AMQP one.
          */
         private void prepareMessages() throws Exception {
+            inventory = destinations();
+            boolean denials = state.has("jms");
+            boolean responders = state.path("amqp").has("responders");
             switch (row.trigger()) {
                 case "amqp" -> broker = Broker.AMQP;
                 case "jms", "mq" -> broker = Broker.JMS;
                 default -> {
-                    if (!response.has("messages")) {
+                    if (!response.has("destinations") && !denials && !responders) {
                         return;
                     }
-                    Class<?> rabbit = Reflect.optionalClass(RABBIT_TEMPLATE_CLASS);
-                    broker = rabbit != null && context.getBeanProvider(rabbit).getIfAvailable() != null
-                            ? Broker.AMQP : Broker.JMS;
+                    if (denials || responders) {
+                        broker = denials ? Broker.JMS : Broker.AMQP;
+                    } else {
+                        Class<?> rabbit = Reflect.optionalClass(RABBIT_TEMPLATE_CLASS);
+                        broker = rabbit != null && context.getBeanProvider(rabbit).getIfAvailable() != null
+                                ? Broker.AMQP : Broker.JMS;
+                    }
                 }
             }
-            List<JsonNode> messages = elements(response.get("messages"), at("response.messages"));
+            if (denials && broker != Broker.JMS) {
+                throw new IllegalStateException(at("state.jms refuses sends on a JMS broker, but this scenario"
+                        + " replays on AMQP"));
+            }
+            if (responders && broker != Broker.AMQP) {
+                throw new IllegalStateException(at("state.amqp.responders answer on an AMQP broker, but this scenario"
+                        + " replays on JMS"));
+            }
             if (broker == Broker.AMQP) {
                 rabbitTemplate = requireBean(requireClass(RABBIT_TEMPLATE_CLASS), RABBIT_TEMPLATE_CLASS);
-                for (JsonNode message : messages) {
-                    amqpQueues.add(text(message, "destination", at("response.messages[].destination")));
+                for (BrokerDestination destination : inventory) {
+                    if (destination.pubSub()) {
+                        throw new IllegalStateException(at("response.destinations lists " + destination
+                                + ", but an AMQP broker is read through queues only, so its pubSub must be false"));
+                    }
+                    amqpQueues.add(destination.name());
                 }
                 for (String queue : amqpQueues) {
                     drainAmqp(queue);
@@ -2840,11 +2915,65 @@ class FixtureParityTest {
                 jmsConnection = Reflect.call(factory, "createConnection");
                 jmsSession = Reflect.call(jmsConnection, "createSession", false, JMS_AUTO_ACKNOWLEDGE);
                 Reflect.call(jmsConnection, "start");
-                for (JsonNode message : messages) {
-                    consumer(text(message, "destination", at("response.messages[].destination")),
-                            message.path("pubSub").asBoolean(false));
+                for (BrokerDestination destination : inventory) {
+                    if (destination.pubSub()) {
+                        topicSubscribers.put(destination, Reflect.call(jmsSession, "createConsumer",
+                                Reflect.call(jmsSession, "createTopic", destination.name())));
+                    } else {
+                        jmsQueues.add(destination.name());
+                        drainJmsQueue(destination.name());
+                    }
                 }
             }
+        }
+
+        /**
+         * {@code response.destinations}, checked against {@code response.messages}: each is present exactly when the
+         * other is, no destination is listed twice, and every message is on a listed destination. A fixture that
+         * breaks one of these rules fails its scenario as malformed.
+         */
+        private List<BrokerDestination> destinations() {
+            boolean messages = response.has("messages");
+            if (messages != response.has("destinations")) {
+                throw new IllegalStateException(at(messages
+                        ? "response.messages needs response.destinations, every destination the capture subscribed"
+                                + " to or browsed, those it found empty included"
+                        : "response.destinations needs response.messages, [] when no listed destination held a"
+                                + " message"));
+            }
+            List<BrokerDestination> listed = new ArrayList<>();
+            List<JsonNode> entries = elements(response.get("destinations"), at("response.destinations"));
+            for (int i = 0; i < entries.size(); i++) {
+                String what = at("response.destinations[" + i + "]");
+                BrokerDestination destination = brokerDestination(entries.get(i), what);
+                if (listed.contains(destination)) {
+                    throw new IllegalStateException(what + " lists " + destination + " a second time");
+                }
+                listed.add(destination);
+            }
+            List<JsonNode> expected = elements(response.get("messages"), at("response.messages"));
+            for (int i = 0; i < expected.size(); i++) {
+                String what = at("response.messages[" + i + "]");
+                BrokerDestination destination = brokerDestination(expected.get(i), what);
+                if (!listed.contains(destination)) {
+                    throw new IllegalStateException(what + " is on " + destination
+                            + ", which response.destinations does not list");
+                }
+            }
+            return List.copyOf(listed);
+        }
+
+        /** The {@code destination} and {@code pubSub} of a fixture entry; {@code pubSub} defaults to {@code false}. */
+        private static BrokerDestination brokerDestination(JsonNode entry, String what) {
+            String destination = text(object(entry, what), "destination", what + ".destination");
+            if (destination.isBlank()) {
+                throw new IllegalStateException(what + ".destination must not be blank");
+            }
+            JsonNode pubSub = entry.get("pubSub");
+            if (pubSub != null && !pubSub.isNull() && !pubSub.isBoolean()) {
+                throw new IllegalStateException(what + ".pubSub must be true or false");
+            }
+            return new BrokerDestination(destination, pubSub != null && pubSub.booleanValue());
         }
 
         /**
@@ -2865,19 +2994,15 @@ class FixtureParityTest {
             return current;
         }
 
-        /** The consumer of a destination, created on first use; a new queue consumer drains the queue first. */
-        private Object consumer(String destination, boolean pubSub) throws Exception {
-            String key = (pubSub ? "topic " : "queue ") + destination;
-            Object consumer = jmsConsumers.get(key);
-            if (consumer == null) {
-                Object target = Reflect.call(jmsSession, pubSub ? "createTopic" : "createQueue", destination);
-                consumer = Reflect.call(jmsSession, "createConsumer", target);
-                jmsConsumers.put(key, consumer);
-                if (!pubSub) {
-                    drainJms(consumer);
-                }
+        /** Drains a JMS queue through a consumer that is closed again, so it never competes with the application. */
+        private void drainJmsQueue(String queue) throws Exception {
+            Object consumer =
+                    Reflect.call(jmsSession, "createConsumer", Reflect.call(jmsSession, "createQueue", queue));
+            try {
+                drainJms(consumer);
+            } finally {
+                Reflect.call(consumer, "close");
             }
-            return consumer;
         }
 
         private static void drainJms(Object consumer) throws Exception {
@@ -2902,71 +3027,161 @@ class FixtureParityTest {
             }
             if (jmsConnection != null) {
                 try {
-                    for (String queue : jmsRequestQueues) {
-                        consumer(queue, false);
-                    }
-                    for (Map.Entry<String, Object> consumer : jmsConsumers.entrySet()) {
-                        if (consumer.getKey().startsWith("queue ")) {
-                            drainJms(consumer.getValue());
-                        }
+                    Set<String> queues = new LinkedHashSet<>(jmsRequestQueues);
+                    queues.addAll(jmsQueues);
+                    for (String queue : queues) {
+                        drainJmsQueue(queue);
                     }
                 } finally {
                     Object connection = jmsConnection;
                     jmsConnection = null;
                     jmsSession = null;
-                    jmsConsumers.clear();
+                    topicSubscribers.clear();
                     Reflect.call(connection, "close");
                 }
             }
         }
 
+        /**
+         * Compares every destination of the inventory with its {@code response.messages} entries, in order; a
+         * destination without entries must have stayed empty. It runs after every other effect has matched, so an
+         * asynchronous flow has finished before an empty destination is judged.
+         */
         private void verifyMessages() throws Exception {
-            List<JsonNode> expected = elements(response.get("messages"), at("response.messages"));
-            for (int i = 0; i < expected.size(); i++) {
-                JsonNode message = expected.get(i);
-                String what = at("response.messages[" + i + "]");
-                String destination = text(message, "destination", what + ".destination");
-                String label = "message " + (i + 1) + " on " + destination;
-                Object received;
-                byte[] body;
+            List<JsonNode> messages = elements(response.get("messages"), at("response.messages"));
+            for (BrokerDestination destination : inventory) {
+                List<Map.Entry<String, JsonNode>> expected = new ArrayList<>();
+                for (int i = 0; i < messages.size(); i++) {
+                    String what = at("response.messages[" + i + "]");
+                    if (destination.equals(brokerDestination(messages.get(i), what))) {
+                        expected.add(Map.entry(what, messages.get(i)));
+                    }
+                }
                 if (broker == Broker.AMQP) {
-                    received = Reflect.call(rabbitTemplate, "receive", destination, awaitMillis);
-                    body = received == null ? null : (byte[]) Reflect.call(received, "getBody");
+                    verifyAmqpQueue(destination, expected);
+                } else if (destination.pubSub()) {
+                    verifyTopic(destination, expected);
                 } else {
-                    received = Reflect.call(consumer(destination, message.path("pubSub").asBoolean(false)), "receive",
-                            awaitMillis);
-                    body = received == null ? null : jmsBody(received);
+                    verifyJmsQueue(destination, expected);
                 }
+            }
+        }
+
+        /** Receives the topic's expected messages in order, each within {@code awaitMillis}; no further may follow. */
+        private void verifyTopic(BrokerDestination topic, List<Map.Entry<String, JsonNode>> expected) throws Exception {
+            Object subscriber = topicSubscribers.get(topic);
+            for (int i = 0; i < expected.size(); i++) {
+                Object received = Reflect.call(subscriber, "receive", awaitMillis);
                 if (received == null) {
-                    throw new AssertionError(name + ": " + label + " did not arrive within " + awaitMillis + " ms");
+                    throw new AssertionError(name + ": " + topic + " delivered " + i + " of the " + expected.size()
+                            + " messages the original received within " + awaitMillis + " ms\n  expected: "
+                            + describeExpected(expected));
                 }
-                compareContent(label, bodyBytes(message, what), body, null);
-                for (Map.Entry<String, JsonNode> property : entries(message.get("properties"), what + ".properties")) {
-                    Object actual = broker == Broker.AMQP ? amqpProperty(received, property.getKey())
-                            : Reflect.call(received, "getObjectProperty", property.getKey());
-                    if (!scalarEquals(property.getValue(), actual)) {
-                        throw new AssertionError(name + ": " + label + " property " + property.getKey() + " expected "
-                                + property.getValue() + " but was " + (actual == null ? "absent" : actual));
-                    }
+                compareJmsMessage("message " + (i + 1) + " on " + topic, expected.get(i), received);
+            }
+            Object extra = Reflect.call(subscriber, "receive", NO_FURTHER_MESSAGE_MILLIS);
+            if (extra != null) {
+                throw new AssertionError(name + ": " + topic + " delivered a further message after the "
+                        + expected.size() + " the original received: " + Content.render(jmsBody(extra)));
+            }
+        }
+
+        /**
+         * Browses the queue, consuming nothing, until it holds exactly the expected messages in order or
+         * {@code awaitMillis} ends, then once more after {@link #NO_FURTHER_MESSAGE_MILLIS}, so a late message fails.
+         */
+        private void verifyJmsQueue(BrokerDestination queue, List<Map.Entry<String, JsonNode>> expected)
+                throws Exception {
+            Action check = () -> {
+                List<Object> browsed = browse(queue.name());
+                if (browsed.size() != expected.size()) {
+                    throw new AssertionError(name + ": " + queue + " holds " + browsed.size()
+                            + " messages but the original left " + expected.size() + "\n  expected: "
+                            + describeExpected(expected) + "\n  actual:   " + describeJms(browsed));
+                }
+                for (int i = 0; i < browsed.size(); i++) {
+                    compareJmsMessage("message " + (i + 1) + " on " + queue, expected.get(i), browsed.get(i));
+                }
+            };
+            awaitMatch(queue.toString(), check);
+            Thread.sleep(NO_FURTHER_MESSAGE_MILLIS);
+            check.run();
+        }
+
+        /**
+         * Receives the queue's expected messages in order, each within {@code awaitMillis}; no further one may follow.
+         * Spring AMQP offers no browse, so the replay consumes from the queue, which it drains at the reset anyway.
+         */
+        private void verifyAmqpQueue(BrokerDestination queue, List<Map.Entry<String, JsonNode>> expected)
+                throws Exception {
+            for (int i = 0; i < expected.size(); i++) {
+                Object received = Reflect.call(rabbitTemplate, "receive", queue.name(), awaitMillis);
+                if (received == null) {
+                    throw new AssertionError(name + ": " + queue + " delivered " + i + " of the " + expected.size()
+                            + " messages the original left within " + awaitMillis + " ms\n  expected: "
+                            + describeExpected(expected));
+                }
+                String label = "message " + (i + 1) + " on " + queue;
+                Map.Entry<String, JsonNode> message = expected.get(i);
+                compareContent(label, bodyBytes(message.getValue(), message.getKey()),
+                        (byte[]) Reflect.call(received, "getBody"), null);
+                for (Map.Entry<String, JsonNode> property : entries(message.getValue().get("properties"),
+                        message.getKey() + ".properties")) {
+                    compareProperty(label, property, amqpProperty(received, property.getKey()));
                 }
             }
-            if (broker == Broker.AMQP) {
-                for (String queue : amqpQueues) {
-                    Object extra = Reflect.call(rabbitTemplate, "receive", queue, NO_FURTHER_MESSAGE_MILLIS);
-                    if (extra != null) {
-                        throw new AssertionError(name + ": an unexpected further message arrived on queue " + queue
-                                + ": " + Content.render((byte[]) Reflect.call(extra, "getBody")));
-                    }
-                }
-            } else {
-                for (Map.Entry<String, Object> consumer : jmsConsumers.entrySet()) {
-                    Object extra = Reflect.call(consumer.getValue(), "receive", NO_FURTHER_MESSAGE_MILLIS);
-                    if (extra != null) {
-                        throw new AssertionError(name + ": an unexpected further message arrived on "
-                                + consumer.getKey() + ": " + Content.render(jmsBody(extra)));
-                    }
-                }
+            Object extra = Reflect.call(rabbitTemplate, "receive", queue.name(), NO_FURTHER_MESSAGE_MILLIS);
+            if (extra != null) {
+                throw new AssertionError(name + ": " + queue + " held a further message after the " + expected.size()
+                        + " the original left: " + Content.render((byte[]) Reflect.call(extra, "getBody")));
             }
+        }
+
+        /** The messages on a JMS queue in queue order, read through a {@code QueueBrowser}, which consumes none. */
+        private List<Object> browse(String queue) throws Exception {
+            Object browser = Reflect.call(jmsSession, "createBrowser", Reflect.call(jmsSession, "createQueue", queue));
+            try {
+                List<Object> browsed = new ArrayList<>();
+                Enumeration<?> messages = (Enumeration<?>) Reflect.call(browser, "getEnumeration");
+                while (messages.hasMoreElements()) {
+                    browsed.add(messages.nextElement());
+                }
+                return browsed;
+            } finally {
+                Reflect.call(browser, "close");
+            }
+        }
+
+        private void compareJmsMessage(String label, Map.Entry<String, JsonNode> expected, Object actual)
+                throws Exception {
+            compareContent(label, bodyBytes(expected.getValue(), expected.getKey()), jmsBody(actual), null);
+            for (Map.Entry<String, JsonNode> property : entries(expected.getValue().get("properties"),
+                    expected.getKey() + ".properties")) {
+                compareProperty(label, property, Reflect.call(actual, "getObjectProperty", property.getKey()));
+            }
+        }
+
+        private void compareProperty(String label, Map.Entry<String, JsonNode> property, Object actual) {
+            if (!scalarEquals(property.getValue(), actual)) {
+                throw new AssertionError(name + ": " + label + " property " + property.getKey() + " expected "
+                        + property.getValue() + " but was " + (actual == null ? "absent" : actual));
+            }
+        }
+
+        private static String describeExpected(List<Map.Entry<String, JsonNode>> expected) {
+            List<String> bodies = new ArrayList<>();
+            for (Map.Entry<String, JsonNode> message : expected) {
+                bodies.add(Content.render(bodyBytes(message.getValue(), message.getKey())));
+            }
+            return bodies.toString();
+        }
+
+        private static String describeJms(List<Object> messages) throws Exception {
+            List<String> bodies = new ArrayList<>();
+            for (Object message : messages) {
+                bodies.add(Content.render(jmsBody(message)));
+            }
+            return bodies.toString();
         }
 
         private static byte[] jmsBody(Object message) throws Exception {
@@ -3001,6 +3216,324 @@ class FixtureParityTest {
                     ? Reflect.call(messageProperties, getter) : null;
         }
 
+        // ----- seeded broker behaviour -----------------------------------------------------------------------
+
+        /**
+         * Makes the application's embedded Artemis server refuse every send to a destination of
+         * {@code state.jms.denySend}, as the capture's broker refused them, the application's own sends included,
+         * until the reset removes the refusal: a broker plugin refuses the message before it is routed, the way Artemis
+         * refuses a send its security settings deny. A project whose JMS connection factory does not reach that server
+         * in-VM cannot reproduce the refusal, so its scenario is reported {@code UNVERIFIED-missing-driver} instead of
+         * running against a broker that accepts the sends.
+         */
+        private void installSendDenial() throws Exception {
+            JsonNode jms = state.get("jms");
+            if (jms == null) {
+                return;
+            }
+            String what = at("state.jms");
+            List<JsonNode> listed = elements(object(jms, what).get("denySend"), what + ".denySend");
+            if (listed.isEmpty()) {
+                throw new IllegalStateException(what + ".denySend lists no destination, but state.jms names the"
+                        + " destinations whose sends the capture's broker refused");
+            }
+            List<BrokerDestination> denied = new ArrayList<>();
+            for (int i = 0; i < listed.size(); i++) {
+                String entry = what + ".denySend[" + i + "]";
+                BrokerDestination destination = brokerDestination(listed.get(i), entry);
+                if (denied.contains(destination)) {
+                    throw new IllegalStateException(entry + " lists " + destination + " a second time");
+                }
+                denied.add(destination);
+            }
+            Object server = Reflect.call(
+                    requireBean(requireClass(ARTEMIS_EMBEDDED_SERVER_CLASS), ARTEMIS_EMBEDDED_SERVER_CLASS),
+                    "getActiveMQServer");
+            Object factory = brokerFactory(
+                    requireBean(requireClass(CONNECTION_FACTORY_CLASS), CONNECTION_FACTORY_CLASS));
+            if (server == null || !reachesInVm(factory, server)) {
+                missingDriver("a JMS connection factory that reaches the embedded Artemis server in-VM, so that the"
+                        + " broker refusing the sends of state.jms is the one the application sends to");
+            }
+            Object plugin = sendDenialPlugin(denied);
+            Reflect.call(server, "registerBrokerPlugin", plugin);
+            artemisServer = server;
+            sendDenial = plugin;
+        }
+
+        /**
+         * Whether every connector of the Artemis connection factory is an in-VM connector to an in-VM acceptor of
+         * {@code server}, which is how Spring Boot's embedded mode connects the application to the embedded server.
+         */
+        private static boolean reachesInVm(Object factory, Object server) throws Exception {
+            if (!Reflect.hasMethod(factory.getClass(), "getStaticConnectors", 0)) {
+                return false;
+            }
+            Object[] connectors = (Object[]) Reflect.call(factory, "getStaticConnectors");
+            if (connectors == null || connectors.length == 0) {
+                return false;
+            }
+            Set<String> serverIds = new HashSet<>();
+            Object configuration = Reflect.call(server, "getConfiguration");
+            for (Object acceptor : (Set<?>) Reflect.call(configuration, "getAcceptorConfigurations")) {
+                if (ARTEMIS_IN_VM_ACCEPTOR_CLASS.equals(Reflect.call(acceptor, "getFactoryClassName"))) {
+                    serverIds.add(inVmServerId(acceptor));
+                }
+            }
+            for (Object connector : connectors) {
+                if (!ARTEMIS_IN_VM_CONNECTOR_CLASS.equals(Reflect.call(connector, "getFactoryClassName"))
+                        || !serverIds.contains(inVmServerId(connector))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /** The in-VM server id of an Artemis transport configuration; Artemis reads an absent one as 0. */
+        private static String inVmServerId(Object transport) throws Exception {
+            Map<?, ?> params = (Map<?, ?>) Reflect.call(transport, "getParams");
+            Object serverId = params == null ? null : params.get("serverId");
+            return String.valueOf(serverId == null ? 0 : serverId);
+        }
+
+        /**
+         * An Artemis message plugin, reached by reflection like the rest of the engine, whose
+         * {@code beforeSend(ServerSession, Transaction, Message, boolean, boolean)} refuses a message addressed to a
+         * denied destination as Artemis refuses a send its security settings deny: a session that does not commit each
+         * send itself, a transacted one, gets its transaction marked rollback-only, so its commit fails, and the send
+         * fails with an {@code ActiveMQSecurityException}. Every other plugin method keeps its default.
+         */
+        private Object sendDenialPlugin(List<BrokerDestination> denied) {
+            Class<?> pluginType = requireClass(ARTEMIS_MESSAGE_PLUGIN_CLASS);
+            Class<?> refusal = requireClass(ARTEMIS_SECURITY_EXCEPTION_CLASS);
+            Class<?> sessionType = requireClass(ARTEMIS_SERVER_SESSION_CLASS);
+            // Artemis keeps whether a session commits each send in this protected field and exposes no accessor.
+            Field autoCommitSends;
+            try {
+                autoCommitSends = sessionType.getDeclaredField("autoCommitSends");
+            } catch (NoSuchFieldException absent) {
+                return missingDriver(ARTEMIS_SERVER_SESSION_CLASS + ".autoCommitSends, which tells a transacted send"
+                        + " whose refusal must roll its transaction back");
+            }
+            if (autoCommitSends.getType() != boolean.class || !autoCommitSends.trySetAccessible()) {
+                return missingDriver("a readable boolean " + ARTEMIS_SERVER_SESSION_CLASS + ".autoCommitSends, which"
+                        + " tells a transacted send whose refusal must roll its transaction back");
+            }
+            String scenario = name;
+            InvocationHandler handler = (proxy, method, args) -> {
+                if (method.getDeclaringClass() == Object.class) {
+                    return switch (method.getName()) {
+                        case "equals" -> proxy == args[0];
+                        case "hashCode" -> System.identityHashCode(proxy);
+                        default -> "refusal of the sends to " + denied + " for " + scenario;
+                    };
+                }
+                if (method.getName().equals("beforeSend") && method.getParameterCount() == 5) {
+                    BrokerDestination target = deniedTarget(args[2], denied);
+                    if (target != null) {
+                        Object refused = Reflect.construct(refusal, scenario + ": sends to " + target
+                                + " are refused, as the capture's broker refused them (state.jms.denySend)");
+                        boolean transacted = args[1] != null && sessionType.isInstance(args[0])
+                                && !autoCommitSends.getBoolean(args[0]);
+                        if (transacted) {
+                            Reflect.call(args[1], "markAsRollbackOnly", refused);
+                        }
+                        LOG.info("{}: the broker refused a send to {}{} (state.jms.denySend)", scenario, target,
+                                transacted ? " and marked its transaction rollback-only" : "");
+                        throw (Throwable) refused;
+                    }
+                    return null;
+                }
+                return method.isDefault() ? InvocationHandler.invokeDefault(proxy, method, args) : null;
+            };
+            return Proxy.newProxyInstance(pluginType.getClassLoader(), new Class<?>[] {pluginType}, handler);
+        }
+
+        /** The denied destination a message is addressed to; a routing type the message carries must match too. */
+        private static BrokerDestination deniedTarget(Object message, List<BrokerDestination> denied) throws Exception {
+            Object address = Reflect.call(message, "getAddress");
+            Object routingType = Reflect.call(message, "getRoutingType");
+            for (BrokerDestination destination : denied) {
+                if (destination.name().equals(address) && (routingType == null
+                        || String.valueOf(routingType).equals(destination.pubSub() ? "MULTICAST" : "ANYCAST"))) {
+                    return destination;
+                }
+            }
+            return null;
+        }
+
+        private void removeSendDenial() throws Exception {
+            if (sendDenial != null) {
+                Object server = artemisServer;
+                Object plugin = sendDenial;
+                artemisServer = null;
+                sendDenial = null;
+                Reflect.call(server, "unRegisterBrokerPlugin", plugin);
+            }
+        }
+
+        /**
+         * Starts one responder per entry of {@code state.amqp.responders}, as the capture ran them, after the drain and
+         * before the trigger. Each takes one request off its {@code queue} within {@code awaitMillis} and publishes its
+         * {@code reply}, with {@code reply.properties} as headers and the request's correlation id, to the request's
+         * reply-to address; {@link #awaitResponders()} joins them before the effects are compared.
+         */
+        private void startResponders() throws Exception {
+            JsonNode configured = state.path("amqp").get("responders");
+            if (configured == null) {
+                return;
+            }
+            String what = at("state.amqp.responders");
+            List<JsonNode> listed = elements(configured, what);
+            if (listed.isEmpty()) {
+                throw new IllegalStateException(what + " lists no responder, but it names the responders the capture"
+                        + " ran");
+            }
+            Class<?> propertiesType = requireClass(AMQP_PROPERTIES_CLASS);
+            Class<?> messageType = requireClass(AMQP_MESSAGE_CLASS);
+            List<Responder> prepared = new ArrayList<>();
+            for (int i = 0; i < listed.size(); i++) {
+                String entry = what + "[" + i + "]";
+                JsonNode responder = object(listed.get(i), entry);
+                String queue = text(responder, "queue", entry + ".queue");
+                if (queue.isBlank()) {
+                    throw new IllegalStateException(entry + ".queue must not be blank");
+                }
+                JsonNode reply = object(responder.get("reply"), entry + ".reply");
+                Map<String, Object> headers = new LinkedHashMap<>();
+                for (Map.Entry<String, JsonNode> property : entries(reply.get("properties"),
+                        entry + ".reply.properties")) {
+                    headers.put(property.getKey(),
+                            scalar(property.getValue(), entry + ".reply.properties." + property.getKey()));
+                }
+                prepared.add(new Responder(queue, bodyBytes(reply, entry + ".reply"), headers, propertiesType,
+                        messageType));
+            }
+            for (Responder responder : prepared) {
+                responders.add(responder);
+                responder.start();
+            }
+        }
+
+        /** Joins every responder after the trigger; one that has not answered fails the scenario. */
+        private void awaitResponders() throws InterruptedException {
+            for (Responder responder : responders) {
+                responder.await();
+            }
+        }
+
+        private void stopResponders() throws Exception {
+            List<Responder> running = new ArrayList<>(responders);
+            responders.clear();
+            List<Exception> failures = new ArrayList<>();
+            for (Responder responder : running) {
+                attempt(failures, responder::stop);
+            }
+            if (!failures.isEmpty()) {
+                Exception first = failures.get(0);
+                failures.subList(1, failures.size()).forEach(first::addSuppressed);
+                throw first;
+            }
+        }
+
+        /** One responder of {@code state.amqp.responders}, on a daemon thread, using the project's RabbitTemplate. */
+        private final class Responder implements Runnable {
+
+            private final String queue;
+            private final byte[] body;
+            private final Map<String, Object> headers;
+            private final Class<?> propertiesType;
+            private final Class<?> messageType;
+            private final Thread thread;
+            private final AtomicReference<Throwable> failure = new AtomicReference<>();
+
+            Responder(String queue, byte[] body, Map<String, Object> headers, Class<?> propertiesType,
+                    Class<?> messageType) {
+                this.queue = queue;
+                this.body = body;
+                this.headers = headers;
+                this.propertiesType = propertiesType;
+                this.messageType = messageType;
+                this.thread = new Thread(this, "fixture-responder-" + queue);
+                this.thread.setDaemon(true);
+            }
+
+            void start() {
+                thread.start();
+            }
+
+            @Override
+            public void run() {
+                try {
+                    respond();
+                } catch (Throwable responderFailure) {
+                    // Reported by await() on the replay's thread, which fails the scenario with it.
+                    failure.set(responderFailure);
+                }
+            }
+
+            private void respond() throws Exception {
+                Object request = Reflect.call(rabbitTemplate, "receive", queue, awaitMillis);
+                if (request == null) {
+                    throw new AssertionError(name + ": no request reached " + this + " within " + awaitMillis
+                            + " ms");
+                }
+                Object requestProperties = Reflect.call(request, "getMessageProperties");
+                Object replyTo = Reflect.call(requestProperties, "getReplyToAddress");
+                if (replyTo == null) {
+                    throw new AssertionError(name + ": the request " + this + " took names no reply-to address: "
+                            + Content.render((byte[]) Reflect.call(request, "getBody")));
+                }
+                Object properties = Reflect.construct(propertiesType);
+                // The reply carries the captured headers and the correlation id only, as the capture's reply did.
+                Reflect.call(properties, "setContentType", (Object) null);
+                Reflect.call(properties, "setPriority", (Object) null);
+                Reflect.call(properties, "setDeliveryMode", (Object) null);
+                for (Map.Entry<String, Object> header : headers.entrySet()) {
+                    Reflect.call(properties, "setHeader", header.getKey(), header.getValue());
+                }
+                Object correlationId = Reflect.call(requestProperties, "getCorrelationId");
+                if (correlationId != null) {
+                    Reflect.call(properties, "setCorrelationId", correlationId);
+                }
+                Reflect.call(rabbitTemplate, "send", Reflect.call(replyTo, "getExchangeName"),
+                        Reflect.call(replyTo, "getRoutingKey"), Reflect.construct(messageType, body, properties));
+            }
+
+            /** Waits for the responder, at most {@code awaitMillis}; a responder that failed fails the scenario. */
+            void await() throws InterruptedException {
+                thread.join(awaitMillis);
+                if (thread.isAlive()) {
+                    throw new AssertionError(name + ": " + this + " had not answered " + awaitMillis
+                            + " ms after the input was sent");
+                }
+                Throwable failed = failure.get();
+                if (failed instanceof AssertionError mismatch) {
+                    throw mismatch;
+                }
+                if (failed != null) {
+                    throw new AssertionError(name + ": " + this + " failed: " + failed, failed);
+                }
+            }
+
+            /** Stops a responder still waiting for its request; one that does not end fails the reset. */
+            void stop() throws InterruptedException {
+                if (thread.isAlive()) {
+                    thread.interrupt();
+                    thread.join(awaitMillis);
+                }
+                if (thread.isAlive()) {
+                    throw new IllegalStateException(name + ": " + this + " did not stop within " + awaitMillis
+                            + " ms");
+                }
+            }
+
+            @Override
+            public String toString() {
+                return "the responder on queue " + queue;
+            }
+        }
+
 
         // ----- side effects ----------------------------------------------------------------------------------
 
@@ -3014,14 +3547,18 @@ class FixtureParityTest {
             if (response.has("collections")) {
                 awaitMatch("collections", this::checkCollections);
             }
-            if (response.has("messages")) {
-                verifyMessages();
-            }
             if (response.has("mails")) {
                 awaitMatch("mails", this::checkMails);
             }
+            if (response.has("mailboxes")) {
+                awaitMatch("mailboxes", this::checkMailboxes);
+            }
             if (response.has("logs")) {
                 awaitMatch("logs", this::checkLogs);
+            }
+            // Last, so the effects above have shown the flow finished before a destination is judged empty.
+            if (response.has("destinations")) {
+                verifyMessages();
             }
         }
 
@@ -3221,14 +3758,20 @@ class FixtureParityTest {
             return tree;
         }
 
+        /**
+         * Compares the outbound mail of {@code response.mails}: every mail GreenMail holds after the run, in any
+         * mailbox, except the input mails this replay delivered. Only this comparison leaves the input out; what a
+         * mailbox finally holds, the input included, is {@code response.mailboxes} ({@link #checkMailboxes}).
+         */
         private void checkMails() throws Exception {
             List<MailView> actual = new ArrayList<>();
             for (Object received : (Object[]) Reflect.call(greenMail, "getReceivedMessages")) {
                 actual.add(MailView.of(received));
             }
-            // Mails this replay delivered as its input sit in their mailbox too; they are not output.
-            for (Object delivered : deliveredMails) {
-                actual.remove(MailView.of(delivered));
+            // The input mails this replay delivered are not output: one the flow left in its mailbox is removed here,
+            // and whether the flow removed it is compared through response.mailboxes alone.
+            for (DeliveredMail delivered : deliveredMails) {
+                actual.remove(delivered.view());
             }
             List<MailView> expected = new ArrayList<>();
             for (JsonNode mail : elements(response.get("mails"), at("response.mails"))) {
@@ -3242,6 +3785,58 @@ class FixtureParityTest {
             for (int i = 0; i < expected.size(); i++) {
                 compareMail("mail " + (i + 1), expected.get(i), actual.get(i));
             }
+        }
+
+        /**
+         * Compares the final contents of each mailbox {@code response.mailboxes} names, keyed by an email of
+         * {@code state.mail.users}: every message its INBOX holds after the run, in mailbox order, the input mail
+         * this replay delivered included while it is still there. A message flagged deleted but not expunged is still
+         * held, so the message count asserts whether the flow removed its input.
+         */
+        private void checkMailboxes() throws Exception {
+            Set<String> users = new HashSet<>();
+            for (JsonNode user : elements(state.path("mail").path("users"), at("state.mail.users"))) {
+                users.add(text(user, "email", at("state.mail.users[].email")));
+            }
+            for (Map.Entry<String, JsonNode> mailbox : entries(response.get("mailboxes"), at("response.mailboxes"))) {
+                String email = mailbox.getKey();
+                String what = at("response.mailboxes." + email);
+                if (!users.contains(email)) {
+                    throw new IllegalStateException(what + ": " + email + " is not a mailbox of state.mail.users");
+                }
+                List<MailView> expected = new ArrayList<>();
+                for (JsonNode mail : elements(mailbox.getValue(), what)) {
+                    expected.add(MailView.of(parseMime(base64(text(mail, "mimeBase64", what + "[].mimeBase64"),
+                            what + "[].mimeBase64"))));
+                }
+                List<MailView> actual = new ArrayList<>();
+                for (Object stored : (List<?>) Reflect.call(inbox(email, what), "getMessages")) {
+                    actual.add(MailView.of(Reflect.call(stored, "getMimeMessage")));
+                }
+                String label = "mailbox " + email;
+                if (expected.size() != actual.size()) {
+                    boolean inputKept = deliveredMails.stream().anyMatch(
+                            delivered -> delivered.mailbox().equals(email) && actual.contains(delivered.view()));
+                    throw new AssertionError(name + ": " + label + " holds " + actual.size()
+                            + " mails but the original left " + expected.size()
+                            + (inputKept ? "; the input mail request.mail the replay delivered to it is still there"
+                                    + " (not expunged)" : "")
+                            + "\n  expected: " + expected + "\n  actual:   " + actual);
+                }
+                for (int i = 0; i < expected.size(); i++) {
+                    compareMail(label + " mail " + (i + 1), expected.get(i), actual.get(i));
+                }
+            }
+        }
+
+        /** The GreenMail INBOX of the user {@code email}, read by reflection like every GreenMail call. */
+        private static Object inbox(String email, String what) throws Exception {
+            Object user = Reflect.call(Reflect.call(greenMail, "getUserManager"), "getUserByEmail", email);
+            if (user == null) {
+                throw new IllegalStateException(what + ": GreenMail holds no mailbox " + email);
+            }
+            Object hostManager = Reflect.call(Reflect.call(greenMail, "getManagers"), "getImapHostManager");
+            return Reflect.call(hostManager, "getInbox", user);
         }
 
         private void compareMail(String label, MailView expected, MailView actual) {

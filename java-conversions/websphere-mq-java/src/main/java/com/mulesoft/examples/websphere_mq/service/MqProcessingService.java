@@ -26,8 +26,10 @@ import org.springframework.stereotype.Service;
  * keeps that order. The JMS transaction around it (WMQ {@code in} with {@code ALWAYS_BEGIN}, WMQ {@code out} with
  * {@code JOIN_IF_POSSIBLE}) belongs to {@code trigger/InQueueListener} and {@code client/MqQueueSender}.
  *
- * <p>The wait runs on the calling transacted listener thread and is deliberately not asynchronous: with the
- * listener's concurrency of 1, later messages on {@code in} queue behind it exactly as they did in the original.
+ * <p>The wait runs synchronously on the calling transacted listener thread and is deliberately not asynchronous.
+ * Queue {@code in} has four consumers ({@code config/IbmMqConfig}, Mule 3.8's default of four concurrent receivers),
+ * each of which holds its message's transaction open for the whole wait, so up to four messages are processed at
+ * once and any further message stays on {@code in} until a consumer is free, as in the original.
  */
 @Service
 public class MqProcessingService {

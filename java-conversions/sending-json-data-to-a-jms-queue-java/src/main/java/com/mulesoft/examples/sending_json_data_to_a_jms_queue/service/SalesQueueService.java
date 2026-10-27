@@ -8,11 +8,19 @@
 
 package com.mulesoft.examples.sending_json_data_to_a_jms_queue.service;
 
+import java.net.URLDecoder;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.AbstractMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
+import java.util.function.IntPredicate;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +28,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.stereotype.Service;
+
+import com.mulesoft.examples.sending_json_data_to_a_jms_queue.exception.UndecodableFormException;
 
 /**
  * Reproduces the {@code byte-array-to-string-transformer}, {@code jms:outbound-endpoint} and {@code logger}
@@ -32,6 +42,15 @@ import org.springframework.stereotype.Service;
  * and the logger are {@link #send(String)}, which runs in the processors' order.
  * {@link #responseContentType(String)} gives the response the {@code Content-Type} the listener derived from that
  * message, naming the same charset.
+ *
+ * <p>An {@code application/x-www-form-urlencoded} entity, a non-empty body or a chunked one, recognised by
+ * {@link #isFormUrlEncoded(String)}, takes {@link #sendForm(byte[], String)} instead: the Mule 3.8 listener had
+ * already decoded such a body into a parameter map, so the transformer received that map, not bytes, and turned it
+ * into its {@code toString} rendering, such as <code>{a=1, b=2}</code>. That rendering is the text queued, logged
+ * and echoed. Before decoding such a body the listener parsed its whole {@code Content-Type} with Guava 18.0's
+ * {@code MediaType} and resolved its charset; a header it could not parse, a charset it could not use, two
+ * different charsets, and a body it could not decode each fail with {@link UndecodableFormException}, carrying the
+ * listener's status and message, before anything is sent or logged.
  *
  * <p>The endpoint is one-way: the payload is sent to the queue synchronously on the caller's thread, with no
  * reply-to and no receive, so a failed send fails the request before anything is logged.
@@ -62,6 +81,36 @@ public class SalesQueueService {
 
     /** The {@code Content-Type} parameter that names the body's charset. */
     private static final String CHARSET_PARAMETER = "charset";
+
+    /** The text whose presence in {@code Content-Type} made the Mule listener parse the body as multipart. */
+    private static final String MULTIPART = "multipart";
+
+    /**
+     * The separators of Guava 18.0's {@code MediaType.TOKEN_MATCHER}: none of them may appear in a type, subtype,
+     * attribute or unquoted value.
+     */
+    private static final String TOKEN_SEPARATORS = "()<>@,;:\\\"/[]?=";
+
+    /** Guava 18.0's {@code MediaType.LINEAR_WHITE_SPACE}, the only whitespace its grammar skips, after a {@code ;}. */
+    private static final String LINEAR_WHITE_SPACE = " \t\r\n";
+
+    /** Characters of the ASCII range, the only ones Guava 18.0's {@code MediaType} grammar accepts. */
+    private static final int ASCII_LIMIT = 0x80;
+
+    /** Separator of the name/value pairs of a form-urlencoded body. */
+    private static final String PAIR_SEPARATOR = "&";
+
+    /** Separator of a pair's name from its value; only the first one in a pair separates. */
+    private static final String NAME_VALUE_SEPARATOR = "=";
+
+    /** The property name Mule 3.8's {@code PropertiesUtils} registers for masking when it renders a map. */
+    private static final String MASKED_PARAMETER = "password";
+
+    /** The text Mule 3.8's {@code PropertiesUtils} writes in place of a masked value. */
+    private static final String MASKED_VALUE = "*****";
+
+    /** Mule's rendering of an absent map entry value, which {@code StringBuilder} writes for a {@code null}. */
+    private static final String NULL_VALUE = "null";
 
     /**
      * The property scopes Mule's message rendering lists, in its order; Mule skips the application scope there,
@@ -105,6 +154,46 @@ public class SalesQueueService {
         Charset charset = resolveCharset(contentType);
         String result = send(new String(body, charset));
         return result.getBytes(charset);
+    }
+
+    /**
+     * Runs the flow from a form-urlencoded request body to the response body, as the Mule 3.8 listener and the
+     * {@code byte-array-to-string-transformer} did for a form entity: decodes {@code body} into the
+     * listener's parameter map as Mule's {@code HttpParser.decodeString} did, renders that map as the transformer's
+     * {@code ObjectToString} did, sends and logs the rendering through {@link #send(String)}, and encodes it for the
+     * response.
+     *
+     * <p>Before the body is read, the whole {@code Content-Type} is checked as the listener checked it, by Guava
+     * 18.0's {@code MediaType.parse} and {@code MediaType.charset()}, which {@link #listenerCharset(String)}
+     * reproduces: a header the grammar rejects fails with status 400 and {@code Could not parse '<header>'}; a
+     * single charset the JVM cannot use fails with status 400 and the lower-cased charset name; two or more
+     * different charsets fail with status 500 and {@value UndecodableFormException#SERVER_PROBLEM}.
+     *
+     * <p>The listener read the form text with the JVM's default charset, and URL-decoded the names and values with
+     * the charset that check resolved: the one the header names, or the JVM's default charset when it names none.
+     * The rendering is encoded for the response with the charset {@link #responseContentType(String)} names; both
+     * resolve it through {@link #resolveCharset(String)}, so the header and the body always agree. For every header
+     * both parsers accept, that is the URL-decoding charset; only the response encoding and header fall back to
+     * UTF-8 for the rare header Guava's grammar accepts and Spring's parser rejects, one with a brace in a token or
+     * a backslash escape in a quoted value, while its URL-decoding still follows the listener.
+     *
+     * @param body        the raw request body; a blank body decodes to the empty map, rendered <code>{}</code>
+     * @param contentType the request's raw {@code Content-Type} header, a form-urlencoded type
+     * @return the queued rendering encoded with the charset {@link #responseContentType(String)} names
+     * @throws UndecodableFormException when the listener rejected the {@code Content-Type}, or when a name or value
+     *         holds a malformed percent escape; its status and message are the listener's response; nothing is sent
+     *         or logged
+     * @throws NullPointerException when {@code body} or {@code contentType} is {@code null}; nothing is sent or
+     *         logged
+     * @throws org.springframework.jms.JmsException when the send fails; it is deliberately left to propagate
+     */
+    public byte[] sendForm(byte[] body, String contentType) throws UndecodableFormException {
+        Objects.requireNonNull(body, "body");
+        Objects.requireNonNull(contentType, "contentType");
+        Charset listenerCharset = listenerCharset(contentType);
+        Map<String, String> parameters = decodeParameters(new String(body, Charset.defaultCharset()), listenerCharset);
+        String result = send(renderParameterMap(parameters));
+        return result.getBytes(resolveCharset(contentType));
     }
 
     /**
@@ -169,6 +258,33 @@ public class SalesQueueService {
     }
 
     /**
+     * Tells whether the Mule 3.8 listener, Mule's {@code HttpRequestToMuleEvent}, made a request entity with this
+     * {@code Content-Type} a parameter map: the header names {@code application/x-www-form-urlencoded}, ignoring
+     * letter case and parameters, and does not contain {@code multipart}, which made the listener parse the body
+     * as multipart parts instead.
+     *
+     * <p>The {@code type/subtype} is the text before the first {@code ;}, parsed on its own, so a header whose
+     * parameters or charset the listener rejected is still a form, which {@link #sendForm(byte[], String)} rejects
+     * as the listener did. A header that is absent, blank or whose {@code type/subtype} cannot be parsed is not a
+     * form: such a body stays on the byte path, the plan default under which it is decoded as UTF-8.
+     *
+     * @param contentType the request's raw {@code Content-Type} header, or {@code null} when it has none
+     * @return {@code true} when the body is to be decoded as a form
+     */
+    public boolean isFormUrlEncoded(String contentType) {
+        if (isBlank(contentType) || contentType.contains(MULTIPART)) {
+            return false;
+        }
+        int parameters = contentType.indexOf(';');
+        try {
+            return MediaType.APPLICATION_FORM_URLENCODED.equalsTypeAndSubtype(
+                    MediaType.parseMediaType(parameters < 0 ? contentType : contentType.substring(0, parameters)));
+        } catch (IllegalArgumentException unparseable) {
+            return false;
+        }
+    }
+
+    /**
      * Renders the message the way Mule's {@code DefaultMuleMessage.toString()} renders it, followed by its
      * {@code Message properties:} section, each line ending with the platform line separator.
      *
@@ -201,6 +317,209 @@ public class SalesQueueService {
             buf.append("  ").append(scope).append(" scoped properties:").append(ls);
         }
         return buf.append('}').toString();
+    }
+
+    /**
+     * Resolves a form entity's charset from its {@code Content-Type} as Mule 3.8's {@code HttpRequestToMuleEvent}
+     * did before it decoded the body: {@code MediaType.parse(header)} and then {@code mediaType.charset()}, both
+     * Guava 18.0, whose {@link IllegalArgumentException} {@code DefaultHttpListener} answered with 400 and the
+     * exception's message, and whose {@link IllegalStateException} it answered with 500 and
+     * {@value UndecodableFormException#SERVER_PROBLEM}. The listener URL-decoded the body's names and values with the
+     * charset returned here.
+     *
+     * <p>{@code charset()} takes the distinct values of the {@code charset} parameters {@link #listenerCharsets}
+     * returns: none gives the JVM's default charset, as the listener's {@code Charset.defaultCharset()} did; one
+     * gives the charset {@link Charset#forName(String)} resolves it to, and otherwise fails with that method's
+     * {@link java.nio.charset.IllegalCharsetNameException} or {@link java.nio.charset.UnsupportedCharsetException},
+     * whose message is the lower-cased name, empty for {@code charset=""}; two or more fail as ambiguous.
+     *
+     * @param header the request's raw {@code Content-Type} header
+     * @return the charset the listener URL-decoded the form with
+     * @throws UndecodableFormException when the listener rejected the header, with its status and message
+     */
+    private static Charset listenerCharset(String header) throws UndecodableFormException {
+        Set<String> charsets = listenerCharsets(header);
+        if (charsets.size() > 1) {
+            throw UndecodableFormException.ambiguousCharset(charsets);
+        }
+        if (charsets.isEmpty()) {
+            return Charset.defaultCharset();
+        }
+        try {
+            return Charset.forName(charsets.iterator().next());
+        } catch (IllegalArgumentException unusable) {
+            // IllegalCharsetNameException and UnsupportedCharsetException, both IllegalArgumentExceptions; the
+            // listener's 400 carries their message.
+            throw UndecodableFormException.unusableContentType(unusable.getMessage(), unusable);
+        }
+    }
+
+    /**
+     * Parses {@code header} by the grammar of Guava 18.0's {@code MediaType.parse} and returns the distinct values of
+     * its {@code charset} parameters, the values {@code MediaType.charset()} chose from:
+     * <ul>
+     *   <li>a type token, {@code /}, a subtype token; then, while input remains: {@code ;}, an optional run of
+     *       linear whitespace (space, tab, CR, LF), an attribute token, {@code =}, and a value that is either a
+     *       quoted string, {@code "} up to the next unescaped {@code "} where {@code \} escapes any one ASCII
+     *       character and every other character is ASCII but {@code "}, {@code \} and CR, or a token;</li>
+     *   <li>a token is one or more ASCII characters that are neither ISO control characters, nor the space, nor
+     *       one of the separators {@link #TOKEN_SEPARATORS}, Guava's {@code TOKEN_MATCHER};</li>
+     *   <li>no other whitespace is allowed: not before a {@code ;}, not around {@code =}, not trailing; a trailing
+     *       {@code ;} and an empty value fail;</li>
+     *   <li>attribute names, and the values of {@code charset}, are lower-cased as Guava's {@code normalizeToken}
+     *       and {@code normalizeParameterValue} lower-cased them; every character is ASCII, so
+     *       {@link Locale#ROOT} lower-cases exactly the letters {@code Ascii.toLowerCase} does.</li>
+     * </ul>
+     * Guava's further check that a wildcard type has a wildcard subtype is not repeated: only form types reach this
+     * parser.
+     *
+     * @param header the request's raw {@code Content-Type} header
+     * @return the distinct lower-cased {@code charset} values, in first-occurrence order
+     * @throws UndecodableFormException with status 400 and {@code Could not parse '<header>'}, Guava's message, when
+     *         the grammar rejects the header
+     */
+    private static Set<String> listenerCharsets(String header) throws UndecodableFormException {
+        ListenerMediaTypeTokenizer tokenizer = new ListenerMediaTypeTokenizer(header);
+        Set<String> charsets = new LinkedHashSet<>();
+        try {
+            tokenizer.consumeToken(SalesQueueService::isTokenCharacter);
+            tokenizer.consumeCharacter('/');
+            tokenizer.consumeToken(SalesQueueService::isTokenCharacter);
+            while (tokenizer.hasMore()) {
+                tokenizer.consumeCharacter(';');
+                tokenizer.consumeTokenIfPresent(SalesQueueService::isLinearWhiteSpace);
+                String attribute = tokenizer.consumeToken(SalesQueueService::isTokenCharacter);
+                tokenizer.consumeCharacter('=');
+                String value;
+                if (tokenizer.previewChar() == '"') {
+                    tokenizer.consumeCharacter('"');
+                    StringBuilder quoted = new StringBuilder();
+                    while (tokenizer.previewChar() != '"') {
+                        if (tokenizer.previewChar() == '\\') {
+                            tokenizer.consumeCharacter('\\');
+                            quoted.append(tokenizer.consumeCharacter(SalesQueueService::isAscii));
+                        } else {
+                            quoted.append(tokenizer.consumeToken(SalesQueueService::isQuotedTextCharacter));
+                        }
+                    }
+                    value = quoted.toString();
+                    tokenizer.consumeCharacter('"');
+                } else {
+                    value = tokenizer.consumeToken(SalesQueueService::isTokenCharacter);
+                }
+                if (CHARSET_PARAMETER.equals(attribute.toLowerCase(Locale.ROOT))) {
+                    charsets.add(value.toLowerCase(Locale.ROOT));
+                }
+            }
+        } catch (IllegalStateException unparseable) {
+            throw UndecodableFormException.unusableContentType("Could not parse '" + header + "'", unparseable);
+        }
+        return charsets;
+    }
+
+    /** Guava 18.0's {@code MediaType.TOKEN_MATCHER}. */
+    private static boolean isTokenCharacter(int c) {
+        return isAscii(c) && !Character.isISOControl(c) && c != ' ' && TOKEN_SEPARATORS.indexOf(c) < 0;
+    }
+
+    /** Guava 18.0's {@code MediaType.QUOTED_TEXT_MATCHER}. */
+    private static boolean isQuotedTextCharacter(int c) {
+        return isAscii(c) && c != '"' && c != '\\' && c != '\r';
+    }
+
+    /** Guava 18.0's {@code MediaType.LINEAR_WHITE_SPACE}. */
+    private static boolean isLinearWhiteSpace(int c) {
+        return LINEAR_WHITE_SPACE.indexOf(c) >= 0;
+    }
+
+    /** Guava 18.0's {@code CharMatcher.ASCII}. */
+    private static boolean isAscii(int c) {
+        return c < ASCII_LIMIT;
+    }
+
+    /**
+     * Decodes a form-urlencoded body as Mule 3.8's {@code HttpParser.decodeString} filled the listener's
+     * {@code ParameterMap}: a blank text gives an empty map; otherwise the text is split on {@code &}
+     * ({@link String#split} semantics, so a leading empty pair is kept as the name {@code ""} and trailing ones are
+     * dropped) and each pair on its first {@code =}; name and value are URL-decoded with {@code charset}, a pair
+     * without {@code =} gets a {@code null} value, and a repeated name keeps its first position and takes its last
+     * value, the value the map's entries carry for that name.
+     *
+     * <p>A malformed percent escape fails as the {@code HttpRequestParsingException} that Mule's
+     * {@code HttpRequestToMuleEvent} raised before the flow ran.
+     *
+     * @param text    the form text, read with the JVM's default charset
+     * @param charset the charset the names and values are URL-decoded with
+     * @return the decoded parameters in first-occurrence order
+     * @throws UndecodableFormException when a name or value holds a malformed percent escape
+     */
+    private static Map<String, String> decodeParameters(String text, Charset charset) throws UndecodableFormException {
+        Map<String, String> parameters = new LinkedHashMap<>();
+        if (text.isBlank()) {
+            return parameters;
+        }
+        try {
+            for (String pair : text.split(PAIR_SEPARATOR)) {
+                int separator = pair.indexOf(NAME_VALUE_SEPARATOR);
+                if (separator < 0) {
+                    parameters.put(URLDecoder.decode(pair, charset), null);
+                } else {
+                    parameters.put(URLDecoder.decode(pair.substring(0, separator), charset),
+                            URLDecoder.decode(pair.substring(separator + 1), charset));
+                }
+            }
+        } catch (IllegalArgumentException malformed) {
+            throw UndecodableFormException.undecodableBody(malformed);
+        }
+        return parameters;
+    }
+
+    /**
+     * Renders a parameter map as Mule 3.8's {@code ObjectToString}, the implementation of
+     * {@code byte-array-to-string-transformer}, rendered the listener's {@code ParameterMap}, through
+     * {@code StringMessageUtils.toString} and {@code MapUtils.toString(map, false)}:
+     * <ul>
+     *   <li>an empty map is <code>{}</code>;</li>
+     *   <li>otherwise the entries are visited in the order of the {@link HashSet} of
+     *       {@link AbstractMap.SimpleEntry} that {@code ParameterMap.entrySet()} built by adding one entry per name,
+     *       in the map's name order, so the order is the set's hash order rather than the body's;</li>
+     *   <li>each entry is written {@code name=value}, with the value masked as
+     *       {@link #maskedValue(Map.Entry)} describes;</li>
+     *   <li>entries are separated by {@code ", "} and the whole is enclosed in braces.</li>
+     * </ul>
+     *
+     * @param parameters the decoded parameters in first-occurrence order
+     * @return the rendering, the payload the transformer produced
+     */
+    private static String renderParameterMap(Map<String, String> parameters) {
+        if (parameters.isEmpty()) {
+            return "{}";
+        }
+        Set<Map.Entry<String, String>> entries = new HashSet<>();
+        for (Map.Entry<String, String> parameter : parameters.entrySet()) {
+            entries.add(new AbstractMap.SimpleEntry<>(parameter.getKey(), parameter.getValue()));
+        }
+        StringBuilder rendering = new StringBuilder("{");
+        String separator = "";
+        for (Map.Entry<String, String> entry : entries) {
+            rendering.append(separator).append(entry.getKey()).append('=').append(maskedValue(entry));
+            separator = ", ";
+        }
+        return rendering.append('}').toString();
+    }
+
+    /**
+     * Mule 3.8's {@code PropertiesUtils.maskedPropertyValue}: the text {@code null} for an absent value, whatever
+     * the name; {@code *****} for the masked name {@code password}; otherwise the value.
+     */
+    private static String maskedValue(Map.Entry<String, String> entry) {
+        if (entry.getKey() == null || entry.getValue() == null) {
+            return NULL_VALUE;
+        }
+        if (MASKED_PARAMETER.equals(entry.getKey())) {
+            return MASKED_VALUE;
+        }
+        return entry.getValue();
     }
 
     /**
@@ -238,5 +557,69 @@ public class SalesQueueService {
 
     private static boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    /**
+     * Guava 18.0's {@code MediaType.Tokenizer}: a cursor over the header on which every unmet expectation, reaching
+     * the end of the input included, throws the {@link IllegalStateException} Guava's {@code checkState} threw, so
+     * that {@link #listenerCharsets(String)} reports the whole header as unparseable.
+     */
+    private static final class ListenerMediaTypeTokenizer {
+
+        private final String input;
+
+        private int position;
+
+        ListenerMediaTypeTokenizer(String input) {
+            this.input = input;
+        }
+
+        /** Consumes the run, possibly empty, of characters {@code matcher} accepts; fails at the end of the input. */
+        String consumeTokenIfPresent(IntPredicate matcher) {
+            checkState(hasMore());
+            int start = position;
+            while (position < input.length() && matcher.test(input.charAt(position))) {
+                position++;
+            }
+            return input.substring(start, position);
+        }
+
+        /** Consumes the run of characters {@code matcher} accepts, which must hold at least one. */
+        String consumeToken(IntPredicate matcher) {
+            int start = position;
+            String token = consumeTokenIfPresent(matcher);
+            checkState(position != start);
+            return token;
+        }
+
+        /** Consumes the next character, which {@code matcher} must accept. */
+        char consumeCharacter(IntPredicate matcher) {
+            char c = previewChar();
+            checkState(matcher.test(c));
+            position++;
+            return c;
+        }
+
+        /** Consumes the next character, which must be {@code expected}. */
+        void consumeCharacter(char expected) {
+            checkState(previewChar() == expected);
+            position++;
+        }
+
+        /** The next character, which must exist. */
+        char previewChar() {
+            checkState(hasMore());
+            return input.charAt(position);
+        }
+
+        boolean hasMore() {
+            return position < input.length();
+        }
+
+        private static void checkState(boolean expectation) {
+            if (!expectation) {
+                throw new IllegalStateException();
+            }
+        }
     }
 }

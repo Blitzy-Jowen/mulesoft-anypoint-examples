@@ -60,7 +60,8 @@ Fixtures are `fixtures/<scenario>.json` beside this file (`src/test/resources/fi
 - `tables`: `{<table>: [{<column>: <value>}]}`, the rows inserted after the table is emptied. Table and column names match `[A-Za-z0-9_]+`.
 - `collections`: `{<collection>: [<document>]}`, MongoDB documents as Extended JSON.
 - `ldap`: `{baseDn, bindDn, bindPassword, ldif}`, where `ldif` is a classpath resource or inline LDIF text.
-- `amqp`: `{initialConfigurationResource}`, the classpath Qpid Broker-J configuration that declares the broker objects and messages.
+- `amqp`: `{initialConfigurationResource, responders}`. `initialConfigurationResource` is the classpath Qpid Broker-J configuration that declares the broker objects and messages. `responders`, present when the capture ran a responder, is `[{queue, reply: {body or bodyBase64, properties}}]`, one entry per responder: it took one request off `queue` and published `reply`, with `properties` as its application headers and the request's correlation id, to the request's reply-to address. The replay starts each responder through the project's `RabbitTemplate` after the drain and before the input is sent, and joins it before comparing the effects; no request on `queue` within `awaitMillis`, a request without a reply-to address or a reply that cannot be sent fails the scenario.
+- `jms`: `{denySend: [{destination, pubSub}]}`, the destinations whose producer sends the capture's broker refused; `pubSub` is `true` for a topic and `false`, the default, for a queue. From before the input is sent until the reset, the application's embedded Artemis server refuses every send to them, the application's own included, as Artemis refuses a send its security settings deny: the send fails with a security exception, and a transacted session's transaction is marked rollback-only, so its commit fails. A project whose JMS connection factory does not reach an embedded Artemis server in-VM reports the scenario `UNVERIFIED-missing-driver`.
 - `mail`: `{users: [{email, login, password}]}`, the mailboxes.
 - For this project, `state` seeds the mailbox and points the poller and the file writer at replay-owned targets:
   - `mail.users` holds the one mailbox: email and login `receiver@localhost`, with the test-only value `application-test.yml` gives `imap.password`. The poller therefore logs in with the test profile's `imap.user` and `imap.password` unchanged. That value is a GreenMail test literal, never a live credential, and this file names it by key only; no live credential appears in any fixture.
@@ -81,15 +82,17 @@ Fixtures are `fixtures/<scenario>.json` beside this file (`src/test/resources/fi
 - `body` (UTF-8 text) or `bodyBase64` (binary): the entity bytes with only the transport framing removed (chunked coding de-chunked, a `Content-Length` body taken exactly) and any `Content-Encoding` left encoded, extracted from the raw capture as Capture step 6 of the reference format defines.
 - Non-HTTP effects:
   - `directories`: the exact final file set of each named directory, so a consumed input directory is `[]` (SC-5 disposition).
-  - `messages`: `[{destination, pubSub, body or bodyBase64, properties}]`, in arrival order; for `amqp`, `destination` is the queue. Only the listed properties are compared, and no further message may follow.
+  - `messages`: `[{destination, pubSub, body or bodyBase64, properties}]`, the messages the capture found on the destinations of `destinations`, each destination's in the order the capture received or browsed them; on an AMQP broker, `destination` is the queue. Bodies and the listed properties are compared, and every destination of `destinations` must hold exactly its entries, so one without entries must stay empty.
+  - `destinations`: `[{destination, pubSub}]`, every destination the capture subscribed to or browsed, in capture order, those it found empty included; `pubSub` is `true` for a topic and `false`, the default, for a queue. It is present exactly when `messages` is, lists each destination once and lists the destination of every `messages` entry; on an AMQP broker every entry is a queue. A fixture that breaks one of these rules fails its scenario. Before the input is sent, the replay subscribes to each topic and drains each queue, a JMS queue through a consumer it closes again at once, so the replay never takes a message the application consumes. After every other effect has matched, it compares each destination with its `messages` entries: a topic's and an AMQP queue's messages are received in order, each within `awaitMillis`, and no further one may arrive within 500 ms; a JMS queue is browsed, not consumed, until it holds exactly its entries within `awaitMillis`, and again 500 ms later.
   - `tables`: the rows of every table the flow writes.
   - `collections`: the stored documents, without `_id`.
-  - `mails`: `[{mimeBase64}]`, the sent or received mails as raw MIME.
+  - `mails`: `[{mimeBase64}]`, the mails the flow sent during the run, as raw MIME. The replay compares them with every mail GreenMail holds after the run, in any mailbox, except the input mail the replay delivered itself, which this comparison leaves out whether or not the flow removed it.
+  - `mailboxes`: `{<email>: [{mimeBase64}]}`, the final contents of each named mailbox after the run, keyed by an email of `state.mail.users`: one raw MIME entry per message still in the mailbox, in mailbox order, the delivered input mail included when the flow did not remove it, and `[]` for a mailbox the capture found empty. The replay compares the message count first, then each message; a message flagged deleted but not expunged still counts.
   - `logs`: `[{logger, level, message}]`, matched as an ordered subsequence of the logged events.
 - For this project, `response` holds no HTTP status, reason or headers, only the effects of the poll:
   - `directories`: the final file set of `output`, each file with its name and its bytes. For `imap-mail-csv-attachment` that is the produced `orders.xml`; for `imap-mail-without-attachment` the captured set, which the row expects to be empty.
   - `logs`: the captured log events, each reduced to its logger category, level and message text, with timestamp and thread name stripped. For `imap-mail-csv-attachment` they are the INFO event `Received: <xml>` of the `Log the converted XML` logger (`imap-to-xml.xml:31`); for `imap-mail-without-attachment`, the ERROR event of Mule's default exception strategy. The replay compares all three fields.
-  - `mails`: the messages left in the INBOX after the poll, one raw MIME entry each, so the array length is the message count. The driver compares it with what GreenMail holds after the poll without counting the delivered input mail, so whether the input mail was expunged is not compared on replay. That disposition stays a Tier 2A verification point, kept with the INBOX flags in the capture evidence `mailbox-after/` (Capture step 5).
+  - `mailboxes`: the one key `receiver@localhost`, holding the messages left in its INBOX after the poll, one raw MIME entry each in INBOX order, so the array length is the message count. The replay compares it with the INBOX GreenMail holds after the poll, the delivered input mail included while it is there and a message flagged `\Deleted` but not expunged counted as there, so whether the poller expunged its input is compared on replay. The INBOX flags stay capture evidence only, in `mailbox-after/flags.txt` (Capture step 5); the replay does not compare them. The fixtures have no `mails`, because the flow sends no mail.
 
 Placeholders, allowed in `state.properties` values, in `request.file.directory` and in directory keys, and resolved at replay:
 
@@ -110,7 +113,7 @@ Replay boundary, applied to the application context before any of its beans exis
 - Table state is seeded, emptied and read only when the application's DataSource is connected to a database the replay owns: an in-memory database (`jdbc:h2:mem:`, `jdbc:derby:memory:`, `jdbc:hsqldb:mem:`); an embedded file database whose path lies inside the replay's temporary root (H2 `jdbc:h2:file:<path>` or `jdbc:h2:<path>`, Derby `jdbc:derby:<name or path>` or `jdbc:derby:directory:<path>`, HSQLDB `jdbc:hsqldb:file:<path>`), read without its `;` or `?` parameters, with `~` as `user.home`, a relative path against `h2.baseDir` or `derby.system.home` when set and `user.dir` otherwise, and no symbolic link leading out of the root; or a server whose every host is a loopback address on a replay-owned port. Any other URL, an unknown embedded form included, fails the scenario before any statement runs.
 - Collection state is dropped, seeded and read only when every `com.mongodb.client.MongoClient` bean of the context, the client the application's `MongoTemplate` works through, is configured solely for servers whose host is a loopback address on a replay-owned port, such as the embedded MongoDB server behind `${mongo.uri}`. Any other server address, a DNS seed list (`mongodb+srv://`), or a `MongoTemplate` without that client type or without a client bean fails the scenario before any collection is dropped, seeded or read.
 - Diagnostics mask credentials: a value whose key's last segment names a secret (a word such as `password`, `secret`, `token`, `key` or `auth`) is shown as `***`; otherwise URI user information (`scheme://***@host`), the user part before `@` of a JDBC URL (`jdbc:oracle:thin:***@host`) or an address-list entry, and parameters with such names (`password=***`) are masked. Keys, hosts and ports stay readable.
-- Each scenario starts from a reset (WireMock, the registered directories, the fixture's tables, the captured log events and the mailboxes) and gets its `upstream` stubs before its `state` and input are written.
+- Each scenario starts from a reset (WireMock, the registered directories, the fixture's tables, the captured log events and the mailboxes) and gets its `upstream` stubs before its `state` and input are written. The reset after a scenario also stops its responders, drains the JMS queue it sent its input to and every queue of its `destinations`, closes its topic subscriptions and removes its send refusals, so the next scenario's broker holds none of them.
 
 Skeleton of an HTTP fixture; every value comes from the capture:
 
@@ -138,7 +141,7 @@ Skeleton of a fixture of this project; every `<captured>` value comes from the c
   "upstream": [],
   "response": { "directories": { "output": "<captured>" },
                 "logs": "<captured>",
-                "mails": "<captured>" }
+                "mailboxes": { "receiver@localhost": "<captured>" } }
 }
 ```
 
@@ -148,7 +151,7 @@ Skeleton of a fixture of this project; every `<captured>` value comes from the c
 - `nondeterministic`: status, reason and the checked headers are compared exactly. Bodies, files and messages are compared for structure only: JSON by key names in order, value kinds and array lengths; XML by child element names (namespace and local name) in order and attribute names as a set, with namespace declarations excluded and text ignored; any other body by empty versus non-empty. Produced files pair up by name, with digit runs in unmatched names replaced by `#`; logs compare logger and level in order and only whether the message is empty; upstream request bodies are not matched. The scenario is reported `UNVERIFIED — nondeterministic output`.
 - `unreachable`: no fixture may exist; the proof belongs in the row (AAP 0.8.2). A fixture for an unreachable row fails the class, and the scenario is `FAILED`.
 
-Both rows of this project are `deterministic`, so the produced files, the log messages and the mails are compared byte for byte, with no normalization.
+Both rows of this project are `deterministic`, so the produced files, the log messages and the INBOX messages are compared byte for byte, with no normalization.
 
 Each run writes `target/fixture-parity/summary.properties` in the project directory: first the counts `verified=<n>`, `unverified=<n>` and `failed=<n>`, then one `scenario.<name>=<STATUS>` line per row, in row order. The statuses:
 
@@ -228,7 +231,7 @@ The capture output of each scenario is kept unedited as the evidence for its fix
      ```
 
      A message the flow flagged but did not expunge is listed with `\Deleted` among its flags.
-6. Write `fixtures/<scenario>.json` raw, without editing: `request` from step 4 (`mail.user` the plain address, `mail.mimeBase64` the Base64 of `mail.eml`, and the `invoke` the Fixture contract names); `state` as the Fixture contract defines it; `"upstream": []`; and `response` from step 5 (`directories.output`, one entry per file of `output/` with its name and its bytes, as `body` when they are valid UTF-8 and `bodyBase64` otherwise; `logs`, the events in logged order; `mails`, one `mimeBase64` per `<n>.eml` of `mailbox-after/`).
+6. Write `fixtures/<scenario>.json` raw, without editing: `request` from step 4 (`mail.user` the plain address, `mail.mimeBase64` the Base64 of `mail.eml`, and the `invoke` the Fixture contract names); `state` as the Fixture contract defines it; `"upstream": []`; and `response` from step 5 (`directories.output`, one entry per file of `output/` with its name and its bytes, as `body` when they are valid UTF-8 and `bodyBase64` otherwise; `logs`, the events in logged order; `mailboxes`, the one key `receiver@localhost` holding one `mimeBase64` per `<n>.eml` of `mailbox-after/` in message-number order, `[]` when `search.txt` lists none).
    - Server-assigned and generated values are not captured: the `Received` and `Return-Path` headers GreenMail adds, the generated `Message-ID`, the GreenMail port, and the timestamp and thread name of each log event.
    - The fixture names no live host: GreenMail and its user are local, and the replay supplies its own ports.
    - Where the captured MIME differs from the row's `Request` description, the captured MIME governs.
@@ -241,7 +244,7 @@ Replay of these fixtures by `FixtureParityTest`'s `mail` driver (AAP 0.8.4, Mail
 2. It applies `state.properties`: `imap.port` becomes the GreenMail IMAPS port, and `orders.output-dir` becomes `${dir:output}`, a directory under the replay's JUnit `@TempDir` root, seeded empty from `state.directories`.
 3. It delivers `request.mail` straight into the INBOX of `receiver@localhost`.
 4. It calls `ImapMailPoller.pollOnce()` through `request.invoke` rather than waiting for the schedule, which replay suppresses (the test profile's `imap.initial-delay` holds it back as well).
-5. It compares the produced files (names and bytes), the log events and `response.mails`.
+5. It compares the produced files (names and bytes), the log events and `response.mailboxes` with the INBOX of `receiver@localhost` after the poll: the message count first, the delivered input mail counted until it is expunged, then each message.
 6. Both rows are `deterministic`, so every comparison is byte for byte, with no normalization.
 
 ## Integrity rule

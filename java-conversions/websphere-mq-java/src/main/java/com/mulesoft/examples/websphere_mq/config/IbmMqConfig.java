@@ -43,6 +43,26 @@ import org.springframework.util.StringUtils;
  *       start-up and, while the queue manager is unreachable or after a connection breaks, keep recovering with
  *       Spring's default back-off (a new attempt every 5 s, without limit), which also stands for the
  *       {@code ee:reconnect-forever} the original README shows.</li>
+ *   <li>The connector sets no transport timeout, and the IBM client's defaults leave a connect, the queue-manager
+ *       negotiation and every later read unbounded or bounded only by the channel heartbeat. Three budgets in whole
+ *       seconds, each {@value #DEFAULT_TRANSPORT_TIMEOUT_SECONDS} by default (the Mule default response timeout),
+ *       bound them instead: {@code wmq.transport.connect-timeout-seconds} the TCP connect,
+ *       {@code wmq.transport.negotiation-timeout-seconds} each reply of the negotiation flow that opens a
+ *       connection, and {@code wmq.transport.receive-timeout-seconds} each read once connected. On a first read
+ *       timeout the client sends a heartbeat and on a second declares the connection broken (reason 2009), so a
+ *       peer that stops answering mid-session is detected within about twice that budget. A send is bounded
+ *       through the read of its reply and that heartbeat as long as the socket can take its bytes. A write that
+ *       blocks because the queue manager or the network keeps the connection open but stops reading once the
+ *       socket buffers are full is not bounded: the IBM client offers no write timeout, its heartbeat waits
+ *       behind the blocked write, and neither closing the JMS connection nor interrupting the thread ends it.
+ *       Such a write ends only when the operating system or the network fails the connection. The budgets reach the
+ *       client as JVM-wide system properties, which it reads once per JVM when the first {@link MQConnectionFactory}
+ *       is constructed ({@link #applyTransportTimeouts(Environment)}). Client reconnection is disabled: otherwise a
+ *       host {@code mqclient.ini} with {@code DefRecon=YES} would turn a detected break into a transparent reconnect
+ *       holding the calling thread for up to the reconnect timeout (1800 s by default). A timed-out operation
+ *       therefore fails once with a {@link JMSException}. Nothing in this class retries or resends it: an
+ *       uncommitted transacted send or receive is backed out by the queue manager once it detects the broken
+ *       connection, and the listener containers recover as described above.</li>
  * </ul>
  *
  * <p>The IBM MQ factory is a bean only while {@link WmqEnabledCondition} holds: {@code wmq.enabled} is not
@@ -80,6 +100,32 @@ public class IbmMqConfig {
     /** Password applied with {@link #USERNAME_KEY} ({@code password} of the original connector). */
     public static final String PASSWORD_KEY = "wmq.password";
 
+    /**
+     * Budget, in whole seconds, for opening the TCP connection to the queue manager's listener. Sets the IBM client
+     * property {@code com.ibm.mq.cfg.TCP.Connect_Timeout}.
+     */
+    public static final String CONNECT_TIMEOUT_KEY = "wmq.transport.connect-timeout-seconds";
+
+    /**
+     * Budget, in whole seconds, for each reply of the queue-manager negotiation flow that opens a connection (channel
+     * start, connect and authentication). Sets the IBM client property
+     * {@code com.ibm.mq.cfg.TCP.QmgrNegotiationFlowTimeout}.
+     */
+    public static final String NEGOTIATION_TIMEOUT_KEY = "wmq.transport.negotiation-timeout-seconds";
+
+    /**
+     * Budget, in whole seconds, for each socket read once a connection is established; a peer that stops answering
+     * is declared broken after about twice this value unless a write to it is blocked (see the class description).
+     * Sets the IBM client property {@code com.ibm.mq.cfg.MQRCVBLKTO}.
+     */
+    public static final String RECEIVE_TIMEOUT_KEY = "wmq.transport.receive-timeout-seconds";
+
+    /**
+     * Default of each {@code wmq.transport.*} budget, in seconds: the Mule default response timeout, the connect and
+     * read budget of the other converted connectors.
+     */
+    public static final int DEFAULT_TRANSPORT_TIMEOUT_SECONDS = 10;
+
     /** Bean name of the container factory for queue {@code in} (flow {@code MessageProcessor}). */
     public static final String TRANSACTED_LISTENER_FACTORY = "transactedListenerContainerFactory";
 
@@ -88,6 +134,21 @@ public class IbmMqConfig {
 
     /** Port used when {@code wmq.port} is absent or blank: the one the original test sets, IBM MQ's default. */
     private static final int DEFAULT_PORT = 1414;
+
+    /**
+     * Largest accepted transport budget, in seconds. The IBM client turns each budget into an {@code int} of
+     * milliseconds, which overflows above this value; the client itself caps the negotiation budget here.
+     */
+    private static final int MAX_TRANSPORT_TIMEOUT_SECONDS = 2147483;
+
+    /** IBM client property for {@link #CONNECT_TIMEOUT_KEY}: attribute {@code Connect_Timeout} of stanza TCP. */
+    private static final String IBM_CONNECT_TIMEOUT_PROPERTY = "com.ibm.mq.cfg.TCP.Connect_Timeout";
+
+    /** IBM client property for {@link #NEGOTIATION_TIMEOUT_KEY}: {@code QmgrNegotiationFlowTimeout} of stanza TCP. */
+    private static final String IBM_NEGOTIATION_TIMEOUT_PROPERTY = "com.ibm.mq.cfg.TCP.QmgrNegotiationFlowTimeout";
+
+    /** IBM client property for {@link #RECEIVE_TIMEOUT_KEY}: the receive block timeout {@code MQRCVBLKTO}. */
+    private static final String IBM_RECEIVE_TIMEOUT_PROPERTY = "com.ibm.mq.cfg.MQRCVBLKTO";
 
     /**
      * Consumers per listener, as minimum and maximum. The {@code wmq:connector} sets no {@code numberOfConsumers},
@@ -106,17 +167,26 @@ public class IbmMqConfig {
      * default stays in place, so no connection value is ever supplied by this class. Credentials are not set here:
      * {@link #connectionFactory(Environment)} applies them to each connection.
      *
+     * <p>Before the factory is constructed, {@link #applyTransportTimeouts(Environment)} sets the JVM-wide IBM client
+     * properties that hold the connect, negotiation and read budgets of its connections, because the client reads
+     * them only then. Client reconnection is disabled, so a broken connection fails the operation instead of being
+     * re-established behind it (see the class description).
+     *
      * <p>The method is public and static, and not a bean, so that the property binding can be verified against any
      * {@link Environment} without a queue manager.
      *
      * @param env the environment holding the {@code wmq.*} keys
      * @return a client-mode {@link MQConnectionFactory}; it connects only when a connection is created
-     * @throws JMSException          when the IBM client rejects a value
-     * @throws NumberFormatException when {@code wmq.port} has text that is not an integer
+     * @throws JMSException             when the IBM client rejects a value
+     * @throws NumberFormatException    when {@code wmq.port} has text that is not an integer
+     * @throws IllegalArgumentException when a {@code wmq.transport.*} budget is not a whole number of seconds
+     *                                  between 1 and 2147483
      */
     public static MQConnectionFactory mqConnectionFactory(Environment env) throws JMSException {
+        applyTransportTimeouts(env);
         MQConnectionFactory factory = new MQConnectionFactory();
         factory.setTransportType(WMQConstants.WMQ_CM_CLIENT);
+        factory.setClientReconnectOptions(WMQConstants.WMQ_CLIENT_RECONNECT_DISABLED);
 
         String host = env.getProperty(HOST_KEY);
         if (StringUtils.hasText(host)) {
@@ -151,6 +221,70 @@ public class IbmMqConfig {
         } catch (NumberFormatException e) {
             throw new NumberFormatException(PORT_KEY + " must be an integer port number, was '" + value + "'");
         }
+    }
+
+    /**
+     * Sets the IBM client properties that hold the connect, negotiation and read budgets of an IBM MQ client
+     * connection from {@link #CONNECT_TIMEOUT_KEY}, {@link #NEGOTIATION_TIMEOUT_KEY} and {@link #RECEIVE_TIMEOUT_KEY},
+     * each defaulting to {@value #DEFAULT_TRANSPORT_TIMEOUT_SECONDS} seconds when absent or blank.
+     *
+     * <p>The properties are JVM-wide, not per factory, and the IBM client reads them once per JVM, when the first
+     * {@link MQConnectionFactory} is constructed. This must therefore run before that construction; a value set
+     * afterwards, a different one included, has no effect. All three values are checked before any property is set,
+     * so a rejected configuration leaves the JVM's properties unchanged.
+     *
+     * @param env the environment holding the {@code wmq.transport.*} keys
+     * @throws IllegalArgumentException naming the key and its value when a budget is not a whole number of seconds
+     *                                  between 1 and 2147483: zero or a negative value would mean no timeout or fail
+     *                                  every connection, and a larger one overflows the client's milliseconds
+     */
+    public static void applyTransportTimeouts(Environment env) {
+        int connectSeconds = transportTimeout(env, CONNECT_TIMEOUT_KEY);
+        int negotiationSeconds = transportTimeout(env, NEGOTIATION_TIMEOUT_KEY);
+        int receiveSeconds = transportTimeout(env, RECEIVE_TIMEOUT_KEY);
+        System.setProperty(IBM_CONNECT_TIMEOUT_PROPERTY, Integer.toString(connectSeconds));
+        System.setProperty(IBM_NEGOTIATION_TIMEOUT_PROPERTY, Integer.toString(negotiationSeconds));
+        System.setProperty(IBM_RECEIVE_TIMEOUT_PROPERTY, Integer.toString(receiveSeconds));
+    }
+
+    /**
+     * Reads one transport budget, falling back to {@value #DEFAULT_TRANSPORT_TIMEOUT_SECONDS} when the key is absent
+     * or blank.
+     *
+     * @param env the environment holding the key
+     * @param key one of the {@code wmq.transport.*} keys
+     * @return the budget in seconds, between 1 and {@value #MAX_TRANSPORT_TIMEOUT_SECONDS}
+     * @throws IllegalArgumentException naming the key and its value when the value is not an integer or lies outside
+     *                                  1 to {@value #MAX_TRANSPORT_TIMEOUT_SECONDS}, so misconfiguration fails at
+     *                                  start-up
+     */
+    private static int transportTimeout(Environment env, String key) {
+        String value = env.getProperty(key);
+        if (!StringUtils.hasText(value)) {
+            return DEFAULT_TRANSPORT_TIMEOUT_SECONDS;
+        }
+        int seconds;
+        try {
+            seconds = Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException(invalidTransportTimeout(key, value), e);
+        }
+        if (seconds < 1 || seconds > MAX_TRANSPORT_TIMEOUT_SECONDS) {
+            throw new IllegalArgumentException(invalidTransportTimeout(key, value));
+        }
+        return seconds;
+    }
+
+    /**
+     * The start-up failure message for a rejected transport budget.
+     *
+     * @param key   the {@code wmq.transport.*} key
+     * @param value the rejected value as configured
+     * @return the message naming the key, the accepted range and the value
+     */
+    private static String invalidTransportTimeout(String key, String value) {
+        return key + " must be a whole number of seconds between 1 and " + MAX_TRANSPORT_TIMEOUT_SECONDS
+                + ", was '" + value + "'";
     }
 
     /**
@@ -239,6 +373,11 @@ public class IbmMqConfig {
      * </ul>
      * A transaction manager on the containers, or a factory wrapped or unwrapped differently for the template, would
      * give the {@code out} send a session of its own, whose message would survive a rollback of the receive.
+     *
+     * <p>Each send and commit is bounded by the transport budgets of the class description, except a write the queue
+     * manager or the network stops reading, which the class description explains. One that times out fails once,
+     * with Spring's {@code JmsException} wrapping the client's {@link JMSException}, and the template never repeats
+     * it, so an uncertain write is not sent twice.
      *
      * @param connectionFactory the application's single {@code ConnectionFactory} bean, the same instance the
      *                          listener containers use

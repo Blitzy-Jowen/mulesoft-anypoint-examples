@@ -40,6 +40,14 @@ wmq:
     out: "out"                     # queue="out" of flows MessageProcessor and Output (websphere-mq.xml:20,25)
   processing:
     wait-ms: 15000                 # test:component waitTime (websphere-mq.xml:19), read by service/MqProcessingService
+  # IBM MQ transport budgets in whole seconds (1 to 2147483), read by config/IbmMqConfig, which sets them as JVM-wide
+  # IBM client properties before the first MQ factory is built. The connector sets none; 10 s is the Mule default
+  # response timeout. An operation that exceeds one fails once and is never retried; a write the queue manager or
+  # the network stops reading is not bounded by these (see config/IbmMqConfig).
+  transport:
+    connect-timeout-seconds: 10      # TCP connect to the queue manager's listener (com.ibm.mq.cfg.TCP.Connect_Timeout)
+    negotiation-timeout-seconds: 10  # each reply of the negotiation that opens a connection (com.ibm.mq.cfg.TCP.QmgrNegotiationFlowTimeout)
+    receive-timeout-seconds: 10      # each read once connected; a silent peer is declared broken after about twice this unless a write is blocked (com.ibm.mq.cfg.MQRCVBLKTO)
 
 # SC-12: Mule Ajax transport, read by AjaxResourceConfig, BayeuxLongPollingController and AjaxChannelBroker, and by
 # client/MqQueueSender and trigger/OutQueueListener for the channels <server-path>/enqueue and <server-path>/dequeue.

@@ -107,6 +107,7 @@ class PreflightDispatchListenerTest {
     void crossOriginPostStillReachesTheController() {
         byte[] body = "{\"product\":\"pencil\",\"units\":12}".getBytes(StandardCharsets.UTF_8);
         String responseContentType = "application/json; charset=UTF-8";
+        when(salesQueueService.isFormUrlEncoded("application/json")).thenReturn(false);
         when(salesQueueService.send(aryEq(body), eq("application/json"))).thenReturn(body);
         when(salesQueueService.responseContentType("application/json")).thenReturn(responseContentType);
         Map<String, String> headers = new LinkedHashMap<>();
@@ -119,6 +120,7 @@ class PreflightDispatchListenerTest {
         assertEquals(responseContentType, response.header("Content-Type"), response::toString);
         assertArrayEquals(body, response.body(), response::toString);
         assertNoCorsHeaders(response);
+        verify(salesQueueService).isFormUrlEncoded("application/json");
         verify(salesQueueService).send(aryEq(body), eq("application/json"));
         verify(salesQueueService).responseContentType("application/json");
         verifyNoMoreInteractions(salesQueueService);
