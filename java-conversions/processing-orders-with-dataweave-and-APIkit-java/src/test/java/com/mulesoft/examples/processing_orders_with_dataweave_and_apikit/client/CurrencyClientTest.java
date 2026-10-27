@@ -84,6 +84,31 @@ class CurrencyClientTest {
     }
 
     @Test
+    void getCurrenciesKeepsTrailingZerosOfRatios() {
+        // currency.json has no trailing zeros, so only these ratios show that none is stripped.
+        wm.stubFor(get(urlEqualTo(CURRENCIES_PATH))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"USD\": [{\"currency\": \"EUR\", \"ratio\": 1.50},"
+                                + " {\"currency\": \"ARS\", \"ratio\": 0.00},"
+                                + " {\"currency\": \"GBP\", \"ratio\": 2.000}]}")));
+
+        JsonNode usd = clientFor(envWithHttpPort(wm.getPort())).getCurrencies().get("USD");
+
+        assertEquals(3, usd.size());
+        String[] expected = {"1.50", "0.00", "2.000"};
+        int[] expectedScales = {2, 2, 3};
+        for (int i = 0; i < expected.length; i++) {
+            JsonNode ratio = usd.get(i).get("ratio");
+            assertTrue(ratio.isBigDecimal(), "ratio " + expected[i] + " is read as a BigDecimal node");
+            // BigDecimal.equals compares the scale as well as the value.
+            assertEquals(new BigDecimal(expected[i]), ratio.decimalValue());
+            assertEquals(expectedScales[i], ratio.decimalValue().scale());
+        }
+    }
+
+    @Test
     void localServerPortTakesPrecedenceOverHttpPort() throws IOException {
         stubCurrencies();
         MockEnvironment env = new MockEnvironment()

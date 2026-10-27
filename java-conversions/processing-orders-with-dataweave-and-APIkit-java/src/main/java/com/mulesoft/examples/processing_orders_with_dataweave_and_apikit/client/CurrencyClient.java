@@ -17,7 +17,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.cfg.JsonNodeFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
-import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 
 import org.springframework.core.env.Environment;
 import org.springframework.http.MediaType;
@@ -128,16 +127,14 @@ public class CurrencyClient {
     }
 
     /**
-     * A mapper that reads floating-point numbers as {@link java.math.BigDecimal} and keeps their trailing zeros.
-     * Jackson 2.15 honours {@link JsonNodeFeature#STRIP_TRAILING_BIGDECIMAL_ZEROES} only when it is set explicitly
-     * and otherwise falls back to the node factory's flag, so both are set.
+     * A mapper that reads floating-point numbers as {@link java.math.BigDecimal} and keeps their trailing zeros
+     * ({@code 1.50} stays {@code 1.50}), because {@link JsonNodeFeature#STRIP_TRAILING_BIGDECIMAL_ZEROES} is
+     * disabled explicitly and Jackson applies an explicitly set feature in place of the node factory's default.
      */
-    @SuppressWarnings("deprecation") // JsonNodeFactory.withExactBigDecimals is deprecated in favour of the feature
     private static ObjectMapper exactDecimalMapper() {
         return JsonMapper.builder()
                 .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
                 .disable(JsonNodeFeature.STRIP_TRAILING_BIGDECIMAL_ZEROES)
-                .nodeFactory(JsonNodeFactory.withExactBigDecimals(true))
                 .build();
     }
 }

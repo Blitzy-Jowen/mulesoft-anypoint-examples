@@ -11,10 +11,19 @@ package com.mulesoft.examples.service_orchestration_and_choice_routing.client;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 
+import org.apache.hc.client5.http.config.ConnectionConfig;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.core5.io.CloseMode;
+import org.apache.hc.core5.util.TimeValue;
+import org.apache.hc.core5.util.Timeout;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
@@ -31,30 +40,68 @@ import org.springframework.web.client.RestClient;
  * did. This is a Tier 2A verification point recorded in the project README; switching to POST would change the
  * behaviour being reproduced.
  *
+ * <p>Exactly one request is sent per call. The transport is Apache httpclient5 with automatic retries disabled, so a
+ * timeout or a connection failure ends the call and the GET is never re-sent; connecting and reading are each
+ * limited to 10 s by default. {@code SimpleClientHttpRequestFactory} is not used because its
+ * {@code HttpURLConnection} silently re-sends a GET once after a connection reset or a premature EOF before the
+ * response head, and the JDK's {@code java.net.http} client likewise re-sends idempotent requests.
+ *
  * <p>Caching by product ID and the price arithmetic belong to the services that call this adapter; it neither logs
- * nor retries, as the original request had no logger and no retry.
+ * nor retries, and its transport re-sends nothing, as the original request had no logger and no retry.
  */
 @Component
-public class ProductPriceClient {
+public class ProductPriceClient implements AutoCloseable {
 
     private final String urlTemplate;
+
+    private final CloseableHttpClient httpClient;
 
     private final RestClient restClient;
 
     /**
-     * Creates the adapter.
+     * Creates the adapter over a single-attempt transport: automatic retries are disabled, so each
+     * {@link #getPrice(String)} call sends exactly one request, and a connection reset, a premature EOF, a refused
+     * connection or a timeout fails it without a second attempt. {@code SimpleClientHttpRequestFactory} is not used
+     * because its {@code HttpURLConnection} re-sends a GET after a reset or a premature EOF.
      *
      * @param urlTemplate price URL with the {@code {productId}} URI-template variable, from {@code orders.price.url};
      *                    the default is the value {@code application.yml} resolves with {@code ports.prices} 9999
-     * @param timeoutMs connect and read timeout in milliseconds, from {@code orders.price.timeout-ms}
+     * @param timeoutMs connect and read timeout in milliseconds, from {@code orders.price.timeout-ms}; the default
+     *                  10000 is Mule's default response timeout
      */
     public ProductPriceClient(
             @Value("${orders.price.url:http://localhost:9999/api/prices/{productId}}") String urlTemplate,
             @Value("${orders.price.timeout-ms:10000}") int timeoutMs) {
         this.urlTemplate = urlTemplate;
-        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
-        requestFactory.setConnectTimeout(timeoutMs);
-        requestFactory.setReadTimeout(timeoutMs);
+        Timeout limit = Timeout.ofMilliseconds(timeoutMs);
+        // HttpURLConnection imposed no concurrency cap, so concurrent in-house orders must not queue behind
+        // httpclient5's default of five connections per route.
+        PoolingHttpClientConnectionManager connectionManager = PoolingHttpClientConnectionManagerBuilder.create()
+                .setDefaultConnectionConfig(ConnectionConfig.custom()
+                        .setConnectTimeout(limit)
+                        .setSocketTimeout(limit)
+                        // No retry, so stale-check every lease: a connection the server closed is never leased.
+                        .setValidateAfterInactivity(TimeValue.ZERO_MILLISECONDS)
+                        .build())
+                .setMaxConnTotal(Integer.MAX_VALUE)
+                .setMaxConnPerRoute(Integer.MAX_VALUE)
+                .build();
+        // No request is ever re-sent: automatic retries are off. The response timeout bounds the wait for the response
+        // head and every wait for body bytes; on expiry the read fails with SocketTimeoutException and RestClient
+        // throws ResourceAccessException. Content compression would add Accept-Encoding and decompress the body, and a
+        // cookie store would replay one order's cookies to the next; HttpURLConnection did neither, so both are off.
+        this.httpClient = HttpClients.custom()
+                .setConnectionManager(connectionManager)
+                .setDefaultRequestConfig(RequestConfig.custom()
+                        .setResponseTimeout(limit)
+                        .setConnectionRequestTimeout(limit)
+                        .build())
+                .disableAutomaticRetries()
+                .disableContentCompression()
+                .disableCookieManagement()
+                .build();
+        // No factory timeout is set, so the client's default request configuration above applies to every GET.
+        HttpComponentsClientHttpRequestFactory requestFactory = new HttpComponentsClientHttpRequestFactory(httpClient);
         this.restClient = RestClient.builder().requestFactory(requestFactory).build();
     }
 
@@ -82,6 +129,16 @@ public class ProductPriceClient {
             return "";
         }
         return new String(body, charsetOf(response.getHeaders().getContentType()));
+    }
+
+    /**
+     * Closes every pooled connection, idle or in use, without a reset; a price request still in progress fails with
+     * {@link org.springframework.web.client.ResourceAccessException}. Spring calls it when the application context
+     * shuts down, as for every {@link AutoCloseable} bean; no request may start afterwards.
+     */
+    @Override
+    public void close() {
+        httpClient.close(CloseMode.GRACEFUL);
     }
 
     private static Charset charsetOf(MediaType contentType) {

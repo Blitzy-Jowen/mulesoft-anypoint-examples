@@ -24,10 +24,13 @@ import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 
 /**
@@ -40,7 +43,8 @@ import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
  * (com/mulesoft/se/orders/ProductPrice.java) answered {@code GET /prices/{productId}} with the {@code text/plain}
  * body {@code 159}, but its 9999 listener accepts POST only (fulfillment.xml:145), so in the running application
  * this GET is answered 405 and must throw, as it did in the original; that case is covered explicitly. Every failure
- * case also proves the adapter sends exactly one request, because the original request had no retry.
+ * case, a connection reset or a close without any response before the response head included, also proves the
+ * adapter sends exactly one request, because the original request had no retry.
  *
  * <p>No Spring context is started: the client is built directly with its two constructor arguments.
  */
@@ -125,6 +129,17 @@ class ProductPriceClientTest {
 
         assertTrue(thrown.contains(SocketTimeoutException.class),
                 () -> "expected a SocketTimeoutException in the cause chain of " + thrown);
+        assertSingleRequest();
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Fault.class, names = {"CONNECTION_RESET_BY_PEER", "EMPTY_RESPONSE"})
+    void connectionFailureBeforeResponsePropagatesWithoutRetry(Fault fault) {
+        // A reset, or a close without any response, before the response head: HttpURLConnection re-sends such a GET.
+        wm.stubFor(get(urlEqualTo(PRICE_PATH)).willReturn(aResponse().withFault(fault)));
+
+        assertThrows(ResourceAccessException.class, () -> client.getPrice(PRODUCT_ID));
+
         assertSingleRequest();
     }
 
