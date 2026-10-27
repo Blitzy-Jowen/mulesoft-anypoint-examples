@@ -90,6 +90,9 @@ class SalesforceOAuthServiceTest {
 
     private static final String QUERY_TEXT = "Salesforce query returned 3 contacts.";
 
+    /** A later {@code /} request's answer, distinct from the callback's so it is seen to come from a fresh query. */
+    private static final String LATER_QUERY_TEXT = "Salesforce query returned 2 contacts.";
+
     /** The flow's answer when the real contact query returns one record. */
     private static final String ONE_CONTACT_TEXT = "Salesforce query returned 1 contacts.";
 
@@ -206,13 +209,14 @@ class SalesforceOAuthServiceTest {
     @Test
     void authorizeWithAStoredTokenRunsTheQueryWithoutAnotherTokenRequest() throws Exception {
         authorizeWith(token("access-1", "refresh-1"));
+        when(contactQueryService.queryContacts()).thenReturn(LATER_QUERY_TEXT);
 
         AuthorizeOutcome outcome = service.authorize();
 
         assertThat(outcome.isRedirect()).isFalse();
         assertThat(outcome.redirectLocation()).isNull();
-        assertThat(outcome.body()).isEqualTo(QUERY_TEXT);
-        assertThat(outcome).isEqualTo(AuthorizeOutcome.completed(QUERY_TEXT));
+        assertThat(outcome.body()).isEqualTo(LATER_QUERY_TEXT);
+        assertThat(outcome).isEqualTo(AuthorizeOutcome.completed(LATER_QUERY_TEXT));
         verify(contactQueryService, times(2)).queryContacts();
         verify(tokenClient, times(1)).exchangeCode(CODE, REDIRECT_URI);
         verifyNoMoreInteractions(tokenClient, contactQueryService);
