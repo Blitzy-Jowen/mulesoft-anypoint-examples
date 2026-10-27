@@ -10,6 +10,7 @@ package com.mulesoft.examples.get_customer_list_from_netsuite.mapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringReader;
 import java.util.ArrayList;
@@ -34,17 +35,36 @@ import org.xmlunit.diff.ComparisonType;
 import org.xmlunit.diff.Diff;
 import org.xmlunit.diff.DifferenceEvaluators;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 /**
  * Output of {@link CustomerHtmlMapper}, the owner of the {@code %dw 1.0} script "Customer List to XML" of
  * {@code get-customer-list-from-netsuite.xml}, rendered through the SC-4 {@link DwXmlWriter}.
  *
- * <p>The customers are those of the original {@code src/test/resources/example.xml}, in its order, which is also
- * the row order of {@code src/test/resources/netsuite/suiteql-customers.json}. Expected documents are written out
- * by hand with explicit {@code \n} and {@code \t}; none is computed through the mapper or the writer. Null cells
- * and escaped text follow the SC-4 contract asserted by {@link DwXmlWriterTest}: an element without text is
- * {@code <td/>}, and {@code &}, {@code <}, {@code >} are written as entity references.
+ * <p>The populated and the empty input are the {@code items} rows of the SuiteQL responses
+ * {@code src/test/resources/netsuite/suiteql-customers.json} and {@code suiteql-empty.json}, as Jackson
+ * deserializes them, per-row {@code links} included; the four customers are those of the original
+ * {@code src/test/resources/example.xml}, in its order. Every other row is keyed by the literal wire keys declared
+ * here, never by the mapper's column constants, so a selector that misses NetSuite's column labels fails these
+ * tests. Expected documents are written out by hand with explicit {@code \n} and {@code \t}; none is computed
+ * through the mapper or the writer. Null cells and escaped text follow the SC-4 contract asserted by
+ * {@link DwXmlWriterTest}: an element without text is {@code <td/>}, and {@code &}, {@code <}, {@code >} are
+ * written as entity references.
  */
 class CustomerHtmlMapperTest {
+
+    /** NetSuite's SuiteQL column label of the last name, as {@code suiteql-customers.json} carries it. */
+    private static final String WIRE_LAST_NAME = "lastname";
+
+    /** NetSuite's SuiteQL column label of the first name, as {@code suiteql-customers.json} carries it. */
+    private static final String WIRE_FIRST_NAME = "firstname";
+
+    /** NetSuite's SuiteQL column label of the email address, as {@code suiteql-customers.json} carries it. */
+    private static final String WIRE_EMAIL = "email";
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private static final String DECLARATION_LINE = "<?xml version='1.0' encoding='UTF-8'?>\n";
 
@@ -160,7 +180,7 @@ class CustomerHtmlMapperTest {
     }
 
     @Test
-    void fourCustomersRenderAsTheExactDataWeaveDocument() {
+    void fourCustomersRenderAsTheExactDataWeaveDocument() throws Exception {
         String actual = mapper.toXml(exampleCustomers());
 
         assertThat(actual).isEqualTo(FOUR_CUSTOMERS_DOCUMENT);
@@ -187,9 +207,10 @@ class CustomerHtmlMapperTest {
     }
 
     @Test
-    void noCustomersWritesTheSingleNoCustomersFoundCellUnderDiv() {
+    void noCustomersWritesTheSingleNoCustomersFoundCellUnderDiv() throws Exception {
         assertThat(NO_CUSTOMERS_DOCUMENT).hasSize(114).contains(CustomerHtmlMapper.NO_CUSTOMERS);
 
+        assertThat(mapper.toXml(suiteQlItems("suiteql-empty.json"))).isEqualTo(NO_CUSTOMERS_DOCUMENT);
         assertThat(mapper.toXml(null)).isEqualTo(NO_CUSTOMERS_DOCUMENT);
         assertThat(mapper.toXml(List.of())).isEqualTo(NO_CUSTOMERS_DOCUMENT);
     }
@@ -203,8 +224,8 @@ class CustomerHtmlMapperTest {
 
         // $.firstName on an absent key yields null, so a row without the key renders like a null value.
         Map<String, Object> withoutFirstName = new LinkedHashMap<>();
-        withoutFirstName.put(CustomerHtmlMapper.LAST_NAME, "Abbott");
-        withoutFirstName.put(CustomerHtmlMapper.EMAIL, "ab@example.com");
+        withoutFirstName.put(WIRE_LAST_NAME, "Abbott");
+        withoutFirstName.put(WIRE_EMAIL, "ab@example.com");
         assertThat(mapper.toXml(List.of(withoutFirstName))).isEqualTo(NULL_FIRST_NAME_DOCUMENT);
 
         List<Map<String, Object>> nullRow = new ArrayList<>();
@@ -227,9 +248,9 @@ class CustomerHtmlMapperTest {
     @Test
     void cellOrderIsLastNameFirstNameEmailWhateverTheRowKeyOrder() {
         Map<String, Object> emailFirst = new LinkedHashMap<>();
-        emailFirst.put(CustomerHtmlMapper.EMAIL, "ab@example.com");
-        emailFirst.put(CustomerHtmlMapper.FIRST_NAME, "Byron");
-        emailFirst.put(CustomerHtmlMapper.LAST_NAME, "Abbott");
+        emailFirst.put(WIRE_EMAIL, "ab@example.com");
+        emailFirst.put(WIRE_FIRST_NAME, "Byron");
+        emailFirst.put(WIRE_LAST_NAME, "Abbott");
 
         assertThat(mapper.toXml(List.of(emailFirst))).isEqualTo(SINGLE_ABBOTT_DOCUMENT);
     }
@@ -245,21 +266,41 @@ class CustomerHtmlMapperTest {
         assertThat(firstCellOfEachRow(parse(actual))).containsExactly("McGill", "Analytics", "Norman", "Abbott");
     }
 
-    /** The customers of {@code example.xml} and {@code suiteql-customers.json}, in their order. */
-    private static List<Map<String, Object>> exampleCustomers() {
-        return List.of(
-                row("Abbott", "Byron", "ab@example.com"),
-                row("Norman", "Gustaffson", "gustaff@example.com"),
-                row("Analytics", "Angels", "aa@example.com"),
-                row("McGill", "Stuart", "mcgill@example.com"));
+    /**
+     * The customers of {@code example.xml}, in its order: the {@code items} rows of {@code suiteql-customers.json}
+     * (Abbott, Norman, Analytics, McGill), read from the fixture rather than built from the mapper's constants.
+     */
+    private static List<Map<String, Object>> exampleCustomers() throws IOException {
+        return suiteQlItems("suiteql-customers.json");
     }
 
-    /** A SuiteQL result row keyed by the mapper's column labels; values may be {@code null}. */
+    /**
+     * The {@code items} rows of a SuiteQL response under {@code /netsuite/} on the test classpath, as Jackson
+     * deserializes them: insertion-ordered maps keyed by NetSuite's column labels, per-row {@code links} included,
+     * which the mapper does not read.
+     *
+     * @param resource the file name under {@code src/test/resources/netsuite/}
+     * @return the rows in fixture order
+     * @throws IOException when the resource cannot be read or is not JSON
+     */
+    private static List<Map<String, Object>> suiteQlItems(String resource) throws IOException {
+        try (InputStream response = CustomerHtmlMapperTest.class.getResourceAsStream("/netsuite/" + resource)) {
+            assertThat(response).as("test-classpath netsuite/%s", resource).isNotNull();
+            JsonNode items = JSON.readTree(response).path("items");
+            assertThat(items.isArray()).as("netsuite/%s has an items array", resource).isTrue();
+            return JSON.convertValue(items, new TypeReference<List<Map<String, Object>>>() { });
+        }
+    }
+
+    /**
+     * A SuiteQL result row keyed by the literal wire keys {@link #WIRE_LAST_NAME}, {@link #WIRE_FIRST_NAME} and
+     * {@link #WIRE_EMAIL}, independent of the mapper's constants; values may be {@code null}.
+     */
     private static Map<String, Object> row(String lastname, String firstname, String email) {
         Map<String, Object> row = new LinkedHashMap<>();
-        row.put(CustomerHtmlMapper.LAST_NAME, lastname);
-        row.put(CustomerHtmlMapper.FIRST_NAME, firstname);
-        row.put(CustomerHtmlMapper.EMAIL, email);
+        row.put(WIRE_LAST_NAME, lastname);
+        row.put(WIRE_FIRST_NAME, firstname);
+        row.put(WIRE_EMAIL, email);
         return row;
     }
 
