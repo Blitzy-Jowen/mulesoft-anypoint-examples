@@ -114,13 +114,7 @@ class OrdersXmlMapperTest {
 
     @Test
     void toXmlOfRowsReadFromInputCsvResource() throws Exception {
-        byte[] csv;
-        try (InputStream in = OrdersXmlMapperTest.class.getResourceAsStream("/input.csv")) {
-            assertThat(in).as("main classpath resource /input.csv").isNotNull();
-            csv = in.readAllBytes();
-        }
-
-        List<Map<String, String>> rows = new DwCsvReader().read(csv);
+        List<Map<String, String>> rows = inputCsvRows();
 
         assertThat(rows).hasSize(2);
         assertThat(mapper.toXml(rows)).isEqualTo(EXPECTED_INPUT_CSV_XML);
@@ -134,7 +128,8 @@ class OrdersXmlMapperTest {
                 .newSchema(new StreamSource(xsd.toExternalForm()));
         DocumentBuilder builder = newDocumentBuilder();
 
-        List<Element> orders = orderElements(EXPECTED_INPUT_CSV_XML);
+        String xml = mapper.toXml(inputCsvRows());
+        List<Element> orders = orderElements(xml);
         assertThat(orders).hasSize(2);
 
         for (Element order : orders) {
@@ -260,6 +255,21 @@ class OrdersXmlMapperTest {
 
     private static String sha256Hex(byte[] bytes) throws Exception {
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+    }
+
+    /**
+     * The rows {@link DwCsvReader} reads from the main classpath resource {@code /input.csv}.
+     *
+     * @return the CSV rows in file order, each keyed by header name
+     * @throws Exception when the resource cannot be read
+     */
+    private static List<Map<String, String>> inputCsvRows() throws Exception {
+        byte[] csv;
+        try (InputStream in = OrdersXmlMapperTest.class.getResourceAsStream("/input.csv")) {
+            assertThat(in).as("main classpath resource /input.csv").isNotNull();
+            csv = in.readAllBytes();
+        }
+        return new DwCsvReader().read(csv);
     }
 
     /** Parses {@code xml} and returns the {@code order} children of its no-namespace {@code orders} root. */
