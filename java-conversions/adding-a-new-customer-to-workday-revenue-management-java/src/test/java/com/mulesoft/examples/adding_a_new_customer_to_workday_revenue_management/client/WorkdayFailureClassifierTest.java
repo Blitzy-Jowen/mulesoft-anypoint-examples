@@ -37,6 +37,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
+import javax.xml.namespace.QName;
+
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
@@ -175,6 +177,7 @@ class WorkdayFailureClassifierTest {
     @Test
     void servesWorkday() {
         assertThat(classifier.system()).isEqualTo(UpstreamSystem.WORKDAY);
+        assertThat(classifier.system().displayName()).isEqualTo("Workday");
     }
 
     @Test
@@ -207,6 +210,17 @@ class WorkdayFailureClassifierTest {
     @MethodSource("authenticationRejections")
     void authenticationRejectionsAreAuthentication(Supplier<Throwable> failure) {
         assertThat(classify(failure.get())).isEqualTo(UpstreamFailureKind.AUTHENTICATION);
+    }
+
+    /** The parsed fault envelopes carry the WS-Security code the classifier matches on, not a lookalike. */
+    @Test
+    void parsedSecurityFaultsCarryTheirWsseFaultCode() {
+        assertThat(soapFault(WSSE_DECLARATION, "wsse:FailedAuthentication", FAILED_AUTHENTICATION_STRING)
+                .getFaultCode()).isEqualTo(new QName(WSSE_NS, "FailedAuthentication"));
+        assertThat(soapFault(WSSE_DECLARATION, "wsse:InvalidSecurity", INVALID_SECURITY_STRING)
+                .getFaultCode()).isEqualTo(new QName(WSSE_NS, "InvalidSecurity"));
+        assertThat(soapFault("", "wsse:FailedAuthentication", FAILED_AUTHENTICATION_STRING)
+                .getFaultCode().getLocalPart()).isEqualTo("FailedAuthentication");
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -251,6 +265,12 @@ class WorkdayFailureClassifierTest {
                 named("Netty ReadTimeoutException", WorkdayFailureClassifierTest::nettyReadTimeout),
                 named("RuntimeException caused by Netty ReadTimeoutException",
                         () -> new RuntimeException("wrapped", nettyReadTimeout())));
+        Stream<Named<Supplier<Throwable>>> nested = Stream.of(
+                named("RuntimeException caused by WebServiceIOException caused by SocketTimeoutException",
+                        () -> new RuntimeException("wrapped", new WebServiceIOException("I/O error: Read timed out",
+                                new SocketTimeoutException("Read timed out")))),
+                named("WebServiceIOException caused by IOException caused by Netty ReadTimeoutException",
+                        () -> new WebServiceIOException("I/O error", new IOException(nettyReadTimeout()))));
         Stream<Named<Supplier<Throwable>>> mixed = Stream.of(
                 named("HTTP 401 caused by SocketTimeoutException",
                         () -> causedBy(httpStatus(401, null), new SocketTimeoutException("Read timed out"))),
@@ -261,7 +281,7 @@ class WorkdayFailureClassifierTest {
                         new SocketException("Connection reset"))),
                 named("cyclic chain holding a SocketTimeoutException",
                         () -> cyclic(new RuntimeException("wrapper"), new SocketTimeoutException("Read timed out"))));
-        return Stream.of(wrapped, netty, mixed).flatMap(shapes -> shapes);
+        return Stream.of(wrapped, netty, nested, mixed).flatMap(shapes -> shapes);
     }
 
     @ParameterizedTest(name = "{0}")
@@ -270,12 +290,32 @@ class WorkdayFailureClassifierTest {
         assertThat(classify(failure.get())).isEqualTo(UpstreamFailureKind.UNAVAILABLE);
     }
 
+    /**
+     * Every unavailable failure, an authentication signal in the same chain included, ends after one attempt and no
+     * re-authentication, so a {@code Put_Customer} that may already have been processed is never sent again.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unavailableFailures")
+    void timeoutsAndConnectivityFailuresAreNeverRetried(Supplier<Throwable> failure) {
+        Exception unavailable = (Exception) failure.get();
+
+        Throwable thrown = catchThrowable(() -> callFailingWith(unavailable));
+
+        assertThat(thrown).isInstanceOfSatisfying(UpstreamUnavailableException.class, exception -> {
+            assertThat(exception.getSystem()).isEqualTo(UpstreamSystem.WORKDAY);
+            assertThat(exception.getCause()).isSameAs(unavailable);
+        });
+        assertThat(calls).hasValue(1);
+        assertThat(reauthentications).hasValue(0);
+    }
+
     // ---------------------------------------------------------------------------------------------------------------
     // Everything else → other, rethrown unchanged
     // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Supplier<Throwable>>> otherFailures() {
         return Stream.of(
+                named("HTTP 400", () -> httpStatus(400, null)),
                 named("HTTP 403", () -> httpStatus(403, null)),
                 named("HTTP 404", () -> httpStatus(404, null)),
                 named("HTTP 500 without a fault", () -> httpStatus(500, null)),
@@ -289,6 +329,7 @@ class WorkdayFailureClassifierTest {
                 named("another WS-Security fault code (wsse:UnsupportedSecurityToken)", () -> soapFault(
                         WSSE_DECLARATION, "wsse:UnsupportedSecurityToken", "An unsupported token was provided")),
                 named("SOAP fault whose code cannot be read", WorkdayFailureClassifierTest::unreadableFault),
+                named("SOAP message without a Fault element", WorkdayFailureClassifierTest::faultWithoutCode),
                 named("MarshallingFailureException", () -> new MarshallingFailureException("cannot marshal")),
                 named("IllegalStateException", () -> new IllegalStateException("Unexpected Workday response")),
                 named("WebServiceIOException caused by an IOException that is no socket failure",
@@ -324,16 +365,22 @@ class WorkdayFailureClassifierTest {
         assertThat(reauthentications).hasValue(1);
     }
 
-    @Test
-    void aSecurityFaultOnBothAttemptsEndsWithAnAuthenticationFailure() {
-        SoapFaultClientException retryFailure =
-                soapFault(WSSE_DECLARATION, "wsse:FailedAuthentication", FAILED_AUTHENTICATION_STRING);
+    static Stream<Arguments> rejectedOnBothAttempts() {
+        return Stream.of(
+                Arguments.of(named("HTTP 401, then HTTP 401", httpStatus(401, null)), httpStatus(401, null)),
+                Arguments.of(named("wsse:InvalidSecurity fault, then wsse:FailedAuthentication fault",
+                                soapFault(WSSE_DECLARATION, "wsse:InvalidSecurity", INVALID_SECURITY_STRING)),
+                        soapFault(WSSE_DECLARATION, "wsse:FailedAuthentication", FAILED_AUTHENTICATION_STRING)));
+    }
 
-        Throwable thrown = catchThrowable(() -> callFailingWith(
-                soapFault(WSSE_DECLARATION, "wsse:InvalidSecurity", INVALID_SECURITY_STRING), retryFailure));
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("rejectedOnBothAttempts")
+    void anAuthenticationRejectionOnBothAttemptsEndsWithAnAuthenticationFailure(Exception firstFailure,
+            Exception retryFailure) {
+        Throwable thrown = catchThrowable(() -> callFailingWith(firstFailure, retryFailure));
 
         assertThat(thrown).isInstanceOf(UpstreamAuthenticationException.class)
-                .hasMessage(FAILED_AUTHENTICATION_STRING)
+                .hasMessage(retryFailure.getMessage())
                 .hasCause(retryFailure);
         assertThat(((UpstreamAuthenticationException) thrown).getSystem()).isEqualTo(UpstreamSystem.WORKDAY);
         assertThat(calls).hasValue(2);
@@ -346,16 +393,6 @@ class WorkdayFailureClassifierTest {
 
         assertThat(thrown).isInstanceOf(UpstreamRateLimitException.class);
         assertThat(((UpstreamRateLimitException) thrown).getRetryAfter()).isEqualTo("30");
-        assertThat(calls).hasValue(1);
-        assertThat(reauthentications).hasValue(0);
-    }
-
-    @Test
-    void aTimeoutIsNeverRetried() {
-        Throwable thrown = catchThrowable(() -> callFailingWith(
-                new WebServiceIOException("I/O error: Read timed out", new SocketTimeoutException("Read timed out"))));
-
-        assertThat(thrown).isInstanceOf(UpstreamUnavailableException.class);
         assertThat(calls).hasValue(1);
         assertThat(reauthentications).hasValue(0);
     }
@@ -471,6 +508,7 @@ class WorkdayFailureClassifierTest {
     /** The exception the client's template raises for an HTTP error without a SOAP fault. */
     private static WorkdayRevenueManagementClient.HttpStatusException httpStatus(int status, String retryAfter) {
         String reason = switch (status) {
+            case 400 -> "Bad Request";
             case 401 -> "Unauthorized";
             case 403 -> "Forbidden";
             case 404 -> "Not Found";
@@ -521,6 +559,13 @@ class WorkdayFailureClassifierTest {
         when(body.getFault()).thenReturn(fault);
         when(fault.getFaultCode()).thenThrow(new IllegalArgumentException("unbound fault code prefix"));
         return new SoapFaultClientException(message);
+    }
+
+    /** A {@link SoapFaultClientException} over an envelope whose Body holds no fault, so its fault code is null. */
+    private static SoapFaultClientException faultWithoutCode() {
+        SoapFaultClientException exception = new SoapFaultClientException(MESSAGE_FACTORY.createWebServiceMessage());
+        assertThat(exception.getFaultCode()).isNull();
+        return exception;
     }
 
     private static ResponseDefinitionBuilder soapResponse(int status, String envelope) {
