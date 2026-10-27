@@ -1,0 +1,282 @@
+/**
+ * MuleSoft Examples
+ * Copyright 2014 MuleSoft, Inc.
+ *
+ * This product includes software developed at
+ * MuleSoft, Inc. (http://www.mulesoft.com/).
+ */
+
+package com.mulesoft.examples.login_form_using_the_http_connector.controller;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+
+import io.undertow.servlet.handlers.ServletRequestContext;
+import io.undertow.util.Headers;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpInputMessage;
+import org.springframework.http.InvalidMediaTypeException;
+import org.springframework.http.MediaType;
+import org.springframework.http.converter.FormHttpMessageConverter;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
+
+import com.mulesoft.examples.login_form_using_the_http_connector.client.LoginRequesterClient.LoginResponse;
+import com.mulesoft.examples.login_form_using_the_http_connector.service.LoginService;
+
+/**
+ * HTTP triggers of the three flows of {@code login-form-using-the-http-connector.xml}, all on the
+ * {@code HttpListenerConfig} listener ({@code 0.0.0.0:${http.port}}, xml:4), whose host and port come from
+ * {@code application.yml}:
+ * <ul>
+ *   <li>{@code GetLoginPageFlow}, {@code allowedMethods="GET" path="/login"} (xml:9): {@link #loginPage};</li>
+ *   <li>{@code DoLoginFlow}, {@code allowedMethods="POST" path="/login"} (xml:16): {@link #login};</li>
+ *   <li>{@code CallLoginFlowUsingRequester}, {@code path="/requesterLogin"} with no {@code allowedMethods}
+ *       (xml:35): {@link #requesterLogin} and {@link #requesterLoginOptions}, so every method runs the flow.</li>
+ * </ul>
+ *
+ * <p>The class only binds the request and writes the service's result. The credential check, the templates and the
+ * username log line belong to {@link LoginService}; a rejected login propagates as
+ * {@link LoginService.LoginFailedException} to {@code LoginExceptionHandler} (403 and {@code loginFailure.html}), and
+ * every other failure to the generic advice of {@code GlobalExceptionHandler}. Each handler obtains the service's
+ * result before it touches the response, so an advice always finds the response uncommitted.
+ *
+ * <p>Bodies are written to the servlet output stream with a {@code Content-Length}, never through a message
+ * converter or the servlet writer, either of which would add or rewrite a Content-Type. The login page goes out
+ * with no Content-Type, because {@code GetLoginPageFlow} sets none; the success page carries exactly
+ * {@link #HTML_CONTENT_TYPE}.
+ */
+@RestController
+public class LoginController {
+
+    /**
+     * Content-Type of the success page, the exact value of {@code set-property propertyName="Content-Type"}
+     * (xml:25), space included.
+     */
+    static final String HTML_CONTENT_TYPE = "text/html; charset=UTF-8";
+
+    /**
+     * Body of the 400 the Mule 3.8 listener sent, before any flow ran, for a form body it could not URL-decode
+     * ({@code HttpRequestToMuleEvent} raised {@code HttpRequestParsingException} with this message, and
+     * {@code DefaultHttpListener} answered {@code BAD_REQUEST} with the message as the body).
+     */
+    static final String UNDECODABLE_FORM_MESSAGE = "Cannot decode x-www-form-urlencoded payload";
+
+    private static final Logger LOG = LoggerFactory.getLogger(LoginController.class);
+
+    /** The methods the two {@code /login} listeners accept together. */
+    private static final List<String> LOGIN_METHODS = List.of("GET", "POST");
+
+    /** Stateless once built, so one instance serves every request; its default charset is UTF-8. */
+    private static final FormHttpMessageConverter FORM_CONVERTER = new FormHttpMessageConverter();
+
+    private final LoginService loginService;
+
+    /**
+     * @param loginService the processor logic of the three flows
+     */
+    public LoginController(LoginService loginService) {
+        this.loginService = Objects.requireNonNull(loginService, "loginService");
+    }
+
+    /**
+     * {@code GetLoginPageFlow}: 200 with {@code login/index.html} byte for byte and no Content-Type.
+     *
+     * @param response the response the page is written to
+     * @throws IOException if the page cannot be written
+     */
+    @GetMapping("/login")
+    public void loginPage(HttpServletResponse response) throws IOException {
+        byte[] page = loginService.loginPage().getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        writeBody(response, page);
+    }
+
+    /**
+     * {@code DoLoginFlow}: hands the posted form to {@link LoginService#login} and answers 200 with the success page
+     * and {@link #HTML_CONTENT_TYPE}. A rejected login leaves this method as {@link LoginService.LoginFailedException}
+     * ({@code message-filter throwOnUnaccepted="true"} and the catch strategy, xml:20-22, 27-30).
+     *
+     * <p>The form is the request body alone, as the Mule payload was; query parameters never count (see
+     * {@link #readForm}). A form body that cannot be URL-decoded is answered as the listener answered it, with 400
+     * {@link #UNDECODABLE_FORM_MESSAGE}, and the flow does not run.
+     *
+     * @param request  the login request
+     * @param response the response the page is written to
+     * @throws IOException if the body cannot be read or the page cannot be written
+     */
+    @PostMapping("/login")
+    public void login(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        Optional<Map<String, String>> form = readForm(request);
+        if (form.isEmpty()) {
+            rejectUndecodableForm(response);
+            return;
+        }
+        byte[] page = loginService.login(form.get()).getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        writeContentTypeVerbatim(response, HTML_CONTENT_TYPE);
+        writeBody(response, page);
+    }
+
+    /**
+     * Rejects {@code HEAD} and {@code OPTIONS} on {@code /login}, which neither original listener accepted, with the
+     * 405 of {@code GlobalExceptionHandler}. Without this mapping Spring MVC would answer {@code HEAD} through
+     * {@link #loginPage} and {@code OPTIONS} itself, both with 200. The other methods outside GET and POST are
+     * rejected by the handler mapping itself.
+     *
+     * @param request the rejected request
+     * @throws HttpRequestMethodNotSupportedException always
+     */
+    @RequestMapping(path = "/login", method = {RequestMethod.HEAD, RequestMethod.OPTIONS})
+    public void loginUnsupportedMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(request.getMethod(), LOGIN_METHODS);
+    }
+
+    /**
+     * {@code CallLoginFlowUsingRequester} for every method except {@code OPTIONS}: relays the response of
+     * {@code POST /login} called with the configured credentials. The inbound body is ignored, because the flow
+     * replaced the payload with the credential map (xml:38-40).
+     *
+     * @param response the response the relayed body is written to
+     * @throws IOException if the relayed body cannot be written
+     */
+    @RequestMapping("/requesterLogin")
+    public void requesterLogin(HttpServletResponse response) throws IOException {
+        relayRequesterLogin(response);
+    }
+
+    /**
+     * {@code CallLoginFlowUsingRequester} for {@code OPTIONS}. A mapping without methods deliberately does not match
+     * {@code OPTIONS}, which Spring MVC would otherwise answer itself; the Mule listener ran the flow for it too.
+     *
+     * @param response the response the relayed body is written to
+     * @throws IOException if the relayed body cannot be written
+     */
+    @RequestMapping(path = "/requesterLogin", method = RequestMethod.OPTIONS)
+    public void requesterLoginOptions(HttpServletResponse response) throws IOException {
+        relayRequesterLogin(response);
+    }
+
+    /**
+     * Writes 200, the relayed Content-Type byte for byte when there is one, and the relayed body. The status is 200
+     * whatever {@code POST /login} answered below 400, because the Mule listener does not relay the requester's
+     * status; a status of 400 or more, and any connection failure, leave {@link LoginService#requesterLogin} as an
+     * exception for the generic 500.
+     */
+    private void relayRequesterLogin(HttpServletResponse response) throws IOException {
+        LoginResponse relayed = loginService.requesterLogin();
+        byte[] body = relayed.body() == null ? new byte[0] : relayed.body();
+        response.setStatus(HttpServletResponse.SC_OK);
+        if (relayed.contentType() != null) {
+            writeContentTypeVerbatim(response, relayed.contentType());
+        }
+        writeBody(response, body);
+    }
+
+    /**
+     * Reads the posted form from the request body only. Servlet parameters are never consulted, because they merge
+     * the query string into the form.
+     *
+     * <p>The body is a form only when the request's media type is exactly {@code application/x-www-form-urlencoded}
+     * (any case, any parameters); otherwise, and when the Content-Type is missing or unparseable, the form is empty,
+     * which the service rejects. The body is decoded in the Content-Type's charset, or UTF-8 when it names none;
+     * pairs keep their order, a repeated name keeps its first value and a name without {@code =} maps to
+     * {@code null}.
+     *
+     * @return the form, or {@link Optional#empty()} when a form body cannot be URL-decoded
+     */
+    private static Optional<Map<String, String>> readForm(HttpServletRequest request) throws IOException {
+        Map<String, String> form = new LinkedHashMap<>();
+        String contentType = request.getContentType();
+        if (contentType == null) {
+            return Optional.of(form);
+        }
+        MediaType mediaType;
+        try {
+            mediaType = MediaType.parseMediaType(contentType);
+        } catch (InvalidMediaTypeException e) {
+            return Optional.of(form);
+        }
+        // Exact type and subtype, not isCompatibleWith: the Mule 3.8 listener decoded a body as a form only when the
+        // parsed type/subtype equalled application/x-www-form-urlencoded, so */* or application/* stays a stream,
+        // which the credential filter rejects.
+        if (!MediaType.APPLICATION_FORM_URLENCODED.equalsTypeAndSubtype(mediaType)) {
+            return Optional.of(form);
+        }
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(mediaType);
+        HttpInputMessage message = new HttpInputMessage() {
+            @Override
+            public InputStream getBody() throws IOException {
+                return request.getInputStream();
+            }
+
+            @Override
+            public HttpHeaders getHeaders() {
+                return headers;
+            }
+        };
+        MultiValueMap<String, String> values;
+        try {
+            values = FORM_CONVERTER.read(null, message);
+        } catch (IllegalArgumentException | HttpMessageNotReadableException e) {
+            // An invalid percent-encoding: URLDecoder's IllegalArgumentException, which Spring 6.1.15 lets through
+            // and later Spring versions wrap. An I/O failure stays an IOException for the generic 500.
+            return Optional.empty();
+        }
+        values.forEach((name, list) -> form.put(name, list.isEmpty() ? null : list.get(0)));
+        return Optional.of(form);
+    }
+
+    /**
+     * Answers an undecodable form body as {@code DefaultHttpListener} did: a WARN log line, then 400 with the
+     * standard reason phrase, no Content-Type and {@link #UNDECODABLE_FORM_MESSAGE} as the body.
+     */
+    private static void rejectUndecodableForm(HttpServletResponse response) throws IOException {
+        LOG.warn("Exception occurred parsing request: {}", UNDECODABLE_FORM_MESSAGE);
+        response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+        writeBody(response, UNDECODABLE_FORM_MESSAGE.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    /**
+     * Sets {@code Content-Type} to exactly {@code value}. Undertow re-serialises a value passed to
+     * {@code setContentType} or {@code setHeader}, turning {@code text/html; charset=UTF-8} into
+     * {@code text/html;charset=UTF-8}, so on Undertow the header is put on the exchange directly. Without an Undertow
+     * request on the calling thread (MockMvc, another container) the servlet response is used. Called before any
+     * body byte is written.
+     */
+    private static void writeContentTypeVerbatim(HttpServletResponse response, String value) {
+        ServletRequestContext context = ServletRequestContext.current();
+        if (context != null) {
+            context.getExchange().getResponseHeaders().put(Headers.CONTENT_TYPE, value);
+        } else {
+            response.setContentType(value);
+        }
+    }
+
+    /** Writes {@code bytes} with their {@code Content-Length} to the output stream, never to the writer. */
+    private static void writeBody(HttpServletResponse response, byte[] bytes) throws IOException {
+        response.setContentLength(bytes.length);
+        OutputStream out = response.getOutputStream();
+        out.write(bytes);
+        out.flush();
+    }
+}

@@ -90,9 +90,9 @@ class OrderLinesMapperTest {
     @CsvSource({
         // units, pricePerUnit, expected units, expected pricePerUnit, expected totalPrice
         "2.0,  10, 2,    10, 20",
-        "4.15, 5,  4.15, 5,  20.75",
-        // A value that is not integral keeps the scale it was read or computed with.
-        "2.50, 3,  2.50, 3,  7.50"
+        // Trailing zeros of a non-integral value (such as 2.50) are not asserted: neither the original output nor
+        // the DataWeave 1.0 evidence settles how they rendered.
+        "4.15, 5,  4.15, 5,  20.75"
     })
     void numbersAreBigDecimalWithIntegralScaleZero(String units, String pricePerUnit, String expectedUnits,
             String expectedPricePerUnit, String expectedTotalPrice) {

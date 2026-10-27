@@ -8,17 +8,24 @@
 
 package com.mulesoft.examples.mule_component_bindings.client;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.absent;
 import static com.github.tomakehurst.wiremock.client.WireMock.and;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.matching;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.tuple;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import java.io.IOException;
@@ -49,6 +56,7 @@ import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.mule_component_bindings.config.StockStatsProperties;
 
 import twitter4j.HttpClientConfiguration;
+import twitter4j.JSONException;
 import twitter4j.QueryResult;
 import twitter4j.Status;
 import twitter4j.TwitterException;
@@ -58,9 +66,12 @@ import twitter4j.conf.ConfigurationBuilder;
 /**
  * The contract of {@link TwitterSearchClient}, which replaces the Mule Twitter connector's {@code twitter:search},
  * against a WireMock stand-in for the Twitter v1.1 REST API: the search sends the query and date bounds signed
- * with the configured OAuth credentials and returns the parsed statuses; the configuration pins 10 s connect and
- * read timeouts and no HTTP retry whatever twitter4j would otherwise inherit; and an upstream that never answers
- * fails the search once, after the 10 s read timeout, with a {@link SocketTimeoutException} cause.
+ * with the configured OAuth credentials and returns the parsed statuses, and sends no date bound it is not given;
+ * the twitter4j instance is built on the first search, so construction needs no credentials, and is reused
+ * afterwards; a rejected search or a response without {@code search_metadata} raises {@link TwitterException},
+ * a rejection carrying Twitter's status and error code and never sent twice; the configuration pins 10 s connect
+ * and read timeouts and no HTTP retry whatever twitter4j would otherwise inherit; and an upstream that never
+ * answers fails the search once, after the 10 s read timeout, with a {@link SocketTimeoutException} cause.
  */
 class TwitterSearchClientTest {
 
@@ -88,17 +99,84 @@ class TwitterSearchClientTest {
     void searchSendsTheQueryAndDatesSignedWithTheConfiguredCredentials() throws TwitterException {
         wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(okJson(SEARCH_RESPONSE)));
 
-        QueryResult result = new TwitterSearchClient(properties()).search("AAPL", "2014-10-26", "2014-11-04");
+        // The "$" + stock query of the binding flow: sent as q=%24AAPL, which WireMock decodes before matching.
+        QueryResult result = new TwitterSearchClient(properties()).search("$AAPL", "2014-10-26", "2014-11-04");
 
         assertThat(result.getTweets()).extracting(Status::getId, Status::getText).containsExactly(
                 tuple(529013410513453056L, "$AAPL closes higher"), tuple(529784356710236160L, "$AAPL up"));
+        // One pattern for the header: WireMock keeps only the last withHeader pattern given for a name.
         wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json"))
-                .withQueryParam("q", equalTo("AAPL"))
+                .withQueryParam("q", equalTo("$AAPL"))
                 .withQueryParam("since", equalTo("2014-10-26"))
                 .withQueryParam("until", equalTo("2014-11-04"))
-                .withHeader("Authorization", and(containing("oauth_consumer_key=\"test-api-key\""),
+                .withHeader("Authorization", and(matching("OAuth .+"),
+                        containing("oauth_consumer_key=\"test-api-key\""),
                         containing("oauth_token=\"test-access-key\""))));
         assertThat(wm.getAllServeEvents()).hasSize(1);
+    }
+
+    @Test
+    void nullSinceAndUntilAreNotSent() throws TwitterException {
+        wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(okJson(SEARCH_RESPONSE)));
+
+        new TwitterSearchClient(properties()).search("AAPL", null, null);
+
+        wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json"))
+                .withQueryParam("q", equalTo("AAPL"))
+                .withQueryParam("since", absent())
+                .withQueryParam("until", absent()));
+    }
+
+    @Test
+    void twitterInstanceIsCreatedLazily() throws TwitterException {
+        wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(okJson(SEARCH_RESPONSE)));
+        ReadCountingProperties noCredentials = new ReadCountingProperties(
+                properties(wm.baseUrl() + "/1.1/", "", "", "", ""));
+
+        // Start-up needs no credentials: constructing the client neither reads its configuration nor calls Twitter.
+        assertDoesNotThrow(() -> new TwitterSearchClient(noCredentials));
+        assertThat(noCredentials.restBaseUrlReads).hasValue(0);
+        wm.verify(0, anyRequestedFor(anyUrl()));
+
+        ReadCountingProperties configured = new ReadCountingProperties(properties());
+        TwitterSearchClient client = new TwitterSearchClient(configured);
+        assertThat(configured.restBaseUrlReads).hasValue(0);
+
+        assertThat(client.search("$AAPL", "2014-10-26", "2014-11-04").getTweets()).hasSize(2);
+        assertThat(client.search("$AAPL", "2014-10-26", "2014-11-04").getTweets()).hasSize(2);
+
+        // Configured once, on the first search, and that instance served both searches.
+        assertThat(configured.restBaseUrlReads).hasValue(1);
+        wm.verify(2, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
+    }
+
+    @Test
+    void unauthorizedRaisesTwitterException() {
+        wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(aResponse()
+                .withStatus(401)
+                .withHeader("Content-Type", "application/json")
+                .withBody("{\"errors\":[{\"code\":32,\"message\":\"Could not authenticate you.\"}]}")));
+        TwitterSearchClient client = new TwitterSearchClient(properties());
+
+        TwitterException ex = assertThrows(TwitterException.class,
+                () -> client.search("$AAPL", "2014-10-26", "2014-11-04"));
+
+        assertThat(ex.getStatusCode()).isEqualTo(401);
+        assertThat(ex.getErrorCode()).isEqualTo(32);
+        // Exactly one request: a rejected search is never retried.
+        wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
+    }
+
+    @Test
+    void missingSearchMetadataRaisesTwitterException() {
+        wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(okJson("{\"statuses\":[]}")));
+        TwitterSearchClient client = new TwitterSearchClient(properties());
+
+        TwitterException ex = assertThrows(TwitterException.class,
+                () -> client.search("$AAPL", "2014-10-26", "2014-11-04"));
+
+        assertThat(ex).hasCauseInstanceOf(JSONException.class);
+        wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
     }
 
     static Stream<Arguments> externalTwitter4jConfigurations() {
@@ -257,8 +335,38 @@ class TwitterSearchClientTest {
 
     /** The {@code application-test.yml} values, with the Twitter REST API at {@code twitterRestBaseUrl}. */
     private static StockStatsProperties properties(String twitterRestBaseUrl) {
-        return new StockStatsProperties("test-access-key", "test-access-secret", "test-api-key", "test-api-secret",
-                twitterRestBaseUrl, "test-stocklytics-key", wm.baseUrl() + "/", "test-sentiment140-key",
-                wm.baseUrl() + "/");
+        return properties(twitterRestBaseUrl, "test-api-key", "test-api-secret", "test-access-key",
+                "test-access-secret");
+    }
+
+    /**
+     * The Twitter REST API at {@code twitterRestBaseUrl} with the given OAuth consumer key and secret and access
+     * token and secret, and the other two services on WireMock with their {@code application-test.yml} keys.
+     */
+    private static StockStatsProperties properties(String twitterRestBaseUrl, String apiKey, String apiSecret,
+            String accessKey, String accessSecret) {
+        return new StockStatsProperties(accessKey, accessSecret, apiKey, apiSecret, twitterRestBaseUrl,
+                "test-stocklytics-key", wm.baseUrl() + "/", "test-sentiment140-key", wm.baseUrl() + "/");
+    }
+
+    /**
+     * A copy of {@code source} that counts reads of the Twitter REST base URL, which the client reads once each time
+     * it builds a twitter4j instance, so the count tells when and how often that happens.
+     */
+    private static final class ReadCountingProperties extends StockStatsProperties {
+
+        private final AtomicInteger restBaseUrlReads = new AtomicInteger();
+
+        ReadCountingProperties(StockStatsProperties source) {
+            super(source.twitterAccessKey(), source.twitterAccessSecret(), source.twitterApiKey(),
+                    source.twitterApiSecret(), source.twitterRestBaseUrl(), source.stocklyticsApiKey(),
+                    source.stocklyticsBaseUrl(), source.sentiment140ApiKey(), source.sentiment140BaseUrl());
+        }
+
+        @Override
+        public String twitterRestBaseUrl() {
+            restBaseUrlReads.incrementAndGet();
+            return super.twitterRestBaseUrl();
+        }
     }
 }

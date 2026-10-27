@@ -27,8 +27,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -38,6 +40,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -153,6 +156,11 @@ class ScatterGatherServiceTest {
         });
         assertThat(results.get(0).value()).isEqualTo(expectedSourceA());
         assertThat(results.get(1).value()).isEqualTo(expectedSourceB());
+        // Each result carries the route's own payload, of the types the MEL scripts created, not a copy.
+        assertThat(results).extracting(BranchResult::value).allSatisfy(value -> {
+            assertThat(value).isInstanceOf(ArrayList.class);
+            assertThat((List<?>) value).allSatisfy(contact -> assertThat(contact).isInstanceOf(HashMap.class));
+        });
         verify(service, times(1)).sourceA();
         verify(service, times(1)).sourceB();
         verifyNoInteractions(mailer);
@@ -176,6 +184,36 @@ class ScatterGatherServiceTest {
         assertThat(threadByRoute.get("A")).isNotEqualTo(threadByRoute.get("B"));
         assertThat(threadByRoute.values()).doesNotContain(Thread.currentThread().getName());
         assertThat(results).extracting(BranchResult::value).containsExactly(expectedSourceA(), expectedSourceB());
+    }
+
+    @Test
+    @DisplayName("scatter keeps route order, route A first, when route B completes before route A")
+    void orderIsPreservedWhenRouteBFinishesFirst() {
+        CountDownLatch routeBDone = new CountDownLatch(1);
+        AtomicBoolean routeAWaitedForRouteB = new AtomicBoolean();
+        Queue<String> completionOrder = new ConcurrentLinkedQueue<>();
+        // Route A completes only after route B has, the reverse of the route order. The outcome is recorded and
+        // asserted on the test thread, because an assertion failing on a route thread would only fail that route.
+        doAnswer(invocation -> {
+            routeAWaitedForRouteB.set(routeBDone.await(WAIT_SECONDS, SECONDS));
+            Object contacts = invocation.callRealMethod();
+            completionOrder.add("A");
+            return contacts;
+        }).when(service).sourceA();
+        doAnswer(invocation -> {
+            Object contacts = invocation.callRealMethod();
+            completionOrder.add("B");
+            routeBDone.countDown();
+            return contacts;
+        }).when(service).sourceB();
+
+        List<BranchResult> results = service.scatter();
+
+        assertThat(routeAWaitedForRouteB).as("route B finished within the bound while route A waited").isTrue();
+        assertThat(completionOrder).containsExactly("B", "A");
+        assertThat(results).hasSize(2).allSatisfy(result -> assertThat(result.isSuccess()).isTrue());
+        assertThat(results.get(0).value()).isEqualTo(expectedSourceA());
+        assertThat(results.get(1).value()).isEqualTo(expectedSourceB());
     }
 
     static Stream<Arguments> oneFailingRoute() {

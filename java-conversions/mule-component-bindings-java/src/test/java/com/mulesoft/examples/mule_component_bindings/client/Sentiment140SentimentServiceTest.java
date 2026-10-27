@@ -53,6 +53,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.mule_component_bindings.config.StockStatsProperties;
 import com.mulesoft.examples.mule_component_bindings.model.Sentiment;
@@ -62,10 +63,11 @@ import com.mulesoft.examples.mule_component_bindings.model.Tweet;
  * The contract of {@link Sentiment140SentimentService}, the port of the original
  * {@code stockstats.impl.sentiment140.Sentiment140SentimentService}, against a WireMock stand-in for
  * {@code http://www.sentiment140.com/api/}: the bulk classification is posted with the original headers and the
- * tweets' JSON as UTF-8 bytes, each returned polarity sets its tweet's sentiment, a status other than 200 fails
- * with the original message, and through the timed transport an upstream that never answers, or that sends its
- * headers and stalls its body, fails once with a {@link SocketTimeoutException} cause within the timeout; the
- * constructor accepts only a timeout the transport can enforce.
+ * tweets' JSON as UTF-8 bytes, each returned polarity sets the sentiment of the tweet with its id and tweets without
+ * a result keep none, a status other than 200 fails with the original message, an unreadable body or an unknown id
+ * fails with a plain {@link RuntimeException}, and through the timed transport an upstream that never answers, or
+ * that sends its headers and stalls its body, fails once with a {@link SocketTimeoutException} cause within the
+ * timeout; the constructor accepts only a timeout the transport can enforce.
  */
 class Sentiment140SentimentServiceTest {
 
@@ -80,40 +82,111 @@ class Sentiment140SentimentServiceTest {
     }
 
     @Test
-    void postsTheTweetsAndAppliesEveryReturnedPolarity() {
+    void classifySendsOriginalRequestAndMapsPolarity() {
+        // The results come back in another order than the tweets were sent, so each one must find its tweet by id.
         wm.stubFor(post(urlEqualTo("/bulkClassifyJson")).willReturn(okJson("{\"data\":["
-                + "{\"id\":\"1\",\"polarity\":0},{\"id\":\"2\",\"polarity\":2},{\"id\":\"3\",\"polarity\":4}]}")));
-        List<Tweet> tweets = List.of(tweet("1", "$AAPL falls"), tweet("2", "$AAPL flat"),
-                tweet("3", "$AAPL \u00e9t\u00e9 high"));
+                + "{\"id\":\"3\",\"text\":\"I hate it\",\"polarity\":0},"
+                + "{\"id\":\"1\",\"text\":\"I love it\",\"polarity\":4},"
+                + "{\"id\":\"4\",\"text\":\"not sure\",\"polarity\":3},"
+                + "{\"id\":\"2\",\"text\":\"It is ok\",\"polarity\":2}]}")));
+        List<Tweet> tweets = List.of(tweet("1", "I love it"), tweet("2", "It is ok"), tweet("3", "I hate it"),
+                tweet("4", "not sure"));
 
-        new Sentiment140SentimentService(RestClient.builder(), properties()).classify(tweets);
+        newService().classify(tweets);
 
-        // Polarity 0 is negative, 2 neutral and any other value positive, as in the original.
+        // Polarity 0 is negative, 2 neutral and any other value, 3 included, positive, as in the original.
         assertThat(tweets).extracting(Tweet::getSentiment)
-                .containsExactly(Sentiment.NEGATIVE, Sentiment.NEUTRAL, Sentiment.POSITIVE);
-        // The compact JSON of the tweets' ids and texts, sent as UTF-8 bytes.
-        byte[] expectedBody = ("{\"data\":[{\"id\":\"1\",\"text\":\"$AAPL falls\"},"
-                + "{\"id\":\"2\",\"text\":\"$AAPL flat\"},"
-                + "{\"id\":\"3\",\"text\":\"$AAPL \u00e9t\u00e9 high\"}]}").getBytes(UTF_8);
+                .containsExactly(Sentiment.POSITIVE, Sentiment.NEUTRAL, Sentiment.NEGATIVE, Sentiment.POSITIVE);
+        // An exact string, not a JSON comparison: one entry per tweet in list order, keys id then text, compact.
         wm.verify(1, postRequestedFor(urlEqualTo("/bulkClassifyJson"))
                 .withHeader("appid", equalTo("test-sentiment140-key"))
                 .withHeader("Accept", equalTo("application/json"))
                 .withHeader("Content-Type", containing("text/plain"))
-                .withRequestBody(binaryEqualTo(expectedBody)));
+                .withRequestBody(equalTo("{\"data\":[{\"id\":\"1\",\"text\":\"I love it\"},"
+                        + "{\"id\":\"2\",\"text\":\"It is ok\"},{\"id\":\"3\",\"text\":\"I hate it\"},"
+                        + "{\"id\":\"4\",\"text\":\"not sure\"}]}")));
         assertThat(wm.getAllServeEvents()).hasSize(1);
     }
 
+    // A non-ASCII text on purpose: the client posts UTF-8 bytes, where a String body declared text/plain without a
+    // charset would go out as ISO-8859-1. Jackson writes these characters unescaped, so the bytes compare directly.
+    @Test
+    void nonAsciiTextIsPostedAsUtf8Bytes() {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson"))
+                .willReturn(okJson("{\"data\":[{\"id\":\"1\",\"polarity\":4}]}")));
+        List<Tweet> tweets = List.of(tweet("1", "$AAPL \u00e9t\u00e9 high"));
+
+        newService().classify(tweets);
+
+        assertThat(tweets.get(0).getSentiment()).isEqualTo(Sentiment.POSITIVE);
+        wm.verify(1, postRequestedFor(urlEqualTo("/bulkClassifyJson"))
+                .withHeader("Content-Type", containing("text/plain"))
+                .withRequestBody(binaryEqualTo(
+                        "{\"data\":[{\"id\":\"1\",\"text\":\"$AAPL \u00e9t\u00e9 high\"}]}".getBytes(UTF_8))));
+    }
+
+    @Test
+    void tweetMissingFromResponseKeepsNullSentiment() {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson"))
+                .willReturn(okJson("{\"data\":[{\"id\":\"1\",\"polarity\":0}]}")));
+        List<Tweet> tweets = List.of(tweet("1", "I hate it"), tweet("2", "no result for me"));
+
+        newService().classify(tweets);
+
+        assertThat(tweets.get(0).getSentiment()).isEqualTo(Sentiment.NEGATIVE);
+        assertThat(tweets.get(1).getSentiment()).isNull();
+    }
+
+    @Test
+    void emptyListStillPostsEmptyData() {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson")).willReturn(okJson("{\"data\":[]}")));
+
+        assertThatCode(() -> newService().classify(new ArrayList<>())).doesNotThrowAnyException();
+
+        wm.verify(1, postRequestedFor(urlEqualTo("/bulkClassifyJson")).withRequestBody(equalTo("{\"data\":[]}")));
+        assertThat(wm.getAllServeEvents()).hasSize(1);
+    }
+
+    // 201 is included because the original accepts exactly 200, not any 2xx.
     @ParameterizedTest
-    @ValueSource(ints = {201, 404, 500})
+    @ValueSource(ints = {201, 403, 404, 500})
     void statusOtherThanOkFailsOnceWithTheOriginalMessage(int status) {
         wm.stubFor(post(urlEqualTo("/bulkClassifyJson")).willReturn(aResponse().withStatus(status)));
         List<Tweet> tweets = List.of(tweet("1", "$AAPL"));
-        Sentiment140SentimentService service = new Sentiment140SentimentService(RestClient.builder(), properties());
+        Sentiment140SentimentService service = newService();
 
         assertThatThrownBy(() -> service.classify(tweets))
                 .isExactlyInstanceOf(RuntimeException.class)
                 .hasMessage("Sentiment140 returned status " + status);
         assertThat(wm.getAllServeEvents()).hasSize(1);
+        assertThat(tweets.get(0).getSentiment()).isNull();
+    }
+
+    @Test
+    void malformedBodyRaisesRuntimeException() {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson")).willReturn(aResponse().withStatus(200)
+                .withHeader("Content-Type", "application/json").withBody("not json")));
+        List<Tweet> tweets = List.of(tweet("1", "I love it"));
+        Sentiment140SentimentService service = newService();
+
+        // The original wraps every parse failure in a plain RuntimeException.
+        assertThatThrownBy(() -> service.classify(tweets))
+                .isExactlyInstanceOf(RuntimeException.class)
+                .hasCauseInstanceOf(JsonProcessingException.class);
+        assertThat(tweets.get(0).getSentiment()).isNull();
+    }
+
+    @Test
+    void unknownResponseIdRaisesRuntimeException() {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson"))
+                .willReturn(okJson("{\"data\":[{\"id\":\"99\",\"polarity\":4}]}")));
+        List<Tweet> tweets = List.of(tweet("1", "I love it"));
+        Sentiment140SentimentService service = newService();
+
+        // The original looks the id up and calls setSentiment on the null result; that NPE is wrapped as well.
+        assertThatThrownBy(() -> service.classify(tweets))
+                .isExactlyInstanceOf(RuntimeException.class)
+                .hasCauseInstanceOf(NullPointerException.class);
         assertThat(tweets.get(0).getSentiment()).isNull();
     }
 
@@ -278,6 +351,11 @@ class Sentiment140SentimentServiceTest {
             chain.add(current);
         }
         return chain;
+    }
+
+    /** The service as the application builds it, with every upstream on WireMock. */
+    private static Sentiment140SentimentService newService() {
+        return new Sentiment140SentimentService(RestClient.builder(), properties());
     }
 
     private static Tweet tweet(String id, String text) {

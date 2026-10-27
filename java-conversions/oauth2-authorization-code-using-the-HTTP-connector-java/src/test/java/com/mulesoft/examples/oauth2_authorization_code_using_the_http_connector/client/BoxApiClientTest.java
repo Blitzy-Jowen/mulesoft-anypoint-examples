@@ -32,6 +32,7 @@ import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URLEncoder;
 import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -52,6 +53,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.web.client.ResourceAccessException;
 
 import ch.qos.logback.classic.Level;
@@ -79,6 +81,8 @@ class BoxApiClientTest {
     private static final String CLIENT_ID = "test-box-client-id";
     private static final String CLIENT_SECRET = "test-box-client-secret";
     private static final String REDIRECT_URL = "https://localhost:8082/redirectUrl";
+    /** {@link #REDIRECT_URL} form-encoded, written out so the expected forms do not reuse the client's encoder. */
+    private static final String ENCODED_REDIRECT = "https%3A%2F%2Flocalhost%3A8082%2FredirectUrl";
     private static final String STORE_PASSWORD = "mule123";
 
     private static final String CODE = "auth code/1";
@@ -141,12 +145,13 @@ class BoxApiClientTest {
     @ParameterizedTest
     @CsvSource(delimiter = '|', value = {
         "REQUEST_TOKEN | code=auth+code%2F1&grant_type=authorization_code&client_secret=test-box-client-secret"
-                + "&redirect_uri=https%3A%2F%2Flocalhost%3A8082%2FredirectUrl&client_id=test-box-client-id",
+                + "&redirect_uri=" + ENCODED_REDIRECT + "&client_id=test-box-client-id",
         "REFRESH_TOKEN | refresh_token=refresh%2Btoken%3D1&grant_type=refresh_token"
                 + "&client_secret=test-box-client-secret"
-                + "&redirect_uri=https%3A%2F%2Flocalhost%3A8082%2FredirectUrl&client_id=test-box-client-id"
+                + "&redirect_uri=" + ENCODED_REDIRECT + "&client_id=test-box-client-id"
     })
     void tokenFormSentInMuleFieldOrderAndEncoding(Operation operation, String expectedForm) {
+        assertThat(ENCODED_REDIRECT).isEqualTo(URLEncoder.encode(REDIRECT_URL, UTF_8));
         wm.stubFor(post(urlEqualTo(TOKEN_PATH)).willReturn(aResponse()
                 .withStatus(200)
                 .withHeader("Content-Type", "application/json")
@@ -169,12 +174,14 @@ class BoxApiClientTest {
     void searchSendsBearerTokenWithoutBody() {
         wm.stubFor(get(urlEqualTo(SEARCH_PATH)).willReturn(aResponse()
                 .withStatus(200)
+                .withHeader("Content-Type", "application/json")
                 .withHeader("X-Box", "v")
                 .withBody("{\"entries\":[]}")));
 
         RawResponse response = client.search(ACCESS_TOKEN);
 
         assertThat(response.status()).isEqualTo(200);
+        assertThat(response.headers().getContentType()).isEqualTo(MediaType.APPLICATION_JSON);
         assertThat(response.headers().getFirst("X-Box")).isEqualTo("v");
         assertThat(new String(response.body(), UTF_8)).isEqualTo("{\"entries\":[]}");
         wm.verify(1, getRequestedFor(urlEqualTo(SEARCH_PATH))
@@ -195,11 +202,13 @@ class BoxApiClientTest {
     })
     void everyStatusIsReturnedNotThrown(Operation operation, int status, String body) {
         wm.stubFor(any(urlEqualTo(operation.requestPath()))
-                .willReturn(aResponse().withStatus(status).withBody(body)));
+                .willReturn(aResponse().withStatus(status).withHeader(HttpHeaders.RETRY_AFTER, "5").withBody(body)));
 
         RawResponse response = operation.callOn(client);
 
         assertThat(response.status()).isEqualTo(status);
+        // Headers are copied with every status, so the caller sees what Box sent alongside an error.
+        assertThat(response.headers().getFirst(HttpHeaders.RETRY_AFTER)).isEqualTo("5");
         assertThat(response.body()).isEqualTo(body.getBytes(UTF_8));
         // Exactly one attempt: an error status is never retried.
         assertThat(wm.getAllServeEvents()).hasSize(1);
