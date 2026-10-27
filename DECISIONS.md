@@ -333,7 +333,7 @@ None yet — Tier 2A not run. When a captured original `?wsdl` (loan-broker serv
 
 ## 8. Query hardening
 
-Several originals build queries by concatenating request input. The conversion returns the same rows for every legitimate input while closing injection, and this is the only intentional difference for hostile input (AAP 0.4.10):
+Several originals build queries by concatenating request input. The conversion returns the same rows for every legitimate input while closing injection; this and the script evaluation at the end of this section are the only intentional differences for hostile input (AAP 0.4.10):
 
 - SQL values are bound as parameters.
 - Values inside SOQL string literals are escaped: backslash → `\\`, single quote → `\'` (`SalesforceRetrievalService.escapeLiteral` in `salesforce-data-retrieval-java`).
@@ -353,6 +353,8 @@ Several originals build queries by concatenating request input. The conversion r
 | `service-orchestration-and-choice-routing` | Already `db:parameterized-query` (`service-orchestration-and-choice-routing/src/main/app/fulfillment.xml:111,135`) | Bind parameters for the `orders` insert and the `order_audits` insert (`service/AuditService`: `insert into order_audits values(default, ?, ?)`) |
 
 Queries without caller input stay as the originals wrote them: the watermark query of `salesforce-data-synchronization-using-watermarking-and-batch-processing` (the timestamp comes from the watermark store) and the fixed contact query of `authenticating-salesforce-using-oauth2`.
+
+Script evaluation: `addition-using-javascript-transformer` passes the request body to JavaScript `eval` (`addition-using-javascript-transformer/src/main/app/javascript-calculator.xml:8`), so the original executes whatever code a caller sends. The conversion runs no script engine (AAP 0.3.2). `service/AdditionService` in `addition-using-javascript-transformer-java` reads the body as literal data by the rules of Rhino 1.7R4, the engine Mule 3.8.0 ran, and reimplements the script's `for-in` sum. Every body of literal data, every JSON body included, gets the original's reply. A body that only works when evaluated as code, such as `{ "a": 1 + 2 }`, is answered with the platform 500 (`Unsupported input at offset <n>: … is JavaScript code, and the request body is read as literal data, never evaluated`) where the original computed a result. The project README lists the constructs this covers.
 
 ---
 
