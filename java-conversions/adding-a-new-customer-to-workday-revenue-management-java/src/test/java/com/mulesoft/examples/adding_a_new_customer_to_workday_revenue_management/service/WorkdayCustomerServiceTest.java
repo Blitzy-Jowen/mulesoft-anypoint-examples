@@ -227,6 +227,23 @@ class WorkdayCustomerServiceTest {
         verifyNoMoreInteractions(client);
     }
 
+    @Test
+    @DisplayName("add_a_new_customer.xml:52 concatenates a null descriptor verbatim, adding no null handling of its own")
+    void nullDescriptorIsConcatenatedVerbatim() throws Exception {
+        JAXBElement<PutCustomerRequestType> request =
+                OBJECT_FACTORY.createPutCustomerRequest(new PutCustomerRequestType());
+        PutCustomerResponseType response = new PutCustomerResponseType();
+        when(requestMapper.map(any(Document.class))).thenReturn(request);
+        when(client.putCustomer(request)).thenReturn(response);
+        when(responseMapper.descriptor(response)).thenReturn(null);
+
+        String answer = service.addCustomer(customerXml());
+
+        assertThat(answer).isEqualTo("Added customer: null");
+        verify(responseMapper).descriptor(responseCaptor.capture());
+        assertThat(responseCaptor.getValue()).isSameAs(response);
+    }
+
     @ParameterizedTest(name = "{0}")
     @MethodSource("rejectedBodies")
     @DisplayName("add_a_new_customer.xml:9 fails a body that is not well-formed or declares a DOCTYPE before "
