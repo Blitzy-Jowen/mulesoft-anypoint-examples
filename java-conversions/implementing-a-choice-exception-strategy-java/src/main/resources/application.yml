@@ -20,3 +20,8 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+logging:
+  level:
+    # choice-error-handling.xml has no logger, so no caller data is logged at any level: a root DEBUG/TRACE override must not reach these
+    org.springframework.web.servlet.mvc.method.annotation: INFO   # DEBUG/TRACE write request and response bodies and the handled exception's message
+    org.springframework.web.method.HandlerMethod: INFO            # TRACE writes handler arguments, the handled exception and its message included

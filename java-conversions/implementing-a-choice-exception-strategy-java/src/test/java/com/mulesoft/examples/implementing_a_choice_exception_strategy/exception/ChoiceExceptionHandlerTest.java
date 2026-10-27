@@ -28,6 +28,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -45,9 +46,17 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
+import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.boot.logging.LogLevel;
+import org.springframework.core.env.PropertySource;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -68,6 +77,9 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
  * line of each branch, which a Logback {@link ListAppender} on the handler's logger proves free of exception
  * messages, cause messages, payload values and throwables while the response body is unchanged, and whose exact
  * form, throw site, cause chain with its cycle and depth limits, escaping and truncation, it checks.
+ *
+ * <p>It also checks that {@code application.yml} holds at INFO the Spring MVC categories whose DEBUG and TRACE
+ * lines carry the payload a branch renders and the message of the exception it handles.
  *
  * <p>Status, Content-Type and body bytes are asserted here. The reason phrases {@code Invalid input data} and
  * {@code Missing input data} are asserted on the wire by the controller and ported tests through ST-1, because
@@ -346,6 +358,25 @@ class ChoiceExceptionHandlerTest {
                                 new StackTraceElement("org.example.Long", longMethod, "Long.java", 3)),
                         "Catch Invalid Data: java.lang.IllegalArgumentException at org.example.Long."
                                 + "m".repeat(256) + "...[truncated](Long.java:3)"));
+    }
+
+    /**
+     * {@code application.yml} sets {@code category} to INFO, bound the way Spring Boot applies {@code logging.level},
+     * so a root DEBUG or TRACE override does not reach it: the method processors write the request and response
+     * bodies and the exception resolver the handled exception's message, {@code HandlerMethod} the handler arguments,
+     * and {@code choice-error-handling.xml} has no logger that writes the payload.
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"org.springframework.web.servlet.mvc.method.annotation",
+            "org.springframework.web.method.HandlerMethod"})
+    void applicationYmlHoldsPayloadWritingCategoryAtInfo(String category) throws IOException {
+        List<PropertySource<?>> documents = new YamlPropertySourceLoader()
+                .load("application.yml", new ClassPathResource("application.yml"));
+        Map<String, LogLevel> levels = new Binder(ConfigurationPropertySources.from(documents))
+                .bind("logging.level", Bindable.mapOf(String.class, LogLevel.class))
+                .orElseGet(Map::of);
+
+        assertEquals(LogLevel.INFO, levels.get(category), () -> "logging.level in application.yml: " + levels);
     }
 
     /** Replaces the stack trace of {@code failure} with {@code frames}, none meaning an empty trace. */
