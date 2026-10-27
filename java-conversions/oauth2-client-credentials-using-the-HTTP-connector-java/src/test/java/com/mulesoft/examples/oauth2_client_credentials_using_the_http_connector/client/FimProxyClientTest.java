@@ -55,9 +55,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManagerFactory;
 
 import org.junit.jupiter.api.AfterEach;
@@ -66,8 +68,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -85,12 +89,15 @@ import com.sun.net.httpserver.HttpsServer;
  * The contract of {@link FimProxyClient}, the {@code http:request} of the {@code /FIM/*} flow in
  * {@code oauth2-client-credentials-using-the-HTTP-connector/src/main/app/http-client-credentials.xml} (lines
  * 29 and 41), against a WireMock stand-in for {@code https://tfim01.demos.ibm.com:443}: the inbound method and
- * raw request URI reach the upstream unchanged, a body and Content-Type are sent only when supplied, for TRACE and
+ * raw request URI reach the upstream unchanged, except that the characters {@code java.net.URI} cannot carry are
+ * percent-encoded and a URL still invalid fails with a fixed message naming no URI, a body and Content-Type are
+ * sent only when supplied, for TRACE and
  * extension methods too, a success comes back with its status, headers and body, a status of 400 or above fails
  * once with Mule's {@code Response code <code> mapped as failure.}, redirects are followed as {@code http:request}
  * follows them by default, every request is sent exactly once whatever ends it (a reset, a connection closed
  * before the response, a refused connect or the deadline), a response whose head or body has not fully arrived when
- * the response timeout ends fails with an {@link HttpTimeoutException} cause, and concurrent calls are not queued.
+ * the response timeout ends fails with an {@link HttpTimeoutException} cause, a TLS failure is reported as
+ * {@code TLS handshake failed} without the JDK's text, and concurrent calls are not queued.
  */
 class FimProxyClientTest {
 
@@ -135,6 +142,96 @@ class FimProxyClientTest {
         assertThat(wm.getAllServeEvents()).hasSize(1);
     }
 
+    /**
+     * Raw target as the controller passes it, and the target sent: each character class of the path, the query and
+     * the fragment, valid escapes of either letter case, and every malformed {@code %} form.
+     */
+    static Stream<Arguments> targetEscapes() {
+        return Stream.of(
+                // Already valid: unchanged, escapes in either letter case included.
+                Arguments.of("/FIM/a%20b/c?x=1&y=%2F", "/FIM/a%20b/c?x=1&y=%2F"),
+                Arguments.of("/FIM/a%2fb%c3%a9?k=%7c", "/FIM/a%2fb%c3%a9?k=%7c"),
+                Arguments.of("/FIM/a!$&'()*+,;=:@-._~/b?q=/?[]&r=!$'()*+,;:@",
+                        "/FIM/a!$&'()*+,;=:@-._~/b?q=/?[]&r=!$'()*+,;:@"),
+                Arguments.of("/FIM/x?", "/FIM/x?"),
+                Arguments.of("/FIM/x#frag", "/FIM/x#frag"),
+                // Characters java.net.URI refuses in a path or a query.
+                Arguments.of("/FIM/a\\b|c^d", "/FIM/a%5Cb%7Cc%5Ed"),
+                Arguments.of("/FIM/\"<>`{}", "/FIM/%22%3C%3E%60%7B%7D"),
+                Arguments.of("/FIM/[x] y", "/FIM/%5Bx%5D%20y"),
+                Arguments.of("/FIM/x?id=abc&z=\\|^{}", "/FIM/x?id=abc&z=%5C%7C%5E%7B%7D"),
+                // A % not followed by two ASCII hexadecimal digits.
+                Arguments.of("/FIM/x?q=%zz", "/FIM/x?q=%25zz"),
+                Arguments.of("/FIM/x%zz", "/FIM/x%25zz"),
+                Arguments.of("/FIM/x%", "/FIM/x%25"),
+                Arguments.of("/FIM/x%2?k=a%", "/FIM/x%252?k=a%25"),
+                Arguments.of("/FIM/x%g0?k=%0g", "/FIM/x%25g0?k=%250g"),
+                Arguments.of("/FIM/%\u0663\u0663", "/FIM/%25%D9%A3%D9%A3"),
+                // Control characters, and non-ASCII: one byte up to U+00FF, UTF-8 above it.
+                Arguments.of("/FIM/a\u0000\u001f\u007f", "/FIM/a%00%1F%7F"),
+                Arguments.of("/FIM/caf\u00c3\u00a9?k=\u0080\u00ff", "/FIM/caf%C3%A9?k=%80%FF"),
+                Arguments.of("/FIM/\u20ac\ud83d\ude00", "/FIM/%E2%82%AC%F0%9F%98%80"),
+                Arguments.of("/FIM/x?k=\ud83d", "/FIM/x?k=%3F"),
+                // The first '#' ends the path and query; a '?' after it belongs to the fragment.
+                Arguments.of("/FIM/x?q=1#a\\b#c", "/FIM/x?q=1#a%5Cb%23c"),
+                Arguments.of("/FIM/x#y?z|", "/FIM/x#y?z%7C"));
+    }
+
+    // The name leaves out the raw target, which holds control characters the test reports cannot carry.
+    @ParameterizedTest(name = "[{index}] -> [{1}]")
+    @MethodSource("targetEscapes")
+    void targetIsEscapedOnlyWhereJavaNetUriCannotCarryIt(String rawUri, String expected) {
+        assertThat(FimProxyClient.escapeTarget(rawUri)).isEqualTo(expected);
+        assertThat(FimProxyClient.forwardUri("http://127.0.0.1:9/fim", rawUri))
+                .hasToString("http://127.0.0.1:9/fim" + expected);
+    }
+
+    /**
+     * A target {@code java.net.URI} refuses reaches the FIM server escaped, as Mule's requester sent it, instead of
+     * failing with a message that repeats the outbound URL; the fragment is not sent.
+     */
+    @ParameterizedTest(name = "[{index}] -> {1}")
+    @CsvSource(delimiter = ' ', value = {
+            "/FIM/SENTINEL_FIMCID/\\x /FIM/SENTINEL_FIMCID/%5Cx",
+            "/FIM/x?id=SENTINEL_FIMCID&z=\\ /FIM/x?id=SENTINEL_FIMCID&z=%5C",
+            "/FIM/x?q=%zz /FIM/x?q=%25zz",
+            "/FIM/caf\u00c3\u00a9| /FIM/caf%C3%A9%7C",
+            "/FIM/x?q=1#a\\b /FIM/x?q=1"
+    })
+    void targetJavaNetUriRefusesIsSentEscaped(String rawUri, String sent) {
+        wm.stubFor(any(urlEqualTo(sent)).willReturn(ok("escaped")));
+
+        ResponseEntity<byte[]> response = client.send("GET", rawUri, null, null);
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(response.getBody()).isNotNull();
+        assertThat(new String(response.getBody(), UTF_8)).isEqualTo("escaped");
+        wm.verify(1, getRequestedFor(urlEqualTo(sent)));
+        assertThat(wm.getAllServeEvents()).hasSize(1);
+    }
+
+    /**
+     * An outbound URL that is still invalid once the target is escaped, which only a base URL {@code java.net.URI}
+     * accepts alone but not followed by a path can produce, fails with a fixed message that repeats neither the base
+     * URL nor the target, the substituted {@code client.id} included, and keeps no cause whose message would.
+     */
+    @ParameterizedTest(name = "[{index}] {0} + {1}")
+    @CsvSource(delimiter = ' ', value = {
+            "http://127.0.0.1:9/SENTINEL_BASE#frag /FIM/SENTINEL_FIMCID#x",
+            "http://127.0.0.1:9/SENTINEL_BASE\\ /FIM/SENTINEL_FIMCID",
+            "http://127.0.0.1:9/SENTINEL_BASE%zz /FIM/SENTINEL_FIMCID?q=SENTINEL_FIMCID"
+    })
+    void stillInvalidOutboundUrlFailsWithAFixedMessageNamingNoUri(String baseUrl, String rawUri) {
+        assertThatThrownBy(() -> FimProxyClient.forwardUri(baseUrl, rawUri))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(FimProxyClient.INVALID_URI_MESSAGE)
+                .hasMessageNotContaining("SENTINEL")
+                .hasMessageNotContaining("127.0.0.1")
+                .hasMessageNotContaining("/FIM")
+                .hasNoCause();
+    }
+
+
     /** TRACE and extension methods carry their body as every other method does, as the original requester sent it. */
     @ParameterizedTest
     @ValueSource(strings = {"POST", "PUT", "DELETE", "PATCH", "TRACE", "PROPFIND"})
@@ -167,6 +264,36 @@ class FimProxyClientTest {
         assertThat(response.getBody()).isNotNull();
         assertThat(new String(response.getBody(), UTF_8)).isEqualTo("accepted");
         wm.verify(1, getRequestedFor(urlEqualTo("/FIM/ok")));
+    }
+
+    /**
+     * {@code fim.base-url} is checked when the client is built: a value carrying user information, plain or
+     * percent-encoded, or one that is not an absolute http or https URL with a host, is refused with a message that
+     * names the key and never the value, so no credential it holds reaches a log line or a caller.
+     */
+    @ParameterizedTest(name = "[{0}] is refused")
+    @CsvSource(nullValues = "null", value = {
+            "http://SENTINEL_U:SENTINEL_P@127.0.0.1:9/fim, must not embed credentials",
+            "http://SENTINEL_U@127.0.0.1:9, must not embed credentials",
+            "https://SENTINEL_U%40corp:SENTINEL_P%3A1@localhost:9/fim, must not embed credentials",
+            "http://:SENTINEL_P@127.0.0.1:9, must not embed credentials",
+            "HTTPS://SENTINEL_U:SENTINEL_P@localhost:9, must not embed credentials",
+            "'http://SENTINEL_U:SENTINEL P@127.0.0.1:9', must be an absolute http or https URL with a host",
+            "http://SENTINEL_U:SENTINEL_P@bad_host:9, must be an absolute http or https URL with a host",
+            "/SENTINEL_PATH/fim, must be an absolute http or https URL with a host",
+            "127.0.0.1:9/SENTINEL, must be an absolute http or https URL with a host",
+            "ftp://127.0.0.1:9/SENTINEL, must be an absolute http or https URL with a host",
+            "http:///SENTINEL, must be an absolute http or https URL with a host",
+            "'http://127.0.0.1:9/SENTINEL x', must be an absolute http or https URL with a host",
+            "'', must be an absolute http or https URL with a host",
+            "null, must be an absolute http or https URL with a host"
+    })
+    void baseUrlRefusedAtConstructionWithoutEchoingIt(String baseUrl, String fault) {
+        assertThatThrownBy(() -> new FimProxyClient(baseUrl, Duration.ofSeconds(2)).close())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith("fim.base-url " + fault)
+                .hasMessageNotContaining("SENTINEL")
+                .hasNoCause();
     }
 
     @ParameterizedTest
@@ -412,6 +539,40 @@ class FimProxyClientTest {
                     assertThat(refused.getSuppressed()).isEmpty();
                     assertThat(refused.getMessage()).contains("[" + InetAddress.getByName("localhost") + "]");
                 });
+    }
+
+    /**
+     * A TLS failure is reported with a fixed message, never with the JDK's text, which names internal classes such
+     * as {@code sun.security.provider.certpath.SunCertPathBuilderException} and would reach the caller's 500 body.
+     * The https upstream presents the generated loopback certificate, which the JVM's default trust store the client
+     * uses does not hold. The JDK's exception stays the cause, and nothing reaches the upstream.
+     */
+    @Test
+    void tlsFailureIsReportedWithoutTheJdkText() throws Exception {
+        AtomicInteger received = new AtomicInteger();
+        HttpsServer upstream = HttpsServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        upstream.setHttpsConfigurator(new HttpsConfigurator(loopbackTls()));
+        upstream.createContext("/FIM/", exchange -> {
+            received.incrementAndGet();
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+        upstream.start();
+        Throwable thrown;
+        try (FimProxyClient untrusting = new FimProxyClient("https://localhost:" + upstream.getAddress().getPort(),
+                Duration.ofSeconds(2))) {
+            thrown = catchThrowable(() -> untrusting.send("GET", "/FIM/x", null, null));
+        } finally {
+            upstream.stop(0);
+        }
+
+        assertThat(thrown).isInstanceOf(ResourceAccessException.class).hasMessageEndingWith(": TLS handshake failed");
+        assertThat(thrown.getMessage()).doesNotContain("sun.security", "PKIX", "Exception");
+        assertThat(thrown.getCause()).isInstanceOf(SSLException.class)
+                .hasMessage("TLS handshake failed")
+                .hasCauseInstanceOf(SSLException.class);
+        assertThat(thrown.getCause().getCause().getMessage()).contains("PKIX");
+        assertThat(received).hasValue(0);
     }
 
     /**

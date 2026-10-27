@@ -29,7 +29,9 @@ server:
     # URL decoding also rewrites HttpServletRequest.getRequestURI() of any percent-encoded target to its decoded form
     # (/FIM/a%20b becomes "/FIM/a b"), so it stays off: the request URI and query reach the controller as sent.
     # Spring MVC decodes path segments itself for mapping, and form bodies are still decoded; only query-string
-    # values read through getParameter stay percent-encoded, and no handler in this project reads them.
+    # values read through getParameter stay percent-encoded, and no handler in this project reads them. A path whose
+    # "%" is not followed by two hex digits, which Undertow then no longer rejects, is answered 400 with an empty body
+    # by config/InvalidPercentEncodingFilter before Spring MVC's path parsing can fail on it outside any handler.
     decode-url: false
     options:
       server:
@@ -75,3 +77,14 @@ box:
 
 fim:
   base-url: https://tfim01.demos.ibm.com:443          # http:request-config HTTP_Request_Configuration1 (xml:29)
+
+logging:
+  level:
+    # Below INFO these loggers write the Box client credentials, the Box tokens or the configured client.id, which
+    # the original never logged: client.id travels in the outbound FIM URI, which a FIM I/O failure's exception
+    # message names. A named level wins over logging.level.root, so a root DEBUG or TRACE does not reach them.
+    org.apache.hc: INFO                                  # httpclient5 transport: Authorization: Basic <oauth.client.id:oauth.client.secret> and Bearer headers, token response bytes, FIM request line with the substituted client_id
+    org.springframework.web.servlet.DispatcherServlet: INFO   # a request failure no exception handler resolved, message included
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # each resolved exception, message included
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO          # the 500 body carrying that message
+    org.springframework.web.method.HandlerMethod: INFO   # exception-handler arguments: the exception, message included

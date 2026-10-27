@@ -45,3 +45,12 @@ netsuite:
     certificate-id: ${NETSUITE_OAUTH_CERTIFICATE_ID:}
     # TODO: supply the path to the PKCS#8 PEM private key of that certificate (file path or classpath: location)
     private-key-path: ${NETSUITE_OAUTH_PRIVATE_KEY_PATH:}
+
+# get-customer-list-from-netsuite.xml has no logger, so no NetSuite data is logged at any level: a root DEBUG/TRACE
+# override must not reach these categories, which below INFO write the access token and the customers' data
+logging:
+  level:
+    org.springframework.core.codec: INFO                          # StringDecoder: the token response and the SuiteQL response bodies
+    org.springframework.http.codec: INFO                          # Jackson2JsonEncoder: the SuiteQL request body with its lastName filter
+    org.springframework.web.HttpLogging: INFO                     # the codec loggers above fall back to this category when their own is held at INFO
+    org.springframework.web.servlet.mvc.method.annotation: INFO   # HttpEntityMethodProcessor: the rendered customer list response body

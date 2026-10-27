@@ -30,6 +30,8 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
+import javax.net.ssl.SSLHandshakeException;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
@@ -39,6 +41,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
@@ -86,6 +89,35 @@ class NetsuiteFailureClassifierTest {
             + "\"title\":\"Unauthorized\",\"status\":401}";
 
     private static final String RETRY_AFTER_SECONDS = "30";
+
+    private static final String OAUTH_ERROR_DESCRIPTION = "Invalid client assertion signature.";
+
+    /** The OAuth 2.0 token error format (RFC 6749, section 5.2), as the token endpoint answers a rejected client. */
+    private static final String OAUTH_ERROR_BODY = "{\"error\":\"invalid_client\",\"error_description\":\""
+            + OAUTH_ERROR_DESCRIPTION + "\"}";
+
+    /** Carried by the token request's response exceptions, so their message names it; never contacted. */
+    private static final URI TOKEN_URI =
+            URI.create("https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token");
+
+    /** The token request as {@code WebClient} attaches it to the response exception of {@code retrieve()}. */
+    private static final HttpRequest TOKEN_REQUEST = new HttpRequest() {
+
+        @Override
+        public HttpMethod getMethod() {
+            return HttpMethod.POST;
+        }
+
+        @Override
+        public URI getURI() {
+            return TOKEN_URI;
+        }
+
+        @Override
+        public HttpHeaders getHeaders() {
+            return new HttpHeaders();
+        }
+    };
 
     /**
      * The SC-9 interface's own message lookup, implementing nothing but the two abstract methods, so the fallback
@@ -161,13 +193,23 @@ class NetsuiteFailureClassifierTest {
         assertThat(kind.retryAfter()).isNull();
     }
 
-    @Test
-    void unauthorizedOnEveryAttemptEvictsTheTokenOnceAndFailsAfterOneRetry() {
-        Throwable thrown = callThroughExecutor(responseException(401, new HttpHeaders(), TITLE_ONLY_BODY));
+    static Stream<Arguments> unauthorizedResponses() {
+        return Stream.of(
+                arguments(named("REST record or SuiteQL call",
+                        responseException(401, new HttpHeaders(), TITLE_ONLY_BODY)), "Unauthorized"),
+                arguments(named("token request", tokenResponseException(401, OAUTH_ERROR_BODY)),
+                        OAUTH_ERROR_DESCRIPTION));
+    }
+
+    @ParameterizedTest
+    @MethodSource("unauthorizedResponses")
+    void unauthorizedOnEveryAttemptEvictsTheTokenOnceAndFailsAfterOneRetry(WebClientResponseException unauthorized,
+            String expectedMessage) {
+        Throwable thrown = callThroughExecutor(unauthorized);
 
         assertThat(thrown).isInstanceOfSatisfying(UpstreamAuthenticationException.class, e -> {
             assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
-            assertThat(e).hasMessage("Unauthorized");
+            assertThat(e).hasMessage(expectedMessage);
             assertThat(e.getCause()).isInstanceOf(WebClientResponseException.class);
         });
         assertThat(calls).hasValue(2);
@@ -316,7 +358,7 @@ class NetsuiteFailureClassifierTest {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
-    // upstreamMessage: NetSuite's own error text, else the interface default
+    // upstreamMessage: NetSuite's own error text, else a status or neutral description, never a WebClient message
     // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> bodiesWithErrorText() {
@@ -329,7 +371,14 @@ class NetsuiteFailureClassifierTest {
                 arguments(named("title with blank detail",
                         "{" + type + ",\"title\":\"Bad Request\",\"status\":400,"
                                 + "\"o:errorDetails\":[{\"detail\":\"  \",\"o:errorCode\":\"INVALID_PARAMETER\"}]}"),
-                        "Bad Request"));
+                        "Bad Request"),
+                arguments(named("title before OAuth error fields",
+                        "{\"title\":\"Unauthorized\",\"error\":\"invalid_client\",\"error_description\":\"x\"}"),
+                        "Unauthorized"),
+                arguments(named("OAuth error_description before error", OAUTH_ERROR_BODY), OAUTH_ERROR_DESCRIPTION),
+                arguments(named("OAuth error alone", "{\"error\":\"invalid_client\"}"), "invalid_client"),
+                arguments(named("OAuth error with blank error_description",
+                        "{\"error\":\"invalid_grant\",\"error_description\":\"  \"}"), "invalid_grant"));
     }
 
     @ParameterizedTest
@@ -346,27 +395,76 @@ class NetsuiteFailureClassifierTest {
                 .isEqualTo(INVALID_QUERY_DETAIL);
     }
 
-    static Stream<Named<String>> bodiesWithoutErrorText() {
+    static Stream<Arguments> responsesWithoutErrorText() {
+        String badGateway = "NetSuite answered HTTP 502 Bad Gateway";
         return Stream.of(
-                named("non-JSON", "<html>gateway</html>"),
-                named("empty", ""),
-                named("blank", "   "),
-                named("JSON without detail or title", "{\"status\":502}"));
+                arguments(502, named("non-JSON", "<html>gateway</html>"), badGateway),
+                arguments(502, named("empty", ""), badGateway),
+                arguments(502, named("blank", "   "), badGateway),
+                arguments(502, named("JSON without detail, title, error_description or error", "{\"status\":502}"),
+                        badGateway),
+                arguments(502, named("OAuth fields that are not strings", "{\"error\":7,\"error_description\":{}}"),
+                        badGateway),
+                arguments(401, named("empty", ""), "NetSuite answered HTTP 401 Unauthorized"),
+                arguments(599, named("empty", ""), "NetSuite answered HTTP 599"));
+    }
+
+    /**
+     * {@code WebClient} names the request's method and URL in a response exception's message, so a body without
+     * error text is described by the status alone, never by that message.
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("responsesWithoutErrorText")
+    void upstreamMessageOfAResponseWithoutErrorTextIsItsStatusAndNeverTheUrl(int status, String body,
+            String expected) {
+        WebClientResponseException response = tokenResponseException(status, body);
+        assertThat(response.getMessage()).contains(TOKEN_URI.toString());
+
+        String message = classifier.upstreamMessage(response);
+
+        assertThat(message).isEqualTo(expected).doesNotContain(TOKEN_URI.getHost());
+        assertThat(classifier.upstreamMessage(new RuntimeException("wrapped " + TOKEN_URI, response)))
+                .isEqualTo(expected);
+    }
+
+    static Stream<Arguments> transportFailuresWithMessages() {
+        return Stream.of(
+                arguments(named("connection refused", new ConnectException("Connection refused: /127.0.0.1:1")),
+                        "NetSuite is unreachable"),
+                arguments(named("unknown host", new UnknownHostException("tstdrv1234567.suitetalk.api.netsuite.com")),
+                        "NetSuite is unreachable"),
+                arguments(named("read timeout", new SocketTimeoutException("Read timed out")),
+                        "NetSuite did not respond in time"),
+                arguments(named("TLS handshake failure", new SSLHandshakeException(
+                        "No subject alternative DNS name matching tstdrv1234567.suitetalk.api.netsuite.com found.")),
+                        "NetSuite call failed"));
+    }
+
+    /**
+     * {@code WebClient}'s request exception copies its cause's message, which names the remote address or host, so
+     * a failure without a response is described neutrally, beneath a wrapper too, never by that message.
+     */
+    @ParameterizedTest
+    @MethodSource("transportFailuresWithMessages")
+    void upstreamMessageOfATransportFailureIsANeutralDescriptionWithoutItsMessage(Throwable cause, String expected) {
+        WebClientRequestException failure = requestException(cause);
+        assertThat(failure.getMessage()).isEqualTo(cause.getMessage());
+
+        assertThat(classifier.upstreamMessage(failure)).isEqualTo(expected).doesNotContain(cause.getMessage());
+        assertThat(classifier.upstreamMessage(new RuntimeException(cause.getMessage(), failure))).isEqualTo(expected);
+    }
+
+    static Stream<Named<Throwable>> failuresWithoutAWebClientException() {
+        return Stream.of(
+                named("missing setting", new IllegalStateException("netsuite.account is not configured")),
+                named("body read failure after the response started", PrematureCloseException.TEST_EXCEPTION),
+                named("messageless read timeout", ReadTimeoutException.INSTANCE));
     }
 
     @ParameterizedTest
-    @MethodSource("bodiesWithoutErrorText")
-    void upstreamMessageFallsBackToTheInterfaceDefault(String body) {
-        WebClientResponseException badGateway = responseException(502, new HttpHeaders(), body);
-
-        assertThat(classifier.upstreamMessage(badGateway)).isEqualTo(INTERFACE_DEFAULT.upstreamMessage(badGateway));
-    }
-
-    @Test
-    void upstreamMessageOfNonHttpFailureIsTheInterfaceDefault() {
-        WebClientRequestException refused = requestException(new ConnectException("Connection refused"));
-
-        assertThat(classifier.upstreamMessage(refused)).isEqualTo(INTERFACE_DEFAULT.upstreamMessage(refused));
+    @MethodSource("failuresWithoutAWebClientException")
+    void upstreamMessageOfAChainWithoutAWebClientExceptionIsTheInterfaceDefault(Throwable failure) {
+        assertThat(classifier.upstreamMessage(failure)).isEqualTo(INTERFACE_DEFAULT.upstreamMessage(failure));
     }
 
     static Stream<Arguments> messagelessTransportFailures() {
@@ -417,6 +515,17 @@ class NetsuiteFailureClassifierTest {
     private static WebClientResponseException responseException(int status, HttpHeaders headers, String body) {
         return WebClientResponseException.create(status, HttpStatus.valueOf(status).getReasonPhrase(), headers,
                 body.getBytes(UTF_8), UTF_8);
+    }
+
+    /**
+     * An HTTP error response to the token request as {@code WebClient} raises it from {@code retrieve()}, with the
+     * request attached, so its message names the request's method and URL. A status without a standard reason phrase
+     * gets an empty one.
+     */
+    private static WebClientResponseException tokenResponseException(int status, String body) {
+        HttpStatus known = HttpStatus.resolve(status);
+        return WebClientResponseException.create(status, known == null ? "" : known.getReasonPhrase(),
+                new HttpHeaders(), body.getBytes(UTF_8), UTF_8, TOKEN_REQUEST);
     }
 
     /** A transport failure as {@code WebClient} raises it for a request that got no response. */

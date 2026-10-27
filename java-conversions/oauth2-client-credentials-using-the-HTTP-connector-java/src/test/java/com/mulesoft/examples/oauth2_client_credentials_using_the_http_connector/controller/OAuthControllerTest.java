@@ -71,8 +71,9 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * as the caller's text, a Box reply without a Content-Type to be answered without one, and every reply to be
  * complete when the controller returns, so TRACE gets no servlet echo and OPTIONS no {@code Allow} header. The error
  * cases are the original's own failure paths, each ending in the platform-default 500 of SC-1 because the flow's
- * rollback strategy only logs (lines 35-37), an unparseable Content-Type, which fails before the flow runs, and the
- * no-listener 404 for paths the listener does not serve.
+ * rollback strategy only logs (lines 35-37), an unparseable Content-Type, which fails before the flow runs, the
+ * no-listener 404 for paths the listener does not serve, and the listener's empty 400 for a path holding a malformed
+ * percent-escape.
  *
  * <p>The original example has no test, so no original assertion is ported here.
  */
@@ -396,6 +397,25 @@ class OAuthControllerTest {
         assertEquals("No listener for endpoint: " + path, response.bodyAsString(), response::toString);
         wm.verify(0, anyRequestedFor(anyUrl()));
     }
+
+    /**
+     * A path holding a {@code %} not followed by two hexadecimal digits, the listener's path with one or any other,
+     * gets the listener's rejection, 400 with an empty body and no Content-Type, before dispatch, instead of
+     * Undertow's HTML 500; the flow does not run, so Box is not called.
+     */
+    @ParameterizedTest(name = "GET {0}")
+    @ValueSource(strings = {"/oauth%zz", "/zz%zz"})
+    void malformedPercentEscapeInThePathIsRejected400WithAnEmptyBodyWithoutCallingBox(String path) {
+        HttpTestClient.Response response = client().get(path);
+
+        assertEquals("HTTP/1.1 400 Bad Request", response.statusLine(), response::toString);
+        assertEquals(List.of("0"), response.headers("Content-Length"), response::toString);
+        assertTrue(response.headers("Content-Type").isEmpty(), response::toString);
+        assertArrayEquals(new byte[0], response.body(), response::toString);
+        assertTrue(serviceLog.list.isEmpty(), () -> serviceLog.list.toString());
+        wm.verify(0, anyRequestedFor(anyUrl()));
+    }
+
 
     private static void stubToken() {
         wm.stubFor(post(urlEqualTo(TOKEN)).willReturn(tokenResponse("tok-1")));

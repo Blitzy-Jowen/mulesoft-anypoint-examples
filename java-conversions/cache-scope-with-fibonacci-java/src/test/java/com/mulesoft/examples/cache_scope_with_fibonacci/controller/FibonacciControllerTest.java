@@ -10,12 +10,14 @@ package com.mulesoft.examples.cache_scope_with_fibonacci.controller;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -30,8 +32,11 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.http.MediaType;
 
+import com.github.benmanes.caffeine.cache.Policy;
+import com.mulesoft.examples.cache_scope_with_fibonacci.model.FibonacciResult;
 import com.mulesoft.examples.cache_scope_with_fibonacci.service.FibonacciCacheService;
 import com.mulesoft.examples.cache_scope_with_fibonacci.support.HttpTestClient;
 import com.mulesoft.examples.cache_scope_with_fibonacci.support.HttpTestClient.Response;
@@ -51,6 +56,10 @@ import com.mulesoft.examples.cache_scope_with_fibonacci.support.HttpTestClient.R
  * <p>Every case starts on an empty cache and issues any request whose cached results it depends on itself, so the
  * expected costs follow the cost model of {@code FibonacciCacheService}: {@code n < 2} costs 1, a cache hit costs 0,
  * and any other {@code n} costs its two sub-results plus one, so a cold {@code n >= 2} costs {@code n + 1}.
+ *
+ * <p>Two cases check the {@code fibonacci} cache as {@code application.yml} configures it: bounded at the Mule 3.8.0
+ * in-memory object-store default ({@code maxEntries} 4000, {@code entryTTL} -1), that is 4000 entries without
+ * expiry, so the distinct spellings of {@code n} callers choose are evicted past the bound instead of growing the heap.
  *
  * <p>The class declares nothing that changes the test context, so it shares the application context, and with it
  * the single {@code fibonacci} cache, with the project's other {@code @SpringBootTest} classes; clearing the cache
@@ -76,6 +85,12 @@ class FibonacciControllerTest {
             + "\r\n"
             + FAVICON + "\r\n"
             + "--b--\r\n";
+
+    /**
+     * The Mule 3.8.0 in-memory object-store default {@code maxEntries} ({@code AbstractMonitoredObjectStore.java:41}),
+     * which {@code application.yml} applies as the cache's maximum size.
+     */
+    private static final long STORE_MAX_ENTRIES = 4000;
 
     @LocalServerPort
     private int port;
@@ -156,6 +171,45 @@ class FibonacciControllerTest {
 
         // The top-level call itself used the cache, so its result was stored.
         assertFlowReply(get("/fibonacci?n=10"), "Fibonacci(10) = 55\nCOST: 0", "0");
+    }
+
+    /**
+     * The bound is the Mule 3.8.0 in-memory object-store default, {@code maxEntries} 4000 and {@code entryTTL} -1,
+     * which never expires an entry ({@code AbstractMonitoredObjectStore.java:41,47}): the cache counts entries up to
+     * the same maximum and neither expires nor refreshes them.
+     */
+    @Test
+    void cacheIsBoundedAtTheStoreMaximumWithoutExpiry() {
+        Policy<Object, Object> policy = nativeCache().policy();
+
+        assertEquals(Optional.of(STORE_MAX_ENTRIES), policy.eviction().map(Policy.Eviction::getMaximum), "maximum");
+        assertEquals(Optional.of(false), policy.eviction().map(Policy.Eviction::isWeighted), "weighted");
+        assertEquals(Optional.empty(), policy.expireAfterWrite(), "expireAfterWrite");
+        assertEquals(Optional.empty(), policy.expireAfterAccess(), "expireAfterAccess");
+        assertEquals(Optional.empty(), policy.expireVariably(), "expireVariably");
+        assertEquals(Optional.empty(), policy.refreshAfterWrite(), "refreshAfterWrite");
+    }
+
+    /**
+     * Each spelling of {@code n} is its own key, so 1000 distinct keys past the maximum leave the cache at the
+     * maximum once Caffeine's pending maintenance has run. Which keys survive is Caffeine's eviction policy, not the
+     * in-memory store's oldest-first trim, so only the count is asserted.
+     */
+    @Test
+    void distinctKeysBeyondTheStoreMaximumAreEvicted() {
+        com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache = nativeCache();
+        try {
+            for (long i = 1; i <= STORE_MAX_ENTRIES + 1000; i++) {
+                String key = "1." + i;
+                cache.put(key, new FibonacciResult(key, 1));
+            }
+            nativeCache.cleanUp();
+
+            assertEquals(STORE_MAX_ENTRIES, nativeCache.estimatedSize());
+        } finally {
+            // The cache belongs to the shared application context: leave it empty for the classes that follow.
+            cache.clear();
+        }
     }
 
     /** {@code n < 20} is false for 20 and for an absent {@code n}, so both take the {@code otherwise} branch. */
@@ -294,6 +348,11 @@ class FibonacciControllerTest {
 
     private Response get(String path) {
         return send("GET", path, Map.of(), new byte[0]);
+    }
+
+    /** @return the Caffeine cache Boot built for the {@code fibonacci} cache from {@code spring.cache.caffeine.spec} */
+    private com.github.benmanes.caffeine.cache.Cache<Object, Object> nativeCache() {
+        return assertInstanceOf(CaffeineCache.class, cache).getNativeCache();
     }
 
     /**

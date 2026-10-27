@@ -66,3 +66,12 @@ netsuite:
     certificate-id: ${NETSUITE_OAUTH_CERTIFICATE_ID:}
     # TODO: supply the path of the PKCS#8 PEM private key matching that certificate (PS256; file path or classpath: location)
     private-key-path: ${NETSUITE_OAUTH_PRIVATE_KEY_PATH:}
+
+# netsuite-api.xml logs only fixed success messages, so no NetSuite data is logged at any level: a root DEBUG/TRACE
+# override must not reach these categories, which below INFO write the access token and the NetSuite records
+logging:
+  level:
+    org.springframework.core.codec: INFO                          # StringDecoder: the token response and the SuiteQL and record response bodies
+    org.springframework.http.codec: INFO                          # Jackson2JsonEncoder: the SuiteQL query and record-create request bodies
+    org.springframework.web.HttpLogging: INFO                     # the codec loggers above fall back to this category when their own is held at INFO
+    org.springframework.web.servlet.mvc.method.annotation: INFO   # the method processors: the /api response bodies carrying the NetSuite records

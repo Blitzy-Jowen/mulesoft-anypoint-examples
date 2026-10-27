@@ -161,6 +161,12 @@ class NetsuiteRestClientTest {
              "status": 401, "o:errorDetails": [{"detail": "Invalid login attempt.",
              "o:errorCode": "INVALID_LOGIN"}]}""";
 
+    private static final String OAUTH_ERROR_DESCRIPTION = "Invalid client assertion signature.";
+
+    /** The OAuth 2.0 token error format (RFC 6749, section 5.2), as the token endpoint rejects a client assertion. */
+    private static final String OAUTH_ERROR_BODY = "{\"error\": \"invalid_client\", \"error_description\": \""
+            + OAUTH_ERROR_DESCRIPTION + "\"}";
+
     /** One key for the whole class: generating an RSA-2048 pair per test would dominate the run time. */
     private static final KeyPair SIGNING_KEY = rsaKeyPair();
 
@@ -930,6 +936,37 @@ class NetsuiteRestClientTest {
         netsuite.verify(2, postRequestedFor(urlPathEqualTo(SUITEQL)));
     }
 
+    static Stream<Arguments> tokenRejections() {
+        return Stream.of(
+                Arguments.of("OAuth 2.0 error body", aResponse().withStatus(401)
+                        .withHeader("Content-Type", "application/json").withBody(OAUTH_ERROR_BODY),
+                        OAUTH_ERROR_DESCRIPTION),
+                Arguments.of("empty body", aResponse().withStatus(401), "NetSuite answered HTTP 401 Unauthorized"));
+    }
+
+    /**
+     * A token endpoint that rejects the client is an authentication failure whose message is NetSuite's text, or its
+     * status, and never {@code WebClient}'s exception message, which names the token URL.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("tokenRejections")
+    void tokenEndpointRejectionIsAuthenticationWithoutTheTokenUrl(String name, ResponseDefinitionBuilder rejection,
+            String expected) {
+        // Newer than the fixture's token stub at the same priority, so this answers every token request.
+        netsuite.stubFor(post(urlPathEqualTo(TOKEN)).atPriority(1).willReturn(rejection));
+
+        assertThatThrownBy(() -> client.suiteQl("SELECT id FROM customer"))
+                .isInstanceOfSatisfying(UpstreamAuthenticationException.class, e -> {
+                    assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
+                    assertThat(e.getCause()).hasMessageContaining(netsuite.baseUrl() + TOKEN);
+                    assertThat(e).hasMessage(expected);
+                    assertThat(e.getMessage()).doesNotContain(netsuite.baseUrl()).doesNotContain(TOKEN);
+                });
+        // The eviction and the one retry ask the token endpoint again; SuiteQL is never reached.
+        netsuite.verify(2, postRequestedFor(urlPathEqualTo(TOKEN)));
+        netsuite.verify(0, postRequestedFor(urlPathEqualTo(SUITEQL)));
+    }
+
     @Test
     void rateLimitIsNotRetriedAndCarriesRetryAfter() {
         netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(aResponse().withStatus(429)
@@ -1057,6 +1094,9 @@ class NetsuiteRestClientTest {
                     assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
                     // Netty's AnnotatedConnectException and the native transport's exception both extend it.
                     assertThat(causeChain(e)).anyMatch(ConnectException.class::isInstance);
+                    // The transport's message names the refused address; the caller's message names neither part.
+                    assertThat(e).hasMessage("NetSuite is unreachable");
+                    assertThat(e.getMessage()).doesNotContain("localhost").doesNotContain(String.valueOf(port));
                 });
         netsuite.verify(0, anyRequestedFor(anyUrl()));
     }

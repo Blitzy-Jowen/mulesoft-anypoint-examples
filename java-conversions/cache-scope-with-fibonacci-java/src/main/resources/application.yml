@@ -30,10 +30,16 @@ spring:
     # "fibonacci", keyed by n. Listing cache names makes the CaffeineCacheManager static.
     type: caffeine
     cache-names: fibonacci
-    # No caffeine spec: unbounded and without expiry, like the default in-memory object store the caching
-    # strategy falls back to (it declares no objectStore). The Mule default object-store limits (entry count,
-    # TTL) are a Tier 2A verification point; a capture showing eviction or expiry adds the spec here.
-logging:
-  level:
-    # the cache scope's INFO logger "aaa: #[]" (cache-scope.xml:64)
-    com.mulesoft.examples.cache_scope_with_fibonacci: INFO
+    caffeine:
+      # The caching strategy declares no objectStore (cache-scope.xml:35). Since Mule 3.5.0 such a strategy uses an
+      # object-store-manager store shared by all cluster nodes ("Object Stores and Clustering",
+      # archive.docs.mulesoft.com/mule-runtime/3.8/cache-scope); its limits in a standalone runtime are not
+      # documented and the EE source is not public. The bound applied here is the Mule 3.8.0 in-memory store default
+      # (github.com/mulesoft/mule tag mule-3.8.0, core/src/main/java/org/mule/util/store/
+      # AbstractMonitoredObjectStore.java:41,47,55, InMemoryObjectStore.java:143-152) and the docs' per-node
+      # in-memory configuration: maxEntries 4000, entryTTL -1, expirationInterval 1000 ms. No expiry is set.
+      # Each spelling of n (007, 7, 7.0) is its own key, as in the original, so without a bound caller-chosen keys
+      # would grow the heap without limit. Whether the original store applied this bound, and Caffeine's
+      # frequency-and-recency eviction against the in-memory store's oldest-first trim, are Tier 2A verification
+      # points (DECISIONS.md section 6.10).
+      spec: maximumSize=4000

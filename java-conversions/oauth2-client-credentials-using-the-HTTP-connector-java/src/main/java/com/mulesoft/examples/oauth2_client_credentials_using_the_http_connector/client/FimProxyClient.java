@@ -14,9 +14,11 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.List;
@@ -26,6 +28,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
 
 import org.apache.hc.client5.http.DnsResolver;
 import org.apache.hc.client5.http.SystemDefaultDnsResolver;
@@ -85,8 +88,10 @@ import org.springframework.web.client.RestClientResponseException;
  *   <li>Line 29, {@code HTTP_Request_Configuration1}: host {@code tfim01.demos.ibm.com}, port 443, HTTPS and no
  *       TLS context, so the JVM's default trust applies. The base URL is the {@code fim.base-url} key.</li>
  *   <li>Line 41, {@code http:request}: the inbound {@code http.request.uri} (path and query string) is the
- *       outbound path, and the inbound {@code http.method} is the outbound method; both are forwarded
- *       verbatim.</li>
+ *       outbound path, and the inbound {@code http.method} is the outbound method. The method is forwarded
+ *       verbatim, and so is the URI, every valid percent-escape included, except for the characters
+ *       {@code java.net.URI} cannot carry, which are percent-encoded as Mule's requester encoded them before
+ *       sending (see {@link #send}).</li>
  *   <li>Line 43, {@code uri-param client_id=${client.id}}: not handled here. {@code service/FimProxyService}
  *       substitutes the {@code {client_id}} placeholder before calling {@link #send}, so this class receives
  *       the final URI.</li>
@@ -98,9 +103,12 @@ import org.springframework.web.client.RestClientResponseException;
  * host name is connected to at the first address it resolves to only. The connect timeout is 10 s, the Mule
  * requester's default response timeout, and one 10 s deadline, started when the exchange starts, bounds the whole
  * response, headers and body: when it passes, the request is aborted, its connection discarded, and the call fails
- * with an {@link HttpTimeoutException} {@code Response not received within <timeout> ms}. A response outside the
- * requester's default success range 0..399 fails with Mule 3.8's response-validator message
- * {@code Response code <code> mapped as failure.}, carried by a {@link RestClientResponseException}.
+ * with an {@link HttpTimeoutException} {@code Response not received within <timeout> ms}. A TLS failure, such as
+ * a certificate the JVM's trust does not hold or one issued for another host, fails the call with an
+ * {@link SSLException} {@code TLS handshake failed}, whose cause is the JDK's exception: the JDK's text names
+ * internal classes and never reaches a message. A response outside the requester's default success range 0..399
+ * fails with Mule 3.8's response-validator message {@code Response code <code> mapped as failure.}, carried by a
+ * {@link RestClientResponseException}.
  *
  * <p>Redirects are followed, as {@code http:request} follows them by default, up to four in a row; the fifth 3xx
  * in a row is returned as received, as is a redirect from {@code https} to {@code http}, which is never followed.
@@ -126,6 +134,12 @@ public class FimProxyClient implements AutoCloseable {
     /** The Mule HTTP requester's default response timeout. */
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
 
+    /**
+     * The message of every TLS failure. The JDK's own text names internal classes and certificate details, and a
+     * transport failure's message reaches the caller's 500 body.
+     */
+    private static final String TLS_FAILURE_MESSAGE = "TLS handshake failed";
+
     /** Most redirects followed in a row; the next 3xx is returned as received. */
     private static final int MAX_REDIRECTS_FOLLOWED = 4;
 
@@ -141,6 +155,22 @@ public class FimProxyClient implements AutoCloseable {
 
     /** Exchange attribute holding the body of the TRACE hop being sent, for the request executor to write. */
     private static final String HELD_TRACE_BODY_ATTRIBUTE = FimProxyClient.class.getName() + ".heldTraceBody";
+
+    /**
+     * Message of the failure for an outbound URL that is not a valid URI even once escaped. It names no URI:
+     * {@code java.net.URI}'s own message repeats the whole URL, the base URL and the substituted {@code client.id}
+     * included, and the generic 500 hands an exception's message to the caller.
+     */
+    static final String INVALID_URI_MESSAGE = "The request URI cannot be forwarded: it is not a valid URI";
+
+    /**
+     * The characters a path keeps unescaped: RFC 3986 {@code unreserved}, {@code sub-delims}, {@code :}, {@code @}
+     * and the segment separator {@code /}, which are the characters {@code java.net.URI} allows in a path.
+     */
+    private static final String PATH_CHARACTERS =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,;=:@/";
+
+    private static final char[] HEX_DIGITS = "0123456789ABCDEF".toCharArray();
 
     /**
      * Resolves a host name to its first address only, so a refused connect is one connection attempt; httpclient5's
@@ -169,6 +199,9 @@ public class FimProxyClient implements AutoCloseable {
      * Creates the client the application uses, with the 10 s Mule default timeouts.
      *
      * @param baseUrl scheme, host and port of the FIM server, without a trailing slash
+     * @throws IllegalStateException when {@code fim.base-url} is not an absolute http or https URL with a host or
+     *         embeds user information, with a message naming the key and never the value, so the application does
+     *         not start
      */
     @Autowired
     public FimProxyClient(@Value("${fim.base-url:https://tfim01.demos.ibm.com:443}") String baseUrl) {
@@ -180,13 +213,15 @@ public class FimProxyClient implements AutoCloseable {
      * opens no connection, so construction never contacts a host.
      *
      * @param baseUrl scheme, host and port of the FIM server, without a trailing slash; the raw URI passed to
-     *                {@link #send} always begins with {@code /FIM/} and is appended unchanged
+     *                {@link #send} always begins with {@code /FIM/} and is appended as {@link #send} describes
      * @param timeout connect timeout, and the time within which each request's whole response, headers and
      *                body, must arrive
-     * @throws IllegalStateException when the JVM has no default TLS context
+     * @throws IllegalStateException when {@code baseUrl} is not an absolute http or https URL with a host or embeds
+     *         user information, checked before anything is built and with a message naming {@code fim.base-url}
+     *         and never the value; or when the JVM has no default TLS context
      */
     public FimProxyClient(String baseUrl, Duration timeout) {
-        this.baseUrl = baseUrl;
+        this.baseUrl = validatedBaseUrl(baseUrl);
         this.timeout = timeout;
         this.deadlines = new ScheduledThreadPoolExecutor(1, task -> {
             Thread thread = new Thread(task, "fim-proxy-response-deadline");
@@ -211,23 +246,60 @@ public class FimProxyClient implements AutoCloseable {
     }
 
     /**
+     * {@code baseUrl} unchanged, once it has proved to be an absolute {@code http} or {@code https} URL with a host
+     * and without user information. The original's {@code host}, {@code port} and {@code protocol} attributes could
+     * hold no credentials; a URL can, and every request to it would then fail with an error that names it.
+     *
+     * @param baseUrl the configured {@code fim.base-url}
+     * @return {@code baseUrl}, unchanged
+     * @throws IllegalStateException when it is not, with a message that names {@code fim.base-url} and never
+     *                               repeats the value
+     */
+    private static String validatedBaseUrl(String baseUrl) {
+        String requirement = "fim.base-url must be an absolute http or https URL with a host";
+        URI uri;
+        try {
+            uri = new URI(baseUrl == null ? "" : baseUrl);
+        } catch (URISyntaxException e) {
+            // Not kept as the cause: its message repeats the whole URL. The reason and index name the fault alone.
+            throw new IllegalStateException(requirement + ": " + e.getReason()
+                    + (e.getIndex() >= 0 ? " at index " + e.getIndex() : ""));
+        }
+        String scheme = uri.getScheme();
+        if (uri.getHost() == null || !("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))) {
+            throw new IllegalStateException(requirement);
+        }
+        if (uri.getRawUserInfo() != null) {
+            throw new IllegalStateException("fim.base-url must not embed credentials");
+        }
+        return baseUrl;
+    }
+
+    /**
      * Forwards one request to the FIM server.
      *
      * @param method      the HTTP method token, sent as given
-     * @param rawUri      path and query string, percent-encoding included, appended to the base URL verbatim
+     * @param rawUri      path and query string as received, percent-encoding included, appended to the base URL
+     *                    with only the characters {@code java.net.URI} cannot carry percent-encoded, as
+     *                    {@link #escapeTarget} describes; a target that is already valid is appended verbatim
      * @param contentType the Content-Type to send, or {@code null} to send none
      * @param body        the request body, or {@code null} to send none
      * @return the upstream status, headers and body; the body is {@code null} when the upstream sent none
+     * @throws IllegalArgumentException with the message {@link #INVALID_URI_MESSAGE} and no cause when the base URL
+     *         followed by the escaped target is still not a valid URI; nothing is sent
      * @throws RestClientResponseException when the upstream status is 400 or above, with the message
      *         {@code Response code <code> mapped as failure.} and the upstream status, headers and body
      * @throws org.springframework.web.client.ResourceAccessException on an I/O failure, including a refused or
-     *         timed-out connect and a response, headers or body, not complete within the timeout (its cause is
-     *         then a {@link HttpTimeoutException}); nothing is retried after one
+     *         timed-out connect, a response, headers or body, not complete within the timeout (its cause is then a
+     *         {@link HttpTimeoutException}), and a TLS failure (its message then ends with
+     *         {@code TLS handshake failed}, and its cause is an {@link SSLException} with that message, caused by
+     *         the JDK's exception); nothing is retried after one
      */
     public ResponseEntity<byte[]> send(String method, String rawUri, MediaType contentType, byte[] body) {
-        // URI.create, not a URI template or builder: the caller's encoding must reach the wire byte for byte.
+        // A URI parsed from the escaped text, not a URI template or builder: the caller's encoding must reach the
+        // wire byte for byte.
         RestClient.RequestBodySpec request = restClient.method(HttpMethod.valueOf(method))
-                .uri(URI.create(baseUrl + rawUri));
+                .uri(forwardUri(baseUrl, rawUri));
         if (contentType != null) {
             request = request.contentType(contentType);
         }
@@ -256,6 +328,135 @@ public class FimProxyClient implements AutoCloseable {
             }
             return ResponseEntity.status(statusCode).headers(headers).body(bytes.length == 0 ? null : bytes);
         });
+    }
+
+    /**
+     * The URL a request for {@code rawUri} is sent to: {@code baseUrl} followed by {@code rawUri} escaped as
+     * {@link #escapeTarget} describes.
+     *
+     * @param baseUrl the {@code fim.base-url} value
+     * @param rawUri  path and query string as received
+     * @return the outbound URL
+     * @throws IllegalArgumentException with the message {@link #INVALID_URI_MESSAGE} and no cause when the result is
+     *         still not a valid URI, for example a base URL ending in a fragment followed by a target holding a
+     *         {@code #}; the {@link URISyntaxException} is not kept, because its message repeats the URL
+     */
+    static URI forwardUri(String baseUrl, String rawUri) {
+        try {
+            return new URI(baseUrl + escapeTarget(rawUri));
+        } catch (URISyntaxException e) {
+            throw new IllegalArgumentException(INVALID_URI_MESSAGE);
+        }
+    }
+
+    /**
+     * {@code rawUri} with every character its component cannot carry percent-encoded, as the Mule 3.8 requester
+     * encoded such a target before sending it, so a request target {@code java.net.URI} would refuse, such as one
+     * holding a raw {@code \}, {@code |}, {@code ^}, {@code "}, {@code <}, {@code >}, {@code `}, <code>{</code>,
+     * <code>}</code>, space, control character or non-ASCII byte, or a {@code %} not followed by two hexadecimal
+     * digits, still reaches the FIM server. The first {@code #} starts the fragment and the first {@code ?} before
+     * it the query, as {@code java.net.URI} reads them, and both delimiters are kept: the path is escaped with the
+     * path's characters, the query and the fragment with the query's. The fragment is still never sent, because
+     * httpclient5 sends none; escaping it only keeps a character after the {@code #}, a second {@code #} included,
+     * from invalidating the URI. Each character is encoded as {@link #escape} describes, so a target that is already
+     * valid is returned unchanged and reaches the FIM server byte for byte.
+     *
+     * @param rawUri path and query string as received
+     * @return the escaped target
+     */
+    static String escapeTarget(String rawUri) {
+        int fragmentStart = rawUri.indexOf('#');
+        int queryStart = rawUri.indexOf('?');
+        if (fragmentStart >= 0 && queryStart > fragmentStart) {
+            queryStart = -1;
+        }
+        int pathEnd = queryStart >= 0 ? queryStart : fragmentStart >= 0 ? fragmentStart : rawUri.length();
+        StringBuilder target = new StringBuilder(rawUri.length() + 16)
+                .append(escape(rawUri.substring(0, pathEnd), TargetComponent.PATH));
+        if (queryStart >= 0) {
+            int queryEnd = fragmentStart >= 0 ? fragmentStart : rawUri.length();
+            target.append('?').append(escape(rawUri.substring(queryStart + 1, queryEnd), TargetComponent.QUERY));
+        }
+        if (fragmentStart >= 0) {
+            target.append('#').append(escape(rawUri.substring(fragmentStart + 1), TargetComponent.QUERY));
+        }
+        return target.toString();
+    }
+
+    /**
+     * Percent-encodes every character of {@code raw} that {@code component} does not keep, and every {@code %} not
+     * followed by two hexadecimal digits as {@code %25}; a valid escape is kept as sent, letter case included. A
+     * character up to {@code U+00FF} is encoded as the one byte of that value, which restores the byte the caller
+     * sent, because the container reads each byte of the request target as one ISO-8859-1 character. A character
+     * above it, which only a target built outside the container holds, is encoded as its UTF-8 bytes, an unpaired
+     * surrogate as {@code %3F}. Escapes this method writes use upper-case hexadecimal digits.
+     *
+     * @param raw       one component of the target, without its delimiter
+     * @param component the component {@code raw} is
+     * @return {@code raw} itself when nothing in it needs encoding, otherwise the encoded string
+     */
+    private static String escape(String raw, TargetComponent component) {
+        StringBuilder escaped = null;
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            boolean kept = c == '%'
+                    ? i + 2 < raw.length() && isHexDigit(raw.charAt(i + 1)) && isHexDigit(raw.charAt(i + 2))
+                    : component.keeps(c);
+            if (kept) {
+                if (escaped != null) {
+                    escaped.append(c);
+                }
+                continue;
+            }
+            if (escaped == null) {
+                escaped = new StringBuilder(raw.length() + 16).append(raw, 0, i);
+            }
+            if (c <= 0xFF) {
+                appendEscape(escaped, c);
+            } else {
+                int codePoint = raw.codePointAt(i);
+                for (byte b : new String(Character.toChars(codePoint)).getBytes(StandardCharsets.UTF_8)) {
+                    appendEscape(escaped, b & 0xFF);
+                }
+                i += Character.charCount(codePoint) - 1;
+            }
+        }
+        return escaped == null ? raw : escaped.toString();
+    }
+
+    /** ASCII hexadecimal digits only: {@link Character#digit} would also accept other scripts' digits. */
+    private static boolean isHexDigit(char c) {
+        return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+    }
+
+    private static void appendEscape(StringBuilder out, int octet) {
+        out.append('%').append(HEX_DIGITS[octet >> 4]).append(HEX_DIGITS[octet & 0xF]);
+    }
+
+    /** A component of the outbound target, with the characters it keeps unescaped besides valid escapes. */
+    private enum TargetComponent {
+
+        /** The path: RFC 3986 {@code pchar} and {@code /}. */
+        PATH(PATH_CHARACTERS),
+
+        /**
+         * The query, and the fragment, which {@code java.net.URI} restricts alike: RFC 3986 {@code pchar}, {@code /}
+         * and {@code ?}, plus {@code [} and {@code ]}, which {@code java.net.URI} accepts there and callers send
+         * unescaped, as in {@code filter[name]=x}.
+         */
+        QUERY(PATH_CHARACTERS + "?[]");
+
+        private final boolean[] kept = new boolean[128];
+
+        TargetComponent(String keptCharacters) {
+            for (int i = 0; i < keptCharacters.length(); i++) {
+                kept[keptCharacters.charAt(i)] = true;
+            }
+        }
+
+        boolean keeps(char c) {
+            return c < kept.length && kept[c];
+        }
     }
 
     /**
@@ -367,7 +568,7 @@ public class FimProxyClient implements AutoCloseable {
     /**
      * Runs one exchange, its redirects included, under the deadline: the response head must arrive before it, and
      * the returned response's body is read under it too. A failure once the deadline has passed is reported as the
-     * timeout.
+     * timeout, and any other TLS failure without the JDK's text ({@link #withoutTlsDetail}).
      */
     private ClassicHttpResponse withinDeadline(ClassicHttpRequest request, ExecChain.Scope scope, ExecChain chain)
             throws IOException, HttpException {
@@ -378,6 +579,9 @@ public class FimProxyClient implements AutoCloseable {
         } catch (IOException | HttpException e) {
             if (deadline.stop()) {
                 throw deadline.timedOut(e);
+            }
+            if (e instanceof IOException failure) {
+                throw withoutTlsDetail(failure);
             }
             throw e;
         } catch (RuntimeException e) {
@@ -391,6 +595,18 @@ public class FimProxyClient implements AutoCloseable {
             response.setEntity(new DeadlineEntity(entity, deadline));
         }
         return response;
+    }
+
+    /**
+     * {@code failure} as the exchange reports it: a TLS failure, any {@link SSLException} (an untrusted or mismatched
+     * certificate, a refused or broken handshake), becomes an {@link SSLException} with the fixed message
+     * {@value #TLS_FAILURE_MESSAGE} and the original as its cause; any other failure is returned unchanged. The JDK's
+     * message names internal classes, such as {@code sun.security.provider.certpath.SunCertPathBuilderException}, and
+     * {@link RestClient} copies the message into the {@code ResourceAccessException} whose text a caller's 500 body
+     * reports.
+     */
+    private static IOException withoutTlsDetail(IOException failure) {
+        return failure instanceof SSLException ? new SSLException(TLS_FAILURE_MESSAGE, failure) : failure;
     }
 
     /**
@@ -427,9 +643,12 @@ public class FimProxyClient implements AutoCloseable {
             return System.nanoTime() - expiresAt >= 0;
         }
 
-        /** {@code failure} reported as the timeout, when the deadline has passed; otherwise {@code failure}. */
+        /**
+         * {@code failure} reported as the timeout, when the deadline has passed; otherwise {@code failure}, a TLS
+         * failure without the JDK's text ({@link #withoutTlsDetail}).
+         */
         IOException translate(IOException failure) {
-            return stop() ? timedOut(failure) : failure;
+            return stop() ? timedOut(failure) : withoutTlsDetail(failure);
         }
 
         HttpTimeoutException timedOut(Exception failure) {

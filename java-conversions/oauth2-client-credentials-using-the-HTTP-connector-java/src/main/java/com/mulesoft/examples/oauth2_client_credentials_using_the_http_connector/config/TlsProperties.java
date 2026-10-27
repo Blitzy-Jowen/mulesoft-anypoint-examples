@@ -20,6 +20,8 @@ import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Component;
@@ -42,10 +44,16 @@ import org.springframework.stereotype.Component;
  * <p>The repository holds no password for either store: the three password keys default to empty and
  * are supplied through the environment variables {@code application.yml} names. Construction therefore
  * only records the values; the application context starts with every password blank, and the stores are
- * read only when {@link #createSslContext()} is called. No password value ever appears in a message.
+ * read only when {@link #createSslContext()} is called.
+ *
+ * <p>A failure's message reaches the caller's 500 body, so it names the configuration keys at fault and never a
+ * configured value: no password and no store path. The paths, which are operator configuration, are logged at WARN
+ * beside the message on the server alone; no password is ever logged.
  */
 @Component
 public class TlsProperties {
+
+    private static final Logger LOG = LoggerFactory.getLogger(TlsProperties.class);
 
     private static final String KEYSTORE_PATH_KEY = "keystore.path";
     private static final String KEYSTORE_PASSWORD_KEY = "keystore.password";
@@ -94,10 +102,11 @@ public class TlsProperties {
      *
      * @return an initialized {@link SSLContext} whose key managers present the key store's key and whose
      *         trust managers trust the trust store's certificates
-     * @throws IllegalStateException naming the configuration key at fault when a password is blank, a
-     *                               path resolves to neither a classpath resource nor a regular file, or a
-     *                               store, key or context cannot be loaded or initialized; the underlying
-     *                               exception, where there is one, is kept as the cause
+     * @throws IllegalStateException naming the configuration key at fault, and never its value, when a password
+     *                               is blank, a path resolves to neither a classpath resource nor a regular
+     *                               file, or a store, key or context cannot be loaded or initialized; the
+     *                               underlying exception, where there is one, is kept as the cause, and a
+     *                               failure of a configured store is first logged at WARN with its path
      */
     public SSLContext createSslContext() {
         requireSet(keystorePassword, KEYSTORE_PASSWORD_KEY, "the store password of the key store");
@@ -113,9 +122,9 @@ public class TlsProperties {
             try {
                 keyStore = loadJks(keyStoreIn, keyStorePasswordChars);
             } catch (IOException | GeneralSecurityException e) {
-                throw new IllegalStateException("TLS configuration: cannot load the JKS key store '" + keystorePath
-                        + "' of key '" + KEYSTORE_PATH_KEY + "' with the password of key '"
-                        + KEYSTORE_PASSWORD_KEY + "'", e);
+                throw new IllegalStateException(logged("TLS configuration: cannot load the JKS key store of key '"
+                        + KEYSTORE_PATH_KEY + "' with the password of key '" + KEYSTORE_PASSWORD_KEY + "'", e,
+                        configured(KEYSTORE_PATH_KEY, keystorePath)), e);
             }
 
             KeyManagerFactory keyManagers;
@@ -123,17 +132,18 @@ public class TlsProperties {
                 keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
                 keyManagers.init(keyStore, keyPasswordChars);
             } catch (GeneralSecurityException e) {
-                throw new IllegalStateException("TLS configuration: cannot recover the private key of the key store '"
-                        + keystorePath + "' with the password of key '" + KEY_PASSWORD_KEY + "'", e);
+                throw new IllegalStateException(logged("TLS configuration: cannot recover the private key of the "
+                        + "key store of key '" + KEYSTORE_PATH_KEY + "' with the password of key '" + KEY_PASSWORD_KEY
+                        + "'", e, configured(KEYSTORE_PATH_KEY, keystorePath)), e);
             }
 
             KeyStore trustStore;
             try {
                 trustStore = loadJks(trustStoreIn, trustStorePasswordChars);
             } catch (IOException | GeneralSecurityException e) {
-                throw new IllegalStateException("TLS configuration: cannot load the JKS trust store '" + truststorePath
-                        + "' of key '" + TRUSTSTORE_PATH_KEY + "' with the password of key '"
-                        + TRUSTSTORE_PASSWORD_KEY + "'", e);
+                throw new IllegalStateException(logged("TLS configuration: cannot load the JKS trust store of key '"
+                        + TRUSTSTORE_PATH_KEY + "' with the password of key '" + TRUSTSTORE_PASSWORD_KEY + "'", e,
+                        configured(TRUSTSTORE_PATH_KEY, truststorePath)), e);
             }
 
             TrustManagerFactory trustManagers;
@@ -141,8 +151,9 @@ public class TlsProperties {
                 trustManagers = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
                 trustManagers.init(trustStore);
             } catch (GeneralSecurityException e) {
-                throw new IllegalStateException("TLS configuration: cannot initialize trust managers from the "
-                        + "trust store '" + truststorePath + "' of key '" + TRUSTSTORE_PATH_KEY + "'", e);
+                throw new IllegalStateException(logged("TLS configuration: cannot initialize trust managers from the "
+                        + "trust store of key '" + TRUSTSTORE_PATH_KEY + "'", e,
+                        configured(TRUSTSTORE_PATH_KEY, truststorePath)), e);
             }
 
             try {
@@ -150,15 +161,15 @@ public class TlsProperties {
                 context.init(keyManagers.getKeyManagers(), trustManagers.getTrustManagers(), null);
                 return context;
             } catch (GeneralSecurityException e) {
-                throw new IllegalStateException("TLS configuration: cannot initialize a " + PROTOCOL
-                        + " context from the key store '" + keystorePath + "' of key '" + KEYSTORE_PATH_KEY
-                        + "' and the trust store '" + truststorePath + "' of key '" + TRUSTSTORE_PATH_KEY + "'", e);
+                throw new IllegalStateException(logged("TLS configuration: cannot initialize a " + PROTOCOL
+                        + " context from the key store of key '" + KEYSTORE_PATH_KEY + "' and the trust store of key '"
+                        + TRUSTSTORE_PATH_KEY + "'", e, bothConfigured()), e);
             }
         } catch (IOException e) {
             // Only closing a store stream reaches here; every read failure above is already wrapped.
-            throw new IllegalStateException("TLS configuration: cannot close the key store '" + keystorePath
-                    + "' of key '" + KEYSTORE_PATH_KEY + "' or the trust store '" + truststorePath + "' of key '"
-                    + TRUSTSTORE_PATH_KEY + "'", e);
+            throw new IllegalStateException(logged("TLS configuration: cannot close the key store of key '"
+                    + KEYSTORE_PATH_KEY + "' or the trust store of key '" + TRUSTSTORE_PATH_KEY + "'", e,
+                    bothConfigured()), e);
         } finally {
             Arrays.fill(keyStorePasswordChars, '\0');
             Arrays.fill(keyPasswordChars, '\0');
@@ -192,11 +203,43 @@ public class TlsProperties {
             }
         } catch (IOException | IllegalArgumentException e) {
             // IllegalArgumentException covers InvalidPathException for a value that is no file-system path.
-            throw new IllegalStateException("TLS configuration key '" + key + "' points to '" + path
-                    + "', which cannot be opened", e);
+            throw new IllegalStateException(logged("TLS configuration key '" + key
+                    + "' cannot be loaded: the store it names cannot be opened", e, configured(key, path)), e);
         }
-        throw new IllegalStateException("TLS configuration key '" + key + "' points to '" + path
-                + "', which is neither a classpath resource nor a regular file");
+        throw new IllegalStateException(logged("TLS configuration key '" + key
+                + "' cannot be loaded: it names neither a classpath resource nor a regular file", null,
+                configured(key, path)));
+    }
+
+    /**
+     * Logs {@code message} at WARN together with {@code paths} and the text of {@code cause}, and returns
+     * {@code message}, the text of the {@link IllegalStateException} the caller then throws. That message reaches the
+     * caller's 500 body, so it names configuration keys only; the store paths, operator configuration rather than
+     * caller input, reach the server log alone. Neither ever holds a password.
+     *
+     * @param message the failure, naming the configuration keys at fault
+     * @param cause   the underlying exception, or {@code null} when there is none
+     * @param paths   the configured store paths at fault, as {@link #configured} renders them
+     * @return {@code message}
+     */
+    private static String logged(String message, Exception cause, String paths) {
+        if (cause == null) {
+            LOG.warn("{}: {}", message, paths);
+        } else {
+            // The cause's text, not the cause itself: one line, without a stack trace.
+            LOG.warn("{}: {}; cause: {}", message, paths, cause.toString());
+        }
+        return message;
+    }
+
+    /** The configured {@code path} of the store key {@code key}, as {@code key = 'path'}, for the WARN line. */
+    private static String configured(String key, String path) {
+        return key + " = '" + path + "'";
+    }
+
+    /** Both configured store paths, key store first, for the WARN line of a failure involving both stores. */
+    private String bothConfigured() {
+        return configured(KEYSTORE_PATH_KEY, keystorePath) + ", " + configured(TRUSTSTORE_PATH_KEY, truststorePath);
     }
 
     private static KeyStore loadJks(InputStream in, char[] password) throws IOException, GeneralSecurityException {

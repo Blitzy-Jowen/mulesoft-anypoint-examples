@@ -77,6 +77,9 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  *       read and the FIM server is called.</li>
  *   <li>An empty query ({@code /FIM/x?}) is forwarded without its {@code ?}, because the servlet API reports an
  *       empty query string as absent.</li>
+ *   <li>A path holding a {@code %} not followed by two hexadecimal digits ({@code /FIM/x%zz}) is answered 400 with
+ *       an empty body by {@code config/InvalidPercentEncodingFilter} before this class runs; how the Mule listener
+ *       answered such a path is unverified.</li>
  * </ol>
  */
 @RestController

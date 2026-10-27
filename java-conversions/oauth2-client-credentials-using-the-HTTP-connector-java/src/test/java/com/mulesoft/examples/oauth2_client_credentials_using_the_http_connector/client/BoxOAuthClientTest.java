@@ -33,6 +33,9 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.http.HttpTimeoutException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.KeyStore;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -40,27 +43,37 @@ import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
+
+import javax.net.ssl.SSLException;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
+import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
@@ -82,9 +95,11 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * GET; redirects are followed, the access token only within the origin, a 307 or 308 of the token request
  * re-sends the form, and one after a 301, 302 or 303 of the token request is followed as a GET without it; neither
  * request is sent twice after a reset, a connection closed before the response, a refused connect or the deadline,
- * which a response not complete within the timeout fails at, releasing the token lock; concurrent first calls share
- * one token request and are not queued; and an https base URL whose TLS stores cannot be opened fails before any
- * request is sent.
+ * which a response not complete within the timeout fails at; concurrent first calls share one token request and are
+ * not queued, and all receive its token or, at its deadline, its one failure, which the next call does not inherit;
+ * concurrent rejections of one token share one refresh; a TLS failure of either request is reported as
+ * {@code TLS handshake failed}, without the JDK's text; and an https base URL whose TLS stores cannot be opened or
+ * loaded fails before any request is sent, with a message naming the configuration key and never its path.
  */
 class BoxOAuthClientTest {
 
@@ -98,6 +113,16 @@ class BoxOAuthClientTest {
 
     /** Every client a test builds, closed after it. */
     private static final List<BoxOAuthClient> CLIENTS = new CopyOnWriteArrayList<>();
+
+    /** Store and key password of the JKS stores {@link #tlsStoreFile} writes. */
+    private static final String TLS_STORE_PASSWORD = "SENTINEL_PW_OK";
+
+    /** The fixed text a TLS failure is reported with, in place of the JDK's. */
+    private static final String TLS_FAILURE_MESSAGE = "TLS handshake failed";
+
+    /** Holds the JKS stores a test writes. */
+    @TempDir
+    Path tlsDir;
 
     @RegisterExtension
     static WireMockExtension wm = WireMockExtension.newInstance()
@@ -136,6 +161,48 @@ class BoxOAuthClientTest {
                 .withRequestBody(notContaining("client_secret")));
         wm.verify(1, postRequestedFor(urlEqualTo(TOKEN_PATH)));
         wm.verify(1, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)));
+    }
+
+    /**
+     * {@code box.oauth.token-url} and {@code box.api.base-url} are checked when the client is built: a value carrying
+     * user information, plain or percent-encoded, or one that is not an absolute http or https URL with a host, is
+     * refused with a message that names the key and never the value, so no credential it holds reaches a log line or
+     * a caller.
+     */
+    @ParameterizedTest(name = "{0} [{1}] is refused")
+    @MethodSource("urlRefusals")
+    void urlKeyRefusedAtConstructionWithoutEchoingTheValue(String key, String url, String fault) {
+        boolean tokenKey = "box.oauth.token-url".equals(key);
+        String tokenUrl = tokenKey ? url : "http://127.0.0.1:9" + TOKEN_PATH;
+        String baseUrl = tokenKey ? "http://127.0.0.1:9" : url;
+
+        assertThatThrownBy(() -> track(new BoxOAuthClient(tokenUrl, CLIENT_ID, CLIENT_SECRET, baseUrl, BASE_PATH,
+                tls(""), Duration.ofSeconds(2))))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith(key + " " + fault)
+                .hasMessageNotContaining("SENTINEL")
+                .hasNoCause();
+    }
+
+    /** Each refused value of each URL key, with the fault its message states after the key. */
+    private static Stream<Arguments> urlRefusals() {
+        String credentials = "must not embed credentials";
+        String notAbsolute = "must be an absolute http or https URL with a host";
+        return Stream.of("box.oauth.token-url", "box.api.base-url").flatMap(key -> Stream.of(
+                Arguments.of(key, "http://SENTINEL_U:SENTINEL_P@127.0.0.1:9" + TOKEN_PATH, credentials),
+                Arguments.of(key, "http://SENTINEL_U@127.0.0.1:9", credentials),
+                Arguments.of(key, "https://SENTINEL_U%40corp:SENTINEL_P%3A1@localhost:9", credentials),
+                Arguments.of(key, "http://:SENTINEL_P@127.0.0.1:9", credentials),
+                Arguments.of(key, "HTTPS://SENTINEL_U:SENTINEL_P@localhost:9", credentials),
+                Arguments.of(key, "http://SENTINEL_U:SENTINEL P@127.0.0.1:9", notAbsolute),
+                Arguments.of(key, "http://SENTINEL_U:SENTINEL_P@bad_host:9", notAbsolute),
+                Arguments.of(key, "/SENTINEL_PATH" + TOKEN_PATH, notAbsolute),
+                Arguments.of(key, "127.0.0.1:9/SENTINEL", notAbsolute),
+                Arguments.of(key, "ftp://127.0.0.1:9/SENTINEL", notAbsolute),
+                Arguments.of(key, "http:///SENTINEL", notAbsolute),
+                Arguments.of(key, "http://127.0.0.1:9/SENTINEL x", notAbsolute),
+                Arguments.of(key, "", notAbsolute),
+                Arguments.of(key, null, notAbsolute)));
     }
 
     @Test
@@ -418,6 +485,44 @@ class BoxOAuthClientTest {
     }
 
     /**
+     * A TLS failure is reported with a fixed message, never with the JDK's text, which names internal classes such
+     * as {@code sun.security.provider.certpath.SunCertPathBuilderException} and would reach the caller's 500 body.
+     * The upstream presents WireMock's self-signed certificate: the token POST trusts the JVM's default trust store,
+     * which does not hold it, and the Box GET the configured trust store, here an empty one. The JDK's exception stays
+     * the cause, and the failed request never reaches the upstream.
+     */
+    @ParameterizedTest
+    @EnumSource(Target.class)
+    void tlsFailureIsReportedWithoutTheJdkText(Target target) throws Exception {
+        WireMockServer tlsUpstream = new WireMockServer(wireMockConfig().httpDisabled(true).dynamicHttpsPort());
+        tlsUpstream.start();
+        try {
+            String tlsUrl = "https://localhost:" + tlsUpstream.httpsPort();
+            stubToken();
+            BoxOAuthClient client = track(target == Target.TOKEN
+                    ? new BoxOAuthClient(tlsUrl + TOKEN_PATH, CLIENT_ID, CLIENT_SECRET, wm.baseUrl(), BASE_PATH,
+                            tls(""), Duration.ofSeconds(2))
+                    : new BoxOAuthClient(wm.baseUrl() + TOKEN_PATH, CLIENT_ID, CLIENT_SECRET, tlsUrl, BASE_PATH,
+                            tlsEmptyStores(), Duration.ofSeconds(2)));
+
+            Throwable thrown = catchThrowable(client::authorize);
+
+            assertThat(thrown).isInstanceOf(ResourceAccessException.class)
+                    .hasMessageEndingWith(": " + TLS_FAILURE_MESSAGE);
+            assertThat(thrown.getMessage()).doesNotContain("sun.security", "PKIX", "Exception");
+            assertThat(thrown.getCause()).isInstanceOf(SSLException.class)
+                    .hasMessage(TLS_FAILURE_MESSAGE)
+                    .hasCauseInstanceOf(SSLException.class);
+            assertThat(thrown.getCause().getCause().getMessage()).isNotEqualTo(TLS_FAILURE_MESSAGE);
+            assertThat(tlsUpstream.getAllServeEvents()).isEmpty();
+            wm.verify(target == Target.TOKEN ? 0 : 1, postRequestedFor(urlEqualTo(TOKEN_PATH)));
+            wm.verify(0, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)));
+        } finally {
+            tlsUpstream.stop();
+        }
+    }
+
+    /**
      * The one deadline bounds each request's whole response: a head held back past it, and a body still dribbling
      * in when it passes, both end the call at the deadline, with the one request sent.
      */
@@ -446,12 +551,13 @@ class BoxOAuthClientTest {
     }
 
     /**
-     * A stalled token response holds the token lock only until its deadline: of two concurrent first calls, the one
-     * whose token request stalls fails at the deadline and leaves no token, and the one waiting for the lock then
-     * requests its own token and succeeds, both long before the stalled response would have arrived.
+     * A stalled token response fails every call awaiting it at its one deadline: two concurrent first calls share
+     * the one token request and both receive its timeout, long before the stalled response would have arrived, and
+     * neither sends a request of its own. The failure is not kept: the next call sends a new token request and
+     * succeeds.
      */
     @Test
-    void stalledTokenResponseReleasesTheTokenLockAtTheDeadline() throws InterruptedException {
+    void stalledTokenResponseFailsEveryConcurrentFirstCallAtItsOneDeadline() throws Exception {
         wm.stubFor(post(urlEqualTo(TOKEN_PATH)).inScenario("token")
                 .whenScenarioStateIs(Scenario.STARTED)
                 .willReturn(tokenResponse("tok-1").withFixedDelay(5000))
@@ -461,36 +567,25 @@ class BoxOAuthClientTest {
                 .willReturn(tokenResponse("tok-2")));
         wm.stubFor(get(urlEqualTo(AUTHORIZE_PATH)).willReturn(aResponse().withStatus(200).withBody("authorized")));
         BoxOAuthClient client = client(wm.baseUrl(), Duration.ofMillis(300));
-        ExecutorService callers = Executors.newFixedThreadPool(2);
-        try {
-            long start = System.nanoTime();
-            List<Future<ResponseEntity<byte[]>>> calls = List.of(callers.submit(client::authorize),
-                    callers.submit(client::authorize));
-            List<Throwable> failures = new ArrayList<>();
-            List<ResponseEntity<byte[]>> successes = new ArrayList<>();
-            for (Future<ResponseEntity<byte[]>> call : calls) {
-                try {
-                    successes.add(call.get(10, TimeUnit.SECONDS));
-                } catch (ExecutionException e) {
-                    failures.add(e.getCause());
-                } catch (TimeoutException e) {
-                    failures.add(e);
-                }
-            }
-            Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
 
-            assertThat(failures).singleElement().isInstanceOf(ResourceAccessException.class)
-                    .satisfies(timedOut -> assertThat(timedOut)
-                            .hasMessageEndingWith(": Response not received within 300 ms"));
-            assertThat(successes).singleElement()
-                    .satisfies(success -> assertThat(success.getBody()).isEqualTo("authorized".getBytes(UTF_8)));
-            assertThat(elapsed).isLessThan(Duration.ofMillis(3000));
-            wm.verify(2, postRequestedFor(urlEqualTo(TOKEN_PATH)));
-            wm.verify(1, getRequestedFor(urlEqualTo(AUTHORIZE_PATH))
-                    .withHeader("Authorization", equalTo("Bearer tok-2")));
-        } finally {
-            callers.shutdownNow();
-        }
+        List<FlightOutcome> outcomes = flightAuthorizeTogether(client, 2);
+
+        Throwable shared = outcomes.get(0).failure();
+        assertThat(shared).isInstanceOf(ResourceAccessException.class)
+                .hasMessageEndingWith(": Response not received within 300 ms");
+        assertThat(outcomes).allSatisfy(outcome -> {
+            assertThat(outcome.failure()).isSameAs(shared);
+            assertThat(outcome.elapsed()).isLessThan(Duration.ofMillis(2000));
+        });
+        assertThat(flightSlowest(outcomes)).isGreaterThanOrEqualTo(Duration.ofMillis(250));
+        wm.verify(1, postRequestedFor(urlEqualTo(TOKEN_PATH)));
+        wm.verify(0, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)));
+
+        ResponseEntity<byte[]> later = client.authorize();
+
+        assertThat(later.getBody()).isEqualTo("authorized".getBytes(UTF_8));
+        wm.verify(2, postRequestedFor(urlEqualTo(TOKEN_PATH)));
+        wm.verify(1, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)).withHeader("Authorization", equalTo("Bearer tok-2")));
     }
 
     /**
@@ -554,6 +649,132 @@ class BoxOAuthClientTest {
         }
     }
 
+    /**
+     * Ten concurrent first calls against a token endpoint that stalls past the timeout all fail at the one token
+     * request's deadline, with its one failure: the endpoint receives a single request, and no call waits for a
+     * request after it, as calls queued one behind another would, one timeout each and the tenth after ten.
+     */
+    @Test
+    void concurrentFirstCallsShareOneStalledTokenRequestAndItsFailure() throws Exception {
+        Duration timeout = Duration.ofMillis(500);
+        wm.stubFor(post(urlEqualTo(TOKEN_PATH)).willReturn(tokenResponse("tok-1").withFixedDelay(3000)));
+        wm.stubFor(get(urlEqualTo(AUTHORIZE_PATH)).willReturn(aResponse().withStatus(200)));
+        BoxOAuthClient client = client(wm.baseUrl(), timeout);
+
+        List<FlightOutcome> outcomes = flightAuthorizeTogether(client, 10);
+
+        Throwable shared = outcomes.get(0).failure();
+        assertThat(shared).isInstanceOf(ResourceAccessException.class)
+                .hasMessageEndingWith(": Response not received within 500 ms");
+        assertThat(causeChain(shared)).anyMatch(HttpTimeoutException.class::isInstance);
+        assertThat(outcomes).hasSize(10).allSatisfy(outcome -> {
+            assertThat(outcome.failure()).isSameAs(shared);
+            assertThat(outcome.elapsed()).isLessThan(timeout.multipliedBy(2).plusMillis(1000));
+        });
+        assertThat(flightSlowest(outcomes)).isGreaterThanOrEqualTo(timeout.minusMillis(50));
+        wm.verify(1, postRequestedFor(urlEqualTo(TOKEN_PATH)));
+        wm.verify(0, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)));
+    }
+
+    /**
+     * Ten concurrent first calls against a token endpoint that answers within the timeout, delayed so that the calls
+     * arrive while its request is in flight, share that one request and all succeed with its token.
+     */
+    @Test
+    void concurrentFirstCallsShareOneSlowTokenRequestAndItsToken() throws Exception {
+        wm.stubFor(post(urlEqualTo(TOKEN_PATH)).willReturn(tokenResponse("tok-1").withFixedDelay(1000)));
+        wm.stubFor(get(urlEqualTo(AUTHORIZE_PATH)).willReturn(aResponse().withStatus(200).withBody("authorized")));
+        BoxOAuthClient client = client(wm.baseUrl(), Duration.ofSeconds(5));
+
+        List<FlightOutcome> outcomes = flightAuthorizeTogether(client, 10);
+
+        assertThat(outcomes).hasSize(10).allSatisfy(outcome -> {
+            assertThat(outcome.failure()).isNull();
+            assertThat(outcome.response().getBody()).isEqualTo("authorized".getBytes(UTF_8));
+        });
+        wm.verify(1, postRequestedFor(urlEqualTo(TOKEN_PATH)));
+        wm.verify(10, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)).withHeader("Authorization", equalTo("Bearer tok-1")));
+    }
+
+    /**
+     * Concurrent calls whose GETs Box rejects with the same token share one refresh: the token endpoint receives one
+     * request for the first token and one for its replacement, and every call retries once, with the new token.
+     */
+    @Test
+    void concurrentRejectionsOfOneTokenShareOneRefresh() throws Exception {
+        wm.stubFor(post(urlEqualTo(TOKEN_PATH)).inScenario("token")
+                .whenScenarioStateIs(Scenario.STARTED)
+                .willReturn(tokenResponse("tok-1"))
+                .willSetStateTo("refreshing"));
+        // Delayed so that the other rejected calls arrive while the refresh is in flight.
+        wm.stubFor(post(urlEqualTo(TOKEN_PATH)).inScenario("token")
+                .whenScenarioStateIs("refreshing")
+                .willReturn(tokenResponse("tok-2").withFixedDelay(1000))
+                .willSetStateTo("refreshed"));
+        wm.stubFor(post(urlEqualTo(TOKEN_PATH)).inScenario("token")
+                .whenScenarioStateIs("refreshed")
+                .willReturn(tokenResponse("tok-3")));
+        wm.stubFor(get(urlEqualTo(AUTHORIZE_PATH)).withHeader("Authorization", equalTo("Bearer tok-1"))
+                .willReturn(aResponse().withStatus(401)));
+        wm.stubFor(get(urlEqualTo(AUTHORIZE_PATH)).withHeader("Authorization", equalTo("Bearer tok-2"))
+                .willReturn(aResponse().withStatus(200).withBody("granted")));
+        BoxOAuthClient client = client(wm.baseUrl(), Duration.ofSeconds(5));
+
+        List<FlightOutcome> outcomes = flightAuthorizeTogether(client, 10);
+
+        assertThat(outcomes).hasSize(10).allSatisfy(outcome -> {
+            assertThat(outcome.failure()).isNull();
+            assertThat(outcome.response().getBody()).isEqualTo("granted".getBytes(UTF_8));
+        });
+        wm.verify(2, postRequestedFor(urlEqualTo(TOKEN_PATH)));
+        wm.verify(10, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)).withHeader("Authorization", equalTo("Bearer tok-1")));
+        wm.verify(10, getRequestedFor(urlEqualTo(AUTHORIZE_PATH)).withHeader("Authorization", equalTo("Bearer tok-2")));
+    }
+
+    /**
+     * Calls {@link BoxOAuthClient#authorize()} from {@code callers} threads released together, and returns each
+     * call's response or failure with the time it took; a call still running after 20 s fails the test.
+     */
+    private static List<FlightOutcome> flightAuthorizeTogether(BoxOAuthClient client, int callers) throws Exception {
+        ExecutorService threads = Executors.newFixedThreadPool(callers);
+        CountDownLatch ready = new CountDownLatch(callers);
+        CountDownLatch release = new CountDownLatch(1);
+        try {
+            List<Future<FlightOutcome>> calls = new ArrayList<>();
+            for (int i = 0; i < callers; i++) {
+                calls.add(threads.submit(() -> {
+                    ready.countDown();
+                    release.await();
+                    long start = System.nanoTime();
+                    try {
+                        ResponseEntity<byte[]> response = client.authorize();
+                        return new FlightOutcome(response, null, Duration.ofNanos(System.nanoTime() - start));
+                    } catch (RuntimeException e) {
+                        return new FlightOutcome(null, e, Duration.ofNanos(System.nanoTime() - start));
+                    }
+                }));
+            }
+            assertThat(ready.await(10, TimeUnit.SECONDS)).as("every caller thread started").isTrue();
+            release.countDown();
+            List<FlightOutcome> outcomes = new ArrayList<>();
+            for (Future<FlightOutcome> call : calls) {
+                outcomes.add(call.get(20, TimeUnit.SECONDS));
+            }
+            return outcomes;
+        } finally {
+            threads.shutdownNow();
+        }
+    }
+
+    /** The longest any of {@code outcomes} took. */
+    private static Duration flightSlowest(List<FlightOutcome> outcomes) {
+        return outcomes.stream().map(FlightOutcome::elapsed).max(Duration::compareTo).orElseThrow();
+    }
+
+    /** One concurrent call's response, or its failure, and the time it took. */
+    private record FlightOutcome(ResponseEntity<byte[]> response, Throwable failure, Duration elapsed) {
+    }
+
     @Test
     void httpsWithBlankTlsPasswordsFailsBeforeAuthorize() {
         stubToken();
@@ -569,9 +790,84 @@ class BoxOAuthClientTest {
         assertThat(wm.getAllServeEvents()).isEmpty();
     }
 
+    /**
+     * A key store or trust store that cannot be found, or cannot be loaded with its password, fails before any
+     * request with a message naming configuration keys only: the configured path appears in the server's one WARN
+     * line and never in the message, which reaches the caller's 500 body, and no password appears in either.
+     */
+    @ParameterizedTest(name = "{4}: {0} with {1}, {2} with {3}")
+    @CsvSource({
+            "none/SENTINEL_KSPATH/key.jks, SENTINEL_PW_OK, SENTINEL_KSPATH/trust.jks, SENTINEL_PW_OK, keystore.path",
+            "SENTINEL_KSPATH/key.jks, SENTINEL_PW_BAD, SENTINEL_KSPATH/trust.jks, SENTINEL_PW_OK, keystore.path",
+            "SENTINEL_KSPATH/key.jks, SENTINEL_PW_OK, none/SENTINEL_KSPATH/trust.jks, SENTINEL_PW_OK, truststore.path",
+            "SENTINEL_KSPATH/key.jks, SENTINEL_PW_OK, SENTINEL_KSPATH/trust.jks, SENTINEL_PW_BAD, truststore.path"})
+    void unloadableTlsStoreFailsNamingTheKeyButNotThePath(String keyStore, String keyStorePassword, String trustStore,
+                                                          String trustStorePassword, String faultyKey)
+            throws Exception {
+        tlsStoreFile(tlsDir.resolve("SENTINEL_KSPATH").resolve("key.jks"));
+        tlsStoreFile(tlsDir.resolve("SENTINEL_KSPATH").resolve("trust.jks"));
+        Path keyStorePath = tlsDir.resolve(keyStore);
+        Path trustStorePath = tlsDir.resolve(trustStore);
+        Path faultyPath = "keystore.path".equals(faultyKey) ? keyStorePath : trustStorePath;
+        stubToken();
+        TlsProperties stores = new TlsProperties(keyStorePath.toString(), keyStorePassword, keyStorePassword,
+                trustStorePath.toString(), trustStorePassword);
+        BoxOAuthClient client = track(new BoxOAuthClient(wm.baseUrl() + TOKEN_PATH, CLIENT_ID, CLIENT_SECRET,
+                "https://127.0.0.1:" + wm.getPort(), BASE_PATH, stores, Duration.ofSeconds(2)));
+        Logger tlsLogger = (Logger) LoggerFactory.getLogger(TlsProperties.class);
+        Level previousLevel = tlsLogger.getLevel();
+        ListAppender<ILoggingEvent> tlsLog = new ListAppender<>();
+        tlsLog.start();
+        tlsLogger.addAppender(tlsLog);
+        tlsLogger.setLevel(Level.WARN);
+        Throwable thrown;
+        try {
+            thrown = catchThrowable(client::authorize);
+        } finally {
+            tlsLogger.detachAppender(tlsLog);
+            tlsLogger.setLevel(previousLevel);
+            tlsLog.stop();
+        }
+
+        assertThat(thrown).isInstanceOf(IllegalStateException.class).hasMessageContaining("'" + faultyKey + "'");
+        String message = thrown.getMessage();
+        assertThat(message).doesNotContain(tlsDir.toString(), "SENTINEL_KSPATH", "SENTINEL_PW");
+        assertThat(tlsLog.list).singleElement().satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.WARN);
+            assertThat(event.getFormattedMessage())
+                    .startsWith(message)
+                    .contains(faultyKey + " = '" + faultyPath + "'")
+                    .doesNotContain("SENTINEL_PW");
+        });
+        // The TLS context is built before the token request, so nothing is sent on a broken TLS setup.
+        assertThat(wm.getAllServeEvents()).isEmpty();
+    }
+
     /** The carried stores of {@code src/main/resources}, with {@code password} in all three password slots. */
     private static TlsProperties tls(String password) {
         return new TlsProperties("keystore.jks", password, password, "trust-store", password);
+    }
+
+    /**
+     * An empty key store and an empty trust store written to {@link #tlsDir}: the TLS context builds, presents no
+     * client certificate and trusts no server certificate.
+     */
+    private TlsProperties tlsEmptyStores() throws Exception {
+        Path keyStore = tlsStoreFile(tlsDir.resolve("empty-keystore.jks"));
+        Path trustStore = tlsStoreFile(tlsDir.resolve("empty-truststore.jks"));
+        return new TlsProperties(keyStore.toString(), TLS_STORE_PASSWORD, TLS_STORE_PASSWORD, trustStore.toString(),
+                TLS_STORE_PASSWORD);
+    }
+
+    /** Writes an empty JKS store protected by {@link #TLS_STORE_PASSWORD} to {@code file}, creating its directories. */
+    private static Path tlsStoreFile(Path file) throws Exception {
+        Files.createDirectories(file.getParent());
+        KeyStore store = KeyStore.getInstance("JKS");
+        store.load(null, null);
+        try (OutputStream out = Files.newOutputStream(file)) {
+            store.store(out, TLS_STORE_PASSWORD.toCharArray());
+        }
+        return file;
     }
 
     private static BoxOAuthClient client(String baseUrl, Duration timeout) {

@@ -67,11 +67,14 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * complete when the controller returns, so TRACE gets no servlet echo and OPTIONS no {@code Allow} header. The
  * error cases are the platform defaults of SC-1, because the flow declares no exception strategy: an upstream
  * failure status, an I/O failure and an unparseable Content-Type each end in the JSON 500, and a path outside
- * {@code /FIM/*} gets the no-listener 404 without any upstream call.
+ * {@code /FIM/*} gets the no-listener 404 without any upstream call. A path holding a malformed percent-escape gets
+ * the listener's empty 400 before dispatch, also without any upstream call.
  *
- * <p>No request carries a literal {@code {client_id}}: its substitution is covered by {@code FimProxyServiceTest},
- * and every upstream URL points at WireMock, so nothing leaves the loopback interface. The original example has no
- * test of its own, so no original assertion is ported here.
+ * <p>A target holding characters {@code java.net.URI} refuses reaches the FIM server percent-encoded, as the
+ * original requester sent it. Only those targets and one rejected path carry a literal {@code {client_id}}, to show
+ * that the substituted {@code client.id} is forwarded rather than echoed in an error body; the substitution itself
+ * is covered by {@code FimProxyServiceTest}. Every upstream URL points at WireMock, so nothing leaves the loopback
+ * interface. The original example has no test of its own, so no original assertion is ported here.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
@@ -118,6 +121,76 @@ class FimProxyControllerTest {
         assertContentType(response, MediaType.APPLICATION_XML);
         assertNull(response.header("X-Fim"), response::toString);
         wm.verify(1, getRequestedFor(urlEqualTo("/FIM/a/b?x=1&y=2")));
+    }
+
+    /**
+     * Raw request target, written to the socket as given, and the URL the FIM server must receive. The targets hold
+     * characters {@code java.net.URI} refuses in a path or a query, or a malformed escape in the query; the literal
+     * {@code {client_id}} is replaced by {@code client.id} of {@code application-test.yml}, as in each case the
+     * outbound URL that would otherwise have been echoed held it. The last target's UTF-8 bytes reach the FIM server
+     * as the same bytes, percent-encoded.
+     */
+    static Stream<Arguments> targetsJavaNetUriRefuses() {
+        return Stream.of(
+                Arguments.of("/FIM/{client_id}/\\x", "/FIM/test-fim-client-id/%5Cx"),
+                Arguments.of("/FIM/{client_id}/|x", "/FIM/test-fim-client-id/%7Cx"),
+                Arguments.of("/FIM/{client_id}/^x", "/FIM/test-fim-client-id/%5Ex"),
+                Arguments.of("/FIM/x?id={client_id}&z=\\", "/FIM/x?id=test-fim-client-id&z=%5C"),
+                Arguments.of("/FIM/x?q=%zz", "/FIM/x?q=%25zz"),
+                Arguments.of("/FIM/caf\u00e9", "/FIM/caf%C3%A9"));
+    }
+
+    /**
+     * A target the original requester percent-encoded and sent is forwarded the same way and answered with the
+     * upstream reply, instead of a 500 whose message repeats the outbound URL with {@code fim.base-url} and the
+     * substituted {@code client.id}.
+     */
+    @ParameterizedTest(name = "GET {0} -> {1}")
+    @MethodSource("targetsJavaNetUriRefuses")
+    void targetJavaNetUriRefusesIsForwardedPercentEncodedAndAnsweredWithTheUpstreamReply(String target,
+                                                                                         String forwarded) {
+        byte[] upstreamBody = "<fim>escaped</fim>".getBytes(StandardCharsets.UTF_8);
+        wm.stubFor(get(urlEqualTo(forwarded)).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", MediaType.APPLICATION_XML_VALUE)
+                .withBody(upstreamBody)));
+
+        HttpTestClient.Response response = http.get(target);
+
+        assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
+        assertArrayEquals(upstreamBody, response.body(), response::toString);
+        assertContentType(response, MediaType.APPLICATION_XML);
+        wm.verify(1, getRequestedFor(urlEqualTo(forwarded)));
+        assertEquals(1, wm.getAllServeEvents().size(), response::toString);
+    }
+
+    /**
+     * A path holding a {@code %} not followed by two hexadecimal digits gets the listener's rejection, 400 with an
+     * empty body and no Content-Type, before dispatch and whatever the method, instead of Undertow's HTML 500; the
+     * FIM server is not called.
+     *
+     * @param method the request method
+     * @param path   the raw request target
+     * @param body   the request body, or {@code null} for none
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @CsvSource(nullValues = "null", value = {
+            "GET, /FIM/x%zz, null",
+            "GET, /FIM/x%, null",
+            "GET, /FIM/{client_id}%zz, null",
+            "POST, /FIM/x%2/y?q=1, abc",
+            "OPTIONS, /FIM/%G0, null"
+    })
+    void malformedPercentEscapeInThePathIsRejected400WithAnEmptyBodyWithoutUpstreamCall(String method, String path,
+                                                                                         String body) {
+        HttpTestClient.Response response = http.send(method, path, Map.of(),
+                body == null ? null : body.getBytes(StandardCharsets.UTF_8));
+
+        assertEquals("HTTP/1.1 400 Bad Request", response.statusLine(), response::toString);
+        assertEquals(List.of("0"), response.headers("Content-Length"), response::toString);
+        assertTrue(response.headers("Content-Type").isEmpty(), response::toString);
+        assertArrayEquals(new byte[0], response.body(), response::toString);
+        wm.verify(0, anyRequestedFor(anyUrl()));
     }
 
     /**

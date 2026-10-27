@@ -14,6 +14,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.Charset;
@@ -22,12 +23,15 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLException;
 
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -121,7 +125,16 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * the Mule requester's default response timeout, and one 10 s deadline, started when each request's exchange
  * starts, bounds its whole response, headers and body: when it passes, the request is aborted, its connection
  * discarded, and the call fails with an {@link HttpTimeoutException}
- * {@code Response not received within <timeout> ms}, so a stalled token response releases the token lock in time.
+ * {@code Response not received within <timeout> ms}. A TLS failure of either request, such as a certificate the
+ * trust does not hold or one issued for another host, fails the call with an {@link SSLException}
+ * {@code TLS handshake failed}, whose cause is the JDK's exception: the JDK's text names internal classes and never
+ * reaches a message.
+ *
+ * <p>Token acquisition is single-flight: the calls that need a token while one is being requested, because none is
+ * cached or because Box rejected the cached one, all wait for that one request instead of sending their own, and
+ * all receive its token or its failure when it ends. A stalled token response therefore holds every waiting call
+ * for one deadline at most, never one deadline for each call queued before it, and a failed request is not retried;
+ * the next call after it sends a new one.
  *
  * <p>Redirects are followed, as {@code http:request} follows them by default, up to four in a row; the fifth 3xx
  * in a row is returned as received, as is a redirect from {@code https} to {@code http}, which is never followed.
@@ -152,6 +165,12 @@ public class BoxOAuthClient implements AutoCloseable {
     private static final int FORBIDDEN = 403;
 
     private static final String HTTPS_SCHEME = "https";
+
+    /**
+     * The message of every TLS failure. The JDK's own text names internal classes and certificate details, and a
+     * transport failure's message reaches the caller's 500 body.
+     */
+    private static final String TLS_FAILURE_MESSAGE = "TLS handshake failed";
 
     /** Most redirects followed in a row; the next 3xx is returned as received. */
     private static final int MAX_REDIRECTS_FOLLOWED = 4;
@@ -220,8 +239,20 @@ public class BoxOAuthClient implements AutoCloseable {
     /** Set by {@link #close()}; guarded by {@link #resourceClientLock}. */
     private boolean closed;
 
-    /** The cached token, replacing {@code Token_Manager_Config}; written only under this instance's lock. */
+    /**
+     * The cached token, replacing {@code Token_Manager_Config}; read without a lock, and written only under
+     * {@link #tokenLock} by the call whose token request answered it.
+     */
     private volatile Token token;
+
+    /** Guards {@link #tokenFlight} and every write of {@link #token}; never held while a request is in progress. */
+    private final Object tokenLock = new Object();
+
+    /**
+     * The token request in progress, or {@code null}: the one request every call that needs a token awaits, which
+     * ends with its token or its failure; guarded by {@link #tokenLock}.
+     */
+    private CompletableFuture<Token> tokenFlight;
 
     /**
      * Creates the client the application uses, with the 10 s Mule default timeouts.
@@ -232,6 +263,9 @@ public class BoxOAuthClient implements AutoCloseable {
      * @param baseUrl      {@code box.api.base-url}: scheme, host and port of the Box resource request
      * @param basePath     {@code box.api.base-path}: the request configuration's basePath
      * @param tls          key store and trust store of the HTTPS resource request
+     * @throws IllegalStateException when {@code box.oauth.token-url} or {@code box.api.base-url} is not an absolute
+     *         http or https URL with a host or embeds user information, with a message naming the key and never the
+     *         value, so the application does not start
      */
     @Autowired
     public BoxOAuthClient(@Value("${box.oauth.token-url:https://app.box.com/api/oauth2/token}") String tokenUrl,
@@ -244,8 +278,8 @@ public class BoxOAuthClient implements AutoCloseable {
     }
 
     /**
-     * Creates a client with the given connect and response timeout. Construction only records the values and
-     * builds the plain token client; it opens no connection and never reads {@code tls}.
+     * Creates a client with the given connect and response timeout. Construction only checks the two URLs, records
+     * the values and builds the plain token client; it opens no connection and never reads {@code tls}.
      *
      * @param tokenUrl     the client-credentials token endpoint
      * @param clientId     the client id sent in the Basic header of the token request; accepted blank here and
@@ -257,14 +291,17 @@ public class BoxOAuthClient implements AutoCloseable {
      * @param tls          TLS stores of the resource request; may be {@code null} unless {@code baseUrl} is https
      * @param timeout      connect timeout of both requests, and the time within which each one's whole response,
      *                     headers and body, must arrive
-     * @throws IllegalStateException when the JVM has no default TLS context
+     * @throws IllegalStateException when {@code tokenUrl} or {@code baseUrl} is not an absolute http or https URL
+     *         with a host or embeds user information, checked before anything is built and with a message naming
+     *         {@code box.oauth.token-url} or {@code box.api.base-url} and never the value; or when the JVM has no
+     *         default TLS context
      */
     public BoxOAuthClient(String tokenUrl, String clientId, String clientSecret, String baseUrl, String basePath,
                           TlsProperties tls, Duration timeout) {
-        this.tokenUrl = tokenUrl;
+        this.tokenUrl = validatedUrl(tokenUrl, "box.oauth.token-url");
         this.clientId = clientId;
         this.clientSecret = clientSecret;
-        this.baseUrl = baseUrl;
+        this.baseUrl = validatedUrl(baseUrl, "box.api.base-url");
         this.basePath = basePath;
         this.tls = tls;
         this.timeout = timeout;
@@ -276,6 +313,37 @@ public class BoxOAuthClient implements AutoCloseable {
         this.deadlines.setRemoveOnCancelPolicy(true);
         this.tokenHttpClient = httpClient(defaultSslContext());
         this.tokenClient = restClient(tokenHttpClient);
+    }
+
+    /**
+     * {@code url} unchanged, once it has proved to be an absolute {@code http} or {@code https} URL with a host and
+     * without user information. The original's {@code host}, {@code port} and {@code protocol} attributes and its
+     * {@code tokenUrl} held no credentials; a configured URL could, and every request to it would then fail with an
+     * error that names it.
+     *
+     * @param url the configured value
+     * @param key its configuration key, which a failure names in place of the value
+     * @return {@code url}, unchanged
+     * @throws IllegalStateException when it is not, with a message that names {@code key} and never repeats the value
+     */
+    private static String validatedUrl(String url, String key) {
+        String requirement = key + " must be an absolute http or https URL with a host";
+        URI uri;
+        try {
+            uri = new URI(url == null ? "" : url);
+        } catch (URISyntaxException e) {
+            // Not kept as the cause: its message repeats the whole URL. The reason and index name the fault alone.
+            throw new IllegalStateException(requirement + ": " + e.getReason()
+                    + (e.getIndex() >= 0 ? " at index " + e.getIndex() : ""));
+        }
+        String scheme = uri.getScheme();
+        if (uri.getHost() == null || !("http".equalsIgnoreCase(scheme) || HTTPS_SCHEME.equalsIgnoreCase(scheme))) {
+            throw new IllegalStateException(requirement);
+        }
+        if (uri.getRawUserInfo() != null) {
+            throw new IllegalStateException(key + " must not embed credentials");
+        }
+        return url;
     }
 
     /**
@@ -293,8 +361,10 @@ public class BoxOAuthClient implements AutoCloseable {
      *         when the TLS context of an https base URL cannot be built; or when an https base URL has no
      *         {@link TlsProperties}, or once the client is closed
      * @throws org.springframework.web.client.ResourceAccessException on an I/O failure of either request,
-     *         including a refused or timed-out connect and a response, headers or body, not complete within the
-     *         timeout (its cause is then a {@link HttpTimeoutException}); nothing is retried after one
+     *         including a refused or timed-out connect, a response, headers or body, not complete within the
+     *         timeout (its cause is then a {@link HttpTimeoutException}), and a TLS failure (its message then ends
+     *         with {@code TLS handshake failed}, and its cause is an {@link SSLException} with that message, caused
+     *         by the JDK's exception); nothing is retried after one
      */
     public ResponseEntity<byte[]> authorize() {
         // Checked here rather than at construction, so the application still starts with the blank placeholders.
@@ -350,38 +420,109 @@ public class BoxOAuthClient implements AutoCloseable {
     }
 
     /**
-     * Returns the cached token, requesting it on first use. Neither expiry nor {@code expires_in} triggers a
-     * refresh; only a rejected resource request does.
+     * Returns the cached token, without taking a lock, or requests it on first use; concurrent first calls share
+     * that one request. Neither expiry nor {@code expires_in} triggers a refresh; only a rejected resource request
+     * does.
      */
     private Token currentToken() {
         Token cached = token;
-        return cached != null ? cached : fetchTokenIfAbsent();
-    }
-
-    private synchronized Token fetchTokenIfAbsent() {
-        if (token == null) {
-            token = requestToken();
-        }
-        return token;
+        return cached != null ? cached : tokenOtherThan(null);
     }
 
     /**
      * Replaces {@code rejected} with a newly requested token. When another thread has already replaced it, that
-     * thread's token is used instead of a second exchange.
+     * thread's token is used instead of a second exchange, and the calls rejected with the same token while its
+     * replacement is requested share that one exchange. A failed exchange leaves {@code rejected} cached.
      */
-    private synchronized Token replaceToken(Token rejected) {
-        if (token == null || token == rejected) {
-            token = requestToken();
+    private Token replaceToken(Token rejected) {
+        return tokenOtherThan(rejected);
+    }
+
+    /**
+     * Returns the cached token unless there is none or it is {@code unusable}; otherwise joins the token request in
+     * flight or, when none is, starts one and runs it on the calling thread. {@link #tokenLock} is held only to
+     * read and set the cache and the flight, never during the request, so every call that joined receives the
+     * flight's token or its failure as soon as the one request ends. A failure is not retried, and a call arriving
+     * once the flight has ended starts a new one.
+     *
+     * @param unusable the token the caller cannot use, or {@code null} when any cached token will do
+     */
+    private Token tokenOtherThan(Token unusable) {
+        CompletableFuture<Token> flight;
+        boolean starts = false;
+        synchronized (tokenLock) {
+            Token cached = token;
+            if (cached != null && cached != unusable) {
+                return cached;
+            }
+            flight = tokenFlight;
+            if (flight == null) {
+                flight = new CompletableFuture<>();
+                tokenFlight = flight;
+                starts = true;
+            }
         }
-        return token;
+        if (starts) {
+            runFlight(flight);
+        }
+        return awaitFlight(flight);
+    }
+
+    /**
+     * Sends the token request of {@code flight} and ends the flight with its outcome. The token is cached and the
+     * flight cleared before the waiting calls are released, so neither they nor a later call find the ended flight.
+     * Whatever ends the request ends the flight, so no waiting call is left without an outcome.
+     */
+    private void runFlight(CompletableFuture<Token> flight) {
+        Token fetched = null;
+        Throwable failure = null;
+        try {
+            fetched = requestToken();
+        } catch (RuntimeException | Error e) {
+            failure = e;
+        } catch (Throwable e) {
+            // requestToken() declares no checked exception; one thrown regardless is wrapped once, here, so every
+            // waiting call still receives the same instance.
+            failure = new IllegalStateException(e.getMessage(), e);
+        }
+        synchronized (tokenLock) {
+            if (failure == null) {
+                token = fetched;
+            }
+            tokenFlight = null;
+        }
+        if (failure == null) {
+            flight.complete(fetched);
+        } else {
+            // Wrapped so that join() throws this CompletionException itself, whose cause is exactly the failure.
+            flight.completeExceptionally(new CompletionException(failure));
+        }
+    }
+
+    /**
+     * Waits for {@code flight} to end, then returns its token or throws its failure, the same
+     * {@link RuntimeException} or {@link Error} instance for every call that waited. The wait is not interruptible
+     * and lasts as long as the one request, which the transport's deadline bounds.
+     */
+    private static Token awaitFlight(CompletableFuture<Token> flight) {
+        try {
+            return flight.join();
+        } catch (CompletionException wrapped) {
+            Throwable failure = wrapped.getCause();
+            if (failure instanceof Error error) {
+                throw error;
+            }
+            // runFlight ends a flight only with a RuntimeException or an Error.
+            throw (RuntimeException) failure;
+        }
     }
 
     private Token requestToken() {
         String credentials = Base64.getEncoder()
                 .encodeToString((clientId + ":" + clientSecret).getBytes(StandardCharsets.UTF_8));
-        // The transport's one deadline for headers and body also bounds how long a stalled token response holds this
-        // instance's lock, so a waiting authorize() is released by a timed failure. The form is set as raw bytes
-        // on the transport's request with an explicit Content-Type and length, so no converter adds a charset
+        // The transport's one deadline for headers and body also bounds how long a stalled token response keeps the
+        // calls sharing this request waiting, so they are all released by one timed failure. The form is set as raw
+        // bytes on the transport's request with an explicit Content-Type and length, so no converter adds a charset
         // parameter, the request is not chunked, and a 307 or 308 re-sends it: RestClient's body(...) would hand
         // httpclient5 a body it declares not repeatable, and httpclient5 follows no redirect of such a request.
         StreamingHttpOutputMessage.Body form = repeatableBody(CLIENT_CREDENTIALS_FORM);
@@ -574,7 +715,7 @@ public class BoxOAuthClient implements AutoCloseable {
     /**
      * Runs one exchange, its redirects included, under the deadline: the response head must arrive before it, and
      * the returned response's body is read under it too. A failure once the deadline has passed is reported as the
-     * timeout.
+     * timeout, and any other TLS failure without the JDK's text ({@link #withoutTlsDetail}).
      */
     private ClassicHttpResponse withinDeadline(ClassicHttpRequest request, ExecChain.Scope scope, ExecChain chain)
             throws IOException, HttpException {
@@ -585,6 +726,9 @@ public class BoxOAuthClient implements AutoCloseable {
         } catch (IOException | HttpException e) {
             if (deadline.stop()) {
                 throw deadline.timedOut(e);
+            }
+            if (e instanceof IOException failure) {
+                throw withoutTlsDetail(failure);
             }
             throw e;
         } catch (RuntimeException e) {
@@ -598,6 +742,18 @@ public class BoxOAuthClient implements AutoCloseable {
             response.setEntity(new DeadlineEntity(entity, deadline));
         }
         return response;
+    }
+
+    /**
+     * {@code failure} as the exchange reports it: a TLS failure, any {@link SSLException} (an untrusted or mismatched
+     * certificate, a refused or broken handshake), becomes an {@link SSLException} with the fixed message
+     * {@value #TLS_FAILURE_MESSAGE} and the original as its cause; any other failure is returned unchanged. The JDK's
+     * message names internal classes, such as {@code sun.security.provider.certpath.SunCertPathBuilderException}, and
+     * {@link RestClient} copies the message into the {@code ResourceAccessException} whose text a caller's 500 body
+     * reports.
+     */
+    private static IOException withoutTlsDetail(IOException failure) {
+        return failure instanceof SSLException ? new SSLException(TLS_FAILURE_MESSAGE, failure) : failure;
     }
 
     /**
@@ -634,9 +790,12 @@ public class BoxOAuthClient implements AutoCloseable {
             return System.nanoTime() - expiresAt >= 0;
         }
 
-        /** {@code failure} reported as the timeout, when the deadline has passed; otherwise {@code failure}. */
+        /**
+         * {@code failure} reported as the timeout, when the deadline has passed; otherwise {@code failure}, a TLS
+         * failure without the JDK's text ({@link #withoutTlsDetail}).
+         */
         IOException translate(IOException failure) {
-            return stop() ? timedOut(failure) : failure;
+            return stop() ? timedOut(failure) : withoutTlsDetail(failure);
         }
 
         HttpTimeoutException timedOut(Exception failure) {
