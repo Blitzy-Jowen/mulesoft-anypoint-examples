@@ -62,6 +62,7 @@ import org.xmlunit.builder.Input;
 import org.xmlunit.diff.Diff;
 
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.web_service_consumer.config.TshirtServiceProperties;
@@ -672,5 +673,30 @@ class TshirtServiceClientTest {
 
             assertThat(causeChain(failure)).anyMatch(ConnectException.class::isInstance);
         }
+    }
+
+    // The JDK re-sends a buffered POST once after a reset; the service has already received the order by then.
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Operation.class)
+    void connectionResetSurfacesAsWebServiceIOExceptionAndIsNeverRetried(Operation operation) {
+        stubService(aResponse().withFault(Fault.CONNECTION_RESET_BY_PEER));
+        TshirtServiceClient client = newClient();
+
+        assertThrows(WebServiceIOException.class, () -> operation.call(client));
+
+        wm.verify(exactly(1), postRequestedFor(urlEqualTo(SERVICE_PATH)));
+    }
+
+    // Single-attempt sending streams the buffered envelope with its exact length, so the request is not chunked.
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(Operation.class)
+    void requestCarriesItsContentLengthAndIsNotChunked(Operation operation) {
+        stubService(soapResponse(200, operation.response));
+
+        operation.call(newClient());
+
+        LoggedRequest request = singlePost();
+        assertThat(request.getHeader("Content-Length")).isEqualTo(String.valueOf(request.getBody().length));
+        assertThat(request.containsHeader("Transfer-Encoding")).isFalse();
     }
 }

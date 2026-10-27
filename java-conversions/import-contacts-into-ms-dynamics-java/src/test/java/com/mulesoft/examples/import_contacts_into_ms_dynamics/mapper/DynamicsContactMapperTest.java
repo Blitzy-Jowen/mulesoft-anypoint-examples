@@ -11,8 +11,6 @@ package com.mulesoft.examples.import_contacts_into_ms_dynamics.mapper;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -36,28 +34,30 @@ import org.junit.jupiter.params.provider.ValueSource;
  * emailaddress1 = #[payload.email], telephone1 = #[payload.businessphone]
  * </pre>
  *
- * <p>Rows are given in the form {@link DwCsvReader} produces them: {@link LinkedHashMap}s of string values keyed by
- * the header. The mapper has no collaborators, so no mock is involved.
+ * <p>Rows are built inline in the form the CSV reader delivers them: {@link LinkedHashMap}s of string values keyed by
+ * the header of {@code contacts.csv} ({@code firstname,surname,phone,email}), holding that file's two records. No
+ * resource, CSV reader, Spring context or mock is involved, so the mapper is tested on its own.
  */
 class DynamicsContactMapperTest {
 
     private static final String JOHN_EMAIL = "john.doe@texasComp.com";
     private static final String JANE_EMAIL = "jane.doe@texasComp.com";
+    private static final String JOHN_PHONE = "096548763";
+    private static final String JANE_PHONE = "091558780";
 
     private final DynamicsContactMapper mapper = new DynamicsContactMapper();
 
     // ---------------------------------------------------------------- map
 
     @Test
-    @DisplayName("The carried contacts.csv maps to one record per row, in row order, with the script's keys and values")
-    void mapsCarriedContactsCsv() throws IOException {
-        List<Map<String, String>> rows = new DwCsvReader().read(carriedContactsCsv());
-
-        List<Map<String, Object>> records = mapper.map(rows);
+    @DisplayName("The contacts.csv rows map to one record per row, in row order, with the script's keys and values")
+    void mapsContactsCsvRowsInRowOrder() {
+        List<Map<String, Object>> records = mapper.map(List.of(john(), jane()));
 
         assertThat(records).hasSize(2);
-        assertRecord(records.get(0), "John", "Doe", "096548763", JOHN_EMAIL);
-        assertRecord(records.get(1), "Jane", "Doe", "091558780", JANE_EMAIL);
+        assertRecord(records.get(0), "John", "Doe", JOHN_PHONE, JOHN_EMAIL);
+        assertRecord(records.get(1), "Jane", "Doe", JANE_PHONE, JANE_EMAIL);
+        assertThat(records.get(0).get(DynamicsContactMapper.BUSINESSPHONE)).isInstanceOf(String.class);
         assertThat(records.get(0))
                 .hasToString("{firstname=John, lastname=Doe, businessphone=096548763, email=" + JOHN_EMAIL + "}");
     }
@@ -147,16 +147,16 @@ class DynamicsContactMapperTest {
     // ---------------------------------------------------------------- toContactAttributes
 
     @Test
-    @DisplayName("A mapped contact becomes the attributes firstname, lastname, emailaddress1, telephone1")
-    void buildsCreateContactAttributesFromMappedRecord() throws IOException {
-        List<Map<String, Object>> records = mapper.map(new DwCsvReader().read(carriedContactsCsv()));
+    @DisplayName("Each mapped contact, in For Each order, becomes firstname, lastname, emailaddress1, telephone1")
+    void buildsCreateContactAttributesForEachMappedRecord() {
+        List<Map<String, Object>> attributeSets = mapper.map(List.of(john(), jane())).stream()
+                .map(mapper::toContactAttributes)
+                .toList();
 
-        Map<String, Object> john = mapper.toContactAttributes(records.get(0));
-        Map<String, Object> jane = mapper.toContactAttributes(records.get(1));
-
-        assertAttributes(john, "John", "Doe", JOHN_EMAIL, "096548763");
-        assertAttributes(jane, "Jane", "Doe", JANE_EMAIL, "091558780");
-        assertThat(john).hasToString(
+        assertThat(attributeSets).hasSize(2);
+        assertAttributes(attributeSets.get(0), "John", "Doe", JOHN_EMAIL, JOHN_PHONE);
+        assertAttributes(attributeSets.get(1), "Jane", "Doe", JANE_EMAIL, JANE_PHONE);
+        assertThat(attributeSets.get(0)).hasToString(
                 "{firstname=John, lastname=Doe, emailaddress1=" + JOHN_EMAIL + ", telephone1=096548763}");
     }
 
@@ -224,16 +224,18 @@ class DynamicsContactMapperTest {
 
     // ---------------------------------------------------------------- helpers
 
-    /** Returns the bytes of the carried {@code contacts.csv}, the original example's input file. */
-    private static byte[] carriedContactsCsv() throws IOException {
-        try (InputStream in = DynamicsContactMapperTest.class.getResourceAsStream("/contacts.csv")) {
-            assertThat(in).as("classpath resource /contacts.csv").isNotNull();
-            return in.readAllBytes();
-        }
+    /** The first record of {@code contacts.csv}, the original IT's {@code EMAIL1} contact. */
+    private static Map<String, String> john() {
+        return csvRow("firstname", "John", "surname", "Doe", "phone", JOHN_PHONE, "email", JOHN_EMAIL);
+    }
+
+    /** The second record of {@code contacts.csv}, the original IT's {@code EMAIL2} contact. */
+    private static Map<String, String> jane() {
+        return csvRow("firstname", "Jane", "surname", "Doe", "phone", JANE_PHONE, "email", JANE_EMAIL);
     }
 
     /**
-     * Builds a CSV row as {@link DwCsvReader} returns it.
+     * Builds a CSV row as the CSV reader returns it.
      *
      * @param keyValues alternating column names and values: name, value, name, value, ...
      */

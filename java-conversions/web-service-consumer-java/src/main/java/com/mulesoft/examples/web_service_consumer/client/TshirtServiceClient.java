@@ -8,6 +8,11 @@
 
 package com.mulesoft.examples.web_service_consumer.client;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
 import java.time.Duration;
 
 import javax.xml.XMLConstants;
@@ -20,12 +25,15 @@ import javax.xml.transform.dom.DOMResult;
 import javax.xml.transform.dom.DOMSource;
 
 import org.springframework.stereotype.Component;
+import org.springframework.ws.WebServiceMessage;
 import org.springframework.ws.client.core.WebServiceMessageCallback;
 import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.soap.SoapMessage;
 import org.springframework.ws.soap.SoapVersion;
 import org.springframework.ws.soap.client.core.SoapFaultMessageResolver;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
+import org.springframework.ws.transport.WebServiceConnection;
+import org.springframework.ws.transport.http.HttpUrlConnection;
 import org.springframework.ws.transport.http.HttpUrlConnectionMessageSender;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -104,7 +112,7 @@ public class TshirtServiceClient {
         messageFactory.setSoapVersion(SoapVersion.SOAP_11);
         messageFactory.afterPropertiesSet();
 
-        HttpUrlConnectionMessageSender messageSender = new HttpUrlConnectionMessageSender();
+        HttpUrlConnectionMessageSender messageSender = new SingleAttemptMessageSender();
         messageSender.setConnectionTimeout(orDefault(properties.getConnectTimeout()));
         messageSender.setReadTimeout(orDefault(properties.getReadTimeout()));
         // Requests do not advertise gzip: Spring WS decides whether a response exists from the raw, still
@@ -213,6 +221,51 @@ public class TshirtServiceClient {
     private Transformer newTransformer() throws TransformerConfigurationException {
         synchronized (transformerFactory) {
             return transformerFactory.newTransformer();
+        }
+    }
+
+    /**
+     * {@link HttpUrlConnectionMessageSender} whose connections send every request exactly once.
+     *
+     * <p>A default {@link HttpURLConnection} buffers the POST body and, when the connection fails while the
+     * response is read (a reset, an unexpected end of stream), silently re-sends the whole request once
+     * ({@code sun.net.http.retryPost}, on by default). For {@code OrderTshirt} that would place the order twice
+     * after the service had already received it, and the flows declare no retry of any kind. In fixed-length
+     * streaming mode the JDK never re-sends, so each connection buffers the envelope Spring WS writes and then
+     * streams it with that exact length: the wire form, {@code Content-Length} included, is unchanged.
+     */
+    private static final class SingleAttemptMessageSender extends HttpUrlConnectionMessageSender {
+
+        @Override
+        public WebServiceConnection createConnection(URI uri) throws IOException {
+            // The parent opens and prepares the HttpURLConnection without connecting it.
+            HttpUrlConnection prepared = (HttpUrlConnection) super.createConnection(uri);
+            return new FixedLengthHttpUrlConnection(prepared.getConnection());
+        }
+    }
+
+    /** Collects the request body, then sends it in fixed-length streaming mode ({@link SingleAttemptMessageSender}). */
+    private static final class FixedLengthHttpUrlConnection extends HttpUrlConnection {
+
+        private final ByteArrayOutputStream requestBody = new ByteArrayOutputStream();
+
+        private FixedLengthHttpUrlConnection(HttpURLConnection connection) {
+            super(connection);
+        }
+
+        @Override
+        protected OutputStream getRequestOutputStream() {
+            return requestBody;
+        }
+
+        @Override
+        protected void onSendAfterWrite(WebServiceMessage message) throws IOException {
+            HttpURLConnection connection = getConnection();
+            connection.setFixedLengthStreamingMode(requestBody.size());
+            try (OutputStream out = connection.getOutputStream()) {
+                requestBody.writeTo(out);
+            }
+            super.onSendAfterWrite(message);
         }
     }
 

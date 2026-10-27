@@ -1,0 +1,13 @@
+# Spring profile "test" only: the original demo values of soap-webservice-security (AAP 0.4.6), needed by the committed
+# keystore.jks and the original assertions. Sources: PasswordCallback.java (users), wssecurity.properties (keystore),
+# saml.properties (issuer key), service-clients.xml (client user). Never copy into src/main/resources.
+soap-security:
+  users:
+    joe: secret
+    stan: elephant
+  keystore:
+    password: keyStorePassword
+  saml:
+    issuer-key-password: secret
+  client:
+    user: joe
