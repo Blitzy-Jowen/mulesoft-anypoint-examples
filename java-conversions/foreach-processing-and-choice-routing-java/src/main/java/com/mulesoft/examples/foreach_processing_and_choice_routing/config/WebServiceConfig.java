@@ -1,5 +1,10 @@
 package com.mulesoft.examples.foreach_processing_and_choice_routing.config;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
@@ -36,6 +41,7 @@ import org.springframework.oxm.mime.MimeContainer;
 import org.springframework.util.Assert;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.xml.StaxUtils;
+import org.springframework.ws.WebServiceMessage;
 import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.client.support.interceptor.ClientInterceptor;
 import org.springframework.ws.client.support.interceptor.ClientInterceptorAdapter;
@@ -47,6 +53,8 @@ import org.springframework.ws.server.endpoint.adapter.method.MethodReturnValueHa
 import org.springframework.ws.soap.SoapMessage;
 import org.springframework.ws.soap.SoapVersion;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
+import org.springframework.ws.transport.WebServiceConnection;
+import org.springframework.ws.transport.http.HttpUrlConnection;
 import org.springframework.ws.transport.http.HttpUrlConnectionMessageSender;
 import org.w3c.dom.Document;
 import org.w3c.dom.Node;
@@ -65,7 +73,8 @@ import org.w3c.dom.Node;
  *   <li>{@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory and the listener boundary by their
  *       bean names, {@value #MESSAGE_FACTORY_BEAN_NAME} and {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME}.</li>
  *   <li>One {@link WebServiceTemplate} carries every outbound credit-agency and bank call; callers pass each URI per
- *       call, because a bank URI is chosen per quote.</li>
+ *       call, because a bank URI is chosen per quote. It sends each request exactly once
+ *       ({@link SingleAttemptMessageSender}), so a failed call is never silently repeated.</li>
  *   <li>{@code GET <listener path>?wsdl} serves {@code wsdl/CreditAgencyService.wsdl} on the credit agency's path
  *       and {@code wsdl/BankService.wsdl} on each bank's path, as CXF published them, through
  *       {@link WsdlQueryPublisher}; no {@code WsdlDefinition} or {@code XsdSchema} bean exists, so the servlet never
@@ -175,9 +184,13 @@ public class WebServiceConfig implements WsConfigurer {
 
     /**
      * The outbound SOAP client of the credit-agency lookup and every bank quote. Connecting and reading are each
-     * bounded by the original {@code responseTimeout}. A SOAP fault answer surfaces as
-     * {@code SoapFaultClientException} and any other HTTP error as {@code WebServiceTransportException}, because
-     * both connection checks keep their default {@code true}. No default URI is set: every call names its target.
+     * bounded by the original {@code responseTimeout}. Each request is sent exactly once, through
+     * {@link SingleAttemptMessageSender}: a connection reset, an unexpected end of stream or a timeout after the
+     * request was written reaches the caller as {@code WebServiceIOException} instead of re-sending the request, as
+     * the original sent every call once and answered any failure with the loan flow's catch branch. A SOAP fault
+     * answer surfaces as {@code SoapFaultClientException} and any other HTTP error as
+     * {@code WebServiceTransportException}, because both connection checks keep their default {@code true}. No
+     * default URI is set: every call names its target.
      * Every request carries the {@code SOAPAction} header the CXF client sent, through
      * {@link SoapActionHeaderInterceptor}, so callers pass no message callback for it.
      *
@@ -192,7 +205,7 @@ public class WebServiceConfig implements WsConfigurer {
                 () -> "loanbroker.response-timeout must be a positive number of milliseconds, but was "
                         + responseTimeoutMillis);
         Duration responseTimeout = Duration.ofMillis(responseTimeoutMillis);
-        HttpUrlConnectionMessageSender messageSender = new HttpUrlConnectionMessageSender();
+        HttpUrlConnectionMessageSender messageSender = new SingleAttemptMessageSender();
         messageSender.setConnectionTimeout(responseTimeout);
         messageSender.setReadTimeout(responseTimeout);
 
@@ -221,6 +234,52 @@ public class WebServiceConfig implements WsConfigurer {
                 request.setSoapAction(request.getSoapAction());
             }
             return true;
+        }
+    }
+
+    /**
+     * {@link HttpUrlConnectionMessageSender} whose connections send every request exactly once.
+     * <p>
+     * A default {@link HttpURLConnection} buffers the POST body and, when the connection fails while the response is
+     * read (a reset, an unexpected end of stream), silently re-sends the whole request once
+     * ({@code sun.net.http.retryPost}, on by default), so a credit agency or bank that had already received the
+     * request would receive it twice. In fixed-length streaming mode the JDK never re-sends, so each connection
+     * buffers the envelope Spring WS writes and then streams it with that exact length: the wire form,
+     * {@code Content-Length} included, is unchanged. Timeouts, {@code Accept-Encoding} and every other connection
+     * setting stay the inherited ones. Stateless, so the shared template's concurrent calls use one instance.
+     */
+    static final class SingleAttemptMessageSender extends HttpUrlConnectionMessageSender {
+
+        @Override
+        public WebServiceConnection createConnection(URI uri) throws IOException {
+            // The parent opens and prepares the HttpURLConnection without connecting it.
+            HttpUrlConnection prepared = (HttpUrlConnection) super.createConnection(uri);
+            return new FixedLengthHttpUrlConnection(prepared.getConnection());
+        }
+    }
+
+    /** Collects the request body, then sends it in fixed-length streaming mode ({@link SingleAttemptMessageSender}). */
+    private static final class FixedLengthHttpUrlConnection extends HttpUrlConnection {
+
+        private final ByteArrayOutputStream requestBody = new ByteArrayOutputStream();
+
+        private FixedLengthHttpUrlConnection(HttpURLConnection connection) {
+            super(connection);
+        }
+
+        @Override
+        protected OutputStream getRequestOutputStream() {
+            return requestBody;
+        }
+
+        @Override
+        protected void onSendAfterWrite(WebServiceMessage message) throws IOException {
+            HttpURLConnection connection = getConnection();
+            connection.setFixedLengthStreamingMode(requestBody.size());
+            try (OutputStream out = connection.getOutputStream()) {
+                requestBody.writeTo(out);
+            }
+            super.onSendAfterWrite(message);
         }
     }
 

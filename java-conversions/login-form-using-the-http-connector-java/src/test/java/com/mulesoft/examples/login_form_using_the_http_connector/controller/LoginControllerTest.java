@@ -15,11 +15,18 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -94,9 +101,16 @@ class LoginControllerTest {
         return HttpTestClient.localhost(port);
     }
 
-    @Test
-    void getLoginReturnsIndexPageWithoutContentType() {
-        HttpTestClient.Response response = client().get(LOGIN_PATH);
+    /**
+     * {@code GetLoginPageFlow} for {@code GET} in any letter case: the Mule 3.8 listener compared the request method
+     * with {@code allowedMethods="GET"} (xml:9) ignoring case.
+     *
+     * @param method {@code GET} in some letter case
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"GET", "get", "Get", "gET"})
+    void getLoginReturnsIndexPageWithoutContentType(String method) {
+        HttpTestClient.Response response = client().send(method, LOGIN_PATH, null, null);
 
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
         assertEquals(List.of(), response.headers(CONTENT_TYPE), response::toString);
@@ -104,17 +118,31 @@ class LoginControllerTest {
         assertArrayEquals(template(INDEX_PAGE), response.body(), response::toString);
     }
 
-    @Test
-    void postLoginWithValidCredentialsReturnsSuccessPage() {
-        HttpTestClient.Response response = client().send("POST", LOGIN_PATH, Map.of(CONTENT_TYPE, FORM),
+    /**
+     * {@code DoLoginFlow} for {@code POST} in any letter case: the Mule 3.8 listener compared the request method
+     * with {@code allowedMethods="POST"} (xml:16) ignoring case.
+     *
+     * @param method {@code POST} in some letter case
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"POST", "post", "Post", "pOST"})
+    void postLoginWithValidCredentialsReturnsSuccessPage(String method) {
+        HttpTestClient.Response response = client().send(method, LOGIN_PATH, Map.of(CONTENT_TYPE, FORM),
                 "username=mule&password=mule".getBytes(UTF_8));
 
         assertSuccessPage(response);
     }
 
-    @Test
-    void postLoginWithWrongPasswordReturnsFailurePage() {
-        HttpTestClient.Response response = client().post(LOGIN_PATH, FORM, "username=mule&password=wrong");
+    /**
+     * The catch branch for {@code POST} in any letter case.
+     *
+     * @param method {@code POST} in some letter case
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"POST", "post", "Post", "pOST"})
+    void postLoginWithWrongPasswordReturnsFailurePage(String method) {
+        HttpTestClient.Response response = client().send(method, LOGIN_PATH, Map.of(CONTENT_TYPE, FORM),
+                "username=mule&password=wrong".getBytes(UTF_8));
 
         assertFailurePage(response, "mule");
         assertTrue(response.bodyAsString().contains("Wrong password for username mule"), response::toString);
@@ -128,6 +156,36 @@ class LoginControllerTest {
 
         assertEquals(403, response.status(), response::toString);
         assertFailurePage(response, "null");
+    }
+
+    /**
+     * A repeated field takes its last value, as Mule 3.8's {@code ParameterMap#get} returned {@code values.getLast()},
+     * so a valid last value logs in whatever came before it.
+     *
+     * @param form the posted form body, whose last {@code username} and {@code password} are the demo credentials
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"username=mule&password=wrong&password=mule", "username=bob&username=mule&password=mule"})
+    void repeatedFieldWithValidLastValueLogsIn(String form) {
+        HttpTestClient.Response response = client().post(LOGIN_PATH, FORM, form);
+
+        assertSuccessPage(response);
+    }
+
+    /**
+     * A repeated field takes its last value, so an invalid last value is rejected whatever came before it, and the
+     * failure page shows the last {@code username}; a last pair without {@code =} is the value {@code null}.
+     *
+     * @param form             the posted form body
+     * @param renderedUsername the username the failure page shows
+     */
+    @ParameterizedTest
+    @CsvSource({"'username=mule&password=mule&password=x', mule", "'username=mule&password=mule&password', mule",
+            "'username=alice&username=bob&password=wrong', bob", "'username=mule&username=bob&password=mule', bob"})
+    void repeatedFieldWithInvalidLastValueIsRejected(String form, String renderedUsername) {
+        HttpTestClient.Response response = client().post(LOGIN_PATH, FORM, form);
+
+        assertFailurePage(response, renderedUsername);
     }
 
     @Test
@@ -163,13 +221,13 @@ class LoginControllerTest {
     }
 
     /**
-     * The two {@code /login} listeners accept GET and POST only ({@code allowedMethods}, xml:9 and 16); every
-     * other method gets the listener's 405.
+     * The two {@code /login} listeners accept GET and POST only ({@code allowedMethods}, xml:9 and 16), compared
+     * ignoring case; every other method, in any letter case, gets the listener's 405.
      *
      * @param method a method neither listener accepts
      */
     @ParameterizedTest
-    @ValueSource(strings = {"PUT", "DELETE", "OPTIONS", "PATCH", "TRACE"})
+    @ValueSource(strings = {"PUT", "DELETE", "OPTIONS", "options", "Options", "PATCH", "TRACE"})
     void methodsOutsideAllowedMethodsReturn405(String method) {
         HttpTestClient.Response response = client().send(method, LOGIN_PATH, null, null);
 
@@ -187,6 +245,25 @@ class LoginControllerTest {
         assertEquals(405, response.status(), response::toString);
         assertEquals("Method Not Allowed", response.reason(), response::toString);
         assertPlainText(response);
+    }
+
+    /**
+     * {@code HEAD} in another letter case gets the same 405: the method is compared ignoring case, so it is no more
+     * allowed than {@code HEAD}. Undertow also treats such a method as {@code HEAD} and sends the head alone, with the
+     * {@code Content-Length} of the 405 text, while ST-1 expects a bodiless response only for {@code HEAD} spelled in
+     * upper case, so the head is read by {@link #responseHead}.
+     *
+     * @param method {@code HEAD} in a letter case other than upper case
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"head", "Head"})
+    void headInOtherLetterCaseOnLoginReturns405(String method) {
+        List<String> head = responseHead(method, LOGIN_PATH);
+
+        assertEquals("HTTP/1.1 405 Method Not Allowed", head.get(0), head::toString);
+        assertPlainText(headerValues(head, CONTENT_TYPE), head::toString);
+        assertEquals(List.of(String.valueOf(("Method not allowed for endpoint: " + LOGIN_PATH).length())),
+                headerValues(head, "Content-Length"), head::toString);
     }
 
     @Test
@@ -284,12 +361,57 @@ class LoginControllerTest {
      * is UTF-8.
      */
     private static void assertPlainText(HttpTestClient.Response response) {
-        List<String> values = response.headers(CONTENT_TYPE);
-        assertEquals(1, values.size(), response::toString);
+        assertPlainText(response.headers(CONTENT_TYPE), response::toString);
+    }
+
+    /** {@link #assertPlainText(HttpTestClient.Response)} over the {@code Content-Type} values of a response. */
+    private static void assertPlainText(List<String> values, Supplier<String> response) {
+        assertEquals(1, values.size(), response);
         MediaType mediaType = MediaType.parseMediaType(values.get(0));
-        assertEquals("text", mediaType.getType(), response::toString);
-        assertEquals("plain", mediaType.getSubtype(), response::toString);
-        assertTrue(mediaType.getCharset() == null || UTF_8.equals(mediaType.getCharset()), response::toString);
+        assertEquals("text", mediaType.getType(), response);
+        assertEquals("plain", mediaType.getSubtype(), response);
+        assertTrue(mediaType.getCharset() == null || UTF_8.equals(mediaType.getCharset()), response);
+    }
+
+    /**
+     * Sends {@code method path HTTP/1.1} with no body on a new connection and returns the response head: the status
+     * line, then each header line, up to the empty line that ends the head. Nothing after the head is read.
+     */
+    private List<String> responseHead(String method, String path) {
+        String request = method + " " + path + " HTTP/1.1\r\nHost: localhost:" + port + "\r\nConnection: close\r\n\r\n";
+        try (Socket socket = new Socket("localhost", port)) {
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            OutputStream out = socket.getOutputStream();
+            out.write(request.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            InputStream in = socket.getInputStream();
+            List<String> lines = new ArrayList<>();
+            ByteArrayOutputStream line = new ByteArrayOutputStream();
+            for (int b = in.read(); b != -1; b = in.read()) {
+                if (b != '\n') {
+                    line.write(b);
+                    continue;
+                }
+                String text = line.toString(StandardCharsets.ISO_8859_1);
+                text = text.endsWith("\r") ? text.substring(0, text.length() - 1) : text;
+                if (text.isEmpty()) {
+                    return lines;
+                }
+                lines.add(text);
+                line.reset();
+            }
+            throw new UncheckedIOException(new EOFException("connection closed inside the response head " + lines));
+        } catch (IOException e) {
+            throw new UncheckedIOException(method + " " + path + " to localhost:" + port + " failed", e);
+        }
+    }
+
+    /** The trimmed values of the header lines of {@code head} named {@code name}, compared ignoring case. */
+    private static List<String> headerValues(List<String> head, String name) {
+        return head.stream().skip(1)
+                .filter(line -> line.regionMatches(true, 0, name + ":", 0, name.length() + 1))
+                .map(line -> line.substring(name.length() + 1).trim())
+                .toList();
     }
 
     private static byte[] failurePage(String username) {

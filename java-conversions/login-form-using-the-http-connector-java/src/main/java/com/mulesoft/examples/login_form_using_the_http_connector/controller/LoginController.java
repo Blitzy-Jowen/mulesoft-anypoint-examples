@@ -33,8 +33,6 @@ import org.springframework.http.converter.FormHttpMessageConverter;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -47,8 +45,11 @@ import com.mulesoft.examples.login_form_using_the_http_connector.service.LoginSe
  * {@code HttpListenerConfig} listener ({@code 0.0.0.0:${http.port}}, xml:4), whose host and port come from
  * {@code application.yml}:
  * <ul>
- *   <li>{@code GetLoginPageFlow}, {@code allowedMethods="GET" path="/login"} (xml:9): {@link #loginPage};</li>
- *   <li>{@code DoLoginFlow}, {@code allowedMethods="POST" path="/login"} (xml:16): {@link #login};</li>
+ *   <li>{@code GetLoginPageFlow}, {@code allowedMethods="GET" path="/login"} (xml:9), and {@code DoLoginFlow},
+ *       {@code allowedMethods="POST" path="/login"} (xml:16): {@link #login}, which renders the page
+ *       ({@link #loginPage}) for {@code GET} and logs in ({@link #doLogin}) for {@code POST} in any letter case,
+ *       because Mule 3.8's {@code MethodRequestMatcher} compared the request method with {@code allowedMethods}
+ *       ignoring case, and {@link #loginUnsupportedMethod}, which rejects {@code OPTIONS};</li>
  *   <li>{@code CallLoginFlowUsingRequester}, {@code path="/requesterLogin"} with no {@code allowedMethods}
  *       (xml:35): {@link #requesterLogin} and {@link #requesterLoginOptions}, so every method runs the flow.</li>
  * </ul>
@@ -98,62 +99,55 @@ public class LoginController {
     }
 
     /**
-     * {@code GetLoginPageFlow}: 200 with {@code login/index.html} byte for byte and no Content-Type.
+     * The two {@code /login} listeners for every method but {@code OPTIONS}: {@code GET} in any letter case runs
+     * {@code GetLoginPageFlow} ({@link #loginPage}), {@code POST} in any letter case runs {@code DoLoginFlow}
+     * ({@link #doLogin}), and any other method gets the 405 of {@code GlobalExceptionHandler}, as the Mule 3.8
+     * listener, which compared the request method with {@code allowedMethods} ignoring case, answered it.
      *
+     * <p>The mapping declares no method because Spring MVC compares declared methods case-sensitively and would
+     * reject {@code get} or {@code Post} with the 405 before any handler ran. Without a declared method it also matches
+     * {@code HEAD}, which this method rejects instead of rendering the page, and {@code TRACE}, which reaches it
+     * because {@code application.yml} sets {@code spring.mvc.dispatch-trace-request: true}. The method is checked
+     * before the body is read, so a rejected request gets the 405 whatever its body.
+     *
+     * @param request  the request, whose method selects the flow and whose body is the posted form
      * @param response the response the page is written to
-     * @throws IOException if the page cannot be written
-     */
-    @GetMapping("/login")
-    public void loginPage(HttpServletResponse response) throws IOException {
-        byte[] page = loginService.loginPage().getBytes(StandardCharsets.UTF_8);
-        response.setStatus(HttpServletResponse.SC_OK);
-        writeBody(response, page);
-    }
-
-    /**
-     * {@code DoLoginFlow}: hands the posted form to {@link LoginService#login} and answers 200 with the success page
-     * and {@link #HTML_CONTENT_TYPE}. A rejected login leaves this method as {@link LoginService.LoginFailedException}
-     * ({@code message-filter throwOnUnaccepted="true"} and the catch strategy, xml:20-22, 27-30).
-     *
-     * <p>The form is the request body alone, as the Mule payload was; query parameters never count (see
-     * {@link #readForm}). A form body that cannot be URL-decoded is answered as the listener answered it, with 400
-     * {@link #UNDECODABLE_FORM_MESSAGE}, and the flow does not run.
-     *
-     * @param request  the login request
-     * @param response the response the page is written to
+     * @throws HttpRequestMethodNotSupportedException when the method is neither {@code GET} nor {@code POST} in any
+     *         letter case; it reaches the generic 405 handler
      * @throws IOException if the body cannot be read or the page cannot be written
      */
-    @PostMapping("/login")
-    public void login(HttpServletRequest request, HttpServletResponse response) throws IOException {
-        Optional<Map<String, String>> form = readForm(request);
-        if (form.isEmpty()) {
-            rejectUndecodableForm(response);
-            return;
+    @RequestMapping("/login")
+    public void login(HttpServletRequest request, HttpServletResponse response)
+            throws HttpRequestMethodNotSupportedException, IOException {
+        String method = request.getMethod();
+        if ("GET".equalsIgnoreCase(method)) {
+            loginPage(response);
+        } else if ("POST".equalsIgnoreCase(method)) {
+            doLogin(request, response);
+        } else {
+            throw new HttpRequestMethodNotSupportedException(method, LOGIN_METHODS);
         }
-        byte[] page = loginService.login(form.get()).getBytes(StandardCharsets.UTF_8);
-        response.setStatus(HttpServletResponse.SC_OK);
-        writeContentTypeVerbatim(response, HTML_CONTENT_TYPE);
-        writeBody(response, page);
     }
 
     /**
-     * Rejects {@code HEAD} and {@code OPTIONS} on {@code /login}, which neither original listener accepted, with the
-     * 405 of {@code GlobalExceptionHandler}. Without this mapping Spring MVC would answer {@code HEAD} through
-     * {@link #loginPage} and {@code OPTIONS} itself, both with 200. The other methods outside GET and POST are
-     * rejected by the handler mapping itself.
+     * Rejects {@code OPTIONS} on {@code /login}, which neither original listener accepted, with the 405 of
+     * {@code GlobalExceptionHandler}. A mapping without methods deliberately does not match {@code OPTIONS} spelled
+     * in upper case, so without this mapping Spring MVC would answer it itself with 200 and an {@code Allow} header.
+     * Every other method outside GET and POST, {@code HEAD} and {@code OPTIONS} in other letter cases included,
+     * reaches {@link #login}, which rejects it.
      *
      * @param request the rejected request
      * @throws HttpRequestMethodNotSupportedException always
      */
-    @RequestMapping(path = "/login", method = {RequestMethod.HEAD, RequestMethod.OPTIONS})
+    @RequestMapping(path = "/login", method = RequestMethod.OPTIONS)
     public void loginUnsupportedMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
         throw new HttpRequestMethodNotSupportedException(request.getMethod(), LOGIN_METHODS);
     }
 
     /**
-     * {@code CallLoginFlowUsingRequester} for every method except {@code OPTIONS}: relays the response of
-     * {@code POST /login} called with the configured credentials. The inbound body is ignored, because the flow
-     * replaced the payload with the credential map (xml:38-40).
+     * {@code CallLoginFlowUsingRequester} for every method except {@code OPTIONS} spelled in upper case: relays the
+     * response of {@code POST /login} called with the configured credentials. The inbound body is ignored, because
+     * the flow replaced the payload with the credential map (xml:38-40).
      *
      * @param response the response the relayed body is written to
      * @throws IOException if the relayed body cannot be written
@@ -165,7 +159,8 @@ public class LoginController {
 
     /**
      * {@code CallLoginFlowUsingRequester} for {@code OPTIONS}. A mapping without methods deliberately does not match
-     * {@code OPTIONS}, which Spring MVC would otherwise answer itself; the Mule listener ran the flow for it too.
+     * {@code OPTIONS} spelled in upper case, which Spring MVC would otherwise answer itself; the Mule listener ran the
+     * flow for it too, as it did for {@code options} in any other letter case, which reaches {@link #requesterLogin}.
      *
      * @param response the response the relayed body is written to
      * @throws IOException if the relayed body cannot be written
@@ -191,6 +186,34 @@ public class LoginController {
         writeBody(response, body);
     }
 
+    /** {@code GetLoginPageFlow}: 200 with {@code login/index.html} byte for byte and no Content-Type. */
+    private void loginPage(HttpServletResponse response) throws IOException {
+        byte[] page = loginService.loginPage().getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        writeBody(response, page);
+    }
+
+    /**
+     * {@code DoLoginFlow}: hands the posted form to {@link LoginService#login} and answers 200 with the success page
+     * and {@link #HTML_CONTENT_TYPE}. A rejected login leaves this method as {@link LoginService.LoginFailedException}
+     * ({@code message-filter throwOnUnaccepted="true"} and the catch strategy, xml:20-22, 27-30).
+     *
+     * <p>The form is the request body alone, as the Mule payload was; query parameters never count (see
+     * {@link #readForm}). A form body that cannot be URL-decoded is answered as the listener answered it, with 400
+     * {@link #UNDECODABLE_FORM_MESSAGE}, and the flow does not run.
+     */
+    private void doLogin(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        Optional<Map<String, String>> form = readForm(request);
+        if (form.isEmpty()) {
+            rejectUndecodableForm(response);
+            return;
+        }
+        byte[] page = loginService.login(form.get()).getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        writeContentTypeVerbatim(response, HTML_CONTENT_TYPE);
+        writeBody(response, page);
+    }
+
     /**
      * Reads the posted form from the request body only. Servlet parameters are never consulted, because they merge
      * the query string into the form.
@@ -198,8 +221,9 @@ public class LoginController {
      * <p>The body is a form only when the request's media type is exactly {@code application/x-www-form-urlencoded}
      * (any case, any parameters); otherwise, and when the Content-Type is missing or unparseable, the form is empty,
      * which the service rejects. The body is decoded in the Content-Type's charset, or UTF-8 when it names none;
-     * pairs keep their order, a repeated name keeps its first value and a name without {@code =} maps to
-     * {@code null}.
+     * pairs keep their order, a name without {@code =} maps to {@code null}, and a repeated name keeps its first
+     * position and its last value, because Mule 3.8's {@code ParameterMap#get} returned {@code values.getLast()}, so
+     * {@code password=mule&password} gives {@code password} the value {@code null}.
      *
      * @return the form, or {@link Optional#empty()} when a form body cannot be URL-decoded
      */
@@ -242,7 +266,8 @@ public class LoginController {
             // and later Spring versions wrap. An I/O failure stays an IOException for the generic 500.
             return Optional.empty();
         }
-        values.forEach((name, list) -> form.put(name, list.isEmpty() ? null : list.get(0)));
+        // The converter returns a LinkedMultiValueMap, so each name keeps the position of its first pair.
+        values.forEach((name, list) -> form.put(name, list.isEmpty() ? null : list.get(list.size() - 1)));
         return Optional.of(form);
     }
 

@@ -8,6 +8,7 @@
 
 package com.mulesoft.examples.foreach_processing_and_choice_routing.service;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -163,6 +164,9 @@ class BankTest {
         assertEquals(Level.INFO, event.getLevel());
         assertEquals("Returning Rate is: " + quote, event.getFormattedMessage());
         assertEquals("Returning Rate is: Bank #1, rate: " + rates[PLATINUM_PROFILE_INDEX], event.getFormattedMessage());
+        // Parameterized, so the quote is rendered only when INFO is enabled.
+        assertEquals("Returning Rate is: {}", event.getMessage());
+        assertArrayEquals(new Object[] {quote}, event.getArgumentArray());
     }
 
     @Test

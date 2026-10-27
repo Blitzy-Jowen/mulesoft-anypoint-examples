@@ -54,7 +54,7 @@ public class Bank implements Serializable, BankService
         quote.setBankName(getBankName());
         int creditScore = request.getCreditProfile().getCreditScore();
         quote.setInterestRate(getCreditScoreRate(creditScore));
-        logger.info("Returning Rate is: " + quote);
+        logger.info("Returning Rate is: {}", quote);
 
         return quote;
     }
