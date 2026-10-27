@@ -8,8 +8,6 @@
 
 package com.mulesoft.examples.proxying_a_soap_api.service;
 
-import static com.mulesoft.examples.proxying_a_soap_api.service.SoapProxyService.UPSTREAM_SOAP11_CONTENT_TYPE;
-import static com.mulesoft.examples.proxying_a_soap_api.service.SoapProxyService.VALIDATOR_FAILURE_MESSAGE;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -70,6 +68,13 @@ class SoapProxyServiceTest {
 
     private static final String SOAP12_CONTENT_TYPE = "application/soap+xml;charset=UTF-8;action=\"urn:create\"";
 
+    /** The SOAP 1.1 default Content-Type the CXF proxy client sends, with a space after {@code ;}. */
+    private static final String EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE = "text/xml; charset=UTF-8";
+
+    /** The Mule 3.8 requester's default success-status validator message; {@code %d} is the upstream status. */
+    private static final String EXPECTED_VALIDATOR_FAILURE_FORMAT =
+            "Response code %d mapped as failure. Message payload is of type: BufferInputStream";
+
     /** The original test request {@code src/test/resources/message.xml}, byte for byte. */
     private static final byte[] REQUEST_ENVELOPE = """
             <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" \
@@ -103,6 +108,13 @@ class SoapProxyServiceTest {
         client = mock(ShopServiceClient.class);
         mapper = spy(new ProxyHeaderMapper());
         service = new SoapProxyService(mapper, client);
+    }
+
+    /** The service's constants hold the wire values, so a wrong constant fails here and not only on the wire. */
+    @Test
+    void theDefaultContentTypeAndValidatorMessageConstantsHoldTheOriginalWireValues() {
+        assertThat(SoapProxyService.UPSTREAM_SOAP11_CONTENT_TYPE).isEqualTo(EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE);
+        assertThat(SoapProxyService.VALIDATOR_FAILURE_MESSAGE).isEqualTo(EXPECTED_VALIDATOR_FAILURE_FORMAT);
     }
 
     @Test
@@ -149,12 +161,12 @@ class SoapProxyServiceTest {
      */
     static Stream<Arguments> contentTypes() {
         return Stream.of(
-                Arguments.of(Named.of("absent", null), UPSTREAM_SOAP11_CONTENT_TYPE),
-                Arguments.of(Named.of("blank", "   "), UPSTREAM_SOAP11_CONTENT_TYPE),
-                Arguments.of(Named.of("unparseable xml", "xml"), UPSTREAM_SOAP11_CONTENT_TYPE),
-                Arguments.of("text/plain", UPSTREAM_SOAP11_CONTENT_TYPE),
-                Arguments.of("application/xml", UPSTREAM_SOAP11_CONTENT_TYPE),
-                Arguments.of("application/json", UPSTREAM_SOAP11_CONTENT_TYPE),
+                Arguments.of(Named.of("absent", null), EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE),
+                Arguments.of(Named.of("blank", "   "), EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE),
+                Arguments.of(Named.of("unparseable xml", "xml"), EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE),
+                Arguments.of("text/plain", EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE),
+                Arguments.of("application/xml", EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE),
+                Arguments.of("application/json", EXPECTED_DEFAULT_SOAP11_CONTENT_TYPE),
                 Arguments.of("text/xml", "text/xml"),
                 Arguments.of("text/xml; charset=ISO-8859-1", "text/xml; charset=ISO-8859-1"),
                 Arguments.of("application/soap+xml", "application/soap+xml"),
@@ -286,23 +298,32 @@ class SoapProxyServiceTest {
         verifyNoMoreInteractions(client);
     }
 
-    /** Failing upstream statuses with the body each answers with; the status alone decides the outcome. */
+    /**
+     * Failing upstream statuses with the body each answers with and the validator message spelled out; the status
+     * alone decides the outcome.
+     */
     static Stream<Arguments> failedUpstreamResponses() {
         return Stream.of(
-                Arguments.of(400, Named.of("a text body", "Bad Request".getBytes(UTF_8))),
-                Arguments.of(404, Named.of("an empty body", new byte[0])),
-                Arguments.of(500, Named.of("a SOAP fault", FAULT_ENVELOPE)),
-                Arguments.of(503, Named.of("no body", null)));
+                Arguments.of(400, Named.of("a text body", "Bad Request".getBytes(UTF_8)),
+                        "Response code 400 mapped as failure. Message payload is of type: BufferInputStream"),
+                Arguments.of(404, Named.of("an empty body", new byte[0]),
+                        "Response code 404 mapped as failure. Message payload is of type: BufferInputStream"),
+                Arguments.of(500, Named.of("a SOAP fault", FAULT_ENVELOPE),
+                        "Response code 500 mapped as failure. Message payload is of type: BufferInputStream"),
+                Arguments.of(503, Named.of("no body", null),
+                        "Response code 503 mapped as failure. Message payload is of type: BufferInputStream"));
     }
 
     @ParameterizedTest(name = "upstream {0} with {1}")
     @MethodSource("failedUpstreamResponses")
-    void everyUpstreamStatusFrom400FailsWithTheDefaultValidatorMessage(int upstreamStatus, byte[] upstreamBody) {
+    void everyUpstreamStatusFrom400FailsWithTheDefaultValidatorMessage(int upstreamStatus, byte[] upstreamBody,
+                                                                       String expectedMessage) {
         stubUpstream(upstreamStatus, upstreamResponseHeaders(), upstreamBody);
 
         assertThatThrownBy(() -> service.forward(soap11RequestHeaders(), REQUEST_ENVELOPE))
                 .isExactlyInstanceOf(IllegalStateException.class)
-                .hasMessage(String.format(VALIDATOR_FAILURE_MESSAGE, upstreamStatus))
+                .hasMessage(expectedMessage)
+                .hasMessage(String.format(EXPECTED_VALIDATOR_FAILURE_FORMAT, upstreamStatus))
                 .hasNoCause();
         verify(client, times(1)).post(any(), any());
         verifyNoMoreInteractions(client);

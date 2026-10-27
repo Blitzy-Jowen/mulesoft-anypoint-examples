@@ -15,6 +15,8 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.stream.Stream;
 
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.CreditProfile;
@@ -32,8 +34,13 @@ import org.junit.jupiter.params.provider.MethodSource;
  *
  * <p>The original draws both values from {@link Math#random()}: the credit score as
  * {@code (int) (Math.random() * 600 + 300)}, so 300 to 899, and the credit history length as
- * {@code (int) (Math.random() * 19 + 1)}, so 1 to 19. The output is random by design, so the tests pin those
- * inclusive ranges over many draws rather than any single value.
+ * {@code (int) (Math.random() * 19 + 1)}, so 1 to 19. The output is random by design, so the random generators
+ * are range-checked over many draws rather than pinned to any single value.
+ *
+ * <p>A deterministic recording subclass pins how {@code getCreditProfile} wires those generators: its two hooks
+ * return fixed values no draw can produce, and the test asserts that the customer's SSN is forwarded to both
+ * hooks, each called once with the credit history hook first, and that each returned value reaches its own
+ * profile field.
  */
 class DefaultCreditAgencyTest {
 
@@ -42,6 +49,11 @@ class DefaultCreditAgencyTest {
     private static final int MIN_CREDIT_HISTORY = 1;
     private static final int MAX_CREDIT_HISTORY = 19;
     private static final int DRAWS = 1000;
+
+    // Outside both generator ranges, distinct from each other and from every test SSN, so a value that reaches
+    // a profile field can only have come from the matching recording hook.
+    private static final int RECORDED_CREDIT_SCORE = 951;
+    private static final int RECORDED_CREDIT_HISTORY = 37;
 
     private final DefaultCreditAgency agency = new DefaultCreditAgency();
 
@@ -85,8 +97,21 @@ class DefaultCreditAgencyTest {
     @ParameterizedTest
     @MethodSource("customers")
     void ssnIsIgnored(Customer customer) {
-        // The original reads the SSN but never uses it, so no SSN value can push a profile out of range.
+        // The original forwards the SSN to both generators, which never use it, so no SSN value can push a profile
+        // out of range.
         assertProfileWithinRanges(agency.getCreditProfile(customer));
+    }
+
+    @ParameterizedTest
+    @MethodSource("customers")
+    void creditProfileForwardsSsnToBothGeneratorsAndKeepsEachValue(Customer customer) {
+        RecordingCreditAgency recordingAgency = new RecordingCreditAgency();
+
+        CreditProfile profile = recordingAgency.getCreditProfile(customer);
+
+        assertEquals(List.of("history:" + customer.getSsn(), "score:" + customer.getSsn()), recordingAgency.calls);
+        assertEquals(RECORDED_CREDIT_SCORE, profile.getCreditScore());
+        assertEquals(RECORDED_CREDIT_HISTORY, profile.getCreditHistory());
     }
 
     @Test
@@ -125,5 +150,26 @@ class DefaultCreditAgencyTest {
     private static void assertCreditHistoryWithinRange(int creditHistory) {
         assertTrue(creditHistory >= MIN_CREDIT_HISTORY && creditHistory <= MAX_CREDIT_HISTORY,
                 () -> "credit history " + creditHistory + " outside " + MIN_CREDIT_HISTORY + ".." + MAX_CREDIT_HISTORY);
+    }
+
+    /**
+     * Replaces both random generators with fixed values and records each call as {@code "<hook>:<ssn>"} in call
+     * order, {@code history} for {@code getCreditHistoryLength} and {@code score} for {@code getCreditScore}.
+     */
+    private static final class RecordingCreditAgency extends DefaultCreditAgency {
+
+        private final List<String> calls = new ArrayList<>();
+
+        @Override
+        protected int getCreditScore(int ssn) {
+            calls.add("score:" + ssn);
+            return RECORDED_CREDIT_SCORE;
+        }
+
+        @Override
+        protected int getCreditHistoryLength(int ssn) {
+            calls.add("history:" + ssn);
+            return RECORDED_CREDIT_HISTORY;
+        }
     }
 }

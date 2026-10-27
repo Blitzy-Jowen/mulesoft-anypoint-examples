@@ -10,13 +10,12 @@ package com.mulesoft.examples.hello_world.controller;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
 import com.mulesoft.examples.hello_world.service.HelloWorldService;
@@ -131,7 +130,7 @@ class HelloWorldControllerTest {
 
             assertEquals(500, response.status(), response::toString);
             assertEquals("Internal Server Error", response.reason(), response::toString);
-            assertMediaType(response, MediaType.APPLICATION_JSON);
+            assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
             assertEquals("{ \"message\": \"boom\" }", response.bodyAsString(), response::toString);
             verify(helloWorldService).hello();
         }
@@ -151,20 +150,17 @@ class HelloWorldControllerTest {
     }
 
     /**
-     * Compares type and subtype only: the string converter appends {@code ;charset=UTF-8} to {@code text/plain}
-     * but not to {@code application/json}, and neither charset is part of the platform default.
+     * Compares the whole value: SC-1 presets the bare media type on the response entity, so the listener writes
+     * exactly one {@code Content-Type} header carrying that value and no charset parameter.
      */
-    private static void assertMediaType(HttpTestClient.Response response, MediaType expected) {
-        String contentType = response.header("Content-Type");
-        assertNotNull(contentType, response::toString);
-        assertTrue(MediaType.parseMediaType(contentType).equalsTypeAndSubtype(expected),
-                () -> "expected " + expected + " but was " + response);
+    private static void assertContentType(HttpTestClient.Response response, String expected) {
+        assertEquals(List.of(expected), response.headers("Content-Type"), response::toString);
     }
 
     private static void assertNoListener(HttpTestClient.Response response, String path) {
         assertEquals(404, response.status(), response::toString);
         assertEquals("Not Found", response.reason(), response::toString);
-        assertMediaType(response, MediaType.TEXT_PLAIN);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
         assertEquals("No listener for endpoint: " + path, response.bodyAsString(), response::toString);
     }
 }
