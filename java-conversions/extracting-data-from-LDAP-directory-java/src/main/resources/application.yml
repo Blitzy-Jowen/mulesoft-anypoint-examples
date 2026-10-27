@@ -11,6 +11,9 @@ spring:
       add-mappings: false   # SC-1: unknown paths reach GlobalExceptionHandler's 404 text
   mvc:
     dispatch-trace-request: true   # the / listener has no allowedMethods: TRACE reaches LdapController like every other method instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false   # the flow ignores the request body: a form body on PUT/PATCH/DELETE reaches LdapController as it does on POST instead of being parsed (and a malformed one rejected with Undertow's HTML 500) by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
