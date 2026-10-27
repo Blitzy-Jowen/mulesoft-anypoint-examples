@@ -89,9 +89,9 @@ public class DynamicsContactImportService {
         int created = 0;
         for (Map<String, Object> record : records) {
             LOG.debug("Creating Dataverse contact for record {} of {}", created + 1, records.size());
-            String contactId = client.createContact(mapper.toContactAttributes(record));
+            client.createContact(mapper.toContactAttributes(record));
             created++;
-            LOG.debug("Created Dataverse contact for record {}: id {}", created, contactId);
+            LOG.debug("Created Dataverse contact for record {} of {}", created, records.size());
         }
         return created;
     }
