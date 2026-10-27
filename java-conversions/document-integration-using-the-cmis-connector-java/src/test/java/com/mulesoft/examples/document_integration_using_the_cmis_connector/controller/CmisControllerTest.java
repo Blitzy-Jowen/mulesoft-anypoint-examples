@@ -8,31 +8,41 @@
 
 package com.mulesoft.examples.document_integration_using_the_cmis_connector.controller;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
+import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.when;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.ArgumentCaptor;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
-import org.springframework.web.client.RestClientResponseException;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 
+import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.document_integration_using_the_cmis_connector.client.CmisAtomPubClient;
 import com.mulesoft.examples.document_integration_using_the_cmis_connector.service.CmisDocumentService;
 import com.mulesoft.examples.document_integration_using_the_cmis_connector.support.HttpTestClient;
@@ -42,17 +52,20 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.suppo
  * (document-integration-using-the-cmis-connector/src/main/app/cmis-document-integration.xml:5-15), on the
  * application's own Undertow listener.
  *
- * <p>The whole application runs on a random port with the real {@link CmisDocumentService} and the SC-1 handler;
- * only {@link CmisAtomPubClient}, the one outbound path to the CMIS repository, is a mock, so no request leaves the
- * host. Requests go through the project's ST-1 {@link HttpTestClient}, which reads the raw status line from the
- * socket, so status, reason phrase, {@code Content-Type} and body bytes are asserted as the listener writes them.
+ * <p>The whole application runs on a random port with the real {@link CmisDocumentService}, the real
+ * {@link CmisAtomPubClient} and the SC-1 handler. The adapter, the one outbound path to the CMIS repository, is a
+ * spy whose {@code cmis.base-url} points at a WireMock stand-in of the repository, so no request leaves the host:
+ * the repository-failure case runs the real AtomPub adapter against that stand-in, and the other cases stub the
+ * spied adapter. Requests go through the project's ST-1 {@link HttpTestClient}, which reads the raw status line
+ * from the socket, so status line, {@code Content-Type} and body bytes are asserted as the listener writes them.
  *
  * <p>The happy paths cover the original test's empty POST, the README's GET, and PUT and OPTIONS, because the
  * original listener declares no {@code allowedMethods}; each proves the flow ran exactly once with the connector
  * arguments of the original. The error cases are the platform defaults of SC-1: the no-listener 404 for a path the
- * flow does not serve, and the JSON 500 for a repository failure, which the flow, having no exception strategy,
- * leaves unhandled. The original {@code DocumentIntegrationUsingTheCmisConnectorIT} assertion is ported separately
- * in {@code DocumentIntegrationUsingTheCmisConnectorTest}.
+ * flow does not serve, and the JSON 500 for a repository failure (the repository's 401) and for any other
+ * exception escaping the adapter, which the flow, having no exception strategy, leaves unhandled. The original
+ * {@code DocumentIntegrationUsingTheCmisConnectorIT} assertion is ported separately in
+ * {@code DocumentIntegrationUsingTheCmisConnectorTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
@@ -65,13 +78,41 @@ class CmisControllerTest {
 
     private static final byte[] EMPTY_BODY = new byte[0];
 
+    /** Status lines as Undertow writes them, each with the standard reason phrase of its code. */
+    private static final String STATUS_OK = "HTTP/1.1 200 OK";
+
+    private static final String STATUS_NOT_FOUND = "HTTP/1.1 404 Not Found";
+
+    private static final String STATUS_INTERNAL_SERVER_ERROR = "HTTP/1.1 500 Internal Server Error";
+
+    /** The exact {@code Content-Type} values the controller and SC-1 write, without parameters. */
+    private static final String APPLICATION_JSON = "application/json";
+
+    private static final String TEXT_PLAIN = "text/plain";
+
+    /** Path of the repository's AtomPub service document, the first request the adapter makes. */
+    private static final String ATOM_ROOT = "/OpenKM/cmis/atom";
+
+    /** Stand-in for the CMIS repository; its stubs are reset after each test. */
+    @RegisterExtension
+    static WireMockExtension wm = WireMockExtension.newInstance()
+            .options(WireMockConfiguration.options().dynamicPort())
+            .build();
+
     private static byte[] logo;
 
     @LocalServerPort
     private int port;
 
-    @MockBean
+    /** The real adapter bean, stubbed per test except where the repository's own answer is exercised. */
+    @SpyBean
     private CmisAtomPubClient cmisClient;
+
+    /** Lazy: the extension's server starts before the context, but its URL is only read when the key resolves. */
+    @DynamicPropertySource
+    static void cmisProperties(DynamicPropertyRegistry r) {
+        r.add("cmis.base-url", () -> wm.baseUrl() + ATOM_ROOT);
+    }
 
     @BeforeAll
     static void readLogo() throws IOException {
@@ -127,41 +168,49 @@ class CmisControllerTest {
     void unknownPathReturnsNoListener404() {
         HttpTestClient.Response response = client().get("/unknown");
 
-        assertWire(response, 404, MediaType.TEXT_PLAIN, "No listener for endpoint: /unknown");
+        assertWire(response, STATUS_NOT_FOUND, TEXT_PLAIN, "No listener for endpoint: /unknown");
         verifyNoInteractions(cmisClient);
     }
 
+    /** Any exception escaping the adapter reaches the caller with its own message in the JSON 500. */
     @Test
     void clientFailureReturnsJson500() {
-        when(cmisClient.createDocumentByPath(any(), any(), any(), any(), any(), any()))
-                .thenThrow(new RuntimeException("boom"));
+        doThrow(new RuntimeException("boom"))
+                .when(cmisClient).createDocumentByPath(any(), any(), any(), any(), any(), any());
 
         HttpTestClient.Response response = client().get(CMIS_PATH);
 
-        assertWire(response, 500, MediaType.APPLICATION_JSON, "{ \"message\": \"boom\" }");
+        assertWire(response, STATUS_INTERNAL_SERVER_ERROR, APPLICATION_JSON, "{ \"message\": \"boom\" }");
         verifyDocumentCreationAttemptedOnce();
     }
 
-    /** Mirrors the {@code post-cmis-upstream-unauthorized} scenario of {@code fixtures/SCENARIOS.md}. */
+    /**
+     * Mirrors the {@code post-cmis-upstream-unauthorized} scenario of {@code fixtures/SCENARIOS.md}: the real
+     * AtomPub adapter asks the WireMock repository for its service document, the repository answers 401, and the
+     * adapter's failure, which the flow leaves unhandled, becomes the JSON 500 carrying the adapter's message. The
+     * repository receives the service-document GET alone.
+     */
     @Test
     void upstreamUnauthorizedReturnsJson500() {
-        when(cmisClient.createDocumentByPath(any(), any(), any(), any(), any(), any()))
-                .thenThrow(new RestClientResponseException("401 Unauthorized", 401, "Unauthorized", null, null,
-                        null));
+        wm.stubFor(get(urlPathEqualTo(ATOM_ROOT)).willReturn(aResponse().withStatus(401)));
 
         HttpTestClient.Response response = client().send("POST", CMIS_PATH, Map.of(), EMPTY_BODY);
 
-        assertWire(response, 500, MediaType.APPLICATION_JSON, "{ \"message\": \"401 Unauthorized\" }");
+        assertWire(response, STATUS_INTERNAL_SERVER_ERROR, APPLICATION_JSON,
+                "{ \"message\": \"CMIS service document request failed with HTTP status 401\" }");
         verifyDocumentCreationAttemptedOnce();
+        wm.verify(1, getRequestedFor(urlPathEqualTo(ATOM_ROOT)));
+        wm.verify(1, anyRequestedFor(anyUrl()));
     }
 
+    /** Stubbed without calling the real method, which would reject the matchers' null arguments. */
     private void stubCreatedDocument(String objectId) {
-        when(cmisClient.createDocumentByPath(any(), any(), any(), any(), any(), any())).thenReturn(objectId);
+        doReturn(objectId).when(cmisClient).createDocumentByPath(any(), any(), any(), any(), any(), any());
     }
 
-    /** 200 {@code application/json} with the service's compact JSON, after exactly one document creation. */
+    /** {@code HTTP/1.1 200 OK}, {@code application/json}, the service's compact JSON, after one document creation. */
     private void assertCreated(HttpTestClient.Response response, String objectId) {
-        assertWire(response, 200, MediaType.APPLICATION_JSON, "{\"id\":\"" + objectId + "\"}");
+        assertWire(response, STATUS_OK, APPLICATION_JSON, "{\"id\":\"" + objectId + "\"}");
         verifyDocumentCreationAttemptedOnce();
     }
 
@@ -181,16 +230,14 @@ class CmisControllerTest {
     }
 
     /**
-     * Asserts the response on the wire: the status code, a non-blank reason phrase (Undertow's standard phrase; its
-     * exact text is a Tier 2A verification point), a {@code Content-Type} of the expected type and subtype (a charset
-     * parameter is irrelevant) and the exact body.
+     * Asserts the response exactly as the listener wrote it: the complete raw status line, so version, code and
+     * Undertow's standard reason phrase for that code all match; exactly one {@code Content-Type} header, with
+     * exactly the expected value, parameters included; and the exact body bytes.
      */
-    private static void assertWire(HttpTestClient.Response response, int status, MediaType type, String body) {
-        assertEquals(status, response.status(), response::toString);
-        assertFalse(response.reason().isBlank(), response::toString);
-        String contentType = response.header("Content-Type");
-        assertNotNull(contentType, response::toString);
-        assertTrue(type.equalsTypeAndSubtype(MediaType.parseMediaType(contentType)), response::toString);
-        assertEquals(body, response.bodyAsString(), response::toString);
+    private static void assertWire(HttpTestClient.Response response, String statusLine, String contentType,
+            String body) {
+        assertEquals(statusLine, response.statusLine(), response::toString);
+        assertEquals(List.of(contentType), response.headers("Content-Type"), response::toString);
+        assertArrayEquals(body.getBytes(StandardCharsets.UTF_8), response.body(), response::toString);
     }
 }
