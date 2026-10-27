@@ -208,7 +208,7 @@ public class DiscountController {
     }
 
     /**
-     * Decodes a form-urlencoded body as Mule 3.8's {@code org.mule.module.http.internal.HttpParser#decodeString}
+     * Decodes a form-urlencoded body as the Mule 3.8 HTTP module's {@code HttpParser#decodeString}
      * filled its {@code ParameterMap}: a blank body gives an empty map; otherwise the body is split on {@code &}
      * ({@link String#split} semantics, so a leading empty pair is kept as the name {@code ""} and trailing ones are
      * dropped) and each pair on its first {@code =}, name and value are URL-decoded with {@code charset}, a pair

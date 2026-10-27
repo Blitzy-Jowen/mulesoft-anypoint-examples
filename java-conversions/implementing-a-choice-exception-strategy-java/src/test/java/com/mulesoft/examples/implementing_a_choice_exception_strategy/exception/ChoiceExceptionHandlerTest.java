@@ -150,6 +150,7 @@ class ChoiceExceptionHandlerTest {
         MockHttpServletResponse response = perform(body);
 
         assertBranchResponse(response, "Invalid input data: " + payload);
+        verify(inputValidationService).validate(same(payload));
     }
 
     @Test
@@ -208,6 +209,7 @@ class ChoiceExceptionHandlerTest {
         assertEquals("Invalid input data", ChoiceExceptionHandler.INVALID_DATA_REASON);
         assertEquals("400", ChoiceExceptionHandler.MISSING_DATA_STATUS_CODE);
         assertEquals("Missing input data", ChoiceExceptionHandler.MISSING_DATA_REASON);
+        assertFalse(ChoiceExceptionHandler.PAYLOAD_ATTRIBUTE.isBlank(), "payload request attribute name is blank");
     }
 
     /**

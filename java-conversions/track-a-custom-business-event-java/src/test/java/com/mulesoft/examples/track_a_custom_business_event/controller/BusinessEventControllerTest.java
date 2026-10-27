@@ -1,3 +1,11 @@
+/**
+ * MuleSoft Examples
+ * Copyright 2014 MuleSoft, Inc.
+ *
+ * This product includes software developed at
+ * MuleSoft, Inc. (http://www.mulesoft.com/).
+ */
+
 package com.mulesoft.examples.track_a_custom_business_event.controller;
 
 import static java.nio.charset.StandardCharsets.ISO_8859_1;
@@ -16,6 +24,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -32,13 +41,15 @@ import com.mulesoft.examples.track_a_custom_business_event.support.HttpTestClien
  *
  * <p>Requests go through the project's ST-1 {@link HttpTestClient}, which adds no {@code Content-Type} of its own
  * and reads the raw status line from the socket, so the reason phrase, every {@code Content-Type} value and the
- * body bytes are asserted exactly as the listener writes them. The happy paths cover the response media type the
- * request's {@code Content-Type} decides, the request's charset decoding the body, and every method, because the
- * original listener declares no {@code allowedMethods}; the error cases are the flow's own script failures, an
- * unpriced item and a price nested 20000 deep, whose message is rendered on the listener's worker thread without
- * exhausting its stack, and the listener-level platform defaults of SC-1: the JSON 500 for a body the flow cannot
- * read or a {@code Content-Type} whose charset Spring cannot parse, and the no-listener 404 for paths the flow does
- * not serve, an illegal request charset included.
+ * body bytes are asserted exactly as the listener writes them. The happy paths cover every item of the script's
+ * discount table, the response media type the request's {@code Content-Type} decides, the request's charset
+ * decoding the body, and every method, because the original listener declares no {@code allowedMethods}. The
+ * response's {@code Content-Type} is asserted as {@link BusinessEventController} writes it, the request's media
+ * type with {@code "; charset="} and the encoding, never a fixed {@code text/plain}. The error cases are the flow's
+ * own script failures, an unpriced item and a price nested 20000 deep, whose message is rendered on the listener's
+ * worker thread without exhausting its stack, and the listener-level platform defaults of SC-1: the JSON 500 for a
+ * body the flow cannot read or a {@code Content-Type} whose charset Spring cannot parse, and the no-listener 404 for
+ * paths the flow does not serve, an illegal request charset included.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class BusinessEventControllerTest {
@@ -57,6 +68,18 @@ class BusinessEventControllerTest {
 
     private HttpTestClient client() {
         return new HttpTestClient(LOOPBACK, port);
+    }
+
+    /** The other two items of the discount table: jeans at 0.2 and jackets at 0.3, each at price 10. */
+    @ParameterizedTest(name = "{0} -> {1}")
+    @CsvSource({"jeans,8.0", "jackets,7.0"})
+    void postOtherDiscountedItems(String item, String expectedPrice) throws IOException {
+        HttpTestClient.Response response =
+                client().send("POST", PATH, Map.of("Content-Type", "application/json"), variant(item));
+
+        assertPrice(response, expectedPrice);
+        assertEquals(List.of("application/json; charset=UTF-8"), response.headers("Content-Type"),
+                response::toString);
     }
 
     @ParameterizedTest(name = "{0} -> {2}")
@@ -139,7 +162,7 @@ class BusinessEventControllerTest {
     }
 
     static Stream<Arguments> failingRequests() throws IOException {
-        String hats = new String(message(), UTF_8).replace("\"shoes\"", "\"hats\"");
+        String hats = new String(variant("hats"), UTF_8);
         String nestedPrice = "[".repeat(20_000) + "0" + "]".repeat(20_000);
         String nestedPriceBody = new String(message(), UTF_8)
                 .replace("\"item price per unit\": 10", "\"item price per unit\": " + nestedPrice);
@@ -224,9 +247,15 @@ class BusinessEventControllerTest {
 
     /** Asserts the 200 of shoes at 10: the text {@code 8.5} with its {@code Content-Length}. */
     private static void assertDiscountedPrice(HttpTestClient.Response response) {
+        assertPrice(response, "8.5");
+    }
+
+    /** Asserts a 200 whose body is exactly {@code expectedPrice}, with its {@code Content-Length}. */
+    private static void assertPrice(HttpTestClient.Response response, String expectedPrice) {
+        byte[] expected = expectedPrice.getBytes(UTF_8);
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
-        assertEquals("3", response.header("Content-Length"), response::toString);
-        assertArrayEquals("8.5".getBytes(UTF_8), response.body(), response::toString);
+        assertEquals(String.valueOf(expected.length), response.header("Content-Length"), response::toString);
+        assertArrayEquals(expected, response.body(), response::toString);
     }
 
     /** Compares type and subtype only: the string converter of the error handler may append a charset. */
@@ -243,5 +272,12 @@ class BusinessEventControllerTest {
             assertNotNull(in, "message.json is on the test classpath");
             return in.readAllBytes();
         }
+    }
+
+    /** {@code message.json} with only its {@code "shoes"} token replaced by {@code "<item>"}. */
+    private static byte[] variant(String item) throws IOException {
+        String message = new String(message(), UTF_8);
+        assertTrue(message.contains("\"shoes\""), "message.json names the item \"shoes\"");
+        return message.replace("\"shoes\"", "\"" + item + "\"").getBytes(UTF_8);
     }
 }

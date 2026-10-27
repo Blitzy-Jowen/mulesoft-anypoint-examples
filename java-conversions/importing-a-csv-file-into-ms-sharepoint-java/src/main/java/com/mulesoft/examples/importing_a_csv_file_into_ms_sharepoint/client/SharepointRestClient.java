@@ -168,8 +168,11 @@ public class SharepointRestClient {
         // Redirects are never followed, so the Set-Cookie headers of the wsignin1.0 redirect reach signIn(), and no
         // cookie handler is installed, so the client never stores or replays cookies by itself. The JDK client
         // re-attempts only a refused TCP connect, which never delivered the request; nothing that reached a server
-        // is sent twice.
+        // is sent twice. HTTP/1.1 is pinned because the original connector spoke HTTP/1.1: the JDK default (HTTP/2)
+        // adds Upgrade: h2c and HTTP2-Settings headers on plain-HTTP calls, which the original never sent and which
+        // the fixture replay (ST-2) compares exactly.
         HttpClient httpClient = HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
                 .followRedirects(HttpClient.Redirect.NEVER)
                 .connectTimeout(timeout)
                 .build();

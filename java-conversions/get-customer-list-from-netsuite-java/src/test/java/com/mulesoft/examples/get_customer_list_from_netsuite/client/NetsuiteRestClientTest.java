@@ -22,9 +22,6 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -37,15 +34,27 @@ import com.mulesoft.examples.get_customer_list_from_netsuite.exception.UpstreamU
 import io.netty.channel.ChannelOption;
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.time.Duration;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
@@ -53,6 +62,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -73,11 +83,13 @@ import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClientConfig;
 
 /**
- * Tests {@link NetsuiteRestClient} (SC-16) against WireMock standing in for the NetSuite REST services, with the token
- * provider mocked and the real SC-9 executor and NetSuite classifier, so the tests need no account and no
+ * Tests {@link NetsuiteRestClient} (SC-16) against WireMock standing in for the NetSuite REST services and the OAuth
+ * 2.0 token endpoint, with the real {@link NetsuiteTokenProvider} (signing its client assertion with an RSA key
+ * generated per run), the real SC-9 executor and the real NetSuite classifier, so the tests need no account and no
  * credential. They cover SuiteQL paging, the record API, the metadata catalog and the custom-field source lookup of
- * AAP 0.7.4, SuiteQL literal escaping (AAP 0.4.10), the approved failure handling of AAP 0.4.8 as the client drives
- * it, and the start-up of the client with every {@code application.yml} placeholder empty.
+ * AAP 0.7.4, SuiteQL literal escaping (AAP 0.4.10), every failure classification of AAP 0.4.8 as the client drives
+ * it, counting the token and API requests each one makes, the {@link NetsuiteProperties} defaults, and the start-up
+ * of the client with every {@code application.yml} placeholder empty.
  *
  * <p>{@code netsuite-data-retrieval-java} carries this class with the client, changing only the package line and
  * the import prefix.
@@ -91,12 +103,31 @@ class NetsuiteRestClientTest {
 
     private static final String SUITEQL = "/services/rest/query/v1/suiteql";
 
+    private static final String TOKEN = "/services/rest/auth/oauth2/v1/token";
+
     private static final String CUSTOMER_RECORDS = "/services/rest/record/v1/customer";
 
     private static final String CUSTOMER_CATALOG = "/services/rest/record/v1/metadata-catalog/customer";
 
     private static final String CUSTOM_FIELD_QUERY_PREFIX =
             "SELECT scriptid, fieldvaluetyperecord FROM customfield WHERE UPPER(scriptid) IN ";
+
+    /** NetSuite's REST error format, as NetSuite answers an invalid SuiteQL query. */
+    private static final String BAD_REQUEST_BODY = """
+            {"type": "https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.1", "title": "Bad Request",
+             "status": 400, "o:errorDetails": [{"detail": "Invalid search query.",
+             "o:errorCode": "INVALID_PARAMETER"}]}""";
+
+    private static final String UNAUTHORIZED_BODY = """
+            {"type": "https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.2", "title": "Unauthorized",
+             "status": 401, "o:errorDetails": [{"detail": "Invalid login attempt.",
+             "o:errorCode": "INVALID_LOGIN"}]}""";
+
+    /** One key for the whole class: generating an RSA-2048 pair per test would dominate the run time. */
+    private static final KeyPair SIGNING_KEY = rsaKeyPair();
+
+    @TempDir
+    Path tmp;
 
     private NetsuiteProperties props;
 
@@ -105,18 +136,69 @@ class NetsuiteRestClientTest {
     private NetsuiteRestClient client;
 
     @BeforeEach
-    void setUp() {
-        props = new NetsuiteProperties();
-        props.setBaseUrl(netsuite.baseUrl());
-        props.setReadTimeout(Duration.ofSeconds(2));
-        tokenProvider = mock(NetsuiteTokenProvider.class);
-        when(tokenProvider.accessToken()).thenReturn("token-1");
+    void setUp() throws IOException {
+        // Priority 1 keeps the token endpoint answering when a test stubs every POST with a delay or a fault.
+        netsuite.stubFor(post(urlPathEqualTo(TOKEN)).atPriority(1).willReturn(okJson(tokenResponse("tok-1"))));
+        props = configuredProperties(netsuite.baseUrl());
+        tokenProvider = new NetsuiteTokenProvider(props, WebClient.builder());
         client = newClient(props);
     }
 
+    /** A client over the given settings that shares this test's token provider and its WireMock token endpoint. */
     private NetsuiteRestClient newClient(NetsuiteProperties properties) {
         UpstreamCallExecutor executor = new UpstreamCallExecutor(List.of(new NetsuiteFailureClassifier()));
         return new NetsuiteRestClient(properties, tokenProvider, executor, WebClient.builder());
+    }
+
+    /**
+     * Settings for a NetSuite reached at {@code baseUrl}, with the OAuth 2.0 M2M credentials the token provider needs.
+     * The read timeout is 2 s rather than the 10 s default so that no test waits long, and long enough that a
+     * loaded build host does not time out a regular WireMock answer.
+     */
+    private NetsuiteProperties configuredProperties(String baseUrl) throws IOException {
+        NetsuiteProperties properties = new NetsuiteProperties();
+        properties.setAccount("TSTDRV1234567");
+        properties.setBaseUrl(baseUrl);
+        properties.setReadTimeout(Duration.ofSeconds(2));
+        properties.getOauth().setClientId("test-client-id");
+        properties.getOauth().setCertificateId("test-certificate-id");
+        properties.getOauth().setPrivateKeyPath(writePkcs8Pem(tmp).toString());
+        return properties;
+    }
+
+    private static String tokenResponse(String accessToken) {
+        return "{\"access_token\": \"" + accessToken + "\", \"token_type\": \"bearer\", \"expires_in\": \"3600\"}";
+    }
+
+    private static KeyPair rsaKeyPair() {
+        try {
+            KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+            generator.initialize(2048);
+            return generator.generateKeyPair();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("RSA key generation is unavailable", e);
+        }
+    }
+
+    /** Writes {@link #SIGNING_KEY}'s private key as the unencrypted PKCS#8 PEM file the token provider reads. */
+    private static Path writePkcs8Pem(Path directory) throws IOException {
+        String base64 = Base64.getMimeEncoder(64, "\n".getBytes(StandardCharsets.US_ASCII))
+                .encodeToString(SIGNING_KEY.getPrivate().getEncoded());
+        Path file = directory.resolve("netsuite-test-key.pem");
+        Files.writeString(file, "-----BEGIN PRIVATE KEY-----\n" + base64 + "\n-----END PRIVATE KEY-----\n",
+                StandardCharsets.US_ASCII);
+        return file;
+    }
+
+    /**
+     * Asserts that exactly one token request and exactly one NetSuite API request were made: the single attempt of a
+     * failure that must never be retried.
+     */
+    private static void assertOneTokenRequestAndOneCall() {
+        netsuite.verify(1, postRequestedFor(urlPathEqualTo(TOKEN)));
+        assertThat(netsuite.findAll(anyRequestedFor(anyUrl())))
+                .filteredOn(request -> !request.getUrl().startsWith(TOKEN))
+                .hasSize(1);
     }
 
     // ---------------------------------------------------------------------------------------------- SuiteQL
@@ -153,11 +235,13 @@ class NetsuiteRestClientTest {
                     .withHeader("Prefer", equalTo("transient"))
                     .withHeader("Content-Type", equalTo("application/json"))
                     .withHeader("Accept", equalTo("application/json"))
-                    .withHeader("Authorization", equalTo("Bearer token-1"))
+                    .withHeader("Authorization", equalTo("Bearer tok-1"))
                     .withRequestBody(equalToJson("{\"q\": \"SELECT email, firstname, lastname FROM customer"
                             + " WHERE lastname LIKE 'O''Br%'\\nORDER BY lastname\"}")));
         }
         netsuite.verify(2, postRequestedFor(urlPathEqualTo(SUITEQL)));
+        // Both pages carry the token of the single token request: it is cached until shortly before it expires.
+        netsuite.verify(1, postRequestedFor(urlPathEqualTo(TOKEN)));
     }
 
     @Test
@@ -255,11 +339,15 @@ class NetsuiteRestClientTest {
         assertThat(NetsuiteRestClient.suiteQlLiteral(value)).isEqualTo(expected);
     }
 
+    /** The result carries no surrounding quotes; backslash, {@code %} and {@code _} pass unchanged. */
     static Stream<Arguments> literals() {
         return Stream.of(
+                Arguments.of("O'Brien", "O''Brien"),
                 Arguments.of("O'Brien\\%", "O''Brien\\%"),
-                Arguments.of("a_b%", "a_b%"),
                 Arguments.of("''", "''''"),
+                Arguments.of("a\\b", "a\\b"),
+                Arguments.of("50%_off", "50%_off"),
+                Arguments.of("a_b%", "a_b%"),
                 Arguments.of("", ""));
     }
 
@@ -288,7 +376,7 @@ class NetsuiteRestClientTest {
                 .isEqualTo(Map.of("id", "3", "refName", "Gold"));
         netsuite.verify(getRequestedFor(urlEqualTo(CUSTOMER_RECORDS + "/107?expandSubResources=true"))
                 .withHeader("Accept", equalTo("application/json"))
-                .withHeader("Authorization", equalTo("Bearer token-1")));
+                .withHeader("Authorization", equalTo("Bearer tok-1")));
     }
 
     @Test
@@ -346,7 +434,7 @@ class NetsuiteRestClientTest {
 
         assertThat(client.listRecordIds("customer")).containsExactly("11", "12", "13");
         netsuite.verify(getRequestedFor(urlEqualTo(CUSTOMER_RECORDS + "?limit=1000&offset=0"))
-                .withHeader("Authorization", equalTo("Bearer token-1")));
+                .withHeader("Authorization", equalTo("Bearer tok-1")));
         netsuite.verify(getRequestedFor(urlEqualTo(CUSTOMER_RECORDS + "?limit=1000&offset=2")));
         netsuite.verify(2, getRequestedFor(urlPathEqualTo(CUSTOMER_RECORDS)));
     }
@@ -363,7 +451,7 @@ class NetsuiteRestClientTest {
 
         netsuite.verify(1, postRequestedFor(urlEqualTo(CUSTOMER_RECORDS))
                 .withHeader("Content-Type", equalTo("application/json"))
-                .withHeader("Authorization", equalTo("Bearer token-1"))
+                .withHeader("Authorization", equalTo("Bearer tok-1"))
                 .withRequestBody(equalToJson("{\"companyName\": \"O'Brien & Co\", \"subsidiary\": {\"id\": \"1\"}}")));
     }
 
@@ -396,7 +484,7 @@ class NetsuiteRestClientTest {
         client.deleteRecord("customer", "4711");
 
         netsuite.verify(1, deleteRequestedFor(urlEqualTo(CUSTOMER_RECORDS + "/4711"))
-                .withHeader("Authorization", equalTo("Bearer token-1")));
+                .withHeader("Authorization", equalTo("Bearer tok-1")));
     }
 
     @Test
@@ -426,7 +514,7 @@ class NetsuiteRestClientTest {
         assertThat(first).containsEntry("type", "object");
         netsuite.verify(1, getRequestedFor(urlEqualTo(CUSTOMER_CATALOG))
                 .withHeader("Accept", equalTo("application/schema+json"))
-                .withHeader("Authorization", equalTo("Bearer token-1")));
+                .withHeader("Authorization", equalTo("Bearer tok-1")));
         @SuppressWarnings("unchecked")
         Map<String, Object> properties = (Map<String, Object>) first.get("properties");
         assertThatThrownBy(() -> first.put("type", "array")).isInstanceOf(UnsupportedOperationException.class);
@@ -576,57 +664,82 @@ class NetsuiteRestClientTest {
 
     @Test
     void unauthorizedEvictsTheTokenAndRetriesOnceWithAFreshOne() {
-        when(tokenProvider.accessToken()).thenReturn("token-1", "token-2");
+        // Newer than the fixture's token stub at the same priority, so these answer first: tok-1, then tok-2.
+        netsuite.stubFor(post(urlPathEqualTo(TOKEN)).atPriority(1).inScenario("token").whenScenarioStateIs(STARTED)
+                .willReturn(okJson(tokenResponse("tok-1"))).willSetStateTo("renewed"));
+        netsuite.stubFor(post(urlPathEqualTo(TOKEN)).atPriority(1).inScenario("token").whenScenarioStateIs("renewed")
+                .willReturn(okJson(tokenResponse("tok-2"))));
         netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).inScenario("auth").whenScenarioStateIs(STARTED)
-                .willReturn(aResponse().withStatus(401)).willSetStateTo("renewed"));
+                .willReturn(aResponse().withStatus(401).withHeader("Content-Type", "application/json")
+                        .withBody(UNAUTHORIZED_BODY))
+                .willSetStateTo("renewed"));
         netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).inScenario("auth").whenScenarioStateIs("renewed")
-                .willReturn(okJson("{\"hasMore\": false, \"items\": [{\"lastname\": \"Abbott\"}]}")));
+                .willReturn(okJson("{\"hasMore\": false, \"items\": [{\"links\": [], \"lastname\": \"Abbott\"}]}")));
 
         assertThat(client.suiteQl("SELECT lastname FROM customer")).containsExactly(Map.of("lastname", "Abbott"));
 
-        verify(tokenProvider, times(2)).accessToken();
-        verify(tokenProvider, times(1)).evict();
+        // The 401 evicted the cached token, so the single retry asked the token endpoint again.
+        netsuite.verify(2, postRequestedFor(urlPathEqualTo(TOKEN)));
+        netsuite.verify(2, postRequestedFor(urlPathEqualTo(SUITEQL)));
         netsuite.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL))
-                .withHeader("Authorization", equalTo("Bearer token-1")));
+                .withHeader("Authorization", equalTo("Bearer tok-1")));
         netsuite.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL))
-                .withHeader("Authorization", equalTo("Bearer token-2")));
+                .withHeader("Authorization", equalTo("Bearer tok-2")));
     }
 
     @Test
     void unauthorizedRetryThatIsRejectedAgainEndsTheAttempt() {
-        netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(aResponse().withStatus(401)));
+        netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(aResponse().withStatus(401)
+                .withHeader("Content-Type", "application/json").withBody(UNAUTHORIZED_BODY)));
 
         assertThatThrownBy(() -> client.suiteQl("SELECT id FROM customer"))
-                .isInstanceOf(UpstreamAuthenticationException.class);
-        verify(tokenProvider, times(1)).evict();
+                .isInstanceOfSatisfying(UpstreamAuthenticationException.class,
+                        e -> assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE));
+        netsuite.verify(2, postRequestedFor(urlPathEqualTo(TOKEN)));
         netsuite.verify(2, postRequestedFor(urlPathEqualTo(SUITEQL)));
     }
 
     @Test
     void rateLimitIsNotRetriedAndCarriesRetryAfter() {
         netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(aResponse().withStatus(429)
-                .withHeader("Retry-After", "30")));
+                .withHeader("Retry-After", "17")));
 
         assertThatThrownBy(() -> client.suiteQl("SELECT id FROM customer"))
-                .isInstanceOfSatisfying(UpstreamRateLimitException.class,
-                        e -> assertThat(e.getRetryAfter()).isEqualTo("30"));
-        verify(tokenProvider, never()).evict();
+                .isInstanceOfSatisfying(UpstreamRateLimitException.class, e -> {
+                    assertThat(e.getRetryAfter()).isEqualTo("17");
+                    assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
+                });
         netsuite.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL)));
+        netsuite.verify(1, postRequestedFor(urlPathEqualTo(TOKEN)));
+    }
+
+    @Test
+    void badRequestIsRethrownUnchangedWithoutReauthentication() {
+        netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(aResponse().withStatus(400)
+                .withHeader("Content-Type", "application/json").withBody(BAD_REQUEST_BODY)));
+
+        // OTHER: NetSuite's own exception reaches the example's exception branch, not an upstream exception.
+        assertThatThrownBy(() -> client.suiteQl("SELECT nonsense FROM customer"))
+                .isInstanceOfSatisfying(WebClientResponseException.class,
+                        e -> assertThat(e.getStatusCode().value()).isEqualTo(400));
+        netsuite.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL)));
+        netsuite.verify(1, postRequestedFor(urlPathEqualTo(TOKEN)));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("timedOutCalls")
-    void readTimeoutIsUnavailableAfterExactlyOneRequest(String name, TimedOutCall call) {
+    void readTimeoutIsUnavailableAndIsNeverRetried(String name, TimedOutCall call) {
+        Duration stubDelay = Duration.ofMillis(1500);
         props.setReadTimeout(Duration.ofMillis(300));
+        // The fixture's token provider keeps its own 2 s transport, so only the NetSuite API call times out.
         NetsuiteRestClient timingOut = newClient(props);
-        netsuite.stubFor(post(anyUrl()).willReturn(okJson("{}").withFixedDelay(1500)));
+        netsuite.stubFor(post(anyUrl()).willReturn(okJson("{}").withFixedDelay((int) stubDelay.toMillis())));
 
         assertThatThrownBy(() -> call.invoke(timingOut)).isInstanceOf(UpstreamUnavailableException.class);
 
-        verify(tokenProvider, never()).evict();
-        await().atMost(Duration.ofSeconds(5))
-                .untilAsserted(() -> netsuite.verify(1, anyRequestedFor(anyUrl())));
-        netsuite.verify(1, anyRequestedFor(anyUrl()));
+        // Wait out the stub delay, so a retry sent after the timeout would have been recorded by now.
+        await().pollDelay(stubDelay).atMost(stubDelay.plusSeconds(5))
+                .untilAsserted(NetsuiteRestClientTest::assertOneTokenRequestAndOneCall);
     }
 
     static Stream<Arguments> timedOutCalls() {
@@ -655,10 +768,9 @@ class NetsuiteRestClientTest {
         assertThatThrownBy(() -> call.invoke(client)).isInstanceOfSatisfying(UpstreamUnavailableException.class,
                 e -> assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE));
 
-        verify(tokenProvider, never()).evict();
         await().atMost(Duration.ofSeconds(5))
-                .untilAsserted(() -> netsuite.verify(1, anyRequestedFor(anyUrl())));
-        netsuite.verify(1, anyRequestedFor(anyUrl()));
+                .untilAsserted(NetsuiteRestClientTest::assertOneTokenRequestAndOneCall);
+        assertOneTokenRequestAndOneCall();
     }
 
     /** Each call of {@link #timedOutCalls()} against each way WireMock drops the connection. */
@@ -677,6 +789,8 @@ class NetsuiteRestClientTest {
                 .body((message, context) -> Mono.delay(Duration.ofMillis(500))
                         .then(Mono.defer(() -> request.body().insert(message, context))))
                 .build());
+        // The token is fetched from WireMock and cached first, so the resetting server sees only the API request.
+        assertThat(tokenProvider.accessToken()).isEqualTo("tok-1");
         try (ResettingServer server = new ResettingServer()) {
             props.setBaseUrl(server.baseUrl());
             NetsuiteRestClient resetting = new NetsuiteRestClient(props, tokenProvider,
@@ -685,11 +799,43 @@ class NetsuiteRestClientTest {
 
             assertThatThrownBy(() -> call.invoke(resetting)).isInstanceOf(RuntimeException.class);
 
-            verify(tokenProvider, times(1)).accessToken();
-            verify(tokenProvider, never()).evict();
+            // A transport retry or a re-authentication (whose token request now targets the resetting server too)
+            // would show as a second connection.
             await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(2))
                     .until(server.connections::get, count -> count == 1);
+            netsuite.verify(1, postRequestedFor(urlPathEqualTo(TOKEN)));
         }
+    }
+
+    @Test
+    void closedPortIsUnavailableWithAConnectExceptionAndIsNeverRetried() throws IOException {
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
+        NetsuiteProperties refusing = configuredProperties("http://localhost:" + port);
+        NetsuiteRestClient unreachable = new NetsuiteRestClient(refusing,
+                new NetsuiteTokenProvider(refusing, WebClient.builder()),
+                new UpstreamCallExecutor(List.of(new NetsuiteFailureClassifier())), WebClient.builder());
+
+        // The token request is the first to meet the refused connection; it runs inside the executor's attempt.
+        assertThatThrownBy(() -> unreachable.suiteQl("SELECT id FROM customer"))
+                .isInstanceOfSatisfying(UpstreamUnavailableException.class, e -> {
+                    assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
+                    // Netty's AnnotatedConnectException and the native transport's exception both extend it.
+                    assertThat(causeChain(e)).anyMatch(ConnectException.class::isInstance);
+                });
+        netsuite.verify(0, anyRequestedFor(anyUrl()));
+    }
+
+    /** The throwable and its causes, each once, so a cyclic chain ends. */
+    private static List<Throwable> causeChain(Throwable failure) {
+        List<Throwable> chain = new ArrayList<>();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable current = failure; current != null && seen.add(current); current = current.getCause()) {
+            chain.add(current);
+        }
+        return chain;
     }
 
     /**
@@ -749,7 +895,7 @@ class NetsuiteRestClientTest {
         assertThatThrownBy(() -> unconfigured.suiteQl("SELECT id FROM customer"))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("netsuite.account");
-        verify(tokenProvider, never()).accessToken();
+        // Not even the token request is made: WireMock serves the token endpoint too.
         netsuite.verify(0, anyRequestedFor(anyUrl()));
     }
 
@@ -768,7 +914,6 @@ class NetsuiteRestClientTest {
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage(message);
         assertThat(message).startsWith(key + " ");
-        verify(tokenProvider, never()).accessToken();
         netsuite.verify(0, anyRequestedFor(anyUrl()));
     }
 
@@ -818,6 +963,26 @@ class NetsuiteRestClientTest {
     }
 
     @Test
+    void propertiesDefaultToTheMuleTimeoutsTheAccountTimeZoneAndNoOverrides() {
+        NetsuiteProperties defaults = new NetsuiteProperties();
+
+        assertThat(defaults.getConnectTimeout()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(defaults.getReadTimeout()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(defaults.getTimeZone()).isEqualTo(ZoneId.of("America/Los_Angeles"));
+        assertThat(defaults.getCustomFieldTypeIds()).isNotNull().isEmpty();
+
+        // null restores each default, so no setting is ever left null.
+        defaults.setConnectTimeout(null);
+        defaults.setReadTimeout(null);
+        defaults.setTimeZone(null);
+        defaults.setCustomFieldTypeIds(null);
+        assertThat(defaults.getConnectTimeout()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(defaults.getReadTimeout()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(defaults.getTimeZone()).isEqualTo(ZoneId.of("America/Los_Angeles"));
+        assertThat(defaults.getCustomFieldTypeIds()).isNotNull().isEmpty();
+    }
+
+    @Test
     void contextStartsWithTheEmptyPlaceholdersOfApplicationYml() {
         contextRunner().run(context -> {
             assertThat(context).hasNotFailed().hasSingleBean(NetsuiteRestClient.class);
@@ -837,6 +1002,12 @@ class NetsuiteRestClientTest {
         netsuite.verify(0, anyRequestedFor(anyUrl()));
     }
 
+    /*
+     * The only Spring context and the only classpath read of this class: just binding the project's own
+     * application.yml and registering the beans as component scan does shows that the client starts with every
+     * credential placeholder empty and that Spring selects the token provider's @Autowired constructor. Both SC-16
+     * consumers carry the same empty netsuite.* placeholders, so the copy stays project-neutral.
+     */
     private static ApplicationContextRunner contextRunner() {
         return new ApplicationContextRunner()
                 .withInitializer(new ConfigDataApplicationContextInitializer())
