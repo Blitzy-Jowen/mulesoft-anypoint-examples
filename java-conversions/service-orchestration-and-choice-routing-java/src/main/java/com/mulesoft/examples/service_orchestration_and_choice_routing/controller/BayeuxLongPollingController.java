@@ -7,10 +7,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
@@ -18,6 +17,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 import jakarta.annotation.PreDestroy;
@@ -61,18 +61,22 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.service.Aj
  * </ul>
  *
  * <p>Responses: HTTP 200 with a plain JSON array, the replies in request order followed, for a connect, by the
- * client's deliveries ({@code channel}, {@code data}, {@code id}). The copied client parses it with
- * {@code eval("(" + text + ")")} and negotiates no comment filtering, so the array is never wrapped in a comment.
- * Without {@code jsonp} the Content-Type is {@code text/json;charset=UTF-8}, the Jetty cometd servlet's; with it the
- * body is {@code <jsonp>(<array>)} as {@code text/javascript;charset=UTF-8}. Bayeux errors are always in-band. A
- * request whose {@code message} is absent, is not JSON, or is neither an object nor an array of objects is answered
- * HTTP 400 with the body {@code []}. That Content-Type and the 400 framing are Tier 2A verification points.
+ * client's deliveries ({@code channel}, {@code data}, {@code id}), none when a held connect is answered by the
+ * request's own timeout. The copied client parses it with {@code eval("(" + text + ")")} and negotiates no comment
+ * filtering, so the array is never wrapped in a comment. Without {@code jsonp} the Content-Type is
+ * {@code text/json;charset=UTF-8}, the Jetty cometd servlet's; with it the body is {@code <jsonp>(<array>)} as
+ * {@code text/javascript;charset=UTF-8}. Bayeux errors are always in-band. A request whose {@code message} is
+ * absent, is not JSON, or is neither an object nor an array of objects is answered HTTP 400 with the body
+ * {@code []}. That Content-Type and the 400 framing are Tier 2A verification points.
  *
  * <p>Connection phase: the first connect after a handshake is answered at once with whatever is queued, as Jetty
  * answered it, because {@code dojox.cometd} flushes the subscriptions and publications queued at page load only after
  * that first successful connect. Every later connect is held, on a wait thread rather than a request thread, until a
- * delivery is queued for the client or {@code ajax.connect-timeout-ms} passes; a held connect is best effort, so
- * deliveries drained for a client that has meanwhile gone away are lost, as with Jetty. The held requests use Servlet
+ * delivery is queued for the client or {@code ajax.connect-timeout-ms} passes. The wait takes nothing from the
+ * client's queue: only the answer that claims the response drains it, and deliveries that response then refuses go
+ * back to the front of the queue, while a request that times out or ends first retires its wait and leaves every
+ * delivery for the client's next connect, so each delivery is accepted by exactly one response. Deliveries a
+ * response has accepted are lost when the client has meanwhile gone away, as with Jetty. The held requests use Servlet
  * async processing, which works because SC-10's {@code PortRoutingFilter} is registered for REQUEST dispatches only and
  * the ASYNC re-dispatch of {@code /ajax/cometd} reaches {@code dispatcherServlet} through its {@code /} mapping.
  *
@@ -95,7 +99,11 @@ public class BayeuxLongPollingController {
      */
     static final int MAX_HELD_CONNECTS = 512;
 
-    /** Time a held connect is given beyond {@code ajax.connect-timeout-ms} before the safety-net timeout answers it. */
+    /**
+     * Time a held connect is given beyond {@code ajax.connect-timeout-ms} before the request's own safety-net timeout
+     * retires its wait and answers it with its replies alone, leaving the client's queued deliveries for its next
+     * connect.
+     */
     static final long HOLD_GRACE_MS = 5000;
 
     private static final Logger LOGGER = LoggerFactory.getLogger(BayeuxLongPollingController.class);
@@ -156,7 +164,7 @@ public class BayeuxLongPollingController {
     private final Map<String, Object> retryAdvice;
 
     /**
-     * Runs the blocking {@link AjaxChannelBroker#awaitMessages} calls of held connects, one daemon thread
+     * Runs the blocking {@link AjaxChannelBroker#awaitDeliveries} calls of held connects, one daemon thread
      * ({@code bayeux-connect-<n>}) per held connect, created on demand and retired after 60 s idle, as a cached pool
      * does. Not Spring's {@code applicationTaskExecutor}, whose bounded core pool would queue held connects.
      */
@@ -369,40 +377,20 @@ public class BayeuxLongPollingController {
     }
 
     /**
-     * Holds a connect until the broker queues a delivery for the client or {@code ajax.connect-timeout-ms} passes,
-     * then answers with the replies and the deliveries. A timeout of the request itself, which the wait normally
-     * precedes by {@link #HOLD_GRACE_MS}, answers with whatever is queued by then.
+     * Holds a connect until the broker has a delivery queued for the client or {@code ajax.connect-timeout-ms}
+     * passes, then answers with the replies and the deliveries. The request's own timeout, which the wait normally
+     * precedes by {@link #HOLD_GRACE_MS}, and the end of the request by an error or its completion retire the wait
+     * instead, leaving every queued delivery for the client's next connect; a timeout answers with the replies alone.
+     * {@link HeldConnect} makes these the one owner of the response.
      */
     private DeferredResult<ResponseEntity<String>> hold(String clientId, List<Object> replies, String jsonp) {
         DeferredResult<ResponseEntity<String>> result = new DeferredResult<>(holdTimeoutMs);
-        result.onTimeout(() -> result.setResult(frame(HttpStatus.OK, withDeliveries(replies, broker.drain(clientId)),
-                jsonp)));
-        try {
-            CompletableFuture.supplyAsync(() -> awaitDeliveries(clientId), waitExecutor)
-                    .whenComplete((deliveries, failure) -> {
-                        if (failure != null) {
-                            LOGGER.debug("Held Bayeux connect released without deliveries: {}",
-                                    failure.getClass().getName());
-                            result.setResult(frame(HttpStatus.OK, replies, jsonp));
-                        } else {
-                            result.setResult(frame(HttpStatus.OK, withDeliveries(replies, deliveries), jsonp));
-                        }
-                    });
-        } catch (RejectedExecutionException saturated) {
-            LOGGER.warn("{} Bayeux connects are already held; this connect is answered at once", MAX_HELD_CONNECTS);
-            result.setResult(frame(HttpStatus.OK, withDeliveries(replies, broker.drain(clientId)), jsonp));
-        }
+        HeldConnect held = new HeldConnect(clientId, replies, jsonp, result);
+        result.onTimeout(held::expire);
+        result.onError(failure -> held.retire());
+        result.onCompletion(held::retire);
+        held.start();
         return result;
-    }
-
-    /** The broker's wait, with an interruption (at shutdown) surfaced as the future's failure. */
-    private List<AjaxChannelBroker.Delivery> awaitDeliveries(String clientId) {
-        try {
-            return broker.awaitMessages(clientId, connectTimeoutMs);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-            throw new CompletionException(interrupted);
-        }
     }
 
     /** The replies followed by one message per delivery, each with its own server-assigned {@code id}. */
@@ -590,6 +578,133 @@ public class BayeuxLongPollingController {
 
         private String connectClientId;
         private boolean holdConnect;
+    }
+
+    /** Who owns a held connect's response: nobody yet, the wait thread's answer, or the request's own end. */
+    private enum HoldState {
+
+        /** The wait thread is waiting for the broker; the response is unclaimed. */
+        WAITING,
+
+        /** The wait thread has claimed the response and answers it. */
+        ANSWERING,
+
+        /** The request timed out or ended first; the wait thread answers nothing and drains nothing. */
+        RETIRED
+    }
+
+    /**
+     * One held connect, the single owner of its response. Three parties can end it: the wait thread, once the broker
+     * has a delivery queued for the client or the connect timeout passes; the request's own timeout; and the end of
+     * the request by an error or its completion. Whoever moves the connect out of {@link HoldState#WAITING} first
+     * owns it:
+     * <ul>
+     *   <li>the wait thread claims it to answer, and drains the client's queue only then and only when its wait was
+     *       still the client's newest and the response is still unset. Should the response nevertheless refuse the
+     *       answer, the drained deliveries go back to the front of the client's queue, so the next connect receives
+     *       each of them exactly once;</li>
+     *   <li>the request's timeout, an error or the completion retires it: the wait thread is interrupted and ends
+     *       without draining, so everything queued stays for the next connect, and a timeout answers the request with
+     *       its replies alone.</li>
+     * </ul>
+     * Retiring never blocks: the container may run those callbacks while holding the locks the wait thread's answer
+     * needs, so they neither wait for the wait thread nor take a lock it holds.
+     */
+    private final class HeldConnect {
+
+        private final String clientId;
+        private final List<Object> replies;
+        private final String jsonp;
+        private final DeferredResult<ResponseEntity<String>> result;
+        private final AtomicReference<HoldState> state = new AtomicReference<>(HoldState.WAITING);
+
+        /** The wait thread's task once submitted; cancelling it interrupts the wait. */
+        private volatile Future<?> waitTask;
+
+        HeldConnect(String clientId, List<Object> replies, String jsonp,
+                DeferredResult<ResponseEntity<String>> result) {
+            this.clientId = clientId;
+            this.replies = replies;
+            this.jsonp = jsonp;
+            this.result = result;
+        }
+
+        /**
+         * Starts the wait on its own wait thread. When {@value BayeuxLongPollingController#MAX_HELD_CONNECTS} connects
+         * are already held, the connect is answered at once with what is queued, so a flood of clients cannot exhaust
+         * the JVM's threads.
+         */
+        void start() {
+            Future<?> task;
+            try {
+                task = waitExecutor.submit(this::awaitAndAnswer);
+            } catch (RejectedExecutionException saturated) {
+                LOGGER.warn("{} Bayeux connects are already held; this connect is answered at once",
+                        MAX_HELD_CONNECTS);
+                answer(true);
+                return;
+            }
+            waitTask = task;
+            // A retirement that ran before the task was stored could not cancel it.
+            if (state.get() == HoldState.RETIRED) {
+                task.cancel(true);
+            }
+        }
+
+        /**
+         * The wait thread: waits without taking anything, then answers. An interrupted wait, by a retirement or by
+         * {@link BayeuxLongPollingController#shutdown()}, is answered with the replies alone unless retired.
+         */
+        private void awaitAndAnswer() {
+            boolean current;
+            try {
+                current = broker.awaitDeliveries(clientId, connectTimeoutMs);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                current = false;
+            }
+            answer(current);
+        }
+
+        /**
+         * Claims the response and answers it with the replies, followed by the client's deliveries when
+         * {@code drain} is set and the response is still unset; deliveries the response refuses are restored to the
+         * client's queue. Does nothing once the connect is retired.
+         */
+        private void answer(boolean drain) {
+            if (!state.compareAndSet(HoldState.WAITING, HoldState.ANSWERING)) {
+                return;
+            }
+            List<AjaxChannelBroker.Delivery> deliveries =
+                    drain && !result.isSetOrExpired() ? broker.drain(clientId) : List.of();
+            boolean accepted;
+            try {
+                accepted = result.setResult(frame(HttpStatus.OK, withDeliveries(replies, deliveries), jsonp));
+            } catch (RuntimeException refused) {
+                // The container may refuse a result for a request it has already ended.
+                LOGGER.debug("Held Bayeux connect could not be answered: {}", refused.getClass().getName());
+                accepted = false;
+            }
+            if (!accepted && !deliveries.isEmpty()) {
+                broker.restore(clientId, deliveries);
+            }
+        }
+
+        /** The request's own timeout: retires the connect and answers with the replies alone. */
+        void expire() {
+            retire();
+            result.setResult(frame(HttpStatus.OK, replies, jsonp));
+        }
+
+        /** Retires the connect unless the wait thread has claimed it, interrupting the wait. Never blocks. */
+        void retire() {
+            if (state.compareAndSet(HoldState.WAITING, HoldState.RETIRED)) {
+                Future<?> task = waitTask;
+                if (task != null) {
+                    task.cancel(true);
+                }
+            }
+        }
     }
 }
 

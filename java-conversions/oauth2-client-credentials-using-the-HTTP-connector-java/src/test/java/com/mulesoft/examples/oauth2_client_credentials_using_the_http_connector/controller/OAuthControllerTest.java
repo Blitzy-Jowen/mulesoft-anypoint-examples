@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -36,6 +37,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
@@ -44,10 +46,16 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.stubbing.Scenario;
 
+import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.service.BoxClientCredentialsService;
 import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.support.HttpTestClient;
 
 /**
@@ -59,9 +67,12 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  *
  * <p>Requests go through the project's ST-1 {@link HttpTestClient}, so status code, reason phrase, headers and
  * body bytes are asserted as the listener writes them. The happy path covers every method, because the listener
- * declares no {@code allowedMethods}; the error cases are the original's own failure paths, each ending in the
- * platform-default 500 of SC-1 because the flow's rollback strategy only logs (lines 35-37), and the no-listener
- * 404 for paths the listener does not serve.
+ * declares no {@code allowedMethods}. The flow's {@code #[payload]} logger (line 33) is shown to write a form body
+ * as the caller's text, a Box reply without a Content-Type to be answered without one, and every reply to be
+ * complete when the controller returns, so TRACE gets no servlet echo and OPTIONS no {@code Allow} header. The error
+ * cases are the original's own failure paths, each ending in the platform-default 500 of SC-1 because the flow's
+ * rollback strategy only logs (lines 35-37), an unparseable Content-Type, which fails before the flow runs, and the
+ * no-listener 404 for paths the listener does not serve.
  *
  * <p>The original example has no test, so no original assertion is ported here.
  */
@@ -109,9 +120,33 @@ class OAuthControllerTest {
     @LocalServerPort
     private int port;
 
+    private Logger serviceLogger;
+
+    private Level previousLevel;
+
+    /** The INFO events of the flow's two loggers (lines 33 and 36), which {@link BoxClientCredentialsService} owns. */
+    private ListAppender<ILoggingEvent> serviceLog;
+
     @BeforeEach
     void resetUpstream() {
         wm.resetAll();
+    }
+
+    @BeforeEach
+    void captureServiceLog() {
+        serviceLogger = (Logger) LoggerFactory.getLogger(BoxClientCredentialsService.class);
+        previousLevel = serviceLogger.getLevel();
+        serviceLog = new ListAppender<>();
+        serviceLog.start();
+        serviceLogger.addAppender(serviceLog);
+        serviceLogger.setLevel(Level.INFO);
+    }
+
+    @AfterEach
+    void releaseServiceLog() {
+        serviceLogger.detachAppender(serviceLog);
+        serviceLog.stop();
+        serviceLogger.setLevel(previousLevel);
     }
 
     private HttpTestClient client() {
@@ -249,6 +284,99 @@ class OAuthControllerTest {
         assertPlatform500(response, "{ \"message\": \"Response code 401 mapped as failure.\" }");
         wm.verify(2, postRequestedFor(urlEqualTo(TOKEN)));
         wm.verify(2, getRequestedFor(urlEqualTo(AUTHORIZE)));
+    }
+
+    /**
+     * The flow logs a form-encoded body as the caller sent it. These are query-less POSTs, whose bodies Spring's
+     * {@code @RequestBody} binding rebuilt from the request parameters: re-sorted, {@code %20} turned into
+     * {@code +}, the Latin-1 escape {@code %e9} decoded as UTF-8, and a bare name or a JSON text given a trailing
+     * {@code =}.
+     *
+     * @param form the form body, sent as UTF-8
+     */
+    @ParameterizedTest(name = "POST /oauth {0}")
+    @ValueSource(strings = {"z=1&a=2", "z=1&a=%e9&b=x%20y", "b=2&a=%C3%A9+x&a=dup&empty=", "{\"x\":1}", "k"})
+    void formBodyIsLoggedAsTheCallersText(String form) {
+        stubToken();
+        wm.stubFor(get(urlEqualTo(AUTHORIZE)).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", MediaType.APPLICATION_JSON_VALUE)
+                .withBody(AUTHORIZED_BODY)));
+
+        HttpTestClient.Response response = client().post(OAUTH_PATH, MediaType.APPLICATION_FORM_URLENCODED_VALUE,
+                form);
+
+        assertEquals(200, response.status(), response::toString);
+        assertArrayEquals(AUTHORIZED_BODY, response.body(), response::toString);
+        assertFalse(serviceLog.list.isEmpty(), "no INFO event of the flow's payload logger");
+        ILoggingEvent payloadLine = serviceLog.list.get(0);
+        assertEquals(Level.INFO, payloadLine.getLevel());
+        assertEquals(form, payloadLine.getFormattedMessage());
+    }
+
+    /**
+     * Method, Box status, Box Content-Type ({@code null} for none) and Box body. Each request carries an
+     * {@code Authorization} header, which the servlet's TRACE echo would repeat.
+     */
+    static Stream<Arguments> boxReplies() {
+        String authorized = new String(AUTHORIZED_BODY, UTF_8);
+        return Stream.of(
+                Arguments.of("TRACE", 200, MediaType.APPLICATION_JSON_VALUE, authorized),
+                Arguments.of("OPTIONS", 200, MediaType.APPLICATION_JSON_VALUE, authorized),
+                Arguments.of("HEAD", 200, MediaType.APPLICATION_JSON_VALUE, authorized),
+                Arguments.of("GET", 200, null, "untyped"),
+                Arguments.of("TRACE", 200, null, "untyped"),
+                Arguments.of("OPTIONS", 200, null, "untyped"),
+                Arguments.of("HEAD", 200, null, "untyped"),
+                Arguments.of("GET", 204, null, ""),
+                Arguments.of("TRACE", 204, null, ""),
+                Arguments.of("OPTIONS", 204, null, ""));
+    }
+
+    /**
+     * The reply carries Box's Content-Type and none when Box sent none, and the {@code Content-Length} of Box's
+     * body, which a HEAD reply declares without sending it, because the flow's Box call is always a GET. Nothing is
+     * added after the controller returns: no servlet TRACE echo and no {@code Allow} header.
+     */
+    @ParameterizedTest(name = "{0} /oauth, Box {1} with Content-Type {2}")
+    @MethodSource("boxReplies")
+    void replyCarriesOnlyTheBoxContentTypeAndIsCompleteWhenTheControllerReturns(String method, int boxStatus,
+                                                                                String boxContentType,
+                                                                                String boxBody) {
+        stubToken();
+        ResponseDefinitionBuilder box = aResponse().withStatus(boxStatus);
+        if (boxContentType != null) {
+            box.withHeader("Content-Type", boxContentType);
+        }
+        if (!boxBody.isEmpty()) {
+            box.withBody(boxBody);
+        }
+        wm.stubFor(get(urlEqualTo(AUTHORIZE)).willReturn(box));
+        byte[] body = boxBody.getBytes(UTF_8);
+
+        HttpTestClient.Response response = client().send(method, OAUTH_PATH,
+                Map.of("Authorization", "Bearer trace-sentinel"), null);
+
+        assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
+        assertEquals(boxContentType == null ? List.of() : List.of(boxContentType), response.headers("Content-Type"),
+                response::toString);
+        assertEquals(List.of(String.valueOf(body.length)), response.headers("Content-Length"), response::toString);
+        assertTrue(response.headers("Allow").isEmpty(), response::toString);
+        assertArrayEquals("HEAD".equals(method) ? new byte[0] : body, response.body(), response::toString);
+        wm.verify(1, getRequestedFor(urlEqualTo(AUTHORIZE)));
+    }
+
+    /**
+     * The Content-Type is parsed before the body is read, as request-body binding parsed it, so the request fails
+     * with the message of that parse before the flow's logger runs and without any Box call.
+     */
+    @Test
+    void unparseableContentTypeIsAnsweredWithThePlatform500BeforeTheFlowRuns() {
+        HttpTestClient.Response response = client().post(OAUTH_PATH, "bogus", "abc");
+
+        assertPlatform500(response, "{ \"message\": \"Invalid mime type \\\"bogus\\\": does not contain '/'\" }");
+        assertTrue(serviceLog.list.isEmpty(), () -> "the flow ran: " + serviceLog.list);
+        wm.verify(0, anyRequestedFor(anyUrl()));
     }
 
     /**

@@ -13,7 +13,7 @@ spring:
     dispatch-trace-request: true   # TRACE reaches the /oauth and /FIM/* mappings instead of the servlet's default TRACE echo
     formcontent:
       filter:
-        enabled: false   # the /FIM/* flow forwards the request body unchanged: a form body on PUT/PATCH/DELETE reaches FimProxyController as it does on POST instead of being parsed by Boot's filter before dispatch
+        enabled: false   # the /FIM/* flow forwards and the /oauth flow logs the request body unchanged: FimProxyController and OAuthController read it from the request stream, which Boot's filter would consume for a PUT/PATCH/DELETE form body before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

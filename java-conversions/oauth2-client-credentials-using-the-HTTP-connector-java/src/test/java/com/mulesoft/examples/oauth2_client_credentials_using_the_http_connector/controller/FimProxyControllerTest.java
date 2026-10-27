@@ -12,6 +12,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.any;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
+import static com.github.tomakehurst.wiremock.client.WireMock.binaryEqualTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.deleteRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
@@ -27,14 +28,19 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
@@ -42,6 +48,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder;
@@ -55,9 +62,12 @@ import com.mulesoft.examples.oauth2_client_credentials_using_the_http_connector.
  * <p>Requests go through the project's ST-1 {@link HttpTestClient}, which reads the raw status line from the
  * socket, so status code, reason phrase, headers and body bytes are asserted exactly as the listener writes them.
  * The happy paths show the listener's method, raw path and query, body and Content-Type reaching the FIM server
- * unchanged and only the upstream body and Content-Type coming back with 200. The error cases are the platform
- * defaults of SC-1, because the flow declares no exception strategy: an upstream failure status and an I/O failure
- * each end in the JSON 500, and a path outside {@code /FIM/*} gets the no-listener 404 without any upstream call.
+ * unchanged and only the upstream body and Content-Type coming back with 200: form bodies as the caller's bytes,
+ * whatever the method and query, and an upstream reply without a Content-Type answered without one. Every reply is
+ * complete when the controller returns, so TRACE gets no servlet echo and OPTIONS no {@code Allow} header. The
+ * error cases are the platform defaults of SC-1, because the flow declares no exception strategy: an upstream
+ * failure status, an I/O failure and an unparseable Content-Type each end in the JSON 500, and a path outside
+ * {@code /FIM/*} gets the no-listener 404 without any upstream call.
  *
  * <p>No request carries a literal {@code {client_id}}: its substitution is covered by {@code FimProxyServiceTest},
  * and every upstream URL points at WireMock, so nothing leaves the loopback interface. The original example has no
@@ -139,6 +149,144 @@ class FimProxyControllerTest {
         assertForwarded(deleteRequestedFor(urlEqualTo("/FIM/orders/1")), "bye", MediaType.TEXT_PLAIN_VALUE);
     }
 
+    /**
+     * Method, path, body text and the charset of its bytes. The query-less POSTs are the bodies Spring's
+     * {@code @RequestBody} binding rebuilt from the request parameters: re-sorted, {@code %20} turned into
+     * {@code +}, the Latin-1 escape {@code %e9} and the raw Latin-1 byte decoded as UTF-8, and a bare name or a JSON
+     * text given a trailing {@code =}.
+     */
+    static Stream<Arguments> formBodies() {
+        return Stream.of(
+                Arguments.of("POST", "/FIM/form", "z=1&a=%e9&b=x%20y", StandardCharsets.US_ASCII),
+                Arguments.of("POST", "/FIM/form", "b=2&a=%C3%A9+x&a=dup&empty=", StandardCharsets.US_ASCII),
+                Arguments.of("POST", "/FIM/form", "token=abc%2Bdef%3D%3D&grant_type=refresh_token",
+                        StandardCharsets.US_ASCII),
+                Arguments.of("POST", "/FIM/form", "{\"x\":1}", StandardCharsets.US_ASCII),
+                Arguments.of("POST", "/FIM/form", "k", StandardCharsets.US_ASCII),
+                Arguments.of("POST", "/FIM/form", "a=caf\u00e9", StandardCharsets.ISO_8859_1),
+                Arguments.of("POST", "/FIM/form?q=1", "z=1&a=%e9&b=x%20y", StandardCharsets.US_ASCII),
+                Arguments.of("PUT", "/FIM/form", "z=1&a=%e9&b=x%20y", StandardCharsets.US_ASCII),
+                Arguments.of("PATCH", "/FIM/form", "z=1&a=%e9&b=x%20y", StandardCharsets.US_ASCII),
+                Arguments.of("DELETE", "/FIM/form", "z=1&a=%e9&b=x%20y", StandardCharsets.US_ASCII));
+    }
+
+    @ParameterizedTest(name = "{0} {1} {2}")
+    @MethodSource("formBodies")
+    void formBodyIsForwardedAsTheCallersBytes(String method, String path, String text, Charset charset) {
+        stubDone();
+        byte[] body = text.getBytes(charset);
+
+        HttpTestClient.Response response = http.send(method, path,
+                Map.of("Content-Type", MediaType.APPLICATION_FORM_URLENCODED_VALUE), body);
+
+        assertDone(response);
+        wm.verify(1, requestedFor(method, urlEqualTo(path))
+                .withRequestBody(binaryEqualTo(body))
+                .withHeader("Content-Type", containing(MediaType.APPLICATION_FORM_URLENCODED_VALUE)));
+    }
+
+    /**
+     * Method, upstream Content-Type ({@code null} for none) and upstream body. Each request carries an
+     * {@code Authorization} header, which the servlet's TRACE echo would repeat.
+     */
+    static Stream<Arguments> upstreamReplies() {
+        return Stream.of(
+                Arguments.of("GET", "text/plain", "fim reply"),
+                Arguments.of("GET", "text/html;charset=UTF-8", "<p>fim</p>"),
+                Arguments.of("GET", "bogus", "fim reply"),
+                Arguments.of("GET", "text/plain", ""),
+                Arguments.of("GET", null, "untyped"),
+                Arguments.of("GET", null, ""),
+                Arguments.of("TRACE", "text/plain", "fim reply"),
+                Arguments.of("TRACE", "text/plain", ""),
+                Arguments.of("TRACE", null, "untyped"),
+                Arguments.of("TRACE", null, ""),
+                Arguments.of("OPTIONS", "text/plain", "fim reply"),
+                Arguments.of("OPTIONS", "text/plain", ""),
+                Arguments.of("OPTIONS", null, "untyped"),
+                Arguments.of("OPTIONS", null, ""),
+                Arguments.of("HEAD", "text/plain", "fim reply"),
+                Arguments.of("HEAD", null, "untyped"));
+    }
+
+    /**
+     * The reply carries the upstream Content-Type exactly as sent, an unparseable one included, and none when the
+     * upstream sent none; its {@code Content-Length} is that of the upstream body, which the requester reads empty
+     * for HEAD. Nothing is added after the controller returns: no servlet TRACE echo and no {@code Allow} header.
+     */
+    @ParameterizedTest(name = "{0}, upstream Content-Type {1}, upstream body \"{2}\"")
+    @MethodSource("upstreamReplies")
+    void replyCarriesOnlyTheUpstreamContentTypeAndIsCompleteWhenTheControllerReturns(
+            String method, String upstreamContentType, String upstreamBody) {
+        ResponseDefinitionBuilder upstream = aResponse().withStatus(200).withBody(upstreamBody);
+        if (upstreamContentType != null) {
+            upstream.withHeader("Content-Type", upstreamContentType);
+        }
+        wm.stubFor(any(urlEqualTo("/FIM/reply")).willReturn(upstream));
+        byte[] expectedBody = "HEAD".equals(method) ? new byte[0] : upstreamBody.getBytes(StandardCharsets.UTF_8);
+
+        HttpTestClient.Response response = http.send(method, "/FIM/reply",
+                Map.of("Authorization", "Bearer trace-sentinel"), null);
+
+        assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
+        assertEquals(upstreamContentType == null ? List.of() : List.of(upstreamContentType),
+                response.headers("Content-Type"), response::toString);
+        assertEquals(List.of(String.valueOf(expectedBody.length)), response.headers("Content-Length"),
+                response::toString);
+        assertTrue(response.headers("Allow").isEmpty(), response::toString);
+        assertArrayEquals(expectedBody, response.body(), response::toString);
+        wm.verify(1, requestedFor(method, urlEqualTo("/FIM/reply")));
+    }
+
+    /**
+     * A HEAD answered by a 303 is followed with one GET, as the Mule requester followed it, so the reply declares the
+     * length of the representation that GET returned and, as a HEAD reply, carries no body.
+     */
+    @Test
+    void headAnsweredBy303IsFollowedAsAGetAndAnsweredWithItsLength() {
+        byte[] representation = "redirectbody".getBytes(StandardCharsets.UTF_8);
+        wm.stubFor(any(urlEqualTo("/FIM/head303")).willReturn(aResponse()
+                .withStatus(303)
+                .withHeader("Location", "/FIM/final303")));
+        wm.stubFor(any(urlEqualTo("/FIM/final303")).willReturn(aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", MediaType.TEXT_PLAIN_VALUE)
+                .withBody(representation)));
+
+        HttpTestClient.Response response = http.send("HEAD", "/FIM/head303", Map.of(), null);
+
+        assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
+        assertEquals(List.of(MediaType.TEXT_PLAIN_VALUE), response.headers("Content-Type"), response::toString);
+        assertEquals(List.of(String.valueOf(representation.length)), response.headers("Content-Length"),
+                response::toString);
+        assertArrayEquals(new byte[0], response.body(), response::toString);
+        wm.verify(1, requestedFor("HEAD", urlEqualTo("/FIM/head303")));
+        wm.verify(1, getRequestedFor(urlEqualTo("/FIM/final303")));
+        assertEquals(2, wm.getAllServeEvents().size(), response::toString);
+    }
+
+    /**
+     * The Content-Type is parsed before the body is read, as request-body binding parsed it, so the request fails
+     * with the message of that parse and the FIM server is never called.
+     *
+     * @param method the request method
+     * @param body   the request body, or {@code null} for none
+     */
+    @ParameterizedTest(name = "{0} with body \"{1}\"")
+    @CsvSource(nullValues = "null", value = {"POST, abc", "GET, null"})
+    void unparseableContentTypeReturnsPlatform500WithoutUpstreamCall(String method, String body) {
+        HttpTestClient.Response response = http.send(method, "/FIM/x", Map.of("Content-Type", "bogus"),
+                body == null ? null : body.getBytes(StandardCharsets.UTF_8));
+
+        assertEquals(500, response.status(), response::toString);
+        assertEquals("Internal Server Error", response.reason(), response::toString);
+        assertEquals(List.of(MediaType.APPLICATION_JSON_VALUE), response.headers("Content-Type"),
+                response::toString);
+        assertEquals("{ \"message\": \"Invalid mime type \\\"bogus\\\": does not contain '/'\" }",
+                response.bodyAsString(), response::toString);
+        wm.verify(0, anyRequestedFor(anyUrl()));
+    }
+
     @Test
     void upstreamFailureStatusReturnsPlatform500WithMappedAsFailureMessage() {
         wm.stubFor(get(urlEqualTo("/FIM/missing")).willReturn(aResponse().withStatus(404)));
@@ -155,7 +303,7 @@ class FimProxyControllerTest {
 
     /**
      * Only the APIkit-spaced envelope is asserted: the I/O exception's message names the WireMock port and carries
-     * JDK-specific wording.
+     * the HTTP transport's own wording.
      */
     @Test
     void upstreamConnectionResetReturnsPlatform500JsonMessage() {

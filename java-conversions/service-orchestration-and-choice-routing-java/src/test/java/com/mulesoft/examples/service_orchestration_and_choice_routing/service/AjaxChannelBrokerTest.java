@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -869,6 +870,164 @@ class AjaxChannelBrokerTest {
                 .hasCauseInstanceOf(InterruptedException.class);
     }
 
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("currentDeliveryWaits")
+    void awaitDeliveriesEndsCurrentAndTakesNothing(String description, boolean published, long timeoutMs) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        if (published) {
+            broker.publish(OUTBOUND, "m1");
+        }
+
+        assertThat(assertTimeoutPreemptively(Duration.ofMillis(WAIT_MS / 2),
+                () -> broker.awaitDeliveries(client, timeoutMs))).isTrue();
+        assertThat(broker.drain(client)).isEqualTo(published
+                ? List.of(new AjaxChannelBroker.Delivery(OUTBOUND, "m1"))
+                : List.of());
+    }
+
+    static Stream<Arguments> currentDeliveryWaits() {
+        return Stream.of(
+                Arguments.of("deliveries already queued", true, WAIT_MS),
+                Arguments.of("the time passed", false, 50L),
+                Arguments.of("no time to wait", false, 0L));
+    }
+
+    @ParameterizedTest(name = "released by {0}")
+    @MethodSource("staleDeliveryWaitReleases")
+    void awaitDeliveriesEndsStaleWhenReleasedBeforeAnyDelivery(String description, ClientAction release)
+            throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        DeliveryWait older = startAwaitingDeliveries(broker, client, WAIT_MS);
+
+        release.apply(broker, client);
+
+        assertThat(older.result()).isFalse();
+    }
+
+    static Stream<Arguments> staleDeliveryWaitReleases() {
+        return Stream.of(
+                Arguments.of("a newer connect",
+                        (ClientAction) (broker, clientId) -> startAwaitingDeliveries(broker, clientId, WAIT_MS)),
+                Arguments.of("disconnect", (ClientAction) AjaxChannelBroker::disconnect),
+                Arguments.of("shutdown", (ClientAction) (broker, clientId) -> broker.shutdown()));
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = "00000000000000000000000000000000")
+    void awaitDeliveriesForAnUnknownClientEndsStaleAtOnce(String clientId) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+
+        assertThat(assertTimeoutPreemptively(Duration.ofMillis(WAIT_MS / 2),
+                () -> broker.awaitDeliveries(clientId, WAIT_MS))).isFalse();
+    }
+
+    @Test
+    void interruptedDeliveryWaitThrowsInterruptedExceptionAndKeepsTheClient() throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        DeliveryWait wait = startAwaitingDeliveries(broker, client, WAIT_MS);
+
+        wait.thread().interrupt();
+
+        assertThatThrownBy(wait::result)
+                .isInstanceOf(ExecutionException.class)
+                .hasCauseInstanceOf(InterruptedException.class);
+        assertThat(broker.isKnownClient(client)).isTrue();
+    }
+
+    @Test
+    void restoredDeliveriesWakeTheWaitingConnectAndComeFirstInTheirOrder() throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        broker.publish(OUTBOUND, "m1");
+        List<AjaxChannelBroker.Delivery> undelivered = broker.drain(client);
+        DeliveryWait waiting = startAwaitingDeliveries(broker, client, WAIT_MS);
+
+        broker.restore(client, undelivered);
+
+        assertThat(waiting.result()).isTrue();
+        broker.publish(OUTBOUND, "m2");
+        undelivered = broker.drain(client);
+        broker.publish(OUTBOUND, "m3");
+
+        broker.restore(client, undelivered);
+
+        assertThat(broker.drain(client)).containsExactly(
+                new AjaxChannelBroker.Delivery(OUTBOUND, "m1"),
+                new AjaxChannelBroker.Delivery(OUTBOUND, "m2"),
+                new AjaxChannelBroker.Delivery(OUTBOUND, "m3"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("clientsWithoutAQueue")
+    void restoreForAClientWithoutAQueueDropsTheDeliveries(String description, ClientSupplier supplier) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String clientId = supplier.get(broker);
+
+        assertThatCode(() -> broker.restore(clientId, List.of(new AjaxChannelBroker.Delivery(OUTBOUND, "m1"))))
+                .doesNotThrowAnyException();
+
+        assertThat(broker.isKnownClient(clientId)).isFalse();
+        assertThat(broker.drain(clientId)).isEmpty();
+        assertThat(loggedMessages(Level.WARN)).isEmpty();
+    }
+
+    static Stream<Arguments> clientsWithoutAQueue() {
+        return Stream.of(
+                Arguments.of("null client", (ClientSupplier) broker -> null),
+                Arguments.of("never registered", (ClientSupplier) broker -> "0".repeat(32)),
+                Arguments.of("disconnected", (ClientSupplier) broker -> {
+                    String clientId = broker.handshake();
+                    broker.disconnect(clientId);
+                    return clientId;
+                }));
+    }
+
+    @Test
+    void restoreOfNothingLeavesTheQueueUnchangedAndNullIsRejected() {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        broker.publish(OUTBOUND, "m1");
+
+        broker.restore(client, List.of());
+
+        assertThatThrownBy(() -> broker.restore(client, null)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> broker.restore(client, Arrays.asList((AjaxChannelBroker.Delivery) null)))
+                .isInstanceOf(NullPointerException.class);
+        assertThat(broker.drain(client)).containsExactly(new AjaxChannelBroker.Delivery(OUTBOUND, "m1"));
+    }
+
+    @ParameterizedTest(name = "{0} restored onto a queue one below its bound")
+    @CsvSource({"1, true", "2, false"})
+    void restoreIsBoundedByTheQueueAndAnOverflowRemovesTheClient(int restored, boolean kept) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        IntStream.range(0, AjaxChannelBroker.MAX_QUEUED_DELIVERIES - 1).forEach(i -> broker.publish(OUTBOUND, i));
+        List<AjaxChannelBroker.Delivery> undelivered = IntStream.range(0, restored)
+                .mapToObj(i -> new AjaxChannelBroker.Delivery(OUTBOUND, "restored-" + i))
+                .toList();
+
+        broker.restore(client, undelivered);
+
+        assertThat(broker.isKnownClient(client)).isEqualTo(kept);
+        if (kept) {
+            assertThat(broker.drain(client)).hasSize(AjaxChannelBroker.MAX_QUEUED_DELIVERIES)
+                    .startsWith(new AjaxChannelBroker.Delivery(OUTBOUND, "restored-0"));
+            assertThat(loggedMessages(Level.WARN)).isEmpty();
+        } else {
+            assertThat(broker.drain(client)).isEmpty();
+            assertThat(loggedMessages(Level.WARN)).containsExactly(overflowWarning(client));
+        }
+    }
+
     @Test
     void idleClientExpiresWhileClientWithHeldConnectStaysKnown() throws Exception {
         AjaxChannelBroker broker = broker(new MockEnvironment().withProperty("ajax.max-interval-ms", "50"));
@@ -1241,6 +1400,28 @@ class AjaxChannelBrokerTest {
     }
 
     /**
+     * Starts {@link AjaxChannelBroker#awaitDeliveries(String, long)} on its own thread and returns once the call is
+     * waiting (or has already returned).
+     */
+    private static DeliveryWait startAwaitingDeliveries(AjaxChannelBroker broker, String clientId, long timeoutMs) {
+        FutureTask<Boolean> task = new FutureTask<>(() -> broker.awaitDeliveries(clientId, timeoutMs));
+        Thread thread = new Thread(task, "await-deliveries-" + clientId);
+        thread.setDaemon(true);
+        thread.start();
+        await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(5))
+                .until(() -> task.isDone() || thread.getState() == Thread.State.TIMED_WAITING);
+        return new DeliveryWait(task, thread);
+    }
+
+    /** A connect waiting on its own thread without taking the deliveries. */
+    private record DeliveryWait(FutureTask<Boolean> task, Thread thread) {
+
+        boolean result() throws Exception {
+            return task.get(WAIT_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
      * Waits up to {@link #WAIT_MS} for a latch the way a handler that does not honour interruption blocks: an
      * interrupt is swallowed and the wait goes on.
      */
@@ -1260,6 +1441,13 @@ class AjaxChannelBrokerTest {
     interface ClientAction {
 
         void apply(AjaxChannelBroker broker, String clientId);
+    }
+
+    /** Yields a client ID of a broker, setting up whatever state the ID needs. */
+    @FunctionalInterface
+    interface ClientSupplier {
+
+        String get(AjaxChannelBroker broker);
     }
 
     /** Steps that make a broker log one diagnostic. */

@@ -10,12 +10,18 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 
+import java.io.IOException;
 import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
+
+import jakarta.servlet.AsyncEvent;
+import jakarta.servlet.AsyncListener;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -26,11 +32,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.MediaType;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.mock.web.MockAsyncContext;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -47,7 +55,9 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.service.Aj
  * standalone {@link MockMvc}: no application context, no network port and no project advice, so only what the
  * controller and Spring MVC's default resolvers produce is asserted. The channels are neutral: {@value #ECHO} is an
  * inbound channel whose handler returns the publication's {@code data}, and {@value #OUT} is a plain application
- * channel. A held connect is observed through its {@link MvcResult}'s async result, never by sleeping.
+ * channel. A held connect is observed through its {@link MvcResult}'s async result, never by sleeping. The race tests
+ * replace the broker with a {@link PausingBroker} that pauses a held connect's wait thread on a latch, and play the
+ * container's timeout, error and completion through the request's async listeners ({@link ContainerEvent}).
  *
  * <p>The class names no project value, so every project serving the Mule Ajax transport carries it with only the
  * {@code package} line and the package root of the {@link AjaxChannelBroker} import changed.
@@ -99,9 +109,7 @@ class BayeuxLongPollingControllerTest {
 
     @BeforeEach
     void createBroker() {
-        broker = new AjaxChannelBroker(new MockEnvironment()
-                .withProperty("ajax.disable-reply-to", "false")
-                .withProperty("ajax.response-timeout-ms", "5000"));
+        broker = new AjaxChannelBroker(brokerEnvironment());
         broker.registerInbound(ECHO, data -> data);
     }
 
@@ -253,6 +261,123 @@ class BayeuxLongPollingControllerTest {
         JsonNode connected = single(parse(finish(mvc, started)));
         assertThat(connected.path("channel").asText()).isEqualTo(CONNECT_CHANNEL);
         assertThat(connected.path("successful").asBoolean()).as(connected.toString()).isTrue();
+    }
+
+    @Test
+    void heldConnectTimingOutWhileItsAnswerIsDelayedLosesNoDelivery() throws Exception {
+        PausingBroker pausing = pausingBroker();
+        MockMvc mvc = mvc(LONG_TIMEOUT_MS);
+        String clientId = handshake(mvc);
+        exchange(mvc, batch(connect(clientId)));
+        exchange(mvc, batch(subscribe(clientId, OUT)));
+        pausing.pauseAfterNextDrain();
+        ArrayNode timedOut;
+        try {
+            MvcResult started = start(mvc, batch(connect(clientId)));
+            broker.publish(OUT, "raced");
+            assertThat(pausing.paused.await(PROMPT_MS, TimeUnit.MILLISECONDS))
+                    .as("the held connect's answer drained the delivery").isTrue();
+
+            ContainerEvent.TIMEOUT.fire(started);
+            timedOut = parse(finish(mvc, started));
+        } finally {
+            pausing.release.countDown();
+        }
+        ArrayNode next = exchange(mvc, batch(connect(clientId)));
+
+        assertThat(find(timedOut, CONNECT_CHANNEL).path("successful").asBoolean()).as(timedOut.toString()).isTrue();
+        // The timeout answered first, so the delayed answer's deliveries went back to the queue.
+        List<JsonNode> received = new ArrayList<>(deliveries(timedOut));
+        received.addAll(deliveries(next));
+        assertThat(received).as(timedOut + " then " + next)
+                .extracting(delivery -> delivery.path("data").asText())
+                .containsExactly("raced");
+    }
+
+    @Test
+    void heldConnectTimingOutBeforeItsWaitClaimsTheResponseRetiresTheWait() throws Exception {
+        PausingBroker pausing = pausingBroker();
+        MockMvc mvc = mvc(LONG_TIMEOUT_MS);
+        String clientId = handshake(mvc);
+        exchange(mvc, batch(connect(clientId)));
+        exchange(mvc, batch(subscribe(clientId, OUT)));
+        pausing.pauseAfterNextWait();
+        ObjectNode connect = connect(clientId);
+        JsonNode timedOut;
+        try {
+            MvcResult started = start(mvc, batch(connect));
+            broker.publish(OUT, "queued");
+            assertThat(pausing.paused.await(PROMPT_MS, TimeUnit.MILLISECONDS))
+                    .as("the held connect's wait saw the delivery").isTrue();
+
+            ContainerEvent.TIMEOUT.fire(started);
+            timedOut = single(parse(finish(mvc, started)));
+
+            assertThat(pausing.interruptedWhilePaused.await(PROMPT_MS, TimeUnit.MILLISECONDS))
+                    .as("the timeout retired the paused wait").isTrue();
+        } finally {
+            pausing.release.countDown();
+        }
+        ArrayNode next = exchange(mvc, batch(connect(clientId)));
+
+        assertThat(timedOut.path("channel").asText()).isEqualTo(CONNECT_CHANNEL);
+        assertThat(timedOut.path("successful").asBoolean()).as(timedOut.toString()).isTrue();
+        assertThat(timedOut.get("id")).isEqualTo(connect.get("id"));
+        assertThat(deliveries(next)).as(next.toString())
+                .extracting(delivery -> delivery.path("data").asText())
+                .containsExactly("queued");
+    }
+
+    @Test
+    void connectBeyondTheHeldConnectBoundIsAnsweredAtOnceWithWhatIsQueued() throws Exception {
+        BlockingBroker blocking = replaceBroker(new BlockingBroker(brokerEnvironment()));
+        MockMvc mvc = mvc(LONG_TIMEOUT_MS);
+        String clientId = handshake(mvc);
+        exchange(mvc, batch(connect(clientId)));
+        exchange(mvc, batch(subscribe(clientId, OUT)));
+        try {
+            // Each held connect keeps its wait thread until released, so these take every wait thread there is.
+            for (int i = 0; i < BayeuxLongPollingController.MAX_HELD_CONNECTS; i++) {
+                assertThat(start(mvc, batch(connect(clientId))).getRequest().isAsyncStarted()).isTrue();
+            }
+            broker.publish(OUT, "beyond the bound");
+
+            MvcResult beyond = start(mvc, batch(connect(clientId)));
+            assertAnsweredPromptly(beyond);
+            ArrayNode reply = parse(finish(mvc, beyond));
+
+            assertThat(find(reply, CONNECT_CHANNEL).path("successful").asBoolean()).as(reply.toString()).isTrue();
+            assertThat(deliveries(reply)).as(reply.toString())
+                    .extracting(delivery -> delivery.path("data").asText())
+                    .containsExactly("beyond the bound");
+        } finally {
+            blocking.release.countDown();
+        }
+    }
+
+    @ParameterizedTest(name = "request ended by its {0}")
+    @EnumSource(value = ContainerEvent.class, names = {"ERROR", "COMPLETION"})
+    void heldConnectWhoseRequestEndsRetiresItsWaitAndLeavesDeliveriesForTheNextConnect(ContainerEvent ending)
+            throws Exception {
+        PausingBroker pausing = pausingBroker();
+        MockMvc mvc = mvc(LONG_TIMEOUT_MS);
+        String clientId = handshake(mvc);
+        exchange(mvc, batch(connect(clientId)));
+        exchange(mvc, batch(subscribe(clientId, OUT)));
+        MvcResult started = start(mvc, batch(connect(clientId)));
+        assertThat(pausing.waitsStarted.await(PROMPT_MS, TimeUnit.MILLISECONDS)).isTrue();
+
+        ending.fire(started);
+
+        assertThat(pausing.waitsInterrupted.await(PROMPT_MS, TimeUnit.MILLISECONDS))
+                .as("the ended request retired its wait").isTrue();
+        broker.publish(OUT, "after the end");
+        ArrayNode next = exchange(mvc, batch(connect(clientId)));
+
+        assertThat(deliveries(next)).as(next.toString())
+                .extracting(delivery -> delivery.path("data").asText())
+                .containsExactly("after the end");
+        assertThat(pausing.deliveringDrains).as("only the next connect drained").hasValue(1);
     }
 
     @Test
@@ -442,6 +567,25 @@ class BayeuxLongPollingControllerTest {
         assertThat(response.getHeader("Allow")).contains("GET").contains("POST");
     }
 
+    private static MockEnvironment brokerEnvironment() {
+        return new MockEnvironment()
+                .withProperty("ajax.disable-reply-to", "false")
+                .withProperty("ajax.response-timeout-ms", "5000");
+    }
+
+    /** Replaces the test's broker with a {@link PausingBroker}; called before the test creates its controller. */
+    private PausingBroker pausingBroker() {
+        return replaceBroker(new PausingBroker(brokerEnvironment()));
+    }
+
+    /** Replaces the test's broker with {@code replacement}; called before the test creates its controller. */
+    private <T extends AjaxChannelBroker> T replaceBroker(T replacement) {
+        broker.shutdown();
+        replacement.registerInbound(ECHO, data -> data);
+        broker = replacement;
+        return replacement;
+    }
+
     private BayeuxLongPollingController controller(long connectTimeoutMs) {
         BayeuxLongPollingController controller = new BayeuxLongPollingController(broker, mapper, connectTimeoutMs);
         controllers.add(controller);
@@ -595,5 +739,126 @@ class BayeuxLongPollingControllerTest {
 
     private static long elapsedMs(long startNanos) {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+    }
+
+    /** What the container can do to a held request, played through the async listeners registered on it. */
+    enum ContainerEvent {
+
+        /** The request's own timeout. */
+        TIMEOUT,
+
+        /** An I/O failure ending the request, such as a client that went away. */
+        ERROR,
+
+        /** The end of the request. */
+        COMPLETION;
+
+        void fire(MvcResult started) throws IOException {
+            MockAsyncContext context = (MockAsyncContext) started.getRequest().getAsyncContext();
+            for (AsyncListener listener : new ArrayList<>(context.getListeners())) {
+                switch (this) {
+                    case TIMEOUT -> listener.onTimeout(
+                            new AsyncEvent(context, context.getRequest(), context.getResponse()));
+                    case ERROR -> listener.onError(new AsyncEvent(context, context.getRequest(),
+                            context.getResponse(), new IOException("Connection reset by peer")));
+                    case COMPLETION -> listener.onComplete(
+                            new AsyncEvent(context, context.getRequest(), context.getResponse()));
+                }
+            }
+        }
+    }
+
+    /**
+     * A broker whose held-connect wait thread a race test can pause once, right after its wait saw deliveries or
+     * right after it drained them, until the test releases it. The pause notes an interrupt instead of obeying it, as
+     * a thread delayed between two steps would. It also signals the first wait's start and its interruption, and
+     * counts the drains that took deliveries.
+     */
+    static final class PausingBroker extends AjaxChannelBroker {
+
+        final CountDownLatch waitsStarted = new CountDownLatch(1);
+        final CountDownLatch waitsInterrupted = new CountDownLatch(1);
+        final CountDownLatch paused = new CountDownLatch(1);
+        final CountDownLatch interruptedWhilePaused = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final AtomicInteger deliveringDrains = new AtomicInteger();
+        private final AtomicBoolean pauseAfterWait = new AtomicBoolean();
+        private final AtomicBoolean pauseAfterDrain = new AtomicBoolean();
+
+        PausingBroker(MockEnvironment environment) {
+            super(environment);
+        }
+
+        void pauseAfterNextWait() {
+            pauseAfterWait.set(true);
+        }
+
+        void pauseAfterNextDrain() {
+            pauseAfterDrain.set(true);
+        }
+
+        @Override
+        public boolean awaitDeliveries(String clientId, long timeoutMs) throws InterruptedException {
+            waitsStarted.countDown();
+            boolean current;
+            try {
+                current = super.awaitDeliveries(clientId, timeoutMs);
+            } catch (InterruptedException interrupted) {
+                waitsInterrupted.countDown();
+                throw interrupted;
+            }
+            if (current && pauseAfterWait.compareAndSet(true, false)) {
+                pause();
+            }
+            return current;
+        }
+
+        @Override
+        public List<AjaxChannelBroker.Delivery> drain(String clientId) {
+            List<AjaxChannelBroker.Delivery> drained = super.drain(clientId);
+            if (!drained.isEmpty()) {
+                deliveringDrains.incrementAndGet();
+                if (pauseAfterDrain.compareAndSet(true, false)) {
+                    pause();
+                }
+            }
+            return drained;
+        }
+
+        private void pause() {
+            paused.countDown();
+            boolean interrupted = false;
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(LONG_TIMEOUT_MS);
+            while (release.getCount() > 0 && deadline - System.nanoTime() > 0) {
+                try {
+                    release.await(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
+                } catch (InterruptedException retired) {
+                    interrupted = true;
+                    interruptedWhilePaused.countDown();
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * A broker whose every held-connect wait first blocks until the test releases it (at most
+     * {@link #LONG_TIMEOUT_MS}), so each held connect keeps its wait thread meanwhile.
+     */
+    static final class BlockingBroker extends AjaxChannelBroker {
+
+        final CountDownLatch release = new CountDownLatch(1);
+
+        BlockingBroker(MockEnvironment environment) {
+            super(environment);
+        }
+
+        @Override
+        public boolean awaitDeliveries(String clientId, long timeoutMs) throws InterruptedException {
+            release.await(LONG_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            return super.awaitDeliveries(clientId, timeoutMs);
+        }
     }
 }

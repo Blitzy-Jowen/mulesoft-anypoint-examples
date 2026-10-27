@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.ListIterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -61,7 +62,7 @@ import org.springframework.stereotype.Service;
  *       the embedded cometd server removed it.</li>
  * </ul>
  *
- * <p>Every resource a client or publication can occupy is bounded:
+ * <p>The per-client queue, the cached-channel hold, the handler threads and their waiting queue are bounded:
  * <ul>
  *   <li>a client holds at most {@value #MAX_QUEUED_DELIVERIES} deliveries between two connects; the delivery that
  *       would exceed that removes the client with its subscriptions and queue, as a client that stopped
@@ -72,6 +73,11 @@ import org.springframework.stereotype.Service;
  *       at INFO and answered with no reply, and never retried.</li>
  * </ul>
  *
+ * <p>The number of clients, the channels one client subscribes to and the length of the channel names it subscribes
+ * to are deliberately not capped: every handshake and subscription is answered as the original transport answered
+ * it, whatever the input. Idle expiry ({@code ajax.max-interval-ms}) releases each client that stops connecting and
+ * is no longer heard from, with its subscriptions and queue.
+ *
  * <p>Diagnostics never carry a handler exception's message or the exception itself, only its type and throw-site
  * identifiers, and every logged channel name or client ID is escaped and bounded, because both can come from a
  * client and could otherwise forge log lines.
@@ -79,8 +85,8 @@ import org.springframework.stereotype.Service;
  * <p>Bayeux framing (message ids, {@code successful}, {@code advice}, {@code /meta/*} dispatch and JSON) belongs to
  * the controller; this class works with client IDs, channel names and plain values only. All state is in memory and
  * lost on restart, as the connector's was. Every public method is thread-safe, and a client's lifecycle
- * (subscription, held-message transfer, publication to it, disconnect, overflow and idle expiry) is one atomic
- * sequence of steps under a single lock.
+ * (subscription, held-message transfer, publication to it, restored deliveries, disconnect, overflow and idle
+ * expiry) is one atomic sequence of steps under a single lock.
  */
 @Service
 public class AjaxChannelBroker {
@@ -167,8 +173,8 @@ public class AjaxChannelBroker {
 
     /**
      * Guards {@link #subscribersByChannel}, every session's channel set and {@link #heldMessages}, and is held by
-     * every client removal (disconnect, idle expiry, queue overflow, shutdown) and every publication, so that a
-     * subscription, a held-message transfer and a removal can never interleave.
+     * every client removal (disconnect, idle expiry, queue overflow, shutdown), every publication and every restore,
+     * so that a subscription, a held-message transfer and a removal can never interleave.
      *
      * <p>Invariant while it is held: a session present in {@link #clients} is open, and a closed session has no
      * subscriptions. A removal therefore closes the session and drops it with all its subscriptions before
@@ -271,7 +277,8 @@ public class AjaxChannelBroker {
     /**
      * Stops the handler executor, interrupting running handlers and dropping waiting calls, stops the response
      * timeouts, and removes every client, releasing each waiting {@link #awaitMessages(String, long)} call with an
-     * empty result. A later publication on an inbound channel is refused and logged at INFO.
+     * empty result and each waiting {@link #awaitDeliveries(String, long)} call with {@code false}. A later
+     * publication on an inbound channel is refused and logged at INFO.
      */
     @PreDestroy
     public void shutdown() {
@@ -368,7 +375,8 @@ public class AjaxChannelBroker {
 
     /**
      * Removes a client with its subscriptions and queued deliveries, and releases its waiting
-     * {@link #awaitMessages(String, long)} call with an empty result. An unknown client is ignored.
+     * {@link #awaitMessages(String, long)} call with an empty result or its waiting
+     * {@link #awaitDeliveries(String, long)} call with {@code false}. An unknown client is ignored.
      *
      * @param clientId the client ID
      */
@@ -416,6 +424,55 @@ public class AjaxChannelBroker {
             return List.of();
         }
         return session.await(timeoutMs);
+    }
+
+    /**
+     * Waits for deliveries for a client like {@link #awaitMessages(String, long)}, but takes nothing: the caller
+     * drains the queue only once it knows its response can still carry the deliveries, and otherwise leaves them for
+     * the client's next connect. Like {@link #awaitMessages(String, long)}, a newer wait for the same client
+     * supersedes an older one.
+     *
+     * @param clientId the client ID
+     * @param timeoutMs the longest wait in milliseconds; zero or less does not wait
+     * @return {@code true} when deliveries are queued or the time has passed while this was still the client's newest
+     *         wait, so the caller may drain; {@code false} when a newer wait superseded it, the client was
+     *         disconnected or removed, or is unknown or {@code null}, so the caller must not drain
+     * @throws InterruptedException when the waiting thread is interrupted
+     */
+    public boolean awaitDeliveries(String clientId, long timeoutMs) throws InterruptedException {
+        ClientSession session = clientId == null ? null : clients.get(clientId);
+        if (session == null) {
+            return false;
+        }
+        return session.awaitQueued(timeoutMs);
+    }
+
+    /**
+     * Puts back deliveries that were drained for a response that could not carry them: they go to the front of the
+     * client's queue in their order, so its next connect receives them ahead of everything queued since, and its
+     * waiting connect is woken. Deliveries for an unknown, disconnected or removed client are dropped, as anything
+     * queued for it was. When the queue cannot take them all within {@value #MAX_QUEUED_DELIVERIES} deliveries, the
+     * client is removed with its subscriptions and queue and logged at WARN, as a publication overflowing it would.
+     *
+     * @param clientId the client ID; {@code null} is ignored
+     * @param deliveries the deliveries in the order they were drained; an empty list is ignored
+     * @throws NullPointerException when {@code deliveries} or one of its elements is {@code null}
+     */
+    public void restore(String clientId, List<Delivery> deliveries) {
+        Objects.requireNonNull(deliveries, "deliveries");
+        deliveries.forEach(delivery -> Objects.requireNonNull(delivery, "delivery"));
+        if (clientId == null || deliveries.isEmpty()) {
+            return;
+        }
+        synchronized (stateLock) {
+            ClientSession session = clients.get(clientId);
+            if (session == null || session.requeue(deliveries) != EnqueueOutcome.OVERFLOW) {
+                return;
+            }
+            // The queue cannot take them, so the session has closed itself; the client goes with all its state.
+            removeClient(clientId, session);
+        }
+        logOverflow(clientId);
     }
 
     /**
@@ -933,6 +990,23 @@ public class AjaxChannelBroker {
          *         within {@link #MAX_QUEUED_DELIVERIES}
          */
         EnqueueOutcome enqueue(List<Delivery> deliveries) {
+            return offer(deliveries, false);
+        }
+
+        /**
+         * Puts deliveries back at the front of the queue, in their order and all together or not at all, ahead of
+         * everything queued since they were taken, and wakes the waiting connect.
+         *
+         * @param deliveries the deliveries, in order
+         * @return {@link EnqueueOutcome#OVERFLOW} after closing the session when the queue cannot take all of them
+         *         within {@link #MAX_QUEUED_DELIVERIES}
+         */
+        EnqueueOutcome requeue(List<Delivery> deliveries) {
+            return offer(deliveries, true);
+        }
+
+        /** {@link #enqueue(List)} at the back of the queue, or {@link #requeue(List)} at its front. */
+        private EnqueueOutcome offer(List<Delivery> deliveries, boolean atFront) {
             lock.lock();
             try {
                 if (closed) {
@@ -942,7 +1016,14 @@ public class AjaxChannelBroker {
                     closeLocked();
                     return EnqueueOutcome.OVERFLOW;
                 }
-                queue.addAll(deliveries);
+                if (atFront) {
+                    ListIterator<Delivery> back = deliveries.listIterator(deliveries.size());
+                    while (back.hasPrevious()) {
+                        queue.addFirst(back.previous());
+                    }
+                } else {
+                    queue.addAll(deliveries);
+                }
                 changed.signalAll();
                 return EnqueueOutcome.ACCEPTED;
             } finally {
@@ -961,29 +1042,51 @@ public class AjaxChannelBroker {
             }
         }
 
+        /** Waits as {@link #awaitQueued(long)} does, then returns and removes the queue unless the wait ended stale. */
         List<Delivery> await(long timeoutMs) throws InterruptedException {
             lock.lock();
             try {
-                long generation = ++waiterGeneration;
-                changed.signalAll();
-                waiters++;
-                lastActivityNanos = System.nanoTime();
-                try {
-                    long remaining = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
-                    while (queue.isEmpty() && !closed && generation == waiterGeneration && remaining > 0) {
-                        remaining = changed.awaitNanos(remaining);
-                    }
-                } finally {
-                    waiters--;
-                    lastActivityNanos = System.nanoTime();
-                }
-                if (closed || generation != waiterGeneration) {
-                    return List.of();
-                }
-                return drainLocked();
+                return waitLocked(timeoutMs) ? drainLocked() : List.of();
             } finally {
                 lock.unlock();
             }
+        }
+
+        /**
+         * Waits until a delivery is queued or {@code timeoutMs} passes, taking nothing from the queue.
+         *
+         * @return whether the wait ended current: the session is open and no newer wait has started since
+         */
+        boolean awaitQueued(long timeoutMs) throws InterruptedException {
+            lock.lock();
+            try {
+                return waitLocked(timeoutMs);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * The wait of one connect, for a caller holding the session's lock. It supersedes any older wait, which
+         * then ends stale, and counts as a waiter until it ends, so the idle sweep spares the session meanwhile.
+         *
+         * @return whether the wait ended current: the session is open and no newer wait has started since
+         */
+        private boolean waitLocked(long timeoutMs) throws InterruptedException {
+            long generation = ++waiterGeneration;
+            changed.signalAll();
+            waiters++;
+            lastActivityNanos = System.nanoTime();
+            try {
+                long remaining = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+                while (queue.isEmpty() && !closed && generation == waiterGeneration && remaining > 0) {
+                    remaining = changed.awaitNanos(remaining);
+                }
+            } finally {
+                waiters--;
+                lastActivityNanos = System.nanoTime();
+            }
+            return !closed && generation == waiterGeneration;
         }
 
         /**
