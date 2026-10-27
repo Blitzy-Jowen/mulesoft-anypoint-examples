@@ -1,0 +1,558 @@
+{
+  "type": "object",
+  "properties": {
+    "accessRole": {
+      "title": "Role",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true
+    },
+    "aging": {
+      "title": "Overdue Balance",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "aging1": {
+      "title": "1-30 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "aging2": {
+      "title": "31-60 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "aging3": {
+      "title": "61-90 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "aging4": {
+      "title": "Over 90 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "altEmail": {
+      "title": "Alt. Email",
+      "type": "string",
+      "nullable": true
+    },
+    "billPay": {
+      "title": "Online Bill Pay",
+      "type": "boolean",
+      "nullable": true
+    },
+    "clickStream": {
+      "title": "Click-Stream",
+      "type": "string",
+      "nullable": true
+    },
+    "companyName": {
+      "title": "Company Name",
+      "type": "string",
+      "nullable": true
+    },
+    "consolAging": {
+      "title": "Consolidated Overdue Balance",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolAging1": {
+      "title": "Consolidated 1-30 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolAging2": {
+      "title": "Consolidated 31-60 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolAging3": {
+      "title": "Consolidated 61-90 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolAging4": {
+      "title": "Consolidated Over 90 Days",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolBalance": {
+      "title": "Consolidated Balance",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolDepositBalance": {
+      "title": "Consolidated Deposit Balance",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolOverdueBalance": {
+      "title": "Consolidated Overdue",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "consolUnbilledOrders": {
+      "title": "Consolidated Unbilled Orders",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "creditHoldOverride": {
+      "title": "Hold",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string",
+          "enum": [
+            "AUTO",
+            "ON",
+            "OFF"
+          ]
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      },
+      "nullable": true
+    },
+    "currency": {
+      "title": "Primary Currency",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true
+    },
+    "custentity18": {
+      "title": "Custom Entity Field 18",
+      "type": "boolean",
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity6": {
+      "title": "Industry",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity7": {
+      "title": "Number of Employees",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity8": {
+      "title": "Annual Revenue",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity_2663_customer_refund": {
+      "title": "Customer Refund",
+      "type": "boolean",
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity_2663_direct_debit": {
+      "title": "Direct Debit",
+      "type": "boolean",
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity_cust_priority": {
+      "title": "Customer Priority",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity_fmt_cur_sales_order": {
+      "title": "Current Sales Order",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity_fmt_cust_credit_on_hold": {
+      "title": "Credit On Hold",
+      "type": "boolean",
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "custentity_fmt_customer_credit_on_hold": {
+      "title": "Customer Credit On Hold",
+      "type": "boolean",
+      "nullable": true,
+      "x-ns-custom-field": true
+    },
+    "dateCreated": {
+      "title": "Date Created",
+      "type": "string",
+      "format": "date",
+      "nullable": true
+    },
+    "defaultAddress": {
+      "title": "Default Address",
+      "type": "string",
+      "nullable": true
+    },
+    "email": {
+      "title": "Email",
+      "type": "string",
+      "nullable": true
+    },
+    "entityId": {
+      "title": "Customer ID",
+      "type": "string",
+      "nullable": true
+    },
+    "entityStatus": {
+      "title": "Status",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true
+    },
+    "externalId": {
+      "title": "External ID",
+      "type": "string",
+      "nullable": true
+    },
+    "firstName": {
+      "title": "First Name",
+      "type": "string",
+      "nullable": true
+    },
+    "firstVisit": {
+      "title": "First Visit",
+      "type": "string",
+      "format": "date-time",
+      "nullable": true
+    },
+    "giveAccess": {
+      "title": "Login Access",
+      "type": "boolean",
+      "nullable": true
+    },
+    "id": {
+      "title": "Internal ID",
+      "type": "string",
+      "readOnly": true
+    },
+    "isInactive": {
+      "title": "Inactive",
+      "type": "boolean",
+      "nullable": true
+    },
+    "isPerson": {
+      "title": "Is Individual",
+      "type": "boolean",
+      "nullable": true
+    },
+    "lastModifiedDate": {
+      "title": "Last Modified Date",
+      "type": "string",
+      "format": "date-time",
+      "nullable": true
+    },
+    "lastName": {
+      "title": "Last Name",
+      "type": "string",
+      "nullable": true
+    },
+    "lastPageVisited": {
+      "title": "Last Page Visited",
+      "type": "string",
+      "nullable": true
+    },
+    "lastVisit": {
+      "title": "Last Visit",
+      "type": "string",
+      "format": "date-time",
+      "nullable": true
+    },
+    "links": {
+      "title": "Links",
+      "type": "array",
+      "readOnly": true,
+      "items": {
+        "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+      }
+    },
+    "phone": {
+      "title": "Phone",
+      "type": "string",
+      "nullable": true
+    },
+    "receivablesAccount": {
+      "title": "Default Receivables Account",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true
+    },
+    "refName": {
+      "title": "Reference Name",
+      "type": "string",
+      "readOnly": true
+    },
+    "shipComplete": {
+      "title": "Ship Complete",
+      "type": "boolean",
+      "nullable": true
+    },
+    "stage": {
+      "title": "Stage",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string",
+          "enum": [
+            "LEAD",
+            "PROSPECT",
+            "CUSTOMER"
+          ]
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      },
+      "nullable": true
+    },
+    "startDate": {
+      "title": "Start Date",
+      "type": "string",
+      "format": "date",
+      "nullable": true
+    },
+    "subsidiary": {
+      "title": "Primary Subsidiary",
+      "type": "object",
+      "properties": {
+        "id": {
+          "title": "Internal identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        },
+        "externalId": {
+          "title": "External identifier",
+          "type": "string"
+        },
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "readOnly": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        }
+      },
+      "nullable": true
+    },
+    "taxable": {
+      "title": "Taxable",
+      "type": "boolean",
+      "nullable": true
+    },
+    "unbilledOrders": {
+      "title": "Unbilled Orders",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "visits": {
+      "title": "Number of Visits",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    }
+  }
+}
