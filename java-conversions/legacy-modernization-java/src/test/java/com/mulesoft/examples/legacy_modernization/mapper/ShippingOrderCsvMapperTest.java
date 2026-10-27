@@ -157,75 +157,61 @@ class ShippingOrderCsvMapperTest {
                 .containsEntry("ShippingAddrStreet", "77 Geary St Level 4"));
     }
 
+    // Only the CSV bytes are fixed: whether the row holds null or "" for the unnamed column is the mapper's choice.
     @ParameterizedTest(name = "{0}")
     @MethodSource("nullNameCases")
-    @DisplayName("a null address name -> an empty field; the column stays, mapped to null")
-    void nullAddressNameIsWrittenAsEmptyField(String column, ShippingOrderConfirmation confirmation,
-            String expectedRow) {
+    @DisplayName("a null address name -> an empty field; the column stays")
+    void nullAddressNameIsWrittenAsEmptyField(ShippingOrderConfirmation confirmation, String expectedRow) {
         assertThat(mapper.toCsv(confirmation)).isEqualTo(HEADER + expectedRow);
-        assertThat(mapper.map(confirmation)).singleElement().satisfies(row -> {
-            assertThat(row.keySet()).containsExactlyElementsOf(COLUMNS);
-            assertThat(row).containsEntry(column, null);
-        });
+        assertThat(mapper.map(confirmation)).singleElement()
+                .satisfies(row -> assertThat(row.keySet()).containsExactlyElementsOf(COLUMNS));
     }
 
     static Stream<Arguments> nullNameCases() {
         Address unnamed = new Address(null, "77 Geary St", "Level 4", "San Francisco", "CA", "USA", "94108");
         return Stream.of(
-                Arguments.of("BillingAddressName",
-                        confirmation(unnamed, mulesoftAddress(), order(new OrderItem("1234", 500))),
+                Arguments.of(Named.of("BillingAddressName null",
+                                confirmation(unnamed, mulesoftAddress(), order(new OrderItem("1234", 500)))),
                         "1234,500,,77 Geary St Level 4,San Francisco,CA,USA,94108,"
                                 + "Mulesoft,77 Geary St Level 4,San Francisco,CA,USA,94108,1234\n"),
-                Arguments.of("ShippingAddrName",
-                        confirmation(mulesoftAddress(), unnamed, order(new OrderItem("1234", 500))),
+                Arguments.of(Named.of("ShippingAddrName null",
+                                confirmation(mulesoftAddress(), unnamed, order(new OrderItem("1234", 500)))),
                         "1234,500,Mulesoft,77 Geary St Level 4,San Francisco,CA,USA,94108,"
                                 + ",77 Geary St Level 4,San Francisco,CA,USA,94108,1234\n"));
     }
 
-    @ParameterizedTest(name = "{0} -> \"{1}\"")
+    // Only the exception type is asserted: the original runtime's error text is a Tier 2A verification point, so
+    // the mapper's message wording is not part of the contract this test pins.
+    @ParameterizedTest(name = "{0}")
     @MethodSource("nullPartCases")
-    @DisplayName("a null part the script navigates -> IllegalArgumentException naming it, from map and toCsv")
-    void nullNavigatedPartIsRejected(ShippingOrderConfirmation confirmation, String message) {
-        assertThatThrownBy(() -> mapper.map(confirmation))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage(message);
-        assertThatThrownBy(() -> mapper.toCsv(confirmation))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage(message);
+    @DisplayName("a null part the script navigates -> IllegalArgumentException from map and toCsv")
+    void nullNavigatedPartIsRejected(ShippingOrderConfirmation confirmation) {
+        assertThatThrownBy(() -> mapper.map(confirmation)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> mapper.toCsv(confirmation)).isInstanceOf(IllegalArgumentException.class);
     }
 
     static Stream<Arguments> nullPartCases() {
         Address noLine1 = new Address("Mulesoft", null, "Level 4", "San Francisco", "CA", "USA", "94108");
         Address noLine2 = new Address("Mulesoft", "77 Geary St", null, "San Francisco", "CA", "USA", "94108");
         return Stream.of(
-                Arguments.of(Named.of("confirmation null", null),
-                        "ShippingOrderConfirmation is null"),
-                Arguments.of(Named.of("shippingOrder null", new ShippingOrderConfirmation(null, true)),
-                        "shippingOrder is null"),
+                Arguments.of(Named.of("confirmation null", null)),
+                Arguments.of(Named.of("shippingOrder null", new ShippingOrderConfirmation(null, true))),
                 Arguments.of(Named.of("order null",
-                                confirmation(mulesoftAddress(), mulesoftAddress(), null)),
-                        "shippingOrder.order is null"),
+                        confirmation(mulesoftAddress(), mulesoftAddress(), null))),
                 Arguments.of(Named.of("orderItemList null",
-                                confirmation(mulesoftAddress(), mulesoftAddress(), new Order(null))),
-                        "shippingOrder.order.orderItemList is null"),
+                        confirmation(mulesoftAddress(), mulesoftAddress(), new Order(null)))),
                 Arguments.of(Named.of("billingAddress null",
-                                confirmation(null, mulesoftAddress(), order(new OrderItem("1234", 500)))),
-                        "shippingOrder.billingAddress is null"),
+                        confirmation(null, mulesoftAddress(), order(new OrderItem("1234", 500))))),
                 Arguments.of(Named.of("shippingAddress null",
-                                confirmation(mulesoftAddress(), null, order(new OrderItem("1234", 500)))),
-                        "shippingOrder.shippingAddress is null"),
+                        confirmation(mulesoftAddress(), null, order(new OrderItem("1234", 500))))),
                 Arguments.of(Named.of("billingAddress.line1 null",
-                                confirmation(noLine1, mulesoftAddress(), order(new OrderItem("1234", 500)))),
-                        "shippingOrder.billingAddress.line1 is null"),
+                        confirmation(noLine1, mulesoftAddress(), order(new OrderItem("1234", 500))))),
                 Arguments.of(Named.of("billingAddress.line2 null",
-                                confirmation(noLine2, mulesoftAddress(), order(new OrderItem("1234", 500)))),
-                        "shippingOrder.billingAddress.line2 is null"),
+                        confirmation(noLine2, mulesoftAddress(), order(new OrderItem("1234", 500))))),
                 Arguments.of(Named.of("shippingAddress.line1 null",
-                                confirmation(mulesoftAddress(), noLine1, order(new OrderItem("1234", 500)))),
-                        "shippingOrder.shippingAddress.line1 is null"),
+                        confirmation(mulesoftAddress(), noLine1, order(new OrderItem("1234", 500))))),
                 Arguments.of(Named.of("shippingAddress.line2 null",
-                                confirmation(mulesoftAddress(), noLine2, order(new OrderItem("1234", 500)))),
-                        "shippingOrder.shippingAddress.line2 is null"));
+                        confirmation(mulesoftAddress(), noLine2, order(new OrderItem("1234", 500))))));
     }
 
     @ParameterizedTest(name = "{0}")

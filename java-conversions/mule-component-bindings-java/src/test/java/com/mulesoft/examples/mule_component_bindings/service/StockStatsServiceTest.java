@@ -43,6 +43,7 @@ import org.mockito.Captor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.mulesoft.examples.mule_component_bindings.exception.InvalidStockSymbol;
@@ -119,9 +120,12 @@ class StockStatsServiceTest {
     @CsvSource({"2012-13-45, 2013-02-14", "2012-02-30, 2012-03-01"})
     void outOfRangeMonthOrDayRollsOverAsTheLenientParseDoes(String dateStr, String rolledDay) throws Exception {
         Date rolled = date(rolledDay);
+        StockStats stats = new StockStats();
+        when(stockService.getHistoricalPrices("AAPL", rolled)).thenReturn(stats);
 
-        service.search("AAPL", dateStr);
+        StockStats result = service.search("AAPL", dateStr);
 
+        assertThat(result).isSameAs(stats);
         verify(stockService).getHistoricalPrices("AAPL", rolled);
         verify(twitterService).search("AAPL", rolled, 100, 1);
         verifyNoMoreInteractions(stockService, twitterService);
@@ -274,6 +278,17 @@ class StockStatsServiceTest {
         verify(otherTwitterService).search("AAPL", day, 100, 1);
         verify(otherSentimentService).classify(List.of());
         verifyNoInteractions(stockService, twitterService, sentimentService);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"BAD_REQUEST, 400, x", "INTERNAL_SERVER_ERROR, 500, "})
+    void responseStatusExceptionCarriesTheStatusAndTheMessageAsItsReason(HttpStatus status, int expectedCode,
+            String message) {
+        ResponseStatusException e = StockStatsService.createResponseStatusException(status, message);
+
+        assertThat(e.getStatusCode().value()).isEqualTo(expectedCode);
+        assertThat(e.getReason()).isEqualTo(message);
+        assertThat(e.getCause()).isNull();
     }
 
     /** The collaborator a failure case makes throw, in the order {@code search} calls them. */

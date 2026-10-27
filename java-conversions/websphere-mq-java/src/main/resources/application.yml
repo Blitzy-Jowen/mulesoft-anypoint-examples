@@ -1,0 +1,57 @@
+# websphere-mq-java runtime configuration
+# Original: websphere-mq/src/main/app/websphere-mq.xml (mule-app.properties holds no keys). The Ajax connector's
+# resourceBase docroot is served from classpath static/services/wmqExample by config/AjaxResourceConfig.
+spring:
+  application:
+    name: websphere-mq-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404; AjaxResourceConfig registers its own resource handlers
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the page, script and /ajax/cometd mappings and gets their 405 instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+  # No JMS connection settings here: config/IbmMqConfig builds the IBM MQ factory from wmq.*, and without a wmq.host
+  # the tests' embedded broker comes from Boot's auto-configuration.
+
+server:
+  port: 8086                       # ajax:connector serverUrl http://0.0.0.0:8086/services/wmqExample (websphere-mq.xml:7), the only listener
+  address: 0.0.0.0                 # host of the same serverUrl
+
+# IBM MQ client connection of wmq:connector (websphere-mq.xml:4), under the original key names, read by
+# config/IbmMqConfig. Its transportType CLIENT_MQ_TCPIP is fixed in IbmMqConfig.
+wmq:
+  enabled: true                    # the MQ connection factory is created only when true and wmq.host has text
+  # TODO: supply the IBM MQ queue manager host name
+  host: ${WMQ_HOST:}
+  port: ${WMQ_PORT:1414}           # the port the original WebsphereMQIT sets, IBM MQ's default listener port
+  # TODO: supply the server-connection (SVRCONN) channel name
+  channel: ${WMQ_CHANNEL:}
+  # TODO: supply the queue manager name
+  # wmq.queue names the queue manager, not a queue: the original maps queueManager="${wmq.queue}".
+  queue: ${WMQ_QUEUE:}
+  # TODO: supply the MQ user name
+  username: ${WMQ_USERNAME:}
+  # TODO: supply the MQ password
+  password: ${WMQ_PASSWORD:}
+  queues:
+    in: "in"                       # queue="in" of flows Input and MessageProcessor (websphere-mq.xml:13,16)
+    out: "out"                     # queue="out" of flows MessageProcessor and Output (websphere-mq.xml:20,25)
+  processing:
+    wait-ms: 15000                 # test:component waitTime (websphere-mq.xml:19), read by service/MqProcessingService
+
+# SC-12: Mule Ajax transport, read by AjaxResourceConfig, BayeuxLongPollingController and AjaxChannelBroker, and by
+# client/MqQueueSender and trigger/OutQueueListener for the channels <server-path>/enqueue and <server-path>/dequeue.
+ajax:
+  server-path: /services/wmqExample   # path of the connector's serverUrl; the docroot is served at <server-path>/
+  disable-reply-to: true           # disableReplyTo="true" (websphere-mq.xml:7): an enqueue publication gets no RPC reply on replyTo
+  cache-messages-channels:         # outbound channel declared with cacheMessages="true" (websphere-mq.xml:26)
+    - /services/wmqExample/dequeue
+  response-timeout-ms: 10000       # responseTimeout of the enqueue inbound endpoint (websphere-mq.xml:9)
+  # Bayeux server-side poll timeout: "The server side poll timeout in milliseconds (default 250000)", Mule tag mule-3.8.0
+  # transports/ajax/src/main/java/org/mule/transport/ajax/embedded/AjaxConnector.java:97-100; the connector sets none.
+  connect-timeout-ms: 250000
+  # Bayeux maxInterval: "The max client side poll timeout in milliseconds (default 30000)", same AjaxConnector.java:80-83;
+  # the connector sets none. AjaxChannelBroker removes a client not heard from for this long.
+  max-interval-ms: 30000
