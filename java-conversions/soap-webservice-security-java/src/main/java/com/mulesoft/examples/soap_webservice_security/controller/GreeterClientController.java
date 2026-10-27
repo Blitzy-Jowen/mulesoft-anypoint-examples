@@ -90,7 +90,10 @@ public class GreeterClientController {
      * a form-urlencoded body into those and joins repeated values, while Mule's {@code http.query.params} held the
      * query alone. Every pair is decoded, as Mule decoded the whole query, so a malformed percent-encoding anywhere
      * in it fails {@link URLDecoder#decode(String, java.nio.charset.Charset)} with an
-     * {@link IllegalArgumentException}, which propagates unhandled (a Tier 2A verification point).
+     * {@link IllegalArgumentException}. Undertow answers such a query with a bare 400 before dispatch, so the
+     * exception arises only outside Undertow, for example under MockMvc, where it reaches
+     * {@code GreeterClientExceptionHandler} like every other failure of this controller (a Tier 2A verification
+     * point).
      *
      * @param rawQuery the raw query string, {@code null} when the request has none
      * @param key      the decoded parameter name
