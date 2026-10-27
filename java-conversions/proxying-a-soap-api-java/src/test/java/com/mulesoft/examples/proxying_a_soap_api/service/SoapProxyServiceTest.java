@@ -345,8 +345,7 @@ class SoapProxyServiceTest {
 
     @Test
     void aClientFailurePropagatesUnchangedAndIsNeverRetried() {
-        ResourceAccessException timeout = new ResourceAccessException(
-                "I/O error on POST request for \"http://www.predic8.com:8080/shop/ShopService\": Read timed out",
+        ResourceAccessException timeout = new ResourceAccessException("I/O error: Read timed out",
                 new SocketTimeoutException("Read timed out"));
         when(client.post(any(), any())).thenThrow(timeout);
 

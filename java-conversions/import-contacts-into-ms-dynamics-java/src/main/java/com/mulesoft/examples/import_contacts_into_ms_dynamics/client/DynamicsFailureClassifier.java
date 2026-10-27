@@ -167,7 +167,8 @@ public class DynamicsFailureClassifier implements UpstreamFailureClassifier {
      *       {@code error} code (a blank, non-JSON or differently shaped body yields nothing);</li>
      *   <li>for the first {@link OAuth2AuthorizationException} in the chain, its error's non-blank description, else
      *       its non-blank error code;</li>
-     *   <li>the inherited lookup: the first non-blank message of the chain, else the failure's class name.</li>
+     *   <li>the inherited lookup: the first non-blank message of the chain, else its neutral description of the
+     *       failure.</li>
      * </ol>
      *
      * @param failure the classified throwable; never {@code null}

@@ -13,6 +13,8 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.junit.jupiter.api.Named.named;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.stubbing.Scenario;
@@ -24,15 +26,20 @@ import com.nimbusds.jose.JWSHeader;
 import com.nimbusds.jose.crypto.RSASSAVerifier;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URLDecoder;
 import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.security.GeneralSecurityException;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.interfaces.RSAPublicKey;
+import java.security.spec.InvalidKeySpecException;
 import java.text.ParseException;
 import java.time.Clock;
 import java.time.Duration;
@@ -49,6 +56,7 @@ import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -56,6 +64,8 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
@@ -64,8 +74,9 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
  * signing with an RSA key generated for each test, together with the {@link NetsuiteProperties} derivations the token
  * URL and the assertion's {@code aud} claim rest on. They cover the client credentials request and its PS256 JWT
  * client assertion (AAP 0.3.3), caching until 60 s before the stated expiry, eviction, the configuration failures
- * that name the {@code netsuite.oauth.*} key (AAP 0.4.6), and the unwrapped token-endpoint failure the SC-9
- * classifier relies on (AAP 0.4.8). No Spring context starts and no classpath resource is read.
+ * that name the {@code netsuite.oauth.*} key (AAP 0.4.6), the private-key loading failures whose caller-facing
+ * message leaves the configured location and the cause to the log, and the unwrapped token-endpoint failure the
+ * SC-9 classifier relies on (AAP 0.4.8). No Spring context starts and no classpath resource is read.
  *
  * <p>{@code netsuite-data-retrieval-java} carries this class with the provider, changing only the package line and
  * the import prefix.
@@ -83,6 +94,8 @@ class NetsuiteTokenProviderTest {
     private static final String CERTIFICATE_ID = "test-certificate-id";
 
     private static final String JWT_BEARER = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+    private static final String PRIVATE_KEY_PATH = "netsuite.oauth.private-key-path";
 
     private static final Instant START = Instant.parse("2025-01-01T00:00:00Z");
 
@@ -312,6 +325,85 @@ class NetsuiteTokenProviderTest {
         wm.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
     }
 
+    /** Writes a key that cannot be loaded under {@code dir} where needed and returns the location to configure. */
+    @FunctionalInterface
+    private interface UnloadableKey {
+
+        String locate(Path dir) throws IOException, GeneralSecurityException;
+    }
+
+    /*
+     * The configured value is trimmed before use, so the malformed path keeps its NUL inside the name. The DER
+     * bodies are minimal SEQUENCEs: the PKCS#1 armour alone decides that rejection, and an INTEGER alone is no
+     * PKCS#8 key.
+     */
+    static Stream<Arguments> unloadableKeys() {
+        return Stream.of(
+                Arguments.of(named("missing file",
+                                (UnloadableKey) dir -> dir.resolve("missing-netsuite-key.pem").toString()),
+                        "could not be read", NoSuchFileException.class),
+                Arguments.of(named("malformed file path",
+                                (UnloadableKey) dir -> dir.resolve("malformed") + "\0netsuite-key.pem"),
+                        "could not be read", InvalidPathException.class),
+                Arguments.of(named("classpath: naming no resource", (UnloadableKey) dir -> "classpath:"),
+                        "names no classpath resource", null),
+                Arguments.of(named("missing classpath resource",
+                                (UnloadableKey) dir -> "classpath:netsuite/missing-netsuite-key.pem"),
+                        "could not be read", FileNotFoundException.class),
+                Arguments.of(named("file that is not PEM",
+                                (UnloadableKey) dir -> Files.writeString(dir.resolve("not-pem-netsuite-key.pem"),
+                                        "not a key\n", US_ASCII).toString()),
+                        "is not an unencrypted PKCS#8 PEM private key", null),
+                Arguments.of(named("PKCS#8 block holding no key",
+                                (UnloadableKey) dir -> pemAt(dir.resolve("invalid-netsuite-key.pem"), "PRIVATE KEY",
+                                        new byte[] {0x30, 0x03, 0x02, 0x01, 0x00})),
+                        "does not hold a valid PKCS#8 RSA private key", InvalidKeySpecException.class),
+                Arguments.of(named("PKCS#1 armour",
+                                (UnloadableKey) dir -> pemAt(dir.resolve("pkcs1-netsuite-key.pem"), "RSA PRIVATE KEY",
+                                        new byte[] {0x30, 0x00})),
+                        "points to a PKCS#1 key", null),
+                Arguments.of(named("RSA key under 2048 bits", (UnloadableKey) dir -> {
+                    KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+                    generator.initialize(1024);
+                    return pemAt(dir.resolve("short-netsuite-key.pem"), "PRIVATE KEY",
+                            generator.generateKeyPair().getPrivate().getEncoded());
+                }), "holds an RSA key of 1024 bits", null));
+    }
+
+    /*
+     * The unhandled-exception 500 hands the message to the caller, so it names the setting and the problem only;
+     * the configured location and the cause go to one ERROR line per failed call, and the cause stays on the
+     * exception. A key that failed to load is not cached, so each call fails and logs again.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unloadableKeys")
+    @ExtendWith(OutputCaptureExtension.class)
+    void unloadableKeyFailsWithCallerSafeMessageAndLogsLocation(UnloadableKey unloadable, String problem,
+            Class<? extends Throwable> causeType, CapturedOutput output) throws IOException, GeneralSecurityException {
+        String location = unloadable.locate(tmp);
+        props.getOauth().setPrivateKeyPath(location);
+        stubToken("tok-1", "\"3600\"");
+        NetsuiteTokenProvider provider = provider();
+
+        List<Throwable> failures = List.of(
+                catchThrowable(() -> provider.createClientAssertion(Instant.now())),
+                catchThrowable(provider::accessToken));
+
+        for (Throwable failure : failures) {
+            assertCallerSafe(failure, location, problem, causeType);
+        }
+        wm.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+        List<String> logLines = output.getAll().lines()
+                .filter(line -> line.contains(PRIVATE_KEY_PATH + " " + problem))
+                .toList();
+        assertThat(logLines).hasSize(failures.size()).allSatisfy(line -> {
+            assertThat(line).contains("ERROR").contains("configured location: " + location);
+            if (causeType != null) {
+                assertThat(line).contains(failures.get(0).getCause().getClass().getName());
+            }
+        });
+    }
+
     // ----------------------------------------------------------------------------------------- derivations
 
     @Test
@@ -394,6 +486,31 @@ class NetsuiteTokenProviderTest {
         assertThat(claims.getAudience()).isEqualTo(List.of(props.tokenUrl()));
     }
 
+    /**
+     * Asserts a key-loading failure the caller may see: an {@link IllegalStateException} whose message is the setting
+     * followed by {@code problem}, without the configured location, its directory or file name, or any exception
+     * class name, and whose cause is of {@code causeType}, or absent when that is {@code null}.
+     */
+    private void assertCallerSafe(Throwable failure, String location, String problem,
+            Class<? extends Throwable> causeType) {
+        assertThat(failure).isInstanceOf(IllegalStateException.class)
+                .hasMessageStartingWith(PRIVATE_KEY_PATH + " " + problem);
+        String fileName = location.substring(Math.max(location.lastIndexOf('/'), location.lastIndexOf(':')) + 1);
+        assertThat(failure.getMessage())
+                .doesNotContain(location)
+                .doesNotContain(tmp.toString())
+                .doesNotContain("Exception");
+        if (!fileName.isEmpty()) {
+            assertThat(failure.getMessage()).doesNotContain(fileName);
+        }
+        if (causeType == null) {
+            assertThat(failure).hasNoCause();
+        } else {
+            assertThat(failure.getCause()).isInstanceOf(causeType);
+            assertThat(failure.getMessage()).doesNotContain(failure.getCause().getClass().getSimpleName());
+        }
+    }
+
     /** The decoded form of the only token request received. */
     private Map<String, String> postedForm() {
         List<Map<String, String>> forms = postedForms();
@@ -429,6 +546,12 @@ class NetsuiteTokenProviderTest {
     private static void writePkcs8Pem(Path file, PrivateKey key) throws IOException {
         // An RSA key from KeyPairGenerator encodes as PKCS#8.
         writePem(file, "PRIVATE KEY", key.getEncoded());
+    }
+
+    /** {@link #writePem}, returning the file's location as {@code netsuite.oauth.private-key-path} names it. */
+    private static String pemAt(Path file, String label, byte[] der) throws IOException {
+        writePem(file, label, der);
+        return file.toString();
     }
 
     /** The armour is assembled from its label, so this source holds no literal key block for secret scanners. */

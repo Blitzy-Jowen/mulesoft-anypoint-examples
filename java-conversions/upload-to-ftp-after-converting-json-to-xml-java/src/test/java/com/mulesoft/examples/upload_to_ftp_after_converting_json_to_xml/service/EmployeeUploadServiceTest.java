@@ -17,6 +17,7 @@ import static org.mockito.AdditionalMatchers.aryEq;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -106,6 +107,22 @@ class EmployeeUploadServiceTest {
 
     private static final String EXPECTED_XML_MD5 = "86159f75689d7a5b40bb14284901d8d6";
 
+    /** An employee whose names are not ASCII; sent as ISO-8859-1, each of {@code é} and {@code ü} is one byte. */
+    private static final String LATIN1_JSON =
+            "{\"employees\":{\"employee\":[{\"name\":\"Jos\u00e9\",\"lastName\":\"M\u00fcller\","
+            + "\"addresses\":{\"address\":[]}}]}}";
+
+    /** The script's output for {@link #LATIN1_JSON}, whatever the charset the JSON arrived in. */
+    private static final String LATIN1_XML = String.join("\n",
+            "<?xml version='1.0' encoding='UTF-8'?>",
+            "<employees>",
+            "\t<employee>",
+            "\t\t<name>Jos\u00e9</name>",
+            "\t\t<lastName>M\u00fcller</lastName>",
+            "\t\t<addresses/>",
+            "\t</employee>",
+            "</employees>");
+
     private FtpUploadClient client;
 
     private EmployeesXmlMapper mapper;
@@ -125,10 +142,10 @@ class EmployeeUploadServiceTest {
     void transformRunsBeforeUpload() throws IOException {
         byte[] json = messageJson();
 
-        service.process(json);
+        service.process(json, null);
 
         InOrder inOrder = inOrder(mapper, client);
-        inOrder.verify(mapper).toXmlBytes(aryEq(json));
+        inOrder.verify(mapper).toXmlBytes(aryEq(json), isNull());
         inOrder.verify(client).upload(anyString(), any(byte[].class));
         verifyNoMoreInteractions(client);
     }
@@ -137,7 +154,7 @@ class EmployeeUploadServiceTest {
     void uploadsUnderOriginalOutputPattern() throws IOException {
         ArgumentCaptor<String> fileName = ArgumentCaptor.forClass(String.class);
 
-        service.process(messageJson());
+        service.process(messageJson(), null);
 
         verify(client).upload(fileName.capture(), any(byte[].class));
         assertEquals("muleExample.xml", FtpUploadClient.OUTPUT_PATTERN);
@@ -149,7 +166,7 @@ class EmployeeUploadServiceTest {
     void uploadedBytesEqualReturnedBytesAndExactDwDocument() throws IOException, NoSuchAlgorithmException {
         ArgumentCaptor<byte[]> bytes = ArgumentCaptor.forClass(byte[].class);
 
-        byte[] result = service.process(messageJson());
+        byte[] result = service.process(messageJson(), null);
 
         verify(client).upload(eq(FtpUploadClient.OUTPUT_PATTERN), bytes.capture());
         assertArrayEquals(result, bytes.getValue());
@@ -172,7 +189,7 @@ class EmployeeUploadServiceTest {
         doThrow(failure).when(client).upload(anyString(), any(byte[].class));
         byte[] json = messageJson();
 
-        RuntimeException thrown = assertThrows(failure.getClass(), () -> service.process(json));
+        RuntimeException thrown = assertThrows(failure.getClass(), () -> service.process(json, null));
 
         assertSame(failure, thrown);
         verify(client, times(1)).upload(anyString(), any(byte[].class));
@@ -184,9 +201,36 @@ class EmployeeUploadServiceTest {
     void malformedJsonFailsBeforeAnyUpload(String payload) {
         byte[] json = payload.getBytes(StandardCharsets.UTF_8);
 
-        assertThrows(IllegalArgumentException.class, () -> service.process(json));
+        assertThrows(IllegalArgumentException.class, () -> service.process(json, null));
 
-        verify(mapper).toXmlBytes(aryEq(json));
+        verify(mapper).toXmlBytes(aryEq(json), isNull());
+        verifyNoInteractions(client);
+    }
+
+    @Test
+    void declaredCharsetReachesTheTransformAndTheUploadIsUtf8() {
+        byte[] json = LATIN1_JSON.getBytes(StandardCharsets.ISO_8859_1);
+        ArgumentCaptor<byte[]> bytes = ArgumentCaptor.forClass(byte[].class);
+
+        byte[] result = service.process(json, StandardCharsets.ISO_8859_1);
+
+        InOrder inOrder = inOrder(mapper, client);
+        inOrder.verify(mapper).toXmlBytes(aryEq(json), eq(StandardCharsets.ISO_8859_1));
+        inOrder.verify(client).upload(eq(FtpUploadClient.OUTPUT_PATTERN), bytes.capture());
+        verifyNoMoreInteractions(client);
+        assertArrayEquals(result, bytes.getValue());
+        assertArrayEquals(LATIN1_XML.getBytes(StandardCharsets.UTF_8), result);
+    }
+
+    @Test
+    void payloadUndecodableInItsDeclaredCharsetFailsBeforeAnyUpload() {
+        byte[] json = LATIN1_JSON.getBytes(StandardCharsets.ISO_8859_1);
+
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> service.process(json, StandardCharsets.UTF_8));
+
+        assertEquals("Malformed UTF-8 input at byte offset 38 of the JSON payload", thrown.getMessage());
+        verify(mapper).toXmlBytes(aryEq(json), eq(StandardCharsets.UTF_8));
         verifyNoInteractions(client);
     }
 

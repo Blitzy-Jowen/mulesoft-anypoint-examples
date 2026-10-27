@@ -34,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -43,12 +44,15 @@ import java.net.InetSocketAddress;
 import java.net.MalformedURLException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -65,11 +69,17 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
+import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.xml.parsers.DocumentBuilderFactory;
 
+import org.apache.hc.client5.http.ConnectTimeoutException;
+import org.apache.hc.client5.http.HttpHostConnectException;
+import org.apache.hc.core5.http.NoHttpResponseException;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.function.ThrowingConsumer;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -90,6 +100,8 @@ import org.w3c.dom.NodeList;
 import org.xmlunit.builder.DiffBuilder;
 import org.xmlunit.diff.Diff;
 
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.proxying_a_soap_api.config.WsdlQueryPublisher;
@@ -146,6 +158,21 @@ class ShopServiceClientTest {
 
     /** Every client a test creates, closed after it so that no connection pool or deadline thread outlives it. */
     private final List<ShopServiceClient> clients = new ArrayList<>();
+
+    /**
+     * One exchange with the stand-in before the first test, under a generous timeout and then forgotten: a freshly
+     * started WireMock pays its class loading on its first answer, which on a loaded build host takes longer than
+     * {@link #TIMEOUT_MS} and would fail whichever test happens to run first.
+     */
+    @BeforeAll
+    static void warmUpTheStandIn() {
+        wm.stubFor(post(urlEqualTo(UPSTREAM_PATH)).willReturn(ok()));
+        try (ShopServiceClient client = new ShopServiceClient(new DefaultResourceLoader(),
+                wm.baseUrl() + UPSTREAM_PATH, CLASSPATH_WSDL, 30_000L)) {
+            client.post(soapHeaders(), new byte[0]);
+        }
+        wm.resetAll();
+    }
 
     @AfterEach
     void closeClients() {
@@ -256,6 +283,9 @@ class ShopServiceClientTest {
 
         private final List<Socket> sockets = new CopyOnWriteArrayList<>();
 
+        /** The connection the calling thread serves, for a responder that acts on the socket itself. */
+        private final ThreadLocal<Socket> serving = new ThreadLocal<>();
+
         private final ExecutorService threads = Executors.newCachedThreadPool(task -> {
             Thread thread = new Thread(task, "raw-upstream");
             thread.setDaemon(true);
@@ -292,6 +322,14 @@ class ShopServiceClientTest {
             out.write(new byte[10]);
         }
 
+        /** Sends a 404 status line and headers at once, then 10 of the 1000 body bytes they announce, and stalls. */
+        static void sendNotFoundHeadersThenStall(RawUpstream upstream, RequestHead head, InputStream in,
+                                                 OutputStream out) throws IOException {
+            out.write("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 1000\r\n\r\n"
+                    .getBytes(US_ASCII));
+            out.write(new byte[10]);
+        }
+
         /** Reads nothing of the request body until {@link #release()}, so the client's writes block. */
         static void neverReadBody(RawUpstream upstream, RequestHead head, InputStream in, OutputStream out)
                 throws InterruptedException {
@@ -313,6 +351,20 @@ class ShopServiceClientTest {
             // Closing the socket's stream closes the socket, which sends the client its end of stream.
             out.close();
             upstream.upstreamClosed.countDown();
+        }
+
+        /** Closes the connection without answering, so the client reads an end of stream where the status should be. */
+        static void closeWithoutAnswering(RawUpstream upstream, RequestHead head, InputStream in, OutputStream out)
+                throws IOException {
+            out.close();
+        }
+
+        /** Resets the connection without answering: with a zero linger time, closing it sends a TCP reset. */
+        static void resetWithoutAnswering(RawUpstream upstream, RequestHead head, InputStream in, OutputStream out)
+                throws IOException {
+            Socket socket = upstream.serving.get();
+            socket.setSoLinger(true, 0);
+            socket.close();
         }
 
         String baseUrl() {
@@ -387,6 +439,7 @@ class ShopServiceClientTest {
         }
 
         private void serve(Socket socket) {
+            serving.set(socket);
             try (socket) {
                 InputStream in = socket.getInputStream();
                 RequestHead head = RequestHead.parse(readHead(in));
@@ -585,6 +638,112 @@ class ShopServiceClientTest {
                 () -> client.post(headers, bytes));
 
         assertThat(causeChain(failure)).hasAtLeastOneElementOfType(ConnectException.class);
+    }
+
+    private static int closedPort() throws IOException {
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        }
+    }
+
+    static Stream<Arguments> transportFailures() {
+        return Stream.of(
+                // No answer: nothing listens on the upstream port.
+                Arguments.of("refused connection", null, ConnectException.class, "I/O error: Connection refused"),
+                Arguments.of("read timeout", ok().withFixedDelay(3000), SocketTimeoutException.class,
+                        "I/O error: Read timed out"),
+                Arguments.of("connection reset", aResponse().withFault(Fault.CONNECTION_RESET_BY_PEER),
+                        SocketException.class, "I/O error: Connection reset"),
+                Arguments.of("empty response", aResponse().withFault(Fault.EMPTY_RESPONSE),
+                        NoHttpResponseException.class, "I/O error: The target server failed to respond"));
+    }
+
+    // The caller's 500 body carries the message: it names the failure, never predic8's URL, host, address or port.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("transportFailures")
+    void transportFailureIsReportedWithoutTheUpstreamLocation(String description, ResponseDefinitionBuilder answer,
+                                                             Class<? extends IOException> causeType,
+                                                             String expectedMessage) throws IOException {
+        int port;
+        if (answer == null) {
+            port = closedPort();
+        } else {
+            wm.stubFor(post(urlEqualTo(UPSTREAM_PATH)).willReturn(answer));
+            port = wm.getPort();
+        }
+        ShopServiceClient client = client("http://localhost:" + port + UPSTREAM_PATH, CLASSPATH_WSDL);
+        HttpHeaders headers = soapHeaders();
+        byte[] bytes = envelope();
+
+        ResourceAccessException failure = assertThrows(ResourceAccessException.class,
+                () -> client.post(headers, bytes));
+
+        assertThat(failure).hasMessage(expectedMessage);
+        assertThat(failure.getMessage()).doesNotContain("://", "127.0.0.1", "localhost", String.valueOf(port));
+        assertThat(failure.getCause()).isInstanceOf(causeType);
+    }
+
+    private static <T extends Throwable> T causedBy(T failure, Throwable cause) {
+        failure.initCause(cause);
+        return failure;
+    }
+
+    private static IOException cyclicChainNamingLocations() {
+        IOException outer = new IOException("Cannot reach http://shop.example/shop/ShopService");
+        IOException inner = new IOException("Redirected to http://other.example/");
+        outer.initCause(inner);
+        inner.initCause(outer);
+        return outer;
+    }
+
+    static Stream<Arguments> ioFailureReasons() {
+        String endpoint = "Connect to http://shop.example:8080 [shop.example/10.0.0.7]";
+        return Stream.of(
+                Arguments.of("unknown host, whose message is the host", new UnknownHostException("shop.example"),
+                        "I/O error: Unknown host"),
+                Arguments.of("connect failure naming the endpoint",
+                        new HttpHostConnectException(endpoint + " failed: Connection refused"),
+                        "I/O error: Connection refused"),
+                Arguments.of("connect timeout naming the endpoint",
+                        new ConnectTimeoutException(endpoint + " failed: Connect timed out"),
+                        "I/O error: Connect timed out"),
+                Arguments.of("connect failure without the socket's text", new HttpHostConnectException(endpoint
+                        + " refused"), "I/O error"),
+                Arguments.of("URL", new IOException("Circular redirect to 'http://other.example/x'"), "I/O error"),
+                Arguments.of("upstream host in another letter case", new IOException("SHOP.EXAMPLE closed the stream"),
+                        "I/O error"),
+                Arguments.of("IPv4 literal", new IOException("No route to 10.0.0.7"), "I/O error"),
+                Arguments.of("bracketed address", new IOException("Peer [::1] went away"), "I/O error"),
+                Arguments.of("angle-bracketed host name",
+                        new SSLPeerUnverifiedException("Certificate for <other.example> doesn't match"), "I/O error"),
+                Arguments.of("no message", new IOException((String) null), "I/O error"),
+                Arguments.of("blank message", new IOException(" "), "I/O error"),
+                Arguments.of("no cause", null, "I/O error"),
+                Arguments.of("location-bearing wrapper of a usable cause",
+                        new IOException("Cannot reach http://shop.example", new SocketException("Connection reset")),
+                        "I/O error: Connection reset"),
+                Arguments.of("write timeout over the socket failure its deadline caused",
+                        causedBy(new SocketTimeoutException("Request body write timed out after 1000 ms"),
+                                new SocketException("Socket closed")),
+                        "I/O error: Request body write timed out after 1000 ms"),
+                Arguments.of("cyclic chain naming locations only", cyclicChainNamingLocations(), "I/O error"));
+    }
+
+    // RestClient's own message quotes the upstream URL; the reported one keeps the I/O failure as its cause only.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("ioFailureReasons")
+    void ioFailureMessageNeverNamesALocation(String description, IOException cause, String expectedMessage) {
+        String restClientMessage = "I/O error on POST request for \"http://shop.example/shop/ShopService\": "
+                + (cause != null ? cause.getMessage() : null);
+        ResourceAccessException failure = cause != null
+                ? new ResourceAccessException(restClientMessage, cause)
+                : new ResourceAccessException(restClientMessage);
+
+        ResourceAccessException reported = assertTimeoutPreemptively(Duration.ofSeconds(5),
+                () -> ShopServiceClient.withoutLocation(failure, "Shop.Example"));
+
+        assertThat(reported).hasMessage(expectedMessage);
+        assertThat(reported.getCause()).isSameAs(cause);
     }
 
     // SC-13 keeps Expect and Upgrade, so they reach predic8 as the caller sent them, and Expect keeps its meaning:
@@ -819,6 +978,167 @@ class ShopServiceClientTest {
         assertThat(failure).isInstanceOf(SocketTimeoutException.class);
         assertTimeoutPreemptively(Duration.ofMillis(TIMEOUT_MS + 2500),
                 () -> assertThat(resource.exists()).isFalse());
+    }
+
+    static Stream<Arguments> unansweredMetadataReads() {
+        Responder endOfStream = RawUpstream::closeWithoutAnswering;
+        Responder reset = RawUpstream::resetWithoutAnswering;
+        ThrowingConsumer<Resource> probe = resource -> assertThat(resource.exists()).isFalse();
+        ThrowingConsumer<Resource> contentRead = resource -> assertThrows(IOException.class, () -> read(resource));
+        return Stream.of(
+                Arguments.of("existence probe answered by an end of stream", endOfStream, probe),
+                Arguments.of("existence probe answered by a reset", reset, probe),
+                Arguments.of("read answered by an end of stream", endOfStream, contentRead),
+                Arguments.of("read answered by a reset", reset, contentRead));
+    }
+
+    // HttpURLConnection silently sends a GET again on a new connection when the first one ends or is reset before the
+    // response head; a metadata read is one GET on one connection, whatever the upstream does with it.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unansweredMetadataReads")
+    void unansweredMetadataReadFailsOnOneConnection(String description, Responder responder,
+                                                    ThrowingConsumer<Resource> failingRead) throws Exception {
+        try (RawUpstream upstream = new RawUpstream(responder)) {
+            Resource wsdl = client(upstream.baseUrl() + WSDL_PATH_AND_QUERY).wsdlResource();
+
+            assertTimeoutPreemptively(Duration.ofMillis(TIMEOUT_MS + 2500), () -> failingRead.accept(wsdl));
+
+            // A second attempt follows the first at once, so it would be counted within this window.
+            await().during(Duration.ofMillis(500)).atMost(Duration.ofSeconds(3))
+                    .untilAsserted(() -> assertThat(upstream.accepted()).as("connections accepted").isEqualTo(1));
+            assertThat(upstream.nextRequestHead().requestLine())
+                    .isEqualTo("GET " + WSDL_PATH_AND_QUERY + " HTTP/1.1");
+            assertThat(upstream.requestsReceived()).as("further requests received").isZero();
+        }
+    }
+
+    static Stream<Arguments> unwantedBodies() {
+        ThrowingConsumer<Resource> probeFindsTheDocument = resource -> assertThat(resource.exists()).isTrue();
+        ThrowingConsumer<Resource> readFindsNoDocument = resource -> assertThat(catchThrowable(() -> read(resource)))
+                .isExactlyInstanceOf(FileNotFoundException.class);
+        return Stream.of(
+                Arguments.of("existence probe answered 200", (Responder) RawUpstream::sendHeadersThenStall,
+                        probeFindsTheDocument),
+                Arguments.of("read answered 404", (Responder) RawUpstream::sendNotFoundHeadersThenStall,
+                        readFindsNoDocument));
+    }
+
+    // Each body stalls short of its length, so reading it would end in a timeout: as with HttpURLConnection, neither
+    // a probe nor a read refused by its status reads the body before the connection is closed.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unwantedBodies")
+    void unwantedBodyIsNeverRead(String description, Responder responder, ThrowingConsumer<Resource> call)
+            throws Exception {
+        try (RawUpstream upstream = new RawUpstream(responder)) {
+            Resource wsdl = client(upstream.baseUrl() + WSDL_PATH_AND_QUERY).wsdlResource();
+
+            assertTimeoutPreemptively(Duration.ofMillis(TIMEOUT_MS + 2500), () -> call.accept(wsdl));
+
+            assertThat(upstream.awaitClientClose(Duration.ofSeconds(5))).as("connection closed by the client").isTrue();
+            assertThat(upstream.accepted()).as("connections accepted").isEqualTo(1);
+        }
+    }
+
+    // A status without a body, such as 204, is an empty document, as HttpURLConnection read it.
+    @Test
+    void statusWithoutABodyIsReadAsAnEmptyDocument() throws IOException {
+        wm.stubFor(get(urlEqualTo(WSDL_PATH_AND_QUERY)).willReturn(aResponse().withStatus(204)));
+        Resource resource = client().wsdlResource();
+
+        assertThat(resource.exists()).isTrue();
+        assertThat(read(resource)).isEmpty();
+        wm.verify(2, getRequestedFor(urlEqualTo(WSDL_PATH_AND_QUERY)));
+    }
+
+    static Stream<Arguments> wsdlRedirects() {
+        return Stream.of(
+                Arguments.of("on the same scheme", "http://localhost:%d" + WSDL_PATH_AND_QUERY, true),
+                Arguments.of("from http to https", "https://localhost:%d" + WSDL_PATH_AND_QUERY, false));
+    }
+
+    // As HttpURLConnection did, a WSDL read follows a redirect that keeps the scheme and returns any other as received.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("wsdlRedirects")
+    void wsdlRedirectIsFollowedOnlyWithinItsScheme(String description, String location, boolean followed)
+            throws IOException {
+        byte[] wsdl = classpathBytes("upstream/ShopService.wsdl");
+        stubXml(WSDL_PATH_AND_QUERY, wsdl);
+        String movedPathAndQuery = "/shop/Moved?wsdl";
+        wm.stubFor(get(urlEqualTo(movedPathAndQuery)).willReturn(aResponse().withStatus(302)
+                .withHeader(HttpHeaders.LOCATION, String.format(location, wm.getPort()))
+                .withBody("moved")));
+        Resource resource = client(wm.baseUrl() + movedPathAndQuery).wsdlResource();
+
+        assertThat(resource.exists()).isEqualTo(followed);
+        assertThat(read(resource)).isEqualTo(followed ? wsdl : "moved".getBytes(UTF_8));
+        assertThat(resource.getURL().toString()).isEqualTo(wm.baseUrl() + movedPathAndQuery);
+        wm.verify(2, getRequestedFor(urlEqualTo(movedPathAndQuery)));
+        wm.verify(followed ? 2 : 0, getRequestedFor(urlEqualTo(WSDL_PATH_AND_QUERY)));
+    }
+
+    static Stream<Arguments> credentialedWsdlReads() {
+        return Stream.of(
+                Arguments.of("without a redirect", null, true),
+                Arguments.of("redirected on the URL's origin", WSDL_PATH_AND_QUERY, true),
+                // 127.0.0.1 reaches the same stand-in under another host name, hence on another origin.
+                Arguments.of("redirected to another origin", "http://127.0.0.1:%d" + WSDL_PATH_AND_QUERY, false));
+    }
+
+    // UrlResource sends a URL's user information as Basic credentials; it never reaches the request line, and a
+    // redirect carries the credentials only while it stays on the URL's origin.
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("credentialedWsdlReads")
+    void wsdlUserInformationTravelsAsBasicCredentialsOnItsOriginOnly(String description, String redirect,
+                                                                    boolean credentialsAtTarget) throws IOException {
+        byte[] wsdl = "<wsdl/>".getBytes(UTF_8);
+        stubXml(WSDL_PATH_AND_QUERY, wsdl);
+        String pathAndQuery = WSDL_PATH_AND_QUERY;
+        if (redirect != null) {
+            pathAndQuery = "/shop/Moved?wsdl";
+            wm.stubFor(get(urlEqualTo(pathAndQuery)).willReturn(aResponse().withStatus(302)
+                    .withHeader(HttpHeaders.LOCATION, String.format(redirect, wm.getPort()))));
+        }
+        Resource resource = client("http://" + USER_INFO + "localhost:" + wm.getPort() + pathAndQuery).wsdlResource();
+
+        assertThat(read(resource)).isEqualTo(wsdl);
+
+        String basic = "Basic " + Base64.getUrlEncoder().encodeToString((USER + ":" + PASSWORD).getBytes(UTF_8));
+        List<LoggedRequest> first = wm.findAll(getRequestedFor(urlEqualTo(pathAndQuery)));
+        assertThat(first).hasSize(1);
+        assertThat(first.get(0).getHeader(HttpHeaders.AUTHORIZATION)).isEqualTo(basic);
+        assertThat(first.get(0).getHeader(HttpHeaders.HOST)).isEqualTo("localhost:" + wm.getPort());
+        // No content encoding is requested, so the body arrives as the upstream stored it.
+        assertThat(first.get(0).containsHeader(HttpHeaders.ACCEPT_ENCODING)).isFalse();
+        List<LoggedRequest> target = wm.findAll(getRequestedFor(urlEqualTo(WSDL_PATH_AND_QUERY)));
+        assertThat(target).hasSize(1);
+        assertThat(target.get(0).containsHeader(HttpHeaders.AUTHORIZATION)).isEqualTo(credentialsAtTarget);
+    }
+
+    static Stream<Arguments> failedReads() {
+        return Stream.of(
+                Arguments.of(404, FileNotFoundException.class),
+                Arguments.of(410, FileNotFoundException.class),
+                Arguments.of(500, IOException.class));
+    }
+
+    // A failed read names the URL as WsdlQueryPublisher names resources, never its credentials or query.
+    @ParameterizedTest(name = "HTTP {0}")
+    @MethodSource("failedReads")
+    void failedStatusFailsTheReadWithoutCredentialsOrQuery(int status, Class<? extends IOException> type) {
+        String pathAndQuery = UPSTREAM_PATH + "?wsdl&token=" + TOKEN;
+        wm.stubFor(get(urlEqualTo(pathAndQuery)).willReturn(aResponse().withStatus(status).withBody("failed")));
+        Resource resource = client("http://" + USER_INFO + "localhost:" + wm.getPort() + pathAndQuery).wsdlResource();
+
+        IOException failure = assertThrows(IOException.class, () -> read(resource));
+
+        assertThat(failure).isExactlyInstanceOf(type);
+        assertThat(failure.getMessage()).contains("http://localhost:" + wm.getPort() + UPSTREAM_PATH)
+                .doesNotContain(USER, PASSWORD, TOKEN);
+        if (type == IOException.class) {
+            assertThat(failure.getMessage()).contains(String.valueOf(status));
+        }
+        assertThat(resource.exists()).isFalse();
+        wm.verify(2, getRequestedFor(urlEqualTo(pathAndQuery)));
     }
 
     // The stand-in surefire sets as proxy.wsdl-location, so every test context starts without the network.

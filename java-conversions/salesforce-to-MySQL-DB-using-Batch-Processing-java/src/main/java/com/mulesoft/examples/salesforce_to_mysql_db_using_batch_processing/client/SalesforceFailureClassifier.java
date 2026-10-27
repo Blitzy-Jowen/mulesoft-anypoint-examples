@@ -104,11 +104,12 @@ public class SalesforceFailureClassifier implements UpstreamFailureClassifier {
     /**
      * Returns Salesforce's own text for a failure: the first non-blank {@link ApiFault#getExceptionMessage()} in
      * the cause chain, even when an outer wrapper carries a message of its own. A parsed {@link ApiFault} keeps
-     * its text only there ({@code getMessage()} is {@code null}), so the inherited lookup would otherwise answer
-     * with the fault's class name. Without such a fault the inherited lookup applies.
+     * its text only there ({@code getMessage()} is {@code null}), so the inherited lookup would otherwise miss it
+     * and answer with its neutral description. Without such a fault the inherited lookup applies.
      *
      * @param failure the classified throwable; never {@code null}
-     * @return the fault's exception message, or the first non-blank message or class name of the chain
+     * @return the fault's exception message, or the first non-blank message of the chain, or the inherited neutral
+     *         description when the chain carries none
      * @throws NullPointerException if {@code failure} is {@code null}
      */
     @Override

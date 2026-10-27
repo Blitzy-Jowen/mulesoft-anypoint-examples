@@ -650,14 +650,17 @@ class UpstreamCallExecutorTest {
         assertTrue(UpstreamFailureClassifier.isUnavailable(new IOException("wrap", readTimeout)));
     }
 
-    /** Netty's shared {@code ReadTimeoutException.INSTANCE} when Netty is loadable, otherwise the stand-in. */
+    /**
+     * Netty's shared {@code ReadTimeoutException.INSTANCE} when Netty is loadable, otherwise the stand-in; either one
+     * carries no message, as {@code INSTANCE} does not.
+     */
     private static RuntimeException nettyReadTimeout() {
         Class<?> netty;
         try {
             netty = Class.forName(UpstreamFailureClassifier.NETTY_READ_TIMEOUT_EXCEPTION, true,
                     UpstreamCallExecutorTest.class.getClassLoader());
         } catch (ClassNotFoundException absent) {
-            return instantiate(NettyStandIns.READ_TIMEOUT, "read timed out");
+            return instantiate(NettyStandIns.READ_TIMEOUT, null);
         }
         try {
             return (RuntimeException) netty.getField("INSTANCE").get(null);
@@ -809,11 +812,18 @@ class UpstreamCallExecutorTest {
     // UpstreamFailureClassifier.upstreamMessage (default)
     // ---------------------------------------------------------------------------------------------------------------
 
-    /** Guarded by {@link #CYCLE_TIMEOUT}, because two of the chains are cyclic. */
+    /**
+     * Without a message anywhere in the chain, the description names the upstream and never a class. Guarded by
+     * {@link #CYCLE_TIMEOUT}, because three of the chains are cyclic.
+     */
     @ParameterizedTest
     @MethodSource("upstreamMessages")
-    void upstreamMessageIsTheFirstNonBlankMessageOrTheClassName(Throwable failure, String expected) {
-        assertEquals(expected, assertTimeoutPreemptively(CYCLE_TIMEOUT, () -> classifier.upstreamMessage(failure)));
+    void upstreamMessageIsTheFirstNonBlankMessageOrANeutralDescription(UpstreamSystem system, Throwable failure,
+            String expected) {
+        ScriptedClassifier systemClassifier = new ScriptedClassifier(system);
+
+        assertEquals(expected,
+                assertTimeoutPreemptively(CYCLE_TIMEOUT, () -> systemClassifier.upstreamMessage(failure)));
     }
 
     private static Stream<Arguments> upstreamMessages() {
@@ -823,18 +833,31 @@ class UpstreamCallExecutorTest {
         IOException tail = new IOException("from the loop");
         VendorException blankCycle = new VendorException(" ", tail);
         tail.initCause(blankCycle);
+        ClosedChannelException closed = new ClosedChannelException();
+        VendorException closedCycle = new VendorException(null, closed);
+        closed.initCause(closedCycle);
         Exception anonymous = new Exception() {
             private static final long serialVersionUID = 1L;
         };
         return Stream.of(
-                Arguments.of(new VendorException("outer text", new IOException("inner text")), "outer text"),
-                Arguments.of(new IllegalStateException(null,
+                Arguments.of(SYSTEM, new VendorException("outer text", new IOException("inner text")), "outer text"),
+                Arguments.of(SYSTEM, new IllegalStateException(null,
                         new VendorException(" \t ", new IOException("  vendor fault text  "))),
                         "  vendor fault text  "),
-                Arguments.of(new VendorException(null, new IOException((String) null)), "VendorException"),
-                Arguments.of(anonymous, anonymous.getClass().getName()),
-                Arguments.of(cycle, "VendorException"),
-                Arguments.of(blankCycle, "from the loop"));
+                Arguments.of(SYSTEM, new VendorException(null, new IOException((String) null)),
+                        "NetSuite call failed"),
+                Arguments.of(SYSTEM, anonymous, "NetSuite call failed"),
+                Arguments.of(SYSTEM, cycle, "NetSuite call failed"),
+                Arguments.of(SYSTEM, blankCycle, "from the loop"),
+                Arguments.of(SYSTEM, new VendorException(null, new SocketTimeoutException()),
+                        "NetSuite did not respond in time"),
+                Arguments.of(SYSTEM, new VendorException(null, nettyReadTimeout()), "NetSuite did not respond in time"),
+                Arguments.of(SYSTEM, new VendorException(null, instantiate(NettyStandIns.READ_TIMEOUT_SUBTYPE, null)),
+                        "NetSuite did not respond in time"),
+                Arguments.of(SYSTEM, new HttpConnectTimeoutException(null), "NetSuite did not respond in time"),
+                Arguments.of(SYSTEM, new VendorException(null, new ConnectException()), "NetSuite is unreachable"),
+                Arguments.of(SYSTEM, closedCycle, "NetSuite is unreachable"),
+                Arguments.of(null, new VendorException(null), "The upstream system call failed"));
     }
 
     @Test

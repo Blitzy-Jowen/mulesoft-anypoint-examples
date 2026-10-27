@@ -14,7 +14,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.io.CharConversionException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.Charset;
+import java.nio.charset.MalformedInputException;
 import java.nio.charset.StandardCharsets;
+import java.nio.charset.UnmappableCharacterException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -113,6 +116,26 @@ class EmployeesXmlMapperTest {
     private static final String JOHN_DOE_ADDRESSES = "{\"address\": ["
             + "{\"street\": \"123 Main Street\",\"zipCode\": \"111\"},"
             + "{\"street\": \"987 Cypress Avenue\",\"zipCode\": \"222\"}]}";
+
+    private static final Charset WINDOWS_1252 = Charset.forName("windows-1252");
+
+    /** One employee whose names and street are not ASCII but are in ISO-8859-1, as text. */
+    private static final String NON_ASCII_JSON = "{\"employees\":{\"employee\":[{\"name\":\"Jos\u00e9\","
+            + "\"lastName\":\"M\u00fcller\",\"addresses\":{\"address\":[{\"street\":\"Stra\u00dfe 5\"}]}}]}}";
+
+    /** The document of {@link #NON_ASCII_JSON}. */
+    private static final String NON_ASCII_DOCUMENT = DECLARATION_LINE
+            + "<employees>\n"
+            + "\t<employee>\n"
+            + "\t\t<name>Jos\u00e9</name>\n"
+            + "\t\t<lastName>M\u00fcller</lastName>\n"
+            + "\t\t<addresses>\n"
+            + "\t\t\t<address>\n"
+            + "\t\t\t\t<street>Stra\u00dfe 5</street>\n"
+            + "\t\t\t</address>\n"
+            + "\t\t</addresses>\n"
+            + "\t</employee>\n"
+            + "</employees>";
 
     private final ObjectMapper json = new ObjectMapper();
 
@@ -581,6 +604,108 @@ class EmployeesXmlMapperTest {
     void invalidInputIsRejected(String label, byte[] input, String message, Class<? extends Throwable> cause) {
         assertRejected(assertThatThrownBy(() -> mapper.toXml(input)), message, cause);
         assertRejected(assertThatThrownBy(() -> mapper.toXmlBytes(input)), message, cause);
+    }
+
+    /**
+     * The non-ASCII payload in each declared charset, with the document it must give: every charset that can encode
+     * {@link #NON_ASCII_JSON} gives {@link #NON_ASCII_DOCUMENT}, a byte-order mark before the text included; the euro
+     * sign case shows that windows-1252 is decoded as itself, where ISO-8859-1 would read its byte 0x80 as a control.
+     */
+    static Stream<Arguments> declaredCharsetPayloads() {
+        Charset utf16le = StandardCharsets.UTF_16LE;
+        return Stream.of(
+                Arguments.of("ISO-8859-1", StandardCharsets.ISO_8859_1,
+                        NON_ASCII_JSON.getBytes(StandardCharsets.ISO_8859_1), NON_ASCII_DOCUMENT),
+                Arguments.of("windows-1252", WINDOWS_1252, NON_ASCII_JSON.getBytes(WINDOWS_1252), NON_ASCII_DOCUMENT),
+                Arguments.of("windows-1252 euro sign, byte 0x80", WINDOWS_1252,
+                        NON_ASCII_JSON.replace("5", "\u20ac").getBytes(WINDOWS_1252),
+                        NON_ASCII_DOCUMENT.replace("5", "\u20ac")),
+                Arguments.of("UTF-16BE without byte-order mark", StandardCharsets.UTF_16BE,
+                        NON_ASCII_JSON.getBytes(StandardCharsets.UTF_16BE), NON_ASCII_DOCUMENT),
+                Arguments.of("UTF-16LE without byte-order mark", utf16le, NON_ASCII_JSON.getBytes(utf16le),
+                        NON_ASCII_DOCUMENT),
+                Arguments.of("UTF-16LE with byte-order mark", utf16le, ("\ufeff" + NON_ASCII_JSON).getBytes(utf16le),
+                        NON_ASCII_DOCUMENT),
+                Arguments.of("UTF-8 without byte-order mark", StandardCharsets.UTF_8, utf8(NON_ASCII_JSON),
+                        NON_ASCII_DOCUMENT),
+                Arguments.of("UTF-8 with byte-order mark", StandardCharsets.UTF_8, utf8("\ufeff" + NON_ASCII_JSON),
+                        NON_ASCII_DOCUMENT),
+                // Java's UTF-16 encoder writes a big-endian byte-order mark, which the UTF-16 decoder consumes.
+                Arguments.of("UTF-16 with byte-order mark", StandardCharsets.UTF_16,
+                        NON_ASCII_JSON.getBytes(StandardCharsets.UTF_16), NON_ASCII_DOCUMENT));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("declaredCharsetPayloads")
+    @DisplayName("a declared charset decodes the payload, one leading byte-order mark dropped, into the same UTF-8 "
+            + "document as the UTF-8 payload")
+    void declaredCharsetDecodesThePayload(String label, Charset charset, byte[] input, String document) {
+        String output = mapper.toXml(input, charset);
+        byte[] bytes = mapper.toXmlBytes(input, charset);
+
+        assertThat(output).isEqualTo(document);
+        assertThat(output).isEqualTo(mapper.toXml(utf8(new String(input, charset).replace("\ufeff", ""))));
+        assertThat(bytes).containsExactly(document.getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    @DisplayName("without a declared charset UTF-8, UTF-16 or UTF-32 is detected from the bytes, as before, so "
+            + "ISO-8859-1 bytes are read as malformed UTF-8")
+    void undeclaredCharsetIsDetectedFromTheBytes() throws IOException {
+        byte[] message = resource("/message.json");
+
+        assertThat(mapper.toXml(message, null)).isEqualTo(EXPECTED).isEqualTo(mapper.toXml(message));
+        assertThat(mapper.toXmlBytes(message, null)).containsExactly(mapper.toXmlBytes(message));
+        assertThat(mapper.toXml(NON_ASCII_JSON.getBytes(StandardCharsets.UTF_16LE), null))
+                .isEqualTo(NON_ASCII_DOCUMENT);
+        byte[] latin1 = NON_ASCII_JSON.getBytes(StandardCharsets.ISO_8859_1);
+        assertRejected(assertThatThrownBy(() -> mapper.toXml(latin1, null)), "Invalid UTF-8 middle byte 0x22",
+                JsonParseException.class);
+    }
+
+    static Stream<Arguments> invalidDeclaredInputs() {
+        byte[] bom = {(byte) 0xEF, (byte) 0xBB, (byte) 0xBF};
+        return Stream.of(
+                Arguments.of("UTF-8 declared, ISO-8859-1 bytes", StandardCharsets.UTF_8,
+                        NON_ASCII_JSON.getBytes(StandardCharsets.ISO_8859_1),
+                        "Malformed UTF-8 input at byte offset 38 of the JSON payload", MalformedInputException.class),
+                Arguments.of("windows-1252 declared, its undefined byte 0x81", WINDOWS_1252,
+                        new byte[] {'{', (byte) 0x81, '}'},
+                        "Unmappable windows-1252 input at byte offset 1 of the JSON payload",
+                        UnmappableCharacterException.class),
+                Arguments.of("UTF-16LE declared, an odd byte count", StandardCharsets.UTF_16LE,
+                        new byte[] {'{', 0, '}'}, "Malformed UTF-16LE input at byte offset 2 of the JSON payload",
+                        MalformedInputException.class),
+                Arguments.of("empty bytes", StandardCharsets.ISO_8859_1, new byte[0], "JSON payload is empty", null),
+                Arguments.of("null", StandardCharsets.ISO_8859_1, null, "JSON payload is empty", null),
+                Arguments.of("UTF-16LE whitespace only", StandardCharsets.UTF_16LE,
+                        " \t\r\n".getBytes(StandardCharsets.UTF_16LE), "JSON payload is empty", null),
+                Arguments.of("UTF-8 byte-order mark only", StandardCharsets.UTF_8, bom, "JSON payload is empty", null),
+                // The UTF-16 decoder consumes the byte-order mark itself, so the decoded text is empty.
+                Arguments.of("UTF-16 byte-order mark only", StandardCharsets.UTF_16,
+                        new byte[] {(byte) 0xFE, (byte) 0xFF}, "JSON payload is empty", null),
+                Arguments.of("UTF-16BE byte-order mark and whitespace", StandardCharsets.UTF_16BE,
+                        new byte[] {(byte) 0xFE, (byte) 0xFF, 0, ' '}, "JSON payload is empty", null),
+                Arguments.of("UTF-8 two byte-order marks, only one dropped", StandardCharsets.UTF_8,
+                        utf8("\ufeff\ufeff{}"), "Unexpected character", JsonParseException.class),
+                Arguments.of("trailing content", StandardCharsets.ISO_8859_1, utf8("{} {}"),
+                        "Trailing token (of type START_OBJECT) found after the JSON value", JsonParseException.class),
+                Arguments.of("malformed", StandardCharsets.UTF_16BE,
+                        "{\"employees\": [".getBytes(StandardCharsets.UTF_16BE), "Unexpected end-of-input",
+                        JsonParseException.class),
+                Arguments.of("top-level array", WINDOWS_1252, utf8("[]"),
+                        "Expected a JSON object at the root but found array", null));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidDeclaredInputs")
+    @DisplayName("under a declared charset, undecodable, empty, malformed, trailing or non-object input raises "
+            + "IllegalArgumentException from both methods, with its message and the decoder's or parser's exception "
+            + "as cause")
+    void invalidDeclaredInputIsRejected(String label, Charset charset, byte[] input, String message,
+            Class<? extends Throwable> cause) {
+        assertRejected(assertThatThrownBy(() -> mapper.toXml(input, charset)), message, cause);
+        assertRejected(assertThatThrownBy(() -> mapper.toXmlBytes(input, charset)), message, cause);
     }
 
     @Test

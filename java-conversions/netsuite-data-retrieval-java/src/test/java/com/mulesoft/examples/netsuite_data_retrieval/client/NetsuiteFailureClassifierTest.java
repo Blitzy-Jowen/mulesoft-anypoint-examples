@@ -369,6 +369,27 @@ class NetsuiteFailureClassifierTest {
         assertThat(classifier.upstreamMessage(refused)).isEqualTo(INTERFACE_DEFAULT.upstreamMessage(refused));
     }
 
+    static Stream<Arguments> messagelessTransportFailures() {
+        return Stream.of(
+                arguments(named("read timeout (Netty ReadTimeoutException.INSTANCE)", ReadTimeoutException.INSTANCE),
+                        "NetSuite did not respond in time"),
+                arguments(named("closed connection (ClosedChannelException)", new ClosedChannelException()),
+                        "NetSuite is unreachable"));
+    }
+
+    /**
+     * {@code WebClient}'s request exception copies its cause's message, so over a messageless transport failure no
+     * throwable in the chain carries one: the 503 message then describes the failure and names no class.
+     */
+    @ParameterizedTest
+    @MethodSource("messagelessTransportFailures")
+    void upstreamMessageOfAMessagelessTransportFailureIsANeutralDescription(Throwable cause, String expected) {
+        WebClientRequestException failure = requestException(cause);
+
+        assertThat(failure.getMessage()).isNull();
+        assertThat(classifier.upstreamMessage(failure)).isEqualTo(expected);
+    }
+
     @Test
     void upstreamMessageRejectsNull() {
         assertThatNullPointerException().isThrownBy(() -> classifier.upstreamMessage(null));

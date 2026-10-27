@@ -10,25 +10,34 @@ package com.mulesoft.examples.proxying_a_soap_api.client;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
 import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.MalformedURLException;
+import java.net.ProxySelector;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntPredicate;
 import java.util.regex.Pattern;
 
 import javax.xml.XMLConstants;
@@ -43,8 +52,11 @@ import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
 
+import org.apache.hc.client5.http.ConnectTimeoutException;
+import org.apache.hc.client5.http.HttpHostConnectException;
 import org.apache.hc.client5.http.classic.ExecChain;
 import org.apache.hc.client5.http.classic.ExecRuntime;
+import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.config.TlsConfig;
@@ -53,10 +65,14 @@ import org.apache.hc.client5.http.impl.DefaultRedirectStrategy;
 import org.apache.hc.client5.http.impl.DefaultSchemePortResolver;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.BasicHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.routing.SystemDefaultRoutePlanner;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.protocol.RedirectLocations;
+import org.apache.hc.client5.http.socket.ConnectionSocketFactory;
+import org.apache.hc.client5.http.socket.PlainConnectionSocketFactory;
 import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactoryBuilder;
 import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.http.ClassicHttpResponse;
@@ -65,6 +81,8 @@ import org.apache.hc.core5.http.HttpException;
 import org.apache.hc.core5.http.HttpRequest;
 import org.apache.hc.core5.http.HttpResponse;
 import org.apache.hc.core5.http.ProtocolException;
+import org.apache.hc.core5.http.URIScheme;
+import org.apache.hc.core5.http.config.RegistryBuilder;
 import org.apache.hc.core5.http.io.entity.HttpEntityWrapper;
 import org.apache.hc.core5.http.protocol.HttpContext;
 import org.apache.hc.core5.io.CloseMode;
@@ -84,6 +102,7 @@ import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.Assert;
 import org.springframework.util.StreamUtils;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -108,8 +127,9 @@ import org.xml.sax.helpers.DefaultHandler;
  * handshake, every write of the request body, the wait for the response status and headers, and every wait for
  * response body bytes, so an upstream that stalls at any point, after its headers included, cannot hold the calling
  * thread longer than that. A timeout, a refused connection, a DNS failure or any other I/O failure, one while the
- * response body is read included, surfaces as the {@link org.springframework.web.client.ResourceAccessException}
- * {@link RestClient} throws, and the connection it happened on is discarded.
+ * response body is read included, surfaces as a {@link ResourceAccessException} whose message is
+ * {@code I/O error: <reason>}, for example {@code I/O error: Connection refused}, and never names the upstream URL,
+ * host or address, with the I/O failure as its cause; the connection it happened on is discarded.
  *
  * <p>Connections are pooled without limit, as the Mule requester's default {@code maxConnections} of -1 allowed, are
  * checked before each reuse so that one the upstream has closed is replaced by a new one rather than failing the post,
@@ -126,7 +146,9 @@ import org.xml.sax.helpers.DefaultHandler;
  * A document reached through such an absolute location or key, and every document it reaches, is read resolved: each
  * of its scheme-less locations is replaced as well, by the key of the URL it denotes, so two such documents that spell
  * one relative location alike never share a key. The whole schema closure is thereby served at {@code ?xsd=<key>}
- * with every reference pointing at the proxy.
+ * with every reference pointing at the proxy. Every read of the WSDL or of a schema, an existence probe included, is
+ * exactly one {@code GET} over httpclient5, on a connection of its own and under the same timeout as a post, and a
+ * read that fails is never sent again (see {@link #wsdlResource()}).
  *
  * <p>The original flow logs nothing, adds no authentication and keeps no state, and neither does this class: no
  * cookie, credential or authentication result is kept from one post to the next, and the caller's headers,
@@ -153,6 +175,16 @@ public class ShopServiceClient implements AutoCloseable {
     /** Exchange attribute set once a redirect has left the original request's origin. */
     private static final String LEFT_ORIGIN_ATTRIBUTE = ShopServiceClient.class.getName() + ".leftOrigin";
 
+    /** The message of a failed post, followed by {@code ": "} and the reason where one is usable. */
+    private static final String IO_ERROR = "I/O error";
+
+    /** Where httpclient5's connect failures end the endpoint and its addresses and begin the socket's own text. */
+    private static final String CONNECT_FAILED = " failed: ";
+
+    /** An IPv4 literal, or text in square or angle brackets, the forms in which an address or host name is quoted. */
+    private static final Pattern QUOTED_ADDRESS =
+            Pattern.compile("\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b|\\[[^\\]]*]|<[^>]*>");
+
     private final ResourceLoader resourceLoader;
 
     private final URI upstreamUri;
@@ -176,7 +208,8 @@ public class ShopServiceClient implements AutoCloseable {
      * @param wsdlLocation      location of the upstream WSDL ({@code proxy.wsdl-location})
      * @param responseTimeoutMs in milliseconds, greater than zero: for a post, the limit on the connect, the TLS
      *                          handshake, each request body write, the wait for the response status and headers and
-     *                          every wait for response body bytes; for a WSDL read, the connect and read timeout
+     *                          every wait for response body bytes; for a WSDL or schema read, the limit on the connect,
+     *                          the TLS handshake, the wait for the response head and every wait for body bytes
      *                          ({@code proxy.response-timeout-ms})
      * @throws IllegalArgumentException when an argument is missing, the URL is not an absolute {@code http} or
      *                                  {@code https} URL with a host, or the timeout is not positive, so the
@@ -298,14 +331,26 @@ public class ShopServiceClient implements AutoCloseable {
      * @return the upstream status, its headers, and its body bytes ({@code byte[0]} when it sent none); the
      *         headers are a copy that outlives the exchange, read-only as every {@link ResponseEntity}'s are
      * @throws IllegalArgumentException when {@code headers} or {@code body} is {@code null}
-     * @throws org.springframework.web.client.ResourceAccessException on a timeout, a refused connection, a DNS
-     *                                                                failure, any other I/O failure, or a
-     *                                                                redirect the client refuses to follow, such
-     *                                                                as a circular one
+     * @throws ResourceAccessException  on a timeout, a refused connection, a DNS failure, any other I/O failure, or a
+     *                                  redirect the client refuses to follow, such as a circular one; its message is
+     *                                  {@code I/O error: <reason>}, the transport's own text such as
+     *                                  {@code Connection refused}, {@code Read timed out} or
+     *                                  {@code Unknown host}, or {@code I/O error} alone where that text would name a
+     *                                  location, so it never names the upstream URL, host or address; its cause is
+     *                                  the I/O failure
      */
     public ResponseEntity<byte[]> post(HttpHeaders headers, byte[] body) {
         Assert.notNull(headers, "headers must not be null");
         Assert.notNull(body, "body must not be null");
+        try {
+            return exchange(headers, body);
+        } catch (ResourceAccessException ex) {
+            throw withoutLocation(ex, upstreamUri.getHost());
+        }
+    }
+
+    /** The one exchange of {@link #post(HttpHeaders, byte[])}, failing with {@link RestClient}'s own exception. */
+    private ResponseEntity<byte[]> exchange(HttpHeaders headers, byte[] body) {
         // exchange() rather than retrieve(): its callback runs inside RestClient's I/O handling, so a failure while
         // the response body is read is a ResourceAccessException as well, and the response is closed afterwards.
         return restClient.post()
@@ -321,6 +366,57 @@ public class ShopServiceClient implements AutoCloseable {
                 .exchange((request, response) -> ResponseEntity.status(response.getStatusCode())
                         .headers(response.getHeaders())
                         .body(StreamUtils.copyToByteArray(response.getBody())));
+    }
+
+    /**
+     * The failure {@link #post(HttpHeaders, byte[])} reports for {@code failure}: a {@link ResourceAccessException}
+     * whose message is {@code I/O error: <reason>}, the form a Spring WS client reports an I/O failure in, with the
+     * I/O failure {@code failure} wraps as its cause. {@link RestClient}'s own message quotes the upstream URL, and the
+     * caller's 500 body carries the message.
+     *
+     * <p>The reason is the first usable message on the cause chain, walked from the I/O failure {@link RestClient}
+     * caught towards its root, each cause once: {@code Unknown host} for an {@link UnknownHostException}, whose message
+     * is the host name; for httpclient5's {@link HttpHostConnectException} and {@link ConnectTimeoutException}, whose
+     * messages name the endpoint and its addresses, the socket's own text after {@code failed: }; for any other
+     * failure, its message. A message is usable when it is not blank and names no location: no {@code ://}, no
+     * {@code upstreamHost} in any letter case, no IPv4 literal and no text in square or angle brackets, the forms in
+     * which the JDK and httpclient5 quote addresses and host names. Without a usable message the message is
+     * {@code I/O error} alone. The outermost usable message is taken because it is the most specific: the timeout of
+     * a request body write carries the socket failure the expired deadline caused as its own cause.
+     */
+    static ResourceAccessException withoutLocation(ResourceAccessException failure, String upstreamHost) {
+        String reason = null;
+        Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable cause = failure.getCause(); cause != null && visited.add(cause) && reason == null;
+             cause = cause.getCause()) {
+            reason = usableReason(cause, upstreamHost);
+        }
+        String message = reason != null ? IO_ERROR + ": " + reason : IO_ERROR;
+        return failure.getCause() instanceof IOException io
+                ? new ResourceAccessException(message, io)
+                : new ResourceAccessException(message);
+    }
+
+    /** The reason {@code cause} gives for an I/O failure, or {@code null} when its message is not usable. */
+    private static String usableReason(Throwable cause, String upstreamHost) {
+        if (cause instanceof UnknownHostException) {
+            return "Unknown host";
+        }
+        String message = cause.getMessage();
+        if (message != null
+                && (cause instanceof HttpHostConnectException || cause instanceof ConnectTimeoutException)) {
+            int failed = message.indexOf(CONNECT_FAILED);
+            if (failed >= 0) {
+                message = message.substring(failed + CONNECT_FAILED.length());
+            }
+        }
+        if (message == null || message.isBlank() || message.contains("://")
+                || (upstreamHost != null && message.toLowerCase(Locale.ROOT)
+                        .contains(upstreamHost.toLowerCase(Locale.ROOT)))
+                || QUOTED_ADDRESS.matcher(message).find()) {
+            return null;
+        }
+        return message;
     }
 
     /**
@@ -521,10 +617,15 @@ public class ShopServiceClient implements AutoCloseable {
      * application reads once at start-up to publish it at {@code ?wsdl}, so an unreachable WSDL fails start-up as
      * the CXF deployment did.
      *
-     * <p>For an {@code http} or {@code https} location every connection, the {@code GET} of {@link Resource#exists()}
-     * and of {@link Resource#getInputStream()} alike, has {@code proxy.response-timeout-ms} as connect and read
-     * timeout and is never retried; the schemas it imports through {@link Resource#createRelative(String)} are read
-     * the same way. The resource reads the WSDL as written: its relative reference locations stay as written, and
+     * <p>For an {@code http} or {@code https} location every read, the {@code GET} of {@link Resource#exists()} and of
+     * {@link Resource#getInputStream()} alike, is exactly one {@code GET} over httpclient5 on a connection no other
+     * read shares, with {@code proxy.response-timeout-ms} as connect, TLS handshake and response timeout and as the
+     * limit on every wait for body bytes. A read that fails, by a timeout, a refused or reset connection or an
+     * upstream that closes it without answering, is never sent again, where {@code HttpURLConnection} would silently
+     * send it a second time after a reset or an empty answer. The schemas it imports through
+     * {@link Resource#createRelative(String)} are read the same way.
+     *
+     * <p>The resource reads the WSDL as written: its relative reference locations stay as written, and
      * each absolute {@code http} or {@code https} one is replaced by the key {@code ./<that URL>}, which
      * {@link Resource#createRelative(String)} resolves back to that URL. A schema reached through relative locations
      * only is read the same way. One reached through an absolute location or a key, and every schema it reaches, is
@@ -561,8 +662,17 @@ public class ShopServiceClient implements AutoCloseable {
      * A {@link UrlResource} for an {@code http} or {@code https} WSDL or schema, adapted to {@code WsdlQueryPublisher}.
      *
      * <ul>
-     *   <li>Every connection, the existence probe of {@link #exists()} included, carries the client's connect and
-     *       read timeouts.</li>
+     *   <li>{@link #exists()}, {@link #isReadable()}, {@link #getInputStream()} and {@link #contentLength()} each send
+     *       exactly one {@code GET}, over httpclient5 rather than {@code HttpURLConnection}, on a connection of their
+     *       own that is closed once they return: automatic retries are off, so a timeout, a reset or an upstream
+     *       that closes the connection without answering fails the read instead of sending it again. The connect,
+     *       the TLS handshake, the wait for the response head and every wait for body bytes are bounded by the
+     *       client's timeout, and a read timeout fails with {@link SocketTimeoutException}. As with
+     *       {@code HttpURLConnection}, a redirect is followed only while it keeps its scheme, at most
+     *       {@value #MAX_REDIRECTS} times; the URL's user information travels as {@code Basic} credentials, which a
+     *       redirect carries only while it stays on the URL's origin; the JVM's proxy selector and default TLS
+     *       context apply; and no content encoding is requested, no cookie kept and no authentication challenge
+     *       answered. Any other {@link URLConnection} {@link UrlResource} opens carries the timeouts too.</li>
      *   <li>{@link #getInputStream()} returns the document with its reference locations replaced by keys as its
      *       {@link Mode} prescribes, and {@link #createRelative(String)} resolves a key back to its URL and any other
      *       location as a URI, into this same type in the mode that location calls for, so the adaptation and the
@@ -631,6 +741,9 @@ public class ShopServiceClient implements AutoCloseable {
         /** Rejects errors as well as fatal errors, which {@link DefaultHandler} alone rejects; warnings pass. */
         private static final DefaultHandler REJECTING_ERRORS = new RejectingErrorHandler();
 
+        /** Redirects one read follows at most: {@code HttpURLConnection}'s default {@code http.maxRedirects}. */
+        private static final int MAX_REDIRECTS = 20;
+
         /** How a document's reference locations are replaced by keys; see the class description. */
         enum Mode {
 
@@ -663,25 +776,18 @@ public class ShopServiceClient implements AutoCloseable {
         }
 
         /**
-         * Whether the location answers a {@code GET} with a 2xx status. {@link UrlResource} probes with
-         * {@code HEAD} instead, which the original never sent: CXF read the WSDL and its schemas with {@code GET}
-         * only, and an upstream that refuses {@code HEAD} (405) would make the WSDL look absent and fail start-up.
-         * The probe reads no body and carries the same timeouts; any I/O failure answers {@code false}.
+         * Whether the location answers a {@code GET} with a 2xx status, after any redirect followed.
+         * {@link UrlResource} probes with {@code HEAD} instead, which the original never sent: CXF read the WSDL and
+         * its schemas with {@code GET} only, and an upstream that refuses {@code HEAD} (405) would make the WSDL look
+         * absent and fail start-up. The probe is one {@code GET} under the same timeouts, never sent again, and closes
+         * its connection without reading the body; any other status and any I/O failure, a reset or an empty answer
+         * included, answer {@code false}.
          */
         @Override
         public boolean exists() {
             try {
-                URLConnection con = getURL().openConnection();
-                customizeConnection(con);
-                if (!(con instanceof HttpURLConnection httpCon)) {
-                    return super.exists();
-                }
-                try {
-                    int code = httpCon.getResponseCode();
-                    return code >= HttpURLConnection.HTTP_OK && code < HttpURLConnection.HTTP_MULT_CHOICE;
-                } finally {
-                    httpCon.disconnect();
-                }
+                int status = get(statusCode -> false).status();
+                return status >= HttpURLConnection.HTTP_OK && status < HttpURLConnection.HTTP_MULT_CHOICE;
             } catch (IOException ex) {
                 return false;
             }
@@ -703,9 +809,14 @@ public class ShopServiceClient implements AutoCloseable {
          *
          * <p>A document in which nothing is replaced is returned with its exact bytes, and so is one the hardened
          * parser refuses (not well-formed, or declaring a DOCTYPE), which the publisher then reports itself. A
-         * changed document is serialized as UTF-8 without added indentation.
+         * changed document is serialized as UTF-8 without added indentation. Any status below 400, after any
+         * redirect followed, yields the body it carries, or an empty document when it carries none.
          *
-         * @throws IOException when the document cannot be read, the timeouts included
+         * @throws IOException when the document cannot be read: an I/O failure of the one {@code GET}, which is never
+         *                     sent again, a {@link SocketTimeoutException} when a timeout expires, or, for a status
+         *                     of 400 or above, whose body is not read, a {@link FileNotFoundException} for 404 and
+         *                     410 and an {@link IOException} naming the status otherwise, as
+         *                     {@code HttpURLConnection} reports them, the URL in its diagnostic form
          */
         @Override
         public InputStream getInputStream() throws IOException {
@@ -722,10 +833,7 @@ public class ShopServiceClient implements AutoCloseable {
         }
 
         private byte[] adaptedContent() throws IOException {
-            byte[] upstream;
-            try (InputStream in = super.getInputStream()) {
-                upstream = in.readAllBytes();
-            }
+            byte[] upstream = upstreamContent();
             Document document;
             try {
                 document = parse(upstream);
@@ -747,6 +855,148 @@ public class ShopServiceClient implements AutoCloseable {
                 }
             }
             return replaced ? serialize(document) : upstream;
+        }
+
+        /**
+         * The document's bytes as the upstream sends them, read with one {@code GET}; a status of 400 or above fails
+         * as {@code HttpURLConnection} fails it, without reading its body.
+         */
+        private byte[] upstreamContent() throws IOException {
+            Answer answer = get(statusCode -> statusCode < HttpURLConnection.HTTP_BAD_REQUEST);
+            int status = answer.status();
+            if (status == HttpURLConnection.HTTP_NOT_FOUND || status == HttpURLConnection.HTTP_GONE) {
+                throw new FileNotFoundException(safeUrl());
+            }
+            if (status >= HttpURLConnection.HTTP_BAD_REQUEST) {
+                throw new IOException("Server returned HTTP response code: " + status + " for URL: " + safeUrl());
+            }
+            return answer.body();
+        }
+
+        /**
+         * Sends exactly one {@code GET} of this URL, on a connection of its own that is closed before this returns,
+         * and answers the final status, after any redirect followed, with the body when {@code bodyWanted} accepts
+         * that status. For any other status the connection is closed without reading the body, and the body is
+         * empty. Nothing is ever sent again: no retry, no authentication challenge answered.
+         */
+        private Answer get(IntPredicate bodyWanted) throws IOException {
+            HttpGet request = request();
+            try (CloseableHttpClient client = singleAttemptClient(bodyWanted)) {
+                return client.execute(request, response -> {
+                    HttpEntity entity = response.getEntity();
+                    if (entity == null) {
+                        return new Answer(response.getCode(), new byte[0]);
+                    }
+                    try (InputStream in = entity.getContent()) {
+                        return new Answer(response.getCode(), in.readAllBytes());
+                    }
+                });
+            }
+        }
+
+        /**
+         * The {@code GET} of this URL. Its user information is sent as the {@code Basic} credentials
+         * {@link UrlResource#customizeConnection(URLConnection)} sends for it and left out of the request URI, which
+         * httpclient5 refuses to send with user information; the fragment is never sent.
+         *
+         * @throws IOException when this URL is not a valid request URI; the message names its diagnostic form and
+         *                     the type of the parse failure, and no cause quoting the URL is attached
+         */
+        private HttpGet request() throws IOException {
+            URI uri;
+            HttpGet request;
+            try {
+                uri = getURL().toURI();
+                request = new HttpGet(uri);
+            } catch (URISyntaxException | IllegalArgumentException ex) {
+                throw new IOException("Cannot request " + safeUrl() + ": " + ex.getClass().getName());
+            }
+            String userInfo = getURL().getUserInfo();
+            if (userInfo != null) {
+                request.setHeader(HttpHeaders.AUTHORIZATION,
+                        "Basic " + Base64.getUrlEncoder().encodeToString(userInfo.getBytes()));
+            }
+            if (uri.getRawUserInfo() != null) {
+                request.setAuthority(new URIAuthority(uri.getHost(), uri.getPort()));
+            }
+            return request;
+        }
+
+        /**
+         * A client for one read, closed with it, so its single connection is never reused by another read. It sends
+         * nothing twice: automatic retries are off, and so are authentication, whose challenge would re-send the
+         * request, content compression, which would add {@code Accept-Encoding} and decode the body, cookies and the
+         * auth cache. Its timeouts are the resource's, its TLS context the JVM's default one and its proxy the one
+         * the JVM's {@link ProxySelector} chooses, as for {@code HttpURLConnection}. Redirects keep their scheme and
+         * the cross-origin header policy of {@link ShopServiceClient#post(HttpHeaders, byte[])}; the outermost
+         * element of the chain closes the connection of a final response whose body {@code bodyWanted} refuses
+         * before anything closes the response, which would read the rest of the body first.
+         */
+        private CloseableHttpClient singleAttemptClient(IntPredicate bodyWanted) {
+            Timeout limit = Timeout.of(Duration.ofMillis(timeoutMs));
+            BasicHttpClientConnectionManager connectionManager = new BasicHttpClientConnectionManager(
+                    RegistryBuilder.<ConnectionSocketFactory>create()
+                            .register(URIScheme.HTTP.id, PlainConnectionSocketFactory.getSocketFactory())
+                            .register(URIScheme.HTTPS.id, SSLConnectionSocketFactoryBuilder.create()
+                                    .setSslContext(SSLContexts.createSystemDefault())
+                                    .build())
+                            .build());
+            connectionManager.setConnectionConfig(ConnectionConfig.custom()
+                    .setConnectTimeout(limit)
+                    .setSocketTimeout(limit)
+                    .build());
+            connectionManager.setTlsConfig(TlsConfig.custom().setHandshakeTimeout(limit).build());
+            return HttpClients.custom()
+                    .setConnectionManager(connectionManager)
+                    .setRoutePlanner(new SystemDefaultRoutePlanner(ProxySelector.getDefault()))
+                    .setDefaultRequestConfig(RequestConfig.custom()
+                            .setResponseTimeout(limit)
+                            .setConnectionRequestTimeout(limit)
+                            .setRedirectsEnabled(true)
+                            .setMaxRedirects(MAX_REDIRECTS)
+                            .setAuthenticationEnabled(false)
+                            .build())
+                    .disableAutomaticRetries()
+                    .disableContentCompression()
+                    .disableCookieManagement()
+                    .disableAuthCaching()
+                    .setRedirectStrategy(new SameSchemeRedirectStrategy())
+                    .addExecInterceptorAfter(ChainElement.REDIRECT.name(), "redirect-header-policy",
+                            ShopServiceClient::applyRedirectHeaderPolicy)
+                    .addExecInterceptorFirst("unwanted-body-discard", (request, scope, chain) -> {
+                        ClassicHttpResponse response = chain.proceed(request, scope);
+                        if (!bodyWanted.test(response.getCode())) {
+                            scope.execRuntime.discardEndpoint();
+                            response.setEntity(null);
+                        }
+                        return response;
+                    })
+                    .build();
+        }
+
+        /** The final status of one read and the body it read, empty where it read none. */
+        private record Answer(int status, byte[] body) {
+        }
+
+        /**
+         * httpclient5's redirect rules, except that a redirect is followed only to the scheme of the URL that
+         * answered with it, as {@code HttpURLConnection} follows redirects: one between {@code http} and
+         * {@code https} is returned as received, and nothing is sent to its location.
+         */
+        private static final class SameSchemeRedirectStrategy extends DefaultRedirectStrategy {
+
+            @Override
+            public boolean isRedirected(HttpRequest request, HttpResponse response, HttpContext context)
+                    throws ProtocolException {
+                if (!super.isRedirected(request, response, context)) {
+                    return false;
+                }
+                // A relative Location keeps the scheme of the URL it answers.
+                String targetScheme = createLocationURI(response.getFirstHeader(HttpHeaders.LOCATION).getValue())
+                        .getScheme();
+                return targetScheme == null
+                        || targetScheme.equalsIgnoreCase(NoDowngradeRedirectStrategy.answeredScheme(request, context));
+            }
         }
 
         /**

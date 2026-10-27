@@ -8,6 +8,8 @@
 
 package com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.service;
 
+import java.nio.charset.Charset;
+
 import org.springframework.stereotype.Service;
 
 import com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.client.FtpUploadClient;
@@ -36,14 +38,21 @@ public class EmployeeUploadService {
     /**
      * Converts the posted employees JSON to XML, uploads it as {@link FtpUploadClient#OUTPUT_PATTERN} and returns it.
      *
+     * <p>The transform reads the body with the charset its request declared, the message encoding the Mule listener
+     * set from the {@code Content-Type}, or detects UTF-8, UTF-16 or UTF-32 from the bytes when none was declared; the
+     * XML is UTF-8 either way.
+     *
      * @param json the request body
+     * @param declaredCharset the charset the request's {@code Content-Type} declares, or {@code null} when it declares
+     *                        none
      * @return the uploaded XML bytes, the same array that was stored on the FTP server
-     * @throws IllegalArgumentException when the payload is empty, malformed, or its root is not a JSON object
+     * @throws IllegalArgumentException when the payload cannot be decoded with {@code declaredCharset}, or is empty,
+     *                                  malformed, or its root is not a JSON object
      * @throws IllegalStateException when the FTP settings are missing or the server rejects the upload
      * @throws java.io.UncheckedIOException when the FTP connection or transfer fails
      */
-    public byte[] process(byte[] json) {
-        byte[] xml = employeesXmlMapper.toXmlBytes(json);            // dw:transform-message (upload-to-ftp.xml:9)
+    public byte[] process(byte[] json, Charset declaredCharset) {
+        byte[] xml = employeesXmlMapper.toXmlBytes(json, declaredCharset); // dw:transform-message (upload-to-ftp.xml:9)
         ftpUploadClient.upload(FtpUploadClient.OUTPUT_PATTERN, xml); // ftp:outbound-endpoint (upload-to-ftp.xml:28)
         return xml;                                                  // HTTP response payload is the XML
     }

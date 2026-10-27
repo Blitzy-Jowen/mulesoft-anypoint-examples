@@ -353,11 +353,12 @@ class SalesforceFailureClassifierTest {
                 Arguments.of(named("no fault: the cause's message beneath a wrapper without one",
                         new ConnectionException(null, new SocketTimeoutException("Read timed out"))),
                         "Read timed out"),
-                Arguments.of(named("no message anywhere: the failure's simple class name", new ApiFault()),
-                        "ApiFault"),
-                Arguments.of(named("cyclic chain without a message: the failure's simple class name",
+                Arguments.of(named("no message anywhere: the neutral description, never a class name",
+                        new ApiFault()),
+                        "Salesforce call failed"),
+                Arguments.of(named("cyclic chain without a message: the neutral description, never a class name",
                         cyclic(new ConnectionException(), new ConnectionException())),
-                        "ConnectionException"));
+                        "Salesforce call failed"));
     }
 
     @ParameterizedTest

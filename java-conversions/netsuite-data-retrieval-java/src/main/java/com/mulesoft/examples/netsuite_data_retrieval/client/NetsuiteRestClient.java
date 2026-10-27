@@ -24,6 +24,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongFunction;
 import java.util.stream.Collectors;
@@ -94,8 +96,11 @@ import reactor.netty.http.client.HttpClient;
  * an {@link IllegalStateException}, as does a page without its {@code items} array and boolean {@code hasMore} and a
  * metadata catalog without its {@code properties} object, so a malformed answer never reads as an empty result or
  * enters the cache; no such message carries any part of the body. The class and its public methods are not final,
- * so tests can mock it; one instance serves concurrent requests, its two caches being concurrent maps that live for
- * the application run.
+ * so tests can mock it; one instance serves concurrent requests. Its two caches, the metadata catalogs and the
+ * custom-field sources, live for the application run and hold successful reads only. Concurrent calls that miss the
+ * same entry share one acquisition: the first registers its read and the others wait for that read's result, or
+ * fail with its failure, which nothing caches, so a later call reads again. Entries are never acquired inside a map
+ * computation, so a slow read of one key never holds up another.
  */
 @Component
 public class NetsuiteRestClient {
@@ -183,6 +188,17 @@ public class NetsuiteRestClient {
 
     /** Lower-cased custom field script ID → internal ID of its select source, resolved lookups only. */
     private final ConcurrentHashMap<String, String> customFieldSourceCache = new ConcurrentHashMap<>();
+
+    /** Record type → its metadata catalog read in progress, which concurrent first reads of the type wait for. */
+    private final ConcurrentHashMap<String, CompletableFuture<Map<String, Object>>> metadataReads =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Lower-cased custom field script ID → its source lookup in progress, which concurrent calls needing the ID wait
+     * for; an empty result means the lookup resolved no source.
+     */
+    private final ConcurrentHashMap<String, CompletableFuture<Optional<String>>> customFieldLookups =
+            new ConcurrentHashMap<>();
 
     /**
      * Creates the client. Nothing is read from the {@code netsuite.*} settings here apart from the two timeouts, so
@@ -375,9 +391,11 @@ public class NetsuiteRestClient {
     /**
      * Returns the metadata catalog (JSON schema) of a record type,
      * {@code GET /services/rest/record/v1/metadata-catalog/{type}} with {@code Accept: application/schema+json}. A
-     * successful read is cached for the application run, so each type is read once; a failure is not cached. A read
-     * succeeds only when the body is a JSON object whose {@code properties}, the field definitions, is a JSON object;
-     * no other schema keyword is required.
+     * successful read is cached for the application run, so each type is read once: concurrent first reads of a type
+     * share one request, the calls arriving while it runs waiting for its result. A failure is shared by the calls
+     * waiting on it and is not cached, so a later call reads the type again. A read succeeds only when the body is a
+     * JSON object whose {@code properties}, the field definitions, is a JSON object; no other schema keyword is
+     * required.
      *
      * @param type the REST record type, for example {@code customer}
      * @return the catalog, deeply unmodifiable, because the cached instance is shared by every caller
@@ -386,7 +404,7 @@ public class NetsuiteRestClient {
      *         {@code properties} is missing or not a JSON object (the message names the record type); nothing is
      *         cached then
      * @throws RuntimeException         the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
-     *         unchanged
+     *         unchanged; a call that waited on a concurrent read throws that read's exception
      */
     public Map<String, Object> metadataCatalog(String type) {
         String recordType = requireText(type, "type");
@@ -394,15 +412,44 @@ public class NetsuiteRestClient {
         if (cached != null) {
             return cached;
         }
+        CompletableFuture<Map<String, Object>> read = new CompletableFuture<>();
+        CompletableFuture<Map<String, Object>> running = metadataReads.putIfAbsent(recordType, read);
+        if (running != null) {
+            return await(running);
+        }
+        try {
+            // A read that ended between the cache miss above and this registration has cached the catalog.
+            Map<String, Object> catalog = metadataCache.get(recordType);
+            if (catalog == null) {
+                catalog = readMetadataCatalog(recordType);
+                // Cached before the read is deregistered, so a call registering after it finds it on that re-check.
+                metadataCache.put(recordType, catalog);
+            }
+            read.complete(catalog);
+            return catalog;
+        } catch (Throwable failure) {
+            read.completeExceptionally(failure);
+            throw failure;
+        } finally {
+            metadataReads.remove(recordType, read);
+        }
+    }
+
+    /**
+     * Reads and checks the metadata catalog of a record type in one executor call.
+     *
+     * @return the catalog, deeply unmodifiable
+     * @throws IllegalStateException when the catalog's {@code properties} is missing or not a JSON object, or as
+     *         {@link #metadataCatalog(String)} describes
+     */
+    private Map<String, Object> readMetadataCatalog(String recordType) {
         URI uri = expand(endpoint(METADATA_CATALOG_PATH), Map.of("type", recordType));
         Map<String, Object> parsed = parse(exchange(() -> get(uri, SCHEMA_JSON)));
         if (!(parsed.get(PROPERTIES) instanceof Map<?, ?>)) {
             throw new IllegalStateException("Unexpected NetSuite metadata catalog for record type " + recordType
                     + ": properties is missing or not an object");
         }
-        Map<String, Object> catalog = immutableMap(parsed);
-        Map<String, Object> earlier = metadataCache.putIfAbsent(recordType, catalog);
-        return earlier != null ? earlier : catalog;
+        return immutableMap(parsed);
     }
 
     /**
@@ -483,7 +530,8 @@ public class NetsuiteRestClient {
      *       NetsuiteProperties#customFieldTypeIdOverride(String)}), for a tenant whose catalog exposes the source
      *       differently;</li>
      *   <li>an earlier lookup of this application run;</li>
-     *   <li>one SuiteQL query for all remaining IDs (one per 1000, Oracle's {@code IN} list limit),
+     *   <li>one SuiteQL query for all remaining IDs that no concurrent call is already looking up (one per 1000,
+     *       Oracle's {@code IN} list limit),
      *       {@code SELECT scriptid, fieldvaluetyperecord FROM customfield WHERE UPPER(scriptid) IN ('CUSTENTITY8', ...)},
      *       taking the raw column value: text is trimmed, an integral number is written without a fraction
      *       ({@code 16}, and {@code -30} for a standard transaction source unchanged), any other number in plain
@@ -491,6 +539,12 @@ public class NetsuiteRestClient {
      * </ol>
      * An ID none of them resolves, the lookup returning no row or a null or blank source for it, is absent from the
      * result and is not cached, so the caller can fail naming it; no source ID is ever guessed.
+     *
+     * <p>Concurrent calls never look the same ID up twice at once. A call claims each ID of a batch that no other
+     * call is looking up, right before it queries that batch, and queries only the IDs it claimed; an ID another call
+     * is looking up is waited for once this call's own batches are done, and its result is used as if this call had
+     * looked it up. A resolved ID is therefore read once per application run. A failed lookup fails the call that made
+     * it and every call waiting on its IDs, and caches nothing, so a later call looks those IDs up again.
      *
      * @param scriptIds custom field script IDs, for example {@code custentity8}; {@code null} and blank elements are
      *                  ignored
@@ -500,7 +554,7 @@ public class NetsuiteRestClient {
      *         {@link #suiteQl(String)} requires (a JSON object with an {@code items} array of objects and a boolean
      *         {@code hasMore})
      * @throws RuntimeException      the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
-     *         unchanged
+     *         unchanged; a call that waited on a concurrent lookup throws that lookup's exception
      */
     public Map<String, String> customFieldSourceIds(Collection<String> scriptIds) {
         if (scriptIds == null || scriptIds.isEmpty()) {
@@ -523,17 +577,13 @@ public class NetsuiteRestClient {
                 unresolved.add(id);
             }
         }
+        Map<String, CompletableFuture<Optional<String>>> othersLookups = new LinkedHashMap<>();
         for (int from = 0; from < unresolved.size(); from += MAX_IN_LIST) {
             List<String> batch = unresolved.subList(from, Math.min(from + MAX_IN_LIST, unresolved.size()));
-            Map<String, String> found = lookUpCustomFieldSources(batch);
-            for (String id : batch) {
-                String source = found.get(id);
-                if (source != null) {
-                    String earlier = customFieldSourceCache.putIfAbsent(id, source);
-                    resolved.put(id, earlier != null ? earlier : source);
-                }
-            }
+            lookUpBatch(batch, resolved, othersLookups);
         }
+        // Waited for only now: this call holds no claim any more, so no two calls can wait on each other.
+        othersLookups.forEach((id, lookup) -> await(lookup).ifPresent(source -> resolved.put(id, source)));
         Map<String, String> result = new LinkedHashMap<>();
         for (String id : ids) {
             String source = resolved.get(id);
@@ -542,6 +592,80 @@ public class NetsuiteRestClient {
             }
         }
         return Collections.unmodifiableMap(result);
+    }
+
+    /**
+     * Looks up one batch of uncached script IDs, claiming each one no other call is looking up and querying the
+     * claimed ones in a single {@link #lookUpCustomFieldSources(List)} call; none is queried when every ID is
+     * already claimed or cached. A resolved source is cached before its claim is released, so a call claiming the ID
+     * afterwards finds it in the cache. On a failure every lookup this batch claimed completes with that failure,
+     * which is rethrown, and nothing is cached. The claims are released in every case.
+     *
+     * @param batch         lower-cased script IDs, at most {@link #MAX_IN_LIST}
+     * @param resolved      receives the source of each claimed ID that resolves
+     * @param othersLookups receives the lookup of each ID another call has in progress, for the caller to wait for
+     */
+    private void lookUpBatch(List<String> batch, Map<String, String> resolved,
+            Map<String, CompletableFuture<Optional<String>>> othersLookups) {
+        Map<String, CompletableFuture<Optional<String>>> claimed = new LinkedHashMap<>();
+        try {
+            List<String> toQuery = new ArrayList<>();
+            for (String id : batch) {
+                CompletableFuture<Optional<String>> lookup = new CompletableFuture<>();
+                CompletableFuture<Optional<String>> running = customFieldLookups.putIfAbsent(id, lookup);
+                if (running != null) {
+                    othersLookups.put(id, running);
+                    continue;
+                }
+                claimed.put(id, lookup);
+                // A lookup that ended between this call's cache miss and its claim has cached the source.
+                String cached = customFieldSourceCache.get(id);
+                if (cached != null) {
+                    resolved.put(id, cached);
+                    lookup.complete(Optional.of(cached));
+                } else {
+                    toQuery.add(id);
+                }
+            }
+            Map<String, String> found = toQuery.isEmpty() ? Map.of() : lookUpCustomFieldSources(toQuery);
+            for (String id : toQuery) {
+                String source = found.get(id);
+                if (source != null) {
+                    customFieldSourceCache.put(id, source);
+                    resolved.put(id, source);
+                }
+                claimed.get(id).complete(Optional.ofNullable(source));
+            }
+        } catch (Throwable failure) {
+            claimed.values().forEach(lookup -> lookup.completeExceptionally(failure));
+            throw failure;
+        } finally {
+            claimed.forEach(customFieldLookups::remove);
+        }
+    }
+
+    /**
+     * Waits for an acquisition a concurrent call started and returns its result, or throws its failure: the
+     * exception that call's request raised, the SC-9 upstream exceptions and NetSuite's {@code WebClient*Exception}
+     * included, so it reaches every waiting caller as it reaches that call. The wait is bounded by that call's own
+     * connect and response timeouts.
+     */
+    private static <T> T await(CompletableFuture<T> acquisition) {
+        try {
+            return acquisition.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            if (cause == null) {
+                throw e;
+            }
+            throw new IllegalStateException("NetSuite call failed", cause);
+        }
     }
 
     /**

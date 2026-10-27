@@ -61,7 +61,9 @@ import org.springframework.web.reactive.function.client.WebClient;
  * {@link #evict()} plus one retry and a timeout or connectivity failure into a 503 with no retry.
  *
  * <p>Neither the assertion, the token, the key nor the token response body is ever logged or placed in an exception
- * message; logs name only the token URL and the expiry instant.
+ * message; logs name only the token URL, the expiry instant and, when the private key cannot be loaded, its
+ * configured location and the cause. A key-loading failure's message names the setting and the problem but not the
+ * location or a Java class, because the message reaches the caller in the 500 body.
  */
 @Component
 public class NetsuiteTokenProvider {
@@ -246,21 +248,21 @@ public class NetsuiteTokenProvider {
 
     /**
      * Reads an unencrypted PKCS#8 PEM RSA private key from a file path or a {@code classpath:} location. Error
-     * messages name the key and the configured location, never the file content.
+     * messages name the key and the problem only, never the configured location, a Java class name or the file
+     * content, because the unhandled-exception 500 returns the message to the caller; the location and the cause's
+     * class and message are logged at ERROR for the operator instead, and the cause stays on the exception.
      */
     private static PrivateKey loadPrivateKey(String location) {
         String pem = readKeyText(location);
         if (pem.contains(PKCS1_BEGIN)) {
-            throw new IllegalStateException(PRIVATE_KEY_PATH_KEY + " points to a PKCS#1 key; NetSuite client"
-                    + " assertions need PKCS#8 — convert with: openssl pkcs8 -topk8 -nocrypt -in key.pem"
-                    + " -out key-pkcs8.pem");
+            throw keyLoadFailure(location, "points to a PKCS#1 key; NetSuite client assertions need PKCS#8 —"
+                    + " convert with: openssl pkcs8 -topk8 -nocrypt -in key.pem -out key-pkcs8.pem", null);
         }
         int begin = pem.indexOf(PKCS8_BEGIN);
         int end = begin < 0 ? -1 : pem.indexOf(PKCS8_END, begin + PKCS8_BEGIN.length());
         if (begin < 0 || end < 0) {
-            throw new IllegalStateException(PRIVATE_KEY_PATH_KEY + " (" + location
-                    + ") is not an unencrypted PKCS#8 PEM private key: expected a block between "
-                    + PKCS8_BEGIN + " and " + PKCS8_END);
+            throw keyLoadFailure(location, "is not an unencrypted PKCS#8 PEM private key: expected a block between "
+                    + PKCS8_BEGIN + " and " + PKCS8_END, null);
         }
         String base64 = pem.substring(begin + PKCS8_BEGIN.length(), end).replaceAll("\\s", "");
         PrivateKey key;
@@ -268,14 +270,12 @@ public class NetsuiteTokenProvider {
             byte[] der = Base64.getDecoder().decode(base64);
             key = KeyFactory.getInstance("RSA").generatePrivate(new PKCS8EncodedKeySpec(der));
         } catch (IllegalArgumentException | GeneralSecurityException e) {
-            throw new IllegalStateException(PRIVATE_KEY_PATH_KEY + " (" + location
-                    + ") does not hold a valid PKCS#8 RSA private key", e);
+            throw keyLoadFailure(location, "does not hold a valid PKCS#8 RSA private key", e);
         }
         // Checked here so the failure names the setting; RSASSASigner would otherwise reject it with a bare message.
         if (key instanceof RSAPrivateKey rsa && rsa.getModulus().bitLength() < MIN_RSA_KEY_BITS) {
-            throw new IllegalStateException(PRIVATE_KEY_PATH_KEY + " (" + location + ") holds an RSA key of "
-                    + rsa.getModulus().bitLength() + " bits; PS256 client assertions need at least "
-                    + MIN_RSA_KEY_BITS + " bits");
+            throw keyLoadFailure(location, "holds an RSA key of " + rsa.getModulus().bitLength()
+                    + " bits; PS256 client assertions need at least " + MIN_RSA_KEY_BITS + " bits", null);
         }
         return key;
     }
@@ -286,8 +286,7 @@ public class NetsuiteTokenProvider {
             if (location.startsWith(CLASSPATH_PREFIX)) {
                 String resource = location.substring(CLASSPATH_PREFIX.length()).trim();
                 if (resource.isEmpty()) {
-                    throw new IllegalStateException(PRIVATE_KEY_PATH_KEY + " (" + location
-                            + ") names no classpath resource");
+                    throw keyLoadFailure(location, "names no classpath resource", null);
                 }
                 try (InputStream in = new ClassPathResource(resource).getInputStream()) {
                     bytes = in.readAllBytes();
@@ -299,9 +298,30 @@ public class NetsuiteTokenProvider {
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | IllegalArgumentException e) {
             // IllegalArgumentException covers InvalidPathException for a malformed file path.
-            throw new IllegalStateException(PRIVATE_KEY_PATH_KEY + " (" + location
-                    + ") could not be read: " + e.getClass().getSimpleName(), e);
+            throw keyLoadFailure(location, "could not be read", e);
         }
+    }
+
+    /**
+     * Logs a private-key loading failure in one ERROR line with the configured location and, when there is one, the
+     * cause's class and message (for an I/O failure, the path), and returns the exception to throw. Its message is
+     * {@code netsuite.oauth.private-key-path <problem>}, which names neither the location nor a Java class, since
+     * it reaches the caller.
+     *
+     * @param location the configured {@code netsuite.oauth.private-key-path}
+     * @param problem  what is wrong with the key, free of the location and of the key content
+     * @param cause    the failure behind it, kept as the exception's cause, or {@code null}
+     */
+    private static IllegalStateException keyLoadFailure(String location, String problem, Throwable cause) {
+        String message = PRIVATE_KEY_PATH_KEY + " " + problem;
+        if (cause == null) {
+            LOG.error("{} (configured location: {})", message, location);
+            return new IllegalStateException(message);
+        }
+        // Class and message are passed as text, so the line carries no stack trace.
+        LOG.error("{} (configured location: {}; cause: {}: {})", message, location, cause.getClass().getName(),
+                cause.getMessage());
+        return new IllegalStateException(message, cause);
     }
 
     private JsonNode parse(String body) {

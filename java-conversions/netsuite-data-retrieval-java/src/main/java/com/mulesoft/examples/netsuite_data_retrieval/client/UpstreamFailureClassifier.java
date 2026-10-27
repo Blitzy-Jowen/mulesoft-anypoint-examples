@@ -106,12 +106,23 @@ public interface UpstreamFailureClassifier {
      *
      * <p>The cause chain is walked from {@code failure} itself, visiting each throwable once even when the chain
      * contains a cycle, and the first message that is neither {@code null} nor blank is returned exactly as the
-     * vendor wrote it, untrimmed. When no throwable in the chain carries a message, the simple class name of
-     * {@code failure} is returned (its full class name for an anonymous class, whose simple name is empty), so the
-     * caller never receives a blank message.
+     * vendor wrote it, untrimmed. When no throwable in the chain carries a message, a neutral description that names
+     * the upstream by its {@link UpstreamSystem#displayName()} is returned instead, so the caller never receives a
+     * blank message and the caller-facing body never names an internal class:
+     * <ul>
+     *   <li>{@code "<upstream> did not respond in time"} when the chain holds a timeout: a
+     *       {@link SocketTimeoutException}, an {@link HttpTimeoutException} (including
+     *       {@code HttpConnectTimeoutException}) or Netty's {@code ReadTimeoutException}, matched by
+     *       {@link #NETTY_READ_TIMEOUT_EXCEPTION} on its class or a superclass;</li>
+     *   <li>{@code "<upstream> is unreachable"} for any other failure {@link #isUnavailable} accepts;</li>
+     *   <li>{@code "<upstream> call failed"} for every other failure.</li>
+     * </ul>
+     * The description states no duration, because each vendor's timeouts are configurable. Should {@link #system()}
+     * break its contract and return {@code null}, the upstream is named {@code "The upstream system"}.
      *
      * @param failure the classified throwable; never {@code null}
-     * @return the first non-blank message in the cause chain, or the failure's class name when there is none
+     * @return the first non-blank message in the cause chain, or the neutral description when there is none; never
+     *         {@code null} or blank
      * @throws NullPointerException if {@code failure} is {@code null}
      */
     default String upstreamMessage(Throwable failure) {
@@ -123,8 +134,7 @@ public interface UpstreamFailureClassifier {
                 return message;
             }
         }
-        String simpleName = failure.getClass().getSimpleName();
-        return simpleName.isEmpty() ? failure.getClass().getName() : simpleName;
+        return neutralDescription(system(), failure);
     }
 
     /**
@@ -200,6 +210,61 @@ public interface UpstreamFailureClassifier {
                     NETTY_PREMATURE_CHANNEL_CLOSURE_EXCEPTION, NETTY_NATIVE_IO_EXCEPTION -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Describes a failure whose cause chain carries no message, naming the upstream and what went wrong but no
+     * internal type, as {@link #upstreamMessage} documents.
+     *
+     * @param system  the upstream to name; {@code null} names it {@code "The upstream system"}
+     * @param failure the classified throwable; never {@code null}
+     * @return the timeout, unreachable or generic description of {@link #upstreamMessage}
+     */
+    private static String neutralDescription(UpstreamSystem system, Throwable failure) {
+        String name = system == null ? "The upstream system" : system.displayName();
+        if (holdsTimeout(failure)) {
+            return name + " did not respond in time";
+        }
+        if (isUnavailable(failure)) {
+            return name + " is unreachable";
+        }
+        return name + " call failed";
+    }
+
+    /**
+     * Tells whether the throwable itself or any throwable in its cause chain is a timeout. The walk visits each
+     * throwable once, so it terminates on a cyclic cause chain.
+     *
+     * @param failure the throwable to inspect; never {@code null}
+     * @return {@code true} when the cause chain holds a timeout of {@link #upstreamMessage}
+     */
+    private static boolean holdsTimeout(Throwable failure) {
+        Set<Throwable> visited = newIdentitySet();
+        for (Throwable current = failure; current != null && visited.add(current); current = current.getCause()) {
+            if (isTimeout(current)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Tests one throwable, without its causes, against the timeout types of {@link #isUnavailable}.
+     *
+     * @param throwable the throwable to test; never {@code null}
+     * @return {@code true} for a {@link SocketTimeoutException}, an {@link HttpTimeoutException} or a throwable whose
+     *         class or a superclass is named {@link #NETTY_READ_TIMEOUT_EXCEPTION}
+     */
+    private static boolean isTimeout(Throwable throwable) {
+        if (throwable instanceof SocketTimeoutException || throwable instanceof HttpTimeoutException) {
+            return true;
+        }
+        for (Class<?> type = throwable.getClass(); type != null; type = type.getSuperclass()) {
+            if (NETTY_READ_TIMEOUT_EXCEPTION.equals(type.getName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

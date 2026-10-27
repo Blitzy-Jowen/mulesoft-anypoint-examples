@@ -44,7 +44,9 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.Up
  *   <li>the session the connector then used for {@code sfdc:query}: this class is the
  *       {@link SalesforcePartnerClient.SessionSource} that switches the Partner API client to session mode, and
  *       {@link #refresh()} renews an expired session with the {@code refresh_token} grant, the re-authentication step
- *       the upstream executor runs once after Salesforce rejects the session.</li>
+ *       the upstream executor runs once after Salesforce rejects the session. The client reads {@link #current()} on
+ *       every Partner API call, so a newly completed grant takes effect on the next call, the callback's own query
+ *       included, without a refresh.</li>
  * </ul>
  *
  * <p>The HTTP token requests live in {@link SalesforceTokenClient}; the redirect and the 200 answer are written by the
@@ -84,8 +86,8 @@ public class SalesforceOAuthService implements SalesforcePartnerClient.SessionSo
 
     /**
      * Creates the service. There is no construction cycle with {@link SalesforcePartnerClient}: the client receives
-     * this {@link SalesforcePartnerClient.SessionSource} through an {@code ObjectProvider}, resolved at its first
-     * connection.
+     * this {@link SalesforcePartnerClient.SessionSource} through an {@code ObjectProvider}, resolved at each of its
+     * calls rather than at construction.
      *
      * @param properties          the consumer key, the authorization URL and the callback settings
      * @param tokenClient         the client of the Salesforce token endpoint
@@ -248,7 +250,9 @@ public class SalesforceOAuthService implements SalesforcePartnerClient.SessionSo
     /**
      * Renews the session with the {@code refresh_token} grant after Salesforce rejected it. The new access token is
      * stored; the refresh token and instance URL are kept unless the response supplies new ones (Salesforce normally
-     * returns no refresh token on this grant).
+     * returns no refresh token on this grant). A grant that {@link #completeAuthorization(String, String, String)}
+     * stored while the exchange was in flight is never overwritten: the renewed token is discarded and the session of
+     * that newer grant is returned, so the retry runs under it.
      *
      * <p>Failures:
      * <ul>
@@ -260,7 +264,7 @@ public class SalesforceOAuthService implements SalesforcePartnerClient.SessionSo
      *   <li>a checked failure: wrapped in an {@link IllegalStateException}, the token kept.</li>
      * </ul>
      *
-     * @return the renewed session
+     * @return the renewed session, or the session of a grant completed during the exchange
      * @throws UpstreamAuthenticationException if the session cannot be renewed by refresh
      */
     @Override
@@ -292,7 +296,10 @@ public class SalesforceOAuthService implements SalesforcePartnerClient.SessionSo
         StoredToken renewed = new StoredToken(accessToken,
                 isBlank(response.refresh_token()) ? stored.refreshToken() : response.refresh_token(),
                 isBlank(response.instance_url()) ? stored.instanceUrl() : response.instance_url());
-        token.set(renewed);
+        if (!token.compareAndSet(stored, renewed)) {
+            LOG.info("Salesforce authorization completed during the token refresh; the newer token is kept");
+            return current();
+        }
         LOG.info("Salesforce access token refreshed");
         return toSession(renewed);
     }

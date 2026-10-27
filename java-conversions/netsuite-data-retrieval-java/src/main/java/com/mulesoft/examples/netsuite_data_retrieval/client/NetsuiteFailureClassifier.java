@@ -110,7 +110,8 @@ public class NetsuiteFailureClassifier implements UpstreamFailureClassifier {
      * falls back to the inherited lookup.
      *
      * @param failure the classified throwable; never {@code null}
-     * @return NetSuite's error text, or the first non-blank message or class name of the chain
+     * @return NetSuite's error text, or the first non-blank message of the chain, or the inherited neutral
+     *         description when the chain carries none
      * @throws NullPointerException if {@code failure} is {@code null}
      */
     @Override

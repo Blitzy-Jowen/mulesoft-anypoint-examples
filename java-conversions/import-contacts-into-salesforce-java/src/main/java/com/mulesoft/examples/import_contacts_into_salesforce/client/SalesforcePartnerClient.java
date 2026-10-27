@@ -51,7 +51,9 @@ import com.sforce.ws.bind.XmlObject;
  *       supplies are used as they are and no {@code login} request is made.</li>
  * </ul>
  * The connection is created lazily on the first call and cached, so the application starts with every
- * {@code sfdc.*} secret empty and nothing connects at startup.
+ * {@code sfdc.*} secret empty and nothing connects at startup. In session mode the source is consulted on every call,
+ * and the cached connection is rebuilt, without a {@link SessionSource#refresh() refresh}, whenever the session it
+ * returns differs from the one the connection was built from (for example after a new authorization).
  *
  * <p>Every vendor call, the lazy login included, runs inside
  * {@link UpstreamCallExecutor#call(UpstreamSystem, UpstreamCall, UpstreamAction)} with {@link #reauthenticate()} as
@@ -104,7 +106,7 @@ public class SalesforcePartnerClient {
 
     private final ObjectProvider<SessionSource> sessionSourceProvider;
 
-    private final AtomicReference<PartnerConnection> connectionRef = new AtomicReference<>();
+    private final AtomicReference<CachedConnection> connectionRef = new AtomicReference<>();
 
     private final Object lock = new Object();
 
@@ -138,7 +140,11 @@ public class SalesforcePartnerClient {
     public interface SessionSource {
 
         /**
-         * @return the session to use for a new connection
+         * Supplies the session the next call runs under. The client consults it on every call and rebuilds its cached
+         * connection, without a {@link #refresh()}, when the session differs from the one that connection was built
+         * from, for example after a new authorization.
+         *
+         * @return the session to use for the call
          * @throws Exception when no session can be supplied, for example because no user has authorized yet
          */
         Session current() throws Exception;
@@ -166,6 +172,15 @@ public class SalesforcePartnerClient {
             return "Session[sessionId=" + (sessionId == null ? "<unset>" : "****")
                     + ", serviceEndpoint=" + serviceEndpoint + "]";
         }
+    }
+
+    /**
+     * The cached connection with the session it was built from, against which session mode checks every call.
+     *
+     * @param connection the connection
+     * @param session    the session the connection carries, or {@code null} in login mode
+     */
+    private record CachedConnection(PartnerConnection connection, Session session) {
     }
 
     /**
@@ -271,39 +286,82 @@ public class SalesforcePartnerClient {
     public void reauthenticate() throws Exception {
         synchronized (lock) {
             connectionRef.set(null);
-            connectionRef.set(createConnection(true));
+            SessionSource source = sessionSource();
+            Session session = source == null ? null : validated(source.refresh());
+            connectionRef.set(new CachedConnection(createConnection(session), session));
         }
     }
 
     /**
-     * Returns the cached connection, creating it on first use. Called only inside the lambdas handed to the
-     * executor, so a failed lazy login is classified like any other vendor failure.
+     * Returns the connection for one call. Login mode returns the cached connection, creating it on first use.
+     * Session mode reads {@link SessionSource#current()} once and returns the cached connection only when it was
+     * built from that same session; otherwise it builds one from that session and caches it in its place. Called only
+     * inside the lambdas handed to the executor, so a failed lazy login is classified like any other vendor failure.
      *
      * @return the connection
-     * @throws Exception the vendor's or the session source's exception, unwrapped
+     * @throws IllegalStateException if the session source returns no session, or one without a session ID or service
+     *                               endpoint
+     * @throws Exception             the vendor's or the session source's exception, unwrapped
      */
     PartnerConnection connection() throws Exception {
-        PartnerConnection current = connectionRef.get();
-        if (current != null) {
-            return current;
+        SessionSource source = sessionSource();
+        if (source == null) {
+            CachedConnection cached = connectionRef.get();
+            if (cached != null) {
+                return cached.connection();
+            }
+            synchronized (lock) {
+                cached = connectionRef.get();
+                if (cached == null) {
+                    cached = new CachedConnection(createConnection(null), null);
+                    connectionRef.set(cached);
+                }
+                return cached.connection();
+            }
+        }
+        Session session = validated(source.current());
+        CachedConnection cached = connectionRef.get();
+        if (cached != null && session.equals(cached.session())) {
+            return cached.connection();
         }
         synchronized (lock) {
-            current = connectionRef.get();
-            if (current == null) {
-                current = createConnection(false);
-                connectionRef.set(current);
+            cached = connectionRef.get();
+            if (cached == null || !session.equals(cached.session())) {
+                cached = new CachedConnection(createConnection(session), session);
+                connectionRef.set(cached);
             }
-            return current;
+            return cached.connection();
         }
+    }
+
+    /**
+     * @return the {@link SessionSource} bean that selects session mode, or {@code null} for login mode
+     */
+    private SessionSource sessionSource() {
+        return sessionSourceProvider == null ? null : sessionSourceProvider.getIfAvailable();
+    }
+
+    /**
+     * Checks a session the {@link SessionSource} supplied before a connection is built from it.
+     *
+     * @param session the session returned by {@link SessionSource#current()} or {@link SessionSource#refresh()}
+     * @return {@code session}
+     * @throws IllegalStateException if {@code session} is {@code null} or its session ID or service endpoint is
+     *                               blank
+     */
+    private static Session validated(Session session) {
+        if (session == null || isBlank(session.sessionId()) || isBlank(session.serviceEndpoint())) {
+            throw new IllegalStateException("Salesforce SessionSource returned no session");
+        }
+        return session;
     }
 
     /**
      * Builds a connection from a fresh {@link ConnectorConfig}.
      *
-     * @param refresh in session mode, whether to renew the session rather than read the current one
+     * @param session in session mode, the validated session to connect with; {@code null} selects login mode
      */
-    private PartnerConnection createConnection(boolean refresh) throws Exception {
-        SessionSource source = sessionSourceProvider == null ? null : sessionSourceProvider.getIfAvailable();
+    private PartnerConnection createConnection(Session session) throws Exception {
         ConnectorConfig config = new ConnectorConfig();
         // Always set explicitly: when it is unset, Connector.newConnection falls back to Connector.END_POINT, which
         // in force-partner-api 65.0.0 is an internal Salesforce test host rather than login.salesforce.com.
@@ -316,11 +374,7 @@ public class SalesforcePartnerClient {
         // executor after exactly one request and are never retried.
         config.setUseChunkedPost(true);
         String mode;
-        if (source != null) {
-            Session session = refresh ? source.refresh() : source.current();
-            if (session == null || isBlank(session.sessionId()) || isBlank(session.serviceEndpoint())) {
-                throw new IllegalStateException("Salesforce SessionSource returned no session");
-            }
+        if (session != null) {
             config.setSessionId(session.sessionId());
             config.setServiceEndpoint(session.serviceEndpoint());
             config.setManualLogin(true);

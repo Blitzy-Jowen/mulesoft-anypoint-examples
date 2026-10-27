@@ -3,6 +3,7 @@ package com.mulesoft.examples.get_customer_list_from_netsuite.client;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
+import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.delete;
 import static com.github.tomakehurst.wiremock.client.WireMock.deleteRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
@@ -25,6 +26,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.get_customer_list_from_netsuite.config.NetsuiteProperties;
@@ -53,11 +55,20 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -87,9 +98,10 @@ import reactor.netty.http.client.HttpClientConfig;
  * 2.0 token endpoint, with the real {@link NetsuiteTokenProvider} (signing its client assertion with an RSA key
  * generated per run), the real SC-9 executor and the real NetSuite classifier, so the tests need no account and no
  * credential. They cover SuiteQL paging, the record API, the metadata catalog and the custom-field source lookup of
- * AAP 0.7.4, SuiteQL literal escaping (AAP 0.4.10), every failure classification of AAP 0.4.8 as the client drives
- * it, counting the token and API requests each one makes, the {@link NetsuiteProperties} defaults, and the start-up
- * of the client with every {@code application.yml} placeholder empty.
+ * AAP 0.7.4 with their caches (concurrent first reads sharing one request included), SuiteQL literal escaping (AAP
+ * 0.4.10), every failure classification of AAP 0.4.8 as the client drives it, counting the token and API requests each
+ * one makes, the {@link NetsuiteProperties} defaults, and the start-up of the client with every {@code application.yml}
+ * placeholder empty.
  *
  * <p>{@code netsuite-data-retrieval-java} carries this class with the client, changing only the package line and
  * the import prefix.
@@ -111,6 +123,32 @@ class NetsuiteRestClientTest {
 
     private static final String CUSTOM_FIELD_QUERY_PREFIX =
             "SELECT scriptid, fieldvaluetyperecord FROM customfield WHERE UPPER(scriptid) IN ";
+
+    /** Callers the concurrency tests release together. */
+    private static final int CONCURRENT_CALLERS = 8;
+
+    /**
+     * The delay of the stub the concurrency tests' callers share: long enough that every released caller starts its
+     * call while the first caller's request is still in flight, on a loaded build host too.
+     */
+    private static final int IN_FLIGHT_DELAY_MILLIS = 1500;
+
+    /** The read timeout of the concurrency tests' client, well above {@link #IN_FLIGHT_DELAY_MILLIS}. */
+    private static final Duration PATIENT_READ_TIMEOUT = Duration.ofSeconds(10);
+
+    /** The longest a concurrency test waits for its callers, so a regression fails the test instead of hanging it. */
+    private static final Duration CALLER_TIMEOUT = Duration.ofSeconds(30);
+
+    /**
+     * A {@code customfield} lookup page holding a row for every script ID of the concurrency tests, whatever the query
+     * asked for; the overridden {@code custentity5}'s row differs from its override.
+     */
+    private static final String CONCURRENT_LOOKUP_PAGE = """
+            {"count": 4, "hasMore": false, "items": [
+             {"scriptid": "CUSTENTITY8", "fieldvaluetyperecord": 16},
+             {"scriptid": "CUSTENTITY7", "fieldvaluetyperecord": 17},
+             {"scriptid": "CUSTENTITY6", "fieldvaluetyperecord": 15},
+             {"scriptid": "CUSTENTITY5", "fieldvaluetyperecord": 5}]}""";
 
     /** NetSuite's REST error format, as NetSuite answers an invalid SuiteQL query. */
     private static final String BAD_REQUEST_BODY = """
@@ -199,6 +237,45 @@ class NetsuiteRestClientTest {
         assertThat(netsuite.findAll(anyRequestedFor(anyUrl())))
                 .filteredOn(request -> !request.getUrl().startsWith(TOKEN))
                 .hasSize(1);
+    }
+
+    /** The result or the failure of one call made by {@link #callTogether(List)}. */
+    private record Outcome<T>(T value, Throwable failure) { }
+
+    /**
+     * Makes every call on its own thread of a bounded pool, releasing all of them at once after each thread has
+     * started, and returns their outcomes in call order. Every wait is bounded by {@link #CALLER_TIMEOUT}.
+     */
+    private static <T> List<Outcome<T>> callTogether(List<Callable<T>> calls) throws Exception {
+        ExecutorService callers = Executors.newFixedThreadPool(calls.size());
+        try {
+            CountDownLatch started = new CountDownLatch(calls.size());
+            CountDownLatch release = new CountDownLatch(1);
+            List<Future<T>> pending = new ArrayList<>();
+            for (Callable<T> call : calls) {
+                pending.add(callers.submit(() -> {
+                    started.countDown();
+                    if (!release.await(CALLER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                        throw new IllegalStateException("the callers were never released");
+                    }
+                    return call.call();
+                }));
+            }
+            assertThat(started.await(CALLER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)).as("every caller started")
+                    .isTrue();
+            release.countDown();
+            List<Outcome<T>> outcomes = new ArrayList<>();
+            for (Future<T> call : pending) {
+                try {
+                    outcomes.add(new Outcome<>(call.get(CALLER_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), null));
+                } catch (ExecutionException e) {
+                    outcomes.add(new Outcome<>(null, e.getCause()));
+                }
+            }
+            return outcomes;
+        } finally {
+            callers.shutdownNow();
+        }
     }
 
     // ---------------------------------------------------------------------------------------------- SuiteQL
@@ -566,6 +643,48 @@ class NetsuiteRestClientTest {
                 Arguments.of("{\"type\": \"object\", \"properties\": \"custentity8\"}", noProperties));
     }
 
+    @Test
+    void concurrentFirstReadsOfAMetadataCatalogShareOneRequest() throws Exception {
+        props.setReadTimeout(PATIENT_READ_TIMEOUT);
+        NetsuiteRestClient patient = newClient(props);
+        netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG))
+                .willReturn(okJson("{\"type\": \"object\", \"properties\": {}}")
+                        .withFixedDelay(IN_FLIGHT_DELAY_MILLIS)));
+        Callable<Map<String, Object>> read = () -> patient.metadataCatalog("customer");
+
+        List<Outcome<Map<String, Object>>> outcomes = callTogether(Collections.nCopies(CONCURRENT_CALLERS, read));
+
+        assertThat(outcomes).extracting(Outcome::failure).containsOnlyNulls();
+        Map<String, Object> catalog = outcomes.get(0).value();
+        assertThat(catalog).containsEntry("type", "object");
+        assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome.value()).isSameAs(catalog));
+        netsuite.verify(1, getRequestedFor(urlEqualTo(CUSTOMER_CATALOG)));
+        assertOneTokenRequestAndOneCall();
+    }
+
+    @Test
+    void concurrentFirstReadsOfAMetadataCatalogShareOneFailureWhichIsNotCached() throws Exception {
+        props.setReadTimeout(PATIENT_READ_TIMEOUT);
+        NetsuiteRestClient patient = newClient(props);
+        netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG)).willReturn(aResponse().withStatus(500)
+                .withFixedDelay(IN_FLIGHT_DELAY_MILLIS)));
+        Callable<Map<String, Object>> read = () -> patient.metadataCatalog("customer");
+
+        List<Outcome<Map<String, Object>>> outcomes = callTogether(Collections.nCopies(CONCURRENT_CALLERS, read));
+
+        // Every caller fails as a single caller does, from the one request, which no caller repeats.
+        assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome.failure())
+                .isInstanceOf(WebClientResponseException.InternalServerError.class));
+        netsuite.verify(1, getRequestedFor(urlEqualTo(CUSTOMER_CATALOG)));
+        assertOneTokenRequestAndOneCall();
+
+        // Newer than the failing stub, so it answers the later read, which the failure did not stop.
+        netsuite.stubFor(get(urlEqualTo(CUSTOMER_CATALOG))
+                .willReturn(okJson("{\"type\": \"object\", \"properties\": {}}")));
+        assertThat(patient.metadataCatalog("customer")).containsEntry("type", "object");
+        netsuite.verify(2, getRequestedFor(urlEqualTo(CUSTOMER_CATALOG)));
+    }
+
 
     // -------------------------------------------------------------------------- Custom-field source lookup
 
@@ -648,6 +767,118 @@ class NetsuiteRestClientTest {
 
     static Stream<List<String>> scriptIdsNeedingNoLookup() {
         return Stream.of(null, List.of(), Arrays.asList(" ", null, ""), List.of("custentity8"));
+    }
+
+    /**
+     * Concurrent calls over shared script IDs query each ID once between them, with no call waiting on another
+     * forever (the reversed sets make each call claim an ID the other needs first), and the overridden
+     * {@code custentity5} is never queried; every call gets its own IDs' sources in its own order.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("concurrentScriptIdSets")
+    void concurrentLookupsQueryEachScriptIdOnceAndKeepOverridesFirst(String name, List<String> firstHalf,
+            List<String> secondHalf) throws Exception {
+        props.setCustomFieldTypeIds(Map.of("custentity5", "55"));
+        props.setReadTimeout(PATIENT_READ_TIMEOUT);
+        NetsuiteRestClient patient = newClient(props);
+        stubEveryCustomFieldLookup(okJson(CONCURRENT_LOOKUP_PAGE).withFixedDelay(IN_FLIGHT_DELAY_MILLIS));
+        List<List<String>> callerIds = new ArrayList<>(Collections.nCopies(CONCURRENT_CALLERS / 2, firstHalf));
+        callerIds.addAll(Collections.nCopies(CONCURRENT_CALLERS / 2, secondHalf));
+        List<Callable<Map<String, String>>> calls = new ArrayList<>();
+        callerIds.forEach(ids -> calls.add(() -> patient.customFieldSourceIds(ids)));
+
+        List<Outcome<Map<String, String>>> outcomes = callTogether(calls);
+
+        Map<String, String> expected = Map.of("custentity8", "16", "custentity7", "17", "custentity6", "15",
+                "custentity5", "55");
+        for (int caller = 0; caller < outcomes.size(); caller++) {
+            Outcome<Map<String, String>> outcome = outcomes.get(caller);
+            assertThat(outcome.failure()).isNull();
+            assertThat(new ArrayList<>(outcome.value().entrySet())).containsExactlyElementsOf(callerIds.get(caller)
+                    .stream()
+                    .map(id -> id.toLowerCase(Locale.ROOT))
+                    .map(id -> Map.entry(id, expected.get(id)))
+                    .toList());
+        }
+        // Each ID the callers need is queried once between them; the overridden one never.
+        Map<String, Integer> lookups = new LinkedHashMap<>();
+        callerIds.forEach(ids -> ids.forEach(id -> lookups.put(id.toUpperCase(Locale.ROOT), 1)));
+        lookups.put("CUSTENTITY5", 0);
+        assertLookupsPerScriptId(lookups);
+    }
+
+    static Stream<Arguments> concurrentScriptIdSets() {
+        return Stream.of(
+                Arguments.of("identical", List.of("custentity8", "custentity7", "custentity5"),
+                        List.of("CustEntity8", "custentity7", "custentity5")),
+                Arguments.of("overlapping", List.of("custentity8", "custentity7", "custentity5"),
+                        List.of("CUSTENTITY7", "custentity6", "custentity5")),
+                Arguments.of("reversed", List.of("custentity8", "custentity7", "custentity6", "custentity5"),
+                        List.of("custentity5", "CUSTENTITY6", "custentity7", "custentity8")));
+    }
+
+    @Test
+    void concurrentLookupsShareOneFailureAndLeaveItsScriptIdsToALaterLookup() throws Exception {
+        props.setReadTimeout(PATIENT_READ_TIMEOUT);
+        NetsuiteRestClient patient = newClient(props);
+        stubEveryCustomFieldLookup(aResponse().withStatus(500).withFixedDelay(IN_FLIGHT_DELAY_MILLIS));
+        List<Callable<Map<String, String>>> calls = new ArrayList<>();
+        for (int caller = 0; caller < CONCURRENT_CALLERS; caller++) {
+            List<String> ids = caller % 2 == 0
+                    ? List.of("custentity8", "custentity7")
+                    : List.of("CUSTENTITY7", "custentity6");
+            calls.add(() -> patient.customFieldSourceIds(ids));
+        }
+
+        List<Outcome<Map<String, String>>> outcomes = callTogether(calls);
+
+        // Every caller fails as a single caller does: those waiting on another's lookup with that lookup's failure.
+        assertThat(outcomes).allSatisfy(outcome -> assertThat(outcome.failure())
+                .isInstanceOf(WebClientResponseException.InternalServerError.class));
+        assertLookupsPerScriptId(Map.of("CUSTENTITY8", 1, "CUSTENTITY7", 1, "CUSTENTITY6", 1));
+
+        // Newer than the failing stub, so it answers the later lookup, which the failure left every ID to.
+        stubEveryCustomFieldLookup(okJson(CONCURRENT_LOOKUP_PAGE));
+        assertThat(patient.customFieldSourceIds(List.of("custentity8", "custentity7", "custentity6"))).containsExactly(
+                Map.entry("custentity8", "16"), Map.entry("custentity7", "17"), Map.entry("custentity6", "15"));
+        assertLookupsPerScriptId(Map.of("CUSTENTITY8", 2, "CUSTENTITY7", 2, "CUSTENTITY6", 2));
+    }
+
+    @Test
+    void customFieldSourceIdsLooksUpAtMostOneThousandScriptIdsPerQuery() {
+        List<String> scriptIds = IntStream.rangeClosed(0, 1000).mapToObj(i -> "custentity_" + i).toList();
+        // Every query is answered with both rows; each batch takes only the rows of the IDs it asked for.
+        stubEveryCustomFieldLookup(okJson("""
+                {"count": 2, "hasMore": false, "items": [
+                 {"scriptid": "CUSTENTITY_0", "fieldvaluetyperecord": 10},
+                 {"scriptid": "CUSTENTITY_1000", "fieldvaluetyperecord": 11}]}"""));
+
+        assertThat(client.customFieldSourceIds(scriptIds))
+                .containsExactly(Map.entry("custentity_0", "10"), Map.entry("custentity_1000", "11"));
+
+        // Oracle's IN-list limit: the first 1000 IDs in one query, the last one in a second.
+        List<String> queries = netsuite.findAll(postRequestedFor(urlPathEqualTo(SUITEQL))).stream()
+                .map(request -> request.getBodyAsString())
+                .toList();
+        assertThat(queries).extracting(query -> query.split("'CUSTENTITY_", -1).length - 1)
+                .containsExactlyInAnyOrder(1000, 1);
+        assertThat(queries).filteredOn(query -> query.contains("('CUSTENTITY_1000')")).hasSize(1);
+    }
+
+    private static void stubEveryCustomFieldLookup(ResponseDefinitionBuilder response) {
+        netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).withRequestBody(containing(CUSTOM_FIELD_QUERY_PREFIX))
+                .willReturn(response));
+    }
+
+    /** Asserts how many of the logged SuiteQL requests asked for each upper-cased script ID. */
+    private static void assertLookupsPerScriptId(Map<String, Integer> expected) {
+        List<String> queries = netsuite.findAll(postRequestedFor(urlPathEqualTo(SUITEQL))).stream()
+                .map(request -> request.getBodyAsString())
+                .toList();
+        expected.forEach((scriptId, lookups) -> assertThat(queries)
+                .as("lookups of %s", scriptId)
+                .filteredOn(query -> query.contains("'" + scriptId + "'"))
+                .hasSize(lookups));
     }
 
     private void stubCustomFieldLookup(String inList, String rows) {
@@ -735,7 +966,9 @@ class NetsuiteRestClientTest {
         NetsuiteRestClient timingOut = newClient(props);
         netsuite.stubFor(post(anyUrl()).willReturn(okJson("{}").withFixedDelay((int) stubDelay.toMillis())));
 
-        assertThatThrownBy(() -> call.invoke(timingOut)).isInstanceOf(UpstreamUnavailableException.class);
+        // The real WebClient chain carries no message, so the caller sees the neutral description, never a class.
+        assertThatThrownBy(() -> call.invoke(timingOut)).isInstanceOf(UpstreamUnavailableException.class)
+                .hasMessage("NetSuite did not respond in time");
 
         // Wait out the stub delay, so a retry sent after the timeout would have been recorded by now.
         await().pollDelay(stubDelay).atMost(stubDelay.plusSeconds(5))

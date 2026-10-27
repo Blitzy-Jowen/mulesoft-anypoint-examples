@@ -519,8 +519,8 @@ class SoapProxyControllerTest {
 
         assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 500 Internal Server Error");
         assertMediaType(response, MediaType.APPLICATION_JSON);
-        // The text is the transport's timeout message, which depends on the JDK and the client.
-        assertThat(response.bodyAsString()).startsWith(ERROR_BODY_START).endsWith(" }").doesNotContain("cartId");
+        // The transport's own text for the timeout, never the upstream URL RestClient's message quotes.
+        assertThat(response.bodyAsString()).isEqualTo(ERROR_BODY_START + "\"I/O error: Read timed out\" }");
         assertThat(elapsedMs).as("elapsed until the %d ms response timeout fired", RESPONSE_TIMEOUT_MS)
                 .isLessThan(SLOW_UPSTREAM_DELAY_MS - 500L);
         await().atMost(Duration.ofSeconds(5))
@@ -583,8 +583,8 @@ class SoapProxyControllerTest {
 
             assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 500 Internal Server Error");
             assertMediaType(response, MediaType.APPLICATION_JSON);
-            // The text is the transport's connect-failure message, which depends on the JDK and the client.
-            assertThat(response.bodyAsString()).startsWith(ERROR_BODY_START).endsWith("\" }");
+            // The transport's own text for the refused connection, never the upstream URL, host or address.
+            assertThat(response.bodyAsString()).isEqualTo(ERROR_BODY_START + "\"I/O error: Connection refused\" }");
             assertThat(forwarded()).as("calls reaching the WireMock upstream").isEmpty();
         }
     }

@@ -69,6 +69,7 @@ import com.sforce.soap.partner.DescribeGlobalResult;
 import com.sforce.soap.partner.DescribeGlobalSObjectResult;
 import com.sforce.soap.partner.DescribeSObjectResult;
 import com.sforce.soap.partner.Field;
+import com.sforce.soap.partner.PartnerConnection;
 import com.sforce.soap.partner.SaveResult;
 import com.sforce.soap.partner.fault.ApiFault;
 import com.sforce.soap.partner.fault.ExceptionCode;
@@ -108,6 +109,9 @@ class SalesforcePartnerClientTest {
 
     /** The instance endpoint path the login returns as {@code serverUrl}. */
     private static final String API_PATH = "/services/Soap/u/65.0/00Dxx0000001gEREAY";
+
+    /** The instance endpoint path of a second instance, where a session from a later authorization lives. */
+    private static final String OTHER_INSTANCE_PATH = "/instance-b/services/Soap/u/65.0";
 
     private static final String SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/";
 
@@ -544,6 +548,45 @@ class SalesforcePartnerClientTest {
         assertUserRecord(records.get(0), USER_A);
     }
 
+    @Test
+    void sessionModeRebuildsTheConnectionWithoutRefreshWhenTheSuppliedSessionChanges() throws Exception {
+        stubApi("queryAll", soap(queryResponse("queryAll", true, null, 1, userRecord(USER_A))));
+        wm.stubFor(post(urlEqualTo(OTHER_INSTANCE_PATH)).withRequestBody(operation("queryAll"))
+                .willReturn(soap(queryResponse("queryAll", true, null, 1, userRecord(USER_B)))));
+        TestSessionSource source = new TestSessionSource(apiUrl());
+        SalesforcePartnerClient client = sessionModeClient(source);
+
+        List<Map<String, Object>> first = client.queryAll(SOQL);
+        // A new authorization replaces the session while the first one is still valid: no fault, no refresh.
+        source.switchTo(SESSION_2, otherInstanceUrl());
+        List<Map<String, Object>> second = client.queryAll(SOQL);
+        PartnerConnection rebuilt = client.connection();
+        List<Map<String, Object>> third = client.queryAll(SOQL);
+        PartnerConnection afterThird = client.connection();
+
+        assertThat(loginRequests()).isEmpty();
+        assertThat(source.refreshCalls).hasValue(0);
+        // Consulted once per call: the three queries and the two direct connection reads.
+        assertThat(source.currentCalls).hasValue(5);
+        assertThat(apiRequests("queryAll")).singleElement().satisfies(request -> assertThat(request.getBodyAsString())
+                .contains("SessionHeader")
+                .contains(">" + SESSION_1 + "<")
+                .doesNotContain(SESSION_2));
+        assertThat(wm.findAll(postRequestedFor(urlEqualTo(OTHER_INSTANCE_PATH)).withRequestBody(operation("queryAll"))))
+                .hasSize(2)
+                .allSatisfy(request -> assertThat(request.getBodyAsString())
+                        .contains("SessionHeader")
+                        .contains(">" + SESSION_2 + "<")
+                        .doesNotContain(SESSION_1));
+        // The third call, with the session unchanged, reused the connection rebuilt for SESSION_2.
+        assertThat(afterThird).isSameAs(rebuilt);
+        assertThat(rebuilt.getConfig().getSessionId()).isEqualTo(SESSION_2);
+        assertThat(rebuilt.getConfig().getServiceEndpoint()).isEqualTo(otherInstanceUrl());
+        assertUserRecord(first.get(0), USER_A);
+        assertUserRecord(second.get(0), USER_B);
+        assertUserRecord(third.get(0), USER_B);
+    }
+
     // ---------------------------------------------------------------------------------------------------------
     // Timeout configuration
     // ---------------------------------------------------------------------------------------------------------
@@ -626,10 +669,13 @@ class SalesforcePartnerClientTest {
                 Named.<ClientCall>of("describeSObject", client -> client.describeSObject("User")));
     }
 
-    /** A session source as the OAuth project supplies one: a current session, renewed once on request. */
+    /**
+     * A session source as the OAuth project supplies one: a current session, renewed once on request or replaced by
+     * a new authorization.
+     */
     private static final class TestSessionSource implements SessionSource {
 
-        private final String serviceEndpoint;
+        private final AtomicReference<String> serviceEndpoint;
 
         private final AtomicReference<String> sessionId = new AtomicReference<>(SESSION_1);
 
@@ -638,20 +684,26 @@ class SalesforcePartnerClientTest {
         private final AtomicInteger refreshCalls = new AtomicInteger();
 
         TestSessionSource(String serviceEndpoint) {
-            this.serviceEndpoint = serviceEndpoint;
+            this.serviceEndpoint = new AtomicReference<>(serviceEndpoint);
         }
 
         @Override
         public Session current() {
             currentCalls.incrementAndGet();
-            return new Session(sessionId.get(), serviceEndpoint);
+            return new Session(sessionId.get(), serviceEndpoint.get());
         }
 
         @Override
         public Session refresh() {
             refreshCalls.incrementAndGet();
             sessionId.set(SESSION_2);
-            return new Session(sessionId.get(), serviceEndpoint);
+            return new Session(sessionId.get(), serviceEndpoint.get());
+        }
+
+        /** Replaces the session as a new authorization does, without a refresh. */
+        void switchTo(String newSessionId, String newServiceEndpoint) {
+            sessionId.set(newSessionId);
+            serviceEndpoint.set(newServiceEndpoint);
         }
     }
 
@@ -671,6 +723,10 @@ class SalesforcePartnerClientTest {
 
     private String apiUrl() {
         return "http://localhost:" + wm.port() + API_PATH;
+    }
+
+    private String otherInstanceUrl() {
+        return "http://localhost:" + wm.port() + OTHER_INSTANCE_PATH;
     }
 
     /** Every login answers with {@link #SESSION_1}. */

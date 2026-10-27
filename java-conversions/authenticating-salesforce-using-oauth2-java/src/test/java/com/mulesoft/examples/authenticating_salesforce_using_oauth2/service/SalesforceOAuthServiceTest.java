@@ -8,6 +8,11 @@
 
 package com.mulesoft.examples.authenticating_salesforce_using_oauth2.service;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.options;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -24,6 +29,8 @@ import java.io.IOException;
 import java.lang.reflect.Field;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
@@ -38,13 +45,22 @@ import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
+import com.github.tomakehurst.wiremock.verification.LoggedRequest;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforceFailureClassifier;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforcePartnerClient;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforcePartnerClient.Session;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforcePartnerClient.SessionSource;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforceTokenClient;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforceTokenClient.TokenEndpointException;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforceTokenClient.TokenResponse;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.UpstreamCallExecutor;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.UpstreamSystem;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.SalesforceOAuthProperties;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.SalesforceProperties;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.UpstreamAuthenticationException;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.UpstreamRateLimitException;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.UpstreamUnavailableException;
@@ -54,14 +70,18 @@ import com.sforce.ws.ConnectionException;
 /**
  * Unit test of {@link SalesforceOAuthService}, the authorization-code flow of {@code salesforce-oauth.xml}
  * ({@code sfdc:config-with-oauth}, {@code sfdc:oauth-callback-config} and {@code sfdc:authorize display="PAGE"}),
- * against a Mockito-mocked {@link SalesforceTokenClient} and {@link ContactQueryService}; no Spring context, network
- * or credentials.
+ * against a Mockito-mocked {@link SalesforceTokenClient} and {@link ContactQueryService}; no Spring context, external
+ * network or credentials.
  *
  * <p>It fixes the flow contract: the authorize redirect built from the original connector settings, the code exchange
  * on {@code /oauth2callback} that stores the token and answers with the contact query text, the session supplied to
  * the Partner API client, and the refresh grant that renews it. Every failure branch is pinned: a callback without a
  * code, a rejected or unreachable token endpoint, an incomplete token response, a refused refresh that clears the
  * token, and the upstream failures that pass through unchanged and keep it.
+ *
+ * <p>One case leaves the mocked query service aside and drives the real {@link ContactQueryService} and SC-15
+ * {@link SalesforcePartnerClient} against a local WireMock Partner API, so the session each completed grant stores is
+ * observed on the SOAP requests themselves.
  */
 @ExtendWith(MockitoExtension.class)
 class SalesforceOAuthServiceTest {
@@ -69,6 +89,9 @@ class SalesforceOAuthServiceTest {
     private static final String CODE = "abc";
 
     private static final String QUERY_TEXT = "Salesforce query returned 3 contacts.";
+
+    /** The flow's answer when the real contact query returns one record. */
+    private static final String ONE_CONTACT_TEXT = "Salesforce query returned 1 contacts.";
 
     private static final String INSTANCE_URL = "https://na1.salesforce.com";
 
@@ -271,6 +294,76 @@ class SalesforceOAuthServiceTest {
 
         verify(tokenClient).refresh("refresh-1");
         verify(tokenClient, times(2)).refresh("refresh-2");
+    }
+
+    @Test
+    void refreshKeepsAGrantCompletedWhileTheRefreshExchangeWasInFlight() throws Exception {
+        String instanceB = "https://na2.salesforce.com";
+        Session grantB = new Session("access-b", instanceB + SalesforceOAuthService.SOAP_ENDPOINT_PATH);
+        authorizeWith(token("access-1", "refresh-1"));
+        when(tokenClient.exchangeCode("code-b", REDIRECT_URI))
+                .thenReturn(response("access-b", "refresh-b", instanceB));
+        when(tokenClient.refresh("refresh-1")).thenAnswer(invocation -> {
+            // A browser completes a new authorization while Salesforce is still answering the refresh of grant A.
+            assertThat(service.completeAuthorization("code-b", null, null)).isEqualTo(QUERY_TEXT);
+            return token("access-2", null);
+        });
+        when(tokenClient.refresh("refresh-b")).thenReturn(response("access-b2", null, null));
+
+        assertThat(service.refresh()).isEqualTo(grantB);
+        assertThat(service.current()).isEqualTo(grantB);
+        assertThat(service.isAuthorized()).isTrue();
+        // Grant B was kept whole: its own refresh token renews it, on its own instance.
+        assertThat(service.refresh()).isEqualTo(new Session("access-b2", grantB.serviceEndpoint()));
+
+        verify(tokenClient).refresh("refresh-1");
+        verify(tokenClient).refresh("refresh-b");
+        verify(tokenClient).exchangeCode("code-b", REDIRECT_URI);
+        verify(contactQueryService, times(2)).queryContacts();
+    }
+
+    /**
+     * Two successful authorizations whose sessions both stay valid, driven through the real
+     * {@link ContactQueryService} and SC-15 {@link SalesforcePartnerClient} in session mode, with this service as its
+     * {@link SessionSource}, against a WireMock Partner API serving grant A's instance under {@code /a} and grant B's
+     * under {@code /b}: the callback of each grant, and every later {@code /} request, queries with the latest grant's
+     * session on its instance, and no refresh grant is spent to get there.
+     */
+    @Test
+    void eachCompletedGrantDrivesThePartnerApiCallsThatFollowIt() throws Exception {
+        WireMockServer partnerApi = new WireMockServer(options().dynamicPort());
+        partnerApi.start();
+        try {
+            String base = "http://localhost:" + partnerApi.port();
+            String instanceA = "/a" + SalesforceOAuthService.SOAP_ENDPOINT_PATH;
+            String instanceB = "/b" + SalesforceOAuthService.SOAP_ENDPOINT_PATH;
+            partnerApi.stubFor(post(urlEqualTo(instanceA)).willReturn(oneContactQueryResponse()));
+            partnerApi.stubFor(post(urlEqualTo(instanceB)).willReturn(oneContactQueryResponse()));
+            when(tokenClient.exchangeCode("code-a", REDIRECT_URI))
+                    .thenReturn(response("access-a", "refresh-a", base + "/a"));
+            when(tokenClient.exchangeCode("code-b", REDIRECT_URI))
+                    .thenReturn(response("access-b", "refresh-b", base + "/b"));
+            SalesforceOAuthService flow = sessionModeFlow(base);
+
+            assertThat(flow.completeAuthorization("code-a", null, null)).isEqualTo(ONE_CONTACT_TEXT);
+            assertThat(partnerApi.findAll(postRequestedFor(urlEqualTo(instanceA))))
+                    .singleElement()
+                    .satisfies(request -> assertContactQueryUnder(request, "access-a", "access-b"));
+            assertThat(partnerApi.findAll(postRequestedFor(urlEqualTo(instanceB)))).isEmpty();
+
+            assertThat(flow.completeAuthorization("code-b", null, null)).isEqualTo(ONE_CONTACT_TEXT);
+            assertThat(flow.authorize()).isEqualTo(AuthorizeOutcome.completed(ONE_CONTACT_TEXT));
+
+            // Grant A's session was never rejected, yet nothing reached its instance after grant B completed.
+            assertThat(partnerApi.findAll(postRequestedFor(urlEqualTo(instanceA)))).hasSize(1);
+            assertThat(partnerApi.findAll(postRequestedFor(urlEqualTo(instanceB))))
+                    .hasSize(2)
+                    .allSatisfy(request -> assertContactQueryUnder(request, "access-b", "access-a"));
+            assertThat(partnerApi.getAllServeEvents()).hasSize(3);
+            verify(tokenClient, never()).refresh(any());
+        } finally {
+            partnerApi.stop();
+        }
     }
 
     @ParameterizedTest
@@ -522,6 +615,53 @@ class SalesforceOAuthServiceTest {
 
     private static TokenResponse response(String accessToken, String refreshToken, String instanceUrl) {
         return new TokenResponse(accessToken, refreshToken, instanceUrl, IDENTITY_URL, ISSUED_AT, TOKEN_TYPE, SCOPE);
+    }
+
+    /**
+     * Wires the flow as the application context does: a real {@link ContactQueryService} over a real
+     * {@link SalesforcePartnerClient} behind the real SC-9 executor and Salesforce classifier, the new service
+     * registered as the client's {@link SessionSource}, and only the token endpoint mocked.
+     *
+     * @param partnerApiBase the WireMock base URL; the login endpoint points there too, so no request can leave it
+     */
+    private SalesforceOAuthService sessionModeFlow(String partnerApiBase) {
+        SalesforceProperties sfdc = new SalesforceProperties();
+        sfdc.setAuthEndpoint(partnerApiBase + SalesforceOAuthService.SOAP_ENDPOINT_PATH);
+        sfdc.setConnectTimeout(Duration.ofSeconds(2));
+        sfdc.setReadTimeout(Duration.ofSeconds(5));
+        DefaultListableBeanFactory beanFactory = new DefaultListableBeanFactory();
+        SalesforcePartnerClient partnerClient = new SalesforcePartnerClient(sfdc,
+                new UpstreamCallExecutor(List.of(new SalesforceFailureClassifier())),
+                beanFactory.getBeanProvider(SessionSource.class));
+        SalesforceOAuthService flow = new SalesforceOAuthService(properties, tokenClient,
+                new ContactQueryService(partnerClient));
+        beanFactory.registerSingleton("sessionSource", flow);
+        return flow;
+    }
+
+    /** A Partner API {@code queryResponse} with one {@code Contact}, its {@code Id} repeated as Salesforce sends it. */
+    private static ResponseDefinitionBuilder oneContactQueryResponse() {
+        String contactId = "003" + "000000000001";
+        String body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                + "<soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\""
+                + " xmlns=\"urn:partner.soap.sforce.com\" xmlns:sf=\"urn:sobject.partner.soap.sforce.com\""
+                + " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><soapenv:Body>"
+                + "<queryResponse><result xsi:type=\"QueryResult\"><done>true</done>"
+                + "<queryLocator xsi:nil=\"true\"/>"
+                + "<records xsi:type=\"sf:sObject\"><sf:type>Contact</sf:type>"
+                + "<sf:Id>" + contactId + "</sf:Id><sf:Id>" + contactId + "</sf:Id>"
+                + "<sf:LastName>Doe</sf:LastName><sf:LastModifiedDate>2024-01-02T03:04:05.000Z</sf:LastModifiedDate>"
+                + "</records><size>1</size></result></queryResponse></soapenv:Body></soapenv:Envelope>";
+        return aResponse().withStatus(200).withHeader("Content-Type", "text/xml; charset=utf-8").withBody(body);
+    }
+
+    /** Asserts a journaled Partner API request: the contact query, sent under one grant's session and not another's. */
+    private static void assertContactQueryUnder(LoggedRequest request, String accessToken, String otherAccessToken) {
+        assertThat(request.getBodyAsString())
+                .contains(ContactQueryService.CONTACT_QUERY)
+                .contains("SessionHeader")
+                .contains(">" + accessToken + "<")
+                .doesNotContain(otherAccessToken);
     }
 
     /**
