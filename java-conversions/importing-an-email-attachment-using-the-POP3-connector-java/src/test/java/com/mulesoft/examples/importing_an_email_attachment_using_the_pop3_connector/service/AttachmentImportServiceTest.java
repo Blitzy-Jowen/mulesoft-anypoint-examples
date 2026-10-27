@@ -8,6 +8,7 @@
 
 package com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connector.service;
 
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -25,6 +26,7 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,6 +41,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.mockito.Mockito;
 import org.mockito.invocation.Invocation;
@@ -49,6 +53,9 @@ import com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connec
 import com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connector.mapper.DwXmlWriter;
 import com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connector.mapper.OrdersXmlMapper;
 
+import jakarta.activation.DataHandler;
+import jakarta.mail.util.ByteArrayDataSource;
+
 /**
  * Unit test of {@link AttachmentImportService}, the processing of flow {@code pop-to-xmlFlow1}
  * ({@code importing-an-email-attachment-using-the-POP3-connector/src/main/app/pop-to-xml.xml}) after its POP3S
@@ -57,10 +64,13 @@ import com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connec
  *
  * <p>The service runs over the real SC-4 {@link DwCsvReader} and {@link DwXmlWriter}, the real
  * {@link OrdersXmlMapper} and a Mockito spy of the real SC-6 {@link FileOutboundWriter}, so every file it writes holds
- * the bytes the converted flow writes; the only doubles are the spy's stubbed write failure and a mocked reader for
- * the failure the real, lenient reader never raises. The original test only counted the files in its output
- * directory; these tests compare the written bytes with fixed literals instead, and when the service output differs
- * from a literal the service is wrong, not the literal.
+ * the bytes the converted flow writes. Attachments are real {@link DataHandler}s over byte data sources, so
+ * {@link DataHandler#getContent()} answers as for a received mail part: a stream for
+ * {@code application/octet-stream}, text decoded with its declared charset for {@code text/plain}. The only doubles
+ * are the spy's stubbed write failure, a mocked reader for the failure the real, lenient reader never raises, and
+ * mocked data handlers for the content forms no mail part type yields here. The original test only counted the files
+ * in its output directory; these tests compare the written bytes with fixed literals instead, and when the service
+ * output differs from a literal the service is wrong, not the literal.
  *
  * <p>Plain JUnit 5 without a Spring context: {@link OutputCaptureExtension} only captures the console, where the
  * logging system's default console appender writes the INFO line. Every file lands under the {@link TempDir}.
@@ -110,6 +120,20 @@ class AttachmentImportServiceTest {
     private static final String EXPECTED_ONE_ORDER_SHA256 =
             "10d31ef6be36de02b482fe984307df98710c22d4b92d58fcfd92385818ac86f8";
 
+    /** A one-record attachment with non-ASCII letters, sent as ISO-8859-1 text in the charset case. */
+    private static final String LATIN_1_CSV = "orderId,name,units,pricePerUnit\n1,Zo\u00eb M\u00fcller,2,10\n";
+
+    /** The document the script produced for {@link #LATIN_1_CSV}, the name decoded and written as UTF-8. */
+    private static final String EXPECTED_LATIN_1 = "<?xml version='1.0' encoding='UTF-8'?>\n"
+            + "<orders>\n"
+            + "\t<order>\n"
+            + "\t\t<orderId>1</orderId>\n"
+            + "\t\t<name>Zo\u00eb M\u00fcller</name>\n"
+            + "\t\t<units>2</units>\n"
+            + "\t\t<pricePerUnit>10</pricePerUnit>\n"
+            + "\t</order>\n"
+            + "</orders>";
+
     /** The outbound endpoint's {@code outputPattern}. */
     private static final String FILE_NAME = "orders.xml";
 
@@ -145,7 +169,7 @@ class AttachmentImportServiceTest {
                 .isEqualTo("orderId,name,units,pricePerUnit\n1,aaa,2.0,10\n2,bbb,4.15,5")
                 .doesNotEndWith("\n");
 
-        Path result = service.process(List.of(inputCsv));
+        Path result = service.process(List.of(octetStream(inputCsv)));
 
         assertThat(result).isEqualTo(tempDir.resolve(FILE_NAME));
         byte[] written = Files.readAllBytes(result);
@@ -163,17 +187,87 @@ class AttachmentImportServiceTest {
 
     @Test
     void ignoresAttachmentsAfterTheFirst() throws Exception {
-        Path result = service.process(List.of(inputCsv, "x,y\n1,2".getBytes(UTF_8)));
+        // Only payload[0].getContent() was evaluated: a later attachment is never read, so it cannot fail the flow.
+        DataHandler later = mock(DataHandler.class);
+
+        Path result = service.process(List.of(octetStream(inputCsv), later));
 
         assertThat(Files.readAllBytes(result)).isEqualTo(EXPECTED.getBytes(UTF_8));
         verify(writer, times(1)).write(eq(tempDir.toString()), eq(FILE_NAME), eq(EXPECTED));
         assertWroteOnceFromService(tempDir.toString(), EXPECTED);
+        verifyNoInteractions(later);
+    }
+
+    @Test
+    void decodesTextPlainWithItsDeclaredCharset() throws Exception {
+        byte[] latin1 = LATIN_1_CSV.getBytes(ISO_8859_1);
+        assertThat(new String(latin1, UTF_8)).as("the bytes are not valid UTF-8").contains("\ufffd");
+        DataHandler attachment = new DataHandler(new ByteArrayDataSource(latin1, "text/plain; charset=ISO-8859-1"));
+
+        Path result = service.process(List.of(attachment));
+
+        byte[] written = Files.readAllBytes(result);
+        assertThat(written).isEqualTo(EXPECTED_LATIN_1.getBytes(UTF_8));
+        assertThat(new String(written, UTF_8)).contains("<name>Zo\u00eb M\u00fcller</name>");
+        assertWroteOnceFromService(tempDir.toString(), EXPECTED_LATIN_1);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("contentForms")
+    void readsEveryContentFormTheDataHandlerReturns(String form, Object content) throws Exception {
+        DataHandler attachment = mock(DataHandler.class);
+        when(attachment.getContent()).thenReturn(content);
+
+        Path result = service.process(List.of(attachment));
+
+        assertThat(Files.readAllBytes(result)).isEqualTo(EXPECTED_ONE_ORDER.getBytes(UTF_8));
+        assertWroteOnceFromService(tempDir.toString(), EXPECTED_ONE_ORDER);
+    }
+
+    static Stream<Arguments> contentForms() {
+        return Stream.of(
+                Arguments.of("text", ONE_ORDER_CSV),
+                Arguments.of("bytes", ONE_ORDER_CSV.getBytes(UTF_8)));
+    }
+
+    @ParameterizedTest(name = "{1}")
+    @MethodSource("unsupportedContents")
+    void rejectsUnsupportedContent(Object content, String message, CapturedOutput output) throws Exception {
+        DataHandler attachment = mock(DataHandler.class);
+        when(attachment.getContent()).thenReturn(content);
+
+        assertThatThrownBy(() -> service.process(List.of(attachment)))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(message);
+
+        assertDirectoryEmpty();
+        assertThat(output.getOut()).doesNotContain("Received:");
+        verifyNoInteractions(writer);
+    }
+
+    static Stream<Arguments> unsupportedContents() {
+        return Stream.of(
+                Arguments.of(null, "Unsupported attachment content: null"),
+                Arguments.of(42, "Unsupported attachment content: java.lang.Integer"));
+    }
+
+    @Test
+    void undecodableContentPropagates(CapturedOutput output) throws Exception {
+        DataHandler attachment = new DataHandler(
+                new ByteArrayDataSource("orderId\n1".getBytes(UTF_8), "text/plain; charset=x-unknown"));
+
+        assertThatThrownBy(() -> service.process(List.of(attachment)))
+                .isInstanceOf(UnsupportedEncodingException.class);
+
+        assertDirectoryEmpty();
+        assertThat(output.getOut()).doesNotContain("Received:");
+        verifyNoInteractions(writer);
     }
 
     @Test
     void overwritesExistingOrdersXml() throws Exception {
-        service.process(List.of(inputCsv));
-        Path result = service.process(List.of(ONE_ORDER_CSV.getBytes(UTF_8)));
+        service.process(List.of(octetStream(inputCsv)));
+        Path result = service.process(List.of(octetStream(ONE_ORDER_CSV.getBytes(UTF_8))));
 
         byte[] written = Files.readAllBytes(result);
         assertThat(written).isEqualTo(EXPECTED_ONE_ORDER.getBytes(UTF_8)).hasSize(170);
@@ -188,7 +282,7 @@ class AttachmentImportServiceTest {
 
     @ParameterizedTest
     @NullAndEmptySource
-    void rejectsMessageWithoutAttachment(List<byte[]> attachments, CapturedOutput output) throws IOException {
+    void rejectsMessageWithoutAttachment(List<DataHandler> attachments, CapturedOutput output) throws IOException {
         assertThatThrownBy(() -> service.process(attachments))
                 .isExactlyInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Message has no attachment");
@@ -208,7 +302,7 @@ class AttachmentImportServiceTest {
         AttachmentImportService failing =
                 new AttachmentImportService(mockReader, mapper, writer, tempDir.toString(), FILE_NAME);
 
-        assertThatThrownBy(() -> failing.process(List.of(inputCsv))).isSameAs(boom);
+        assertThatThrownBy(() -> failing.process(List.of(octetStream(inputCsv)))).isSameAs(boom);
 
         assertThat(tempDir.resolve(FILE_NAME)).doesNotExist();
         assertThat(output.getOut()).doesNotContain("Received:");
@@ -222,7 +316,7 @@ class AttachmentImportServiceTest {
         AttachmentImportService blocked =
                 new AttachmentImportService(reader, mapper, writer, blocker.toString(), FILE_NAME);
 
-        assertThatThrownBy(() -> blocked.process(List.of(inputCsv)))
+        assertThatThrownBy(() -> blocked.process(List.of(octetStream(inputCsv))))
                 .isInstanceOf(IOException.class)
                 .isInstanceOf(FileAlreadyExistsException.class);
 
@@ -238,7 +332,7 @@ class AttachmentImportServiceTest {
         IOException ioe = new IOException("disk full");
         doThrow(ioe).when(writer).write(anyString(), anyString(), anyString());
 
-        assertThatThrownBy(() -> service.process(List.of(inputCsv))).isSameAs(ioe);
+        assertThatThrownBy(() -> service.process(List.of(octetStream(inputCsv)))).isSameAs(ioe);
 
         // The flow logs (line 27) before it writes (line 28), so a failed write still leaves the log line.
         assertThat(output.getOut()).contains("Received: <?xml");
@@ -262,6 +356,14 @@ class AttachmentImportServiceTest {
         assertThat(call.getMethod().getParameterTypes()).containsExactly(String.class, String.class, String.class);
         assertThat(call.getArguments()).containsExactly(dir, FILE_NAME, content);
         verify(writer, never()).write(anyString(), anyString(), any(byte[].class));
+    }
+
+    /**
+     * An attachment as the original test sent it, {@code application/octet-stream}, for which no content handler
+     * exists, so {@link DataHandler#getContent()} returns a stream of the bytes.
+     */
+    private static DataHandler octetStream(byte[] content) {
+        return new DataHandler(new ByteArrayDataSource(content, "application/octet-stream"));
     }
 
     private void assertDirectoryEmpty() throws IOException {

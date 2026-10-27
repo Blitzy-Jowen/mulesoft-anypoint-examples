@@ -13,7 +13,9 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -66,6 +68,10 @@ import com.mulesoft.examples.web_service_consumer.config.TshirtServiceProperties
  * empty Body. Response SOAP headers ({@code APIUsageInformation}) are not returned: the original flows read
  * only the body payload after the consumer.
  *
+ * <p>Each request is sent as SAAJ serializes it, except that supplementary characters are written as UTF-8
+ * bytes rather than character references, as the original's CXF stack wrote them
+ * ({@code encodeSupplementaryCharacterReferences}).
+ *
  * <p>Failures reach the caller as the Spring WS runtime exceptions the template raises, unwrapped and never
  * retried: {@code SoapFaultClientException} for a SOAP fault, {@code WebServiceTransportException} for an
  * HTTP error without a fault, {@code WebServiceIOException} for a timeout or connection failure. The
@@ -93,6 +99,16 @@ public class TshirtServiceClient {
 
     /** Mule's default response timeout, used when a timeout is not configured. */
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+
+    /**
+     * Opening and closing delimiters, in pairs, of the markup whose content the serializer writes verbatim:
+     * comments, CDATA sections and processing instructions ({@link #encodeSupplementaryCharacterReferences}).
+     */
+    private static final byte[][] VERBATIM_DELIMITERS = {
+            ascii("<!--"), ascii("-->"),
+            ascii("<![CDATA["), ascii("]]>"),
+            ascii("<?"), ascii("?>"),
+    };
 
     private final WebServiceTemplate template;
 
@@ -232,7 +248,8 @@ public class TshirtServiceClient {
      * ({@code sun.net.http.retryPost}, on by default). For {@code OrderTshirt} that would place the order twice
      * after the service had already received it, and the flows declare no retry of any kind. In fixed-length
      * streaming mode the JDK never re-sends, so each connection buffers the envelope Spring WS writes and then
-     * streams it with that exact length: the wire form, {@code Content-Length} included, is unchanged.
+     * streams it with the exact length of the bytes it sends; apart from supplementary characters, which
+     * {@link #encodeSupplementaryCharacterReferences(byte[])} writes as UTF-8, the wire form is unchanged.
      */
     private static final class SingleAttemptMessageSender extends HttpUrlConnectionMessageSender {
 
@@ -244,7 +261,11 @@ public class TshirtServiceClient {
         }
     }
 
-    /** Collects the request body, then sends it in fixed-length streaming mode ({@link SingleAttemptMessageSender}). */
+    /**
+     * Collects the request body, writes its supplementary characters as UTF-8
+     * ({@link #encodeSupplementaryCharacterReferences(byte[])}), then sends it in fixed-length streaming mode
+     * ({@link SingleAttemptMessageSender}).
+     */
     private static final class FixedLengthHttpUrlConnection extends HttpUrlConnection {
 
         private final ByteArrayOutputStream requestBody = new ByteArrayOutputStream();
@@ -260,13 +281,104 @@ public class TshirtServiceClient {
 
         @Override
         protected void onSendAfterWrite(WebServiceMessage message) throws IOException {
+            byte[] body = encodeSupplementaryCharacterReferences(requestBody.toByteArray());
             HttpURLConnection connection = getConnection();
-            connection.setFixedLengthStreamingMode(requestBody.size());
+            connection.setFixedLengthStreamingMode(body.length);
             try (OutputStream out = connection.getOutputStream()) {
-                requestBody.writeTo(out);
+                out.write(body);
             }
             super.onSendAfterWrite(message);
         }
+    }
+
+    /**
+     * Rewrites each numeric character reference to a supplementary character (U+10000 to U+10FFFF) in a
+     * serialized UTF-8 envelope as that character's UTF-8 bytes, and leaves every other byte as it is.
+     *
+     * <p>SAAJ writes the envelope through the JDK's built-in XML serializer, which writes every character outside
+     * the Basic Multilingual Plane as a decimal reference ({@code &#128512;} for U+1F600), in text and attribute
+     * values alike, although UTF-8 encodes it; the CXF/Woodstox stack of the original {@code ws:consumer} wrote
+     * such characters as UTF-8 bytes. Outside comments, CDATA sections and processing instructions the serializer
+     * writes every {@code &} of the content as {@code &amp;}, so each {@code &#} there starts a reference it
+     * generated. Inside them it writes the content verbatim, so a {@code &#} there is literal text and is kept.
+     * References below U+10000, such as {@code &#13;} for a carriage return, are kept too. UTF-8 encodes no ASCII
+     * byte inside a multi-byte sequence, so the markup is found by scanning bytes.
+     *
+     * <p>Package-private for its tests.
+     *
+     * @param xml the serialized envelope, UTF-8 encoded
+     * @return {@code xml} itself when it holds no such reference, otherwise the rewritten bytes
+     */
+    static byte[] encodeSupplementaryCharacterReferences(byte[] xml) {
+        ByteArrayOutputStream rewritten = null;
+        int copied = 0;
+        int i = 0;
+        while (i < xml.length) {
+            if (xml[i] == '<') {
+                i = endOfVerbatimRegion(xml, i);
+            }
+            else if (xml[i] == '&' && i + 1 < xml.length && xml[i + 1] == '#') {
+                // &#digits; or &#xhex; (XML allows only a lower-case x); the value is capped so it cannot overflow.
+                boolean hex = i + 2 < xml.length && xml[i + 2] == 'x';
+                int radix = hex ? 16 : 10;
+                int digits = hex ? i + 3 : i + 2;
+                int end = digits;
+                int codePoint = 0;
+                while (end < xml.length && Character.digit(xml[end], radix) >= 0) {
+                    codePoint = Math.min(codePoint * radix + Character.digit(xml[end], radix),
+                            Character.MAX_CODE_POINT + 1);
+                    end++;
+                }
+                if (end > digits && end < xml.length && xml[end] == ';'
+                        && codePoint >= Character.MIN_SUPPLEMENTARY_CODE_POINT
+                        && codePoint <= Character.MAX_CODE_POINT) {
+                    if (rewritten == null) {
+                        rewritten = new ByteArrayOutputStream(xml.length);
+                    }
+                    rewritten.write(xml, copied, i - copied);
+                    rewritten.writeBytes(Character.toString(codePoint).getBytes(StandardCharsets.UTF_8));
+                    copied = end + 1;
+                }
+                i = end;
+            }
+            else {
+                i++;
+            }
+        }
+        if (rewritten == null) {
+            return xml;
+        }
+        rewritten.write(xml, copied, xml.length - copied);
+        return rewritten.toByteArray();
+    }
+
+    /**
+     * Index just after the comment, CDATA section or processing instruction that starts at {@code start}, or the
+     * length of {@code xml} when it is not closed; {@code start + 1} when none starts there.
+     */
+    private static int endOfVerbatimRegion(byte[] xml, int start) {
+        for (int d = 0; d < VERBATIM_DELIMITERS.length; d += 2) {
+            byte[] open = VERBATIM_DELIMITERS[d];
+            byte[] close = VERBATIM_DELIMITERS[d + 1];
+            if (startsWith(xml, start, open)) {
+                for (int i = start + open.length; i <= xml.length - close.length; i++) {
+                    if (startsWith(xml, i, close)) {
+                        return i + close.length;
+                    }
+                }
+                return xml.length;
+            }
+        }
+        return start + 1;
+    }
+
+    private static boolean startsWith(byte[] xml, int offset, byte[] prefix) {
+        return offset + prefix.length <= xml.length
+                && Arrays.equals(xml, offset, offset + prefix.length, prefix, 0, prefix.length);
+    }
+
+    private static byte[] ascii(String delimiter) {
+        return delimiter.getBytes(StandardCharsets.US_ASCII);
     }
 
     private static Duration orDefault(Duration timeout) {

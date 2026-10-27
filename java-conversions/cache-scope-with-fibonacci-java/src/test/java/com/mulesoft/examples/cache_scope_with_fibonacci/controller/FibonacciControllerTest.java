@@ -16,11 +16,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -41,8 +44,9 @@ import com.mulesoft.examples.cache_scope_with_fibonacci.support.HttpTestClient.R
  * so the reason phrase, the {@code cost}, {@code Content-Type} and {@code Content-Length} headers and the body bytes
  * are asserted exactly as the listener writes them. The happy paths cover the calculation, every method (the listener
  * declares no {@code allowedMethods}) and the cache states the raw-string key and the two {@code nocache} controls
- * select; the error cases are the flow's {@code otherwise} branch, its favicon filter and the SC-1 platform defaults:
- * the no-listener 404 and the JSON 500.
+ * select; the error cases are the flow's {@code otherwise} branch, its favicon filter on each kind of listener payload,
+ * the listener's 400 for a form body it cannot decode and the SC-1 platform defaults: the no-listener 404 and the
+ * JSON 500.
  *
  * <p>Every case starts on an empty cache and issues any request whose cached results it depends on itself, so the
  * expected costs follow the cost model of {@code FibonacciCacheService}: {@code n < 2} costs 1, a cache hit costs 0,
@@ -62,6 +66,16 @@ class FibonacciControllerTest {
 
     /** Payload of the flow's {@code otherwise} branch (cache-scope.xml:56). */
     private static final String TOO_HIGH = "ERROR: n must be less than 20";
+
+    /** Pattern of the flow's favicon {@code wildcard-filter} (cache-scope.xml:47). */
+    private static final String FAVICON = "/favicon.ico";
+
+    /** A well-formed multipart body, boundary {@code b}, whose only part holds the favicon path. */
+    private static final String MULTIPART_FAVICON_BODY = "--b\r\n"
+            + "Content-Disposition: form-data; name=\"icon\"\r\n"
+            + "\r\n"
+            + FAVICON + "\r\n"
+            + "--b--\r\n";
 
     @LocalServerPort
     private int port;
@@ -152,17 +166,99 @@ class FibonacciControllerTest {
     }
 
     /**
-     * The favicon wildcard-filter tests the payload (cache-scope.xml:45-49): a request body of exactly
-     * {@code /favicon.ico} ends the flow before the calculation, answered with an empty 200 (AAP 0.4.7), and nothing
-     * is cached.
+     * The favicon wildcard-filter tests the payload (cache-scope.xml:45-49): a text body that reads as exactly
+     * {@code /favicon.ico} in the charset its {@code Content-Type} declares, UTF-8 when it declares none or no
+     * {@code Content-Type} is sent, ends the flow before the calculation, answered with an empty 200 (AAP 0.4.7), and
+     * nothing is cached.
+     *
+     * @param contentType the {@code Content-Type} sent, or {@code null} for none
+     * @param body        the request body
      */
-    @Test
-    void faviconPayloadIsFilteredToAnEmpty200() {
-        Response response = send("POST", "/fibonacci?n=10", Map.of("Content-Type", "text/plain"),
-                "/favicon.ico".getBytes(StandardCharsets.UTF_8));
+    @ParameterizedTest(name = "[{index}] Content-Type {0}")
+    @MethodSource("faviconTextBodies")
+    void faviconPayloadIsFilteredToAnEmpty200(String contentType, byte[] body) {
+        Map<String, String> headers = contentType == null ? Map.of() : Map.of("Content-Type", contentType);
+
+        Response response = send("POST", "/fibonacci?n=10", headers, body);
 
         assertFlowReply(response, "", null);
         assertNull(cache.get("10"), "the filtered request must not reach the cache scope");
+    }
+
+    /**
+     * @return {@code Content-Type} (or {@code null} for none) and body pairs whose text payload is
+     *         {@code /favicon.ico}
+     */
+    private static Stream<Arguments> faviconTextBodies() {
+        return Stream.of(
+                Arguments.of(MediaType.TEXT_PLAIN_VALUE, bytes(FAVICON)),
+                Arguments.of(null, bytes(FAVICON)),
+                Arguments.of("text/plain; charset=UTF-16BE", FAVICON.getBytes(StandardCharsets.UTF_16BE)));
+    }
+
+    /**
+     * The Mule 3.8 listener handed the flow a form-urlencoded body as its decoded parameter map and a multipart body
+     * as a null payload, so neither equals the filter's text, even when it carries exactly {@code /favicon.ico}:
+     * both pass the filter and reach the calculation. curl's {@code --data-binary} declares the form type unless
+     * told otherwise.
+     *
+     * @param contentType the {@code Content-Type} sent
+     * @param body        the request body
+     */
+    @ParameterizedTest(name = "[{index}] Content-Type {0}")
+    @MethodSource("faviconNonTextBodies")
+    void faviconFormOrMultipartBodyPassesTheFilter(String contentType, byte[] body) {
+        Response response = send("POST", "/fibonacci?n=10", Map.of("Content-Type", contentType), body);
+
+        assertFlowReply(response, "Fibonacci(10) = 55\nCOST: 11", "11");
+    }
+
+    /**
+     * @return {@code Content-Type} and body pairs carrying {@code /favicon.ico} that the listener did not hand over
+     *         as text: a form body and a multipart body
+     */
+    private static Stream<Arguments> faviconNonTextBodies() {
+        return Stream.of(
+                Arguments.of(MediaType.APPLICATION_FORM_URLENCODED_VALUE, bytes(FAVICON)),
+                Arguments.of("multipart/form-data; boundary=b", bytes(MULTIPART_FAVICON_BODY)));
+    }
+
+    /**
+     * A form-urlencoded body with a malformed percent escape fails in the listener before the flow runs, whatever the
+     * method: the Mule 3.8 listener answered {@code BAD_REQUEST} with its decoding message and no
+     * {@code Content-Type}, so no {@code cost} header is set and nothing is cached. The committed reply also leaves
+     * Spring MVC's own {@code OPTIONS} answer out.
+     *
+     * @param method the request method, sent with the same malformed form body each time
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+    void undecodableFormBodyReturnsListener400(String method) {
+        Response response = send(method, "/fibonacci?n=10",
+                Map.of("Content-Type", MediaType.APPLICATION_FORM_URLENCODED_VALUE), bytes("a=1&b=%ZZ"));
+
+        byte[] expected = bytes("Cannot decode x-www-form-urlencoded payload");
+        assertEquals("HTTP/1.1 400 Bad Request", response.statusLine(), response::toString);
+        assertNull(response.header("Content-Type"), response::toString);
+        assertEquals(List.of(Integer.toString(expected.length)), response.headers("Content-Length"),
+                response::toString);
+        assertEquals(List.of(), response.headers("cost"), response::toString);
+        assertEquals(List.of(), response.headers("Allow"), response::toString);
+        assertArrayEquals(expected, response.body(), response::toString);
+        assertNull(cache.get("10"), "the rejected request must not reach the cache scope");
+    }
+
+    /** A {@code Content-Type} that cannot be parsed fails the payload binding, which reaches the SC-1 500. */
+    @Test
+    void unparseableContentTypeReturnsGeneric500() {
+        Response response = send("POST", "/fibonacci?n=10", Map.of("Content-Type", "bogus"), bytes("ping"));
+
+        assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
+        assertEquals(List.of(MediaType.APPLICATION_JSON_VALUE), response.headers("Content-Type"), response::toString);
+        assertEquals(List.of(), response.headers("cost"), response::toString);
+        assertArrayEquals(bytes("{ \"message\": \"Invalid mime type \\\"bogus\\\": does not contain '/'\" }"),
+                response.body(), response::toString);
+        assertNull(cache.get("10"), "the failed request must not reach the cache scope");
     }
 
     /**

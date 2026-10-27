@@ -33,7 +33,10 @@ import org.w3c.dom.Document;
  *   <li>leaves stay strings ({@code "count": "5"}) although {@code tshirt.wsdl} types {@code count} as
  *       {@code xsd:integer}, because the XML reader yields text;</li>
  *   <li>namespace prefixes and attributes are dropped; layout is two-space indentation, LF line ends and no
- *       trailing line feed.</li>
+ *       trailing line feed;</li>
+ *   <li>a selector that misses (no payload, another root, or {@code ListInventoryResponse} outside the
+ *       {@code ns0} namespace) or selects an empty element yields null, which the JSON writer writes as the
+ *       four characters {@code null}.</li>
  * </ul>
  * For the original sample {@code sample_data/ListInventoryResponse.xml} (five items) the result is:
  * <pre>{@code
@@ -79,17 +82,11 @@ public class ListInventoryResponseMapper {
      * selected content as DataWeave 1.0 JSON.
      *
      * @param doc the SOAP Body child returned by the {@code ListInventory} operation; may be {@code null}
-     * @return the JSON text without a trailing line feed; {@code null} when the document is {@code null}, its root
-     *         is not {@code ListInventoryResponse} in {@link #NAMESPACE}, or that root is empty
+     * @return the JSON text without a trailing line feed, never {@code null}; the JSON literal {@code null} when
+     *         the document is {@code null}, its root is not {@code ListInventoryResponse} in {@link #NAMESPACE}, or
+     *         that root is empty, because the selector then yields null and the JSON writer writes it as such
      */
     public String toJson(Document doc) {
-        Object selected = dwXmlToJson.select(doc, NAMESPACE, ROOT);
-        if (selected == null) {
-            // A selector that misses yields null in DataWeave. Whether the original then wrote the text "null" or
-            // an empty body is a Tier 2A verification point, so the HTTP body for a null result is decided by the
-            // service and controller, not here.
-            return null;
-        }
-        return dwJsonWriter.write(selected);
+        return dwJsonWriter.write(dwXmlToJson.select(doc, NAMESPACE, ROOT));
     }
 }

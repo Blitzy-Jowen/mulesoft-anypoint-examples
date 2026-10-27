@@ -16,10 +16,10 @@ import java.util.List;
 
 import org.springframework.stereotype.Service;
 
-import com.mulesoft.examples.mule_component_bindings.client.TwitterSearchClient;
 import com.mulesoft.examples.mule_component_bindings.mapper.TwitterResponseMapper;
 import com.mulesoft.examples.mule_component_bindings.model.Tweet;
 
+import twitter4j.QueryResult;
 import twitter4j.TwitterException;
 
 /**
@@ -42,11 +42,32 @@ public class TwitterSearchService implements TwitterService {
 
 	private static final String DATE_FORMAT = "yyyy-MM-dd";
 
-	private final TwitterSearchClient client;
+	/**
+	 * The {@code twitter:search} operation, with the {@code query}, {@code since} and {@code until} attributes the
+	 * connector carried; a {@code null} date bound sends none. This service owns the port and the outbound Twitter
+	 * adapter, {@code client.TwitterSearchClient}, implements it, so the service package does not depend on the
+	 * client package.
+	 */
+	public interface RawSearch {
+
+		/**
+		 * Executes the search.
+		 *
+		 * @param query the search query
+		 * @param since the {@code yyyy-MM-dd} lower date bound, or {@code null} to send none
+		 * @param until the {@code yyyy-MM-dd} upper date bound, or {@code null} to send none
+		 * @return the search result
+		 * @throws TwitterException when Twitter rejects or fails the search
+		 */
+		QueryResult search(String query, String since, String until) throws TwitterException;
+
+	}
+
+	private final RawSearch client;
 
 	private final TwitterResponseMapper mapper;
 
-	public TwitterSearchService(TwitterSearchClient client, TwitterResponseMapper mapper) {
+	public TwitterSearchService(RawSearch client, TwitterResponseMapper mapper) {
 		this.client = client;
 		this.mapper = mapper;
 	}

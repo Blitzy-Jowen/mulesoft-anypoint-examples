@@ -34,7 +34,6 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
-import com.mulesoft.examples.mule_component_bindings.client.TwitterSearchClient;
 import com.mulesoft.examples.mule_component_bindings.mapper.TwitterResponseMapper;
 import com.mulesoft.examples.mule_component_bindings.model.Tweet;
 
@@ -48,13 +47,13 @@ import twitter4j.TwitterException;
  * {@code since} as {@code yyyy-MM-dd}, {@code until} ten calendar days later, {@code rpp} and {@code page} stored but
  * never read by {@code twitter:search}), the search and the {@code TwitterResponseProcessor} mapping; and the fixed
  * {@code AAPL} search of flow {@code mule-component-bindingsFlow1} behind the {@code "/"} listener. The Twitter
- * client and the mapper are Mockito mocks.
+ * search port {@link TwitterSearchService.RawSearch} and the mapper are Mockito mocks.
  */
 @ExtendWith(MockitoExtension.class)
 class TwitterSearchServiceTest {
 
     @Mock
-    private TwitterSearchClient client;
+    private TwitterSearchService.RawSearch client;
 
     @Mock
     private TwitterResponseMapper mapper;

@@ -14,6 +14,9 @@ spring:
       add-mappings: false   # unknown paths must reach GlobalExceptionHandler as 404 "No listener for endpoint: <path>"
   mvc:
     dispatch-trace-request: true   # /orders and /inventory listeners have no allowedMethods: TRACE reaches TshirtController
+    formcontent:
+      filter:
+        enabled: false   # TshirtController reads the raw body: a form body on PUT/PATCH/DELETE reaches it as it does on POST instead of being parsed by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404

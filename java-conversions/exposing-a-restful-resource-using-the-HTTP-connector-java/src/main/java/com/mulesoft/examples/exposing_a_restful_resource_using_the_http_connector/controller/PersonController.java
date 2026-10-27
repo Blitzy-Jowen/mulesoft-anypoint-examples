@@ -47,9 +47,12 @@ import com.mulesoft.examples.exposing_a_restful_resource_using_the_http_connecto
  *
  * <p>No mapping restricts the request or response media type, because the Mule listener ignored the request's
  * {@code Content-Type} and {@code Accept}; each response presets its Content-Type instead, so Spring skips content
- * negotiation and never answers 406 or 415. Methods outside each listener's {@code allowedMethods} reach SC-1's
- * 405: PUT, DELETE and PATCH through Spring's own method check, HEAD and OPTIONS through the rejecting mappings
- * below, which Spring would otherwise answer itself with 200.
+ * negotiation and never answers 406 or 415. GET and POST in any letter case, which the Mule listener matched
+ * ignoring case, reach these mappings through {@code config/ListenerMethodFilter}. Methods outside each listener's
+ * {@code allowedMethods} reach SC-1's 405: PUT, DELETE, PATCH and other spellings such as {@code head} or
+ * {@code options} through Spring's own method check, HEAD and OPTIONS through the rejecting mappings below, which
+ * Spring would otherwise answer itself with 200. A CORS pre-flight is dispatched as the plain OPTIONS it is by
+ * {@code config/PreflightDispatchConfig}, so it reaches the rejecting mappings below and gets the 405 too.
  *
  * <p>Tier 2A verification point: the Content-Types the Mule listener emitted, {@code application/json} for the two
  * GET flows (their {@code object-to-json-transformer}) and {@code text/plain;charset=UTF-8} for the

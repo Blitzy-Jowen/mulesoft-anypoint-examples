@@ -76,7 +76,8 @@ import com.mulesoft.examples.web_service_consumer.config.TshirtServiceProperties
  * the {@code ns0:AuthenticationHeader} with the configured key and refuses to send without one, while
  * {@code ListInventory} carries no header and needs no key. The response Body child comes back as its own document,
  * no response or an empty Body as {@code null}; a SOAP fault, an HTTP error without a fault, a read timeout and a
- * refused connection surface as the Spring WS exceptions, never retried.
+ * refused connection surface as the Spring WS exceptions, never retried. Requests go out byte for byte as SAAJ
+ * writes them, except that characters outside the BMP are sent as UTF-8 bytes rather than character references.
  *
  * <p>Plain JUnit 5: the client is built directly from {@link TshirtServiceProperties}; no Spring context is started.
  * Every document the test reads is parsed with DOCTYPE declarations and external entities disabled.
@@ -261,6 +262,25 @@ class TshirtServiceClientTest {
             <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
               <soap:Body/>
             </soap:Envelope>""";
+
+    /** The SAAJ wire form of an {@code OrderTshirt} envelope up to its Body content, with no XML declaration. */
+    private static final String ORDER_ENVELOPE_START = "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"" + SOAP_ENVELOPE_NAMESPACE
+            + "\"><SOAP-ENV:Header><ns0:AuthenticationHeader xmlns:ns0=\"" + TshirtServiceClient.NAMESPACE
+            + "\"><apiKey>" + API_KEY + "</apiKey></ns0:AuthenticationHeader></SOAP-ENV:Header><SOAP-ENV:Body>";
+
+    /** The SAAJ wire form of a {@code ListInventory} envelope up to its Body content: empty Header, no declaration. */
+    private static final String LIST_INVENTORY_ENVELOPE_START = "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\""
+            + SOAP_ENVELOPE_NAMESPACE + "\"><SOAP-ENV:Header/><SOAP-ENV:Body>";
+
+    private static final String ENVELOPE_END = "</SOAP-ENV:Body></SOAP-ENV:Envelope>";
+
+    private static final String NS0 = "xmlns:ns0=\"" + TshirtServiceClient.NAMESPACE + "\"";
+
+    /** U+1F600, U+20000 and U+10FFFF, characters outside the BMP that the JDK serializer writes as references. */
+    private static final String SUPPLEMENTARY = Character.toString(0x1F600) + " " + Character.toString(0x20000) + " "
+            + Character.toString(0x10FFFF);
+
+    private static final String GRINNING_FACE = Character.toString(0x1F600);
 
     // gzip left enabled: the client must not advertise it, or an empty 200 would arrive compressed.
     @RegisterExtension
@@ -698,5 +718,104 @@ class TshirtServiceClientTest {
         LoggedRequest request = singlePost();
         assertThat(request.getHeader("Content-Length")).isEqualTo(String.valueOf(request.getBody().length));
         assertThat(request.containsHeader("Transfer-Encoding")).isFalse();
+    }
+
+    /**
+     * Requests and the exact Body content SAAJ sends for them. Each request is written in the serializer's own form
+     * (no declaration, {@code />} for an empty element, its escaping), so apart from the CDATA case the Body content
+     * is the request itself.
+     *
+     * @return the operation, a description, the request ({@code null} for none) and the expected Body content
+     *         ({@code null} when it is the request)
+     */
+    static Stream<Arguments> wireForms() {
+        String bmp = "M\u00fcller \u65e5\u672c \u20ac &amp;&lt;&gt;\"' &#13; x";
+        String bmpAttribute = "&#13;&#10;&#9; " + bmp.replace("\"", "&quot;");
+        return Stream.of(
+                Arguments.of(Operation.ORDER_TSHIRT, "supplementary characters in element text",
+                        "<ns0:OrderTshirt " + NS0 + "><email>utf8@x</email><name>M\u00fcller \u65e5\u672c \u20ac "
+                                + SUPPLEMENTARY + "</name></ns0:OrderTshirt>", null),
+                Arguments.of(Operation.LIST_INVENTORY, "supplementary characters in an attribute value",
+                        "<ns0:ListInventory " + NS0 + " filter=\"" + SUPPLEMENTARY + "\"/>", null),
+                Arguments.of(Operation.LIST_INVENTORY, "supplementary characters in passed-through text and namespace",
+                        "<ns0:ListInventory " + NS0 + "><size>" + SUPPLEMENTARY + "</size><x xmlns=\"urn:"
+                                + GRINNING_FACE + "\"/></ns0:ListInventory>", null),
+                Arguments.of(Operation.ORDER_TSHIRT, "BMP text, escapes, a carriage return and an empty element",
+                        "<ns0:OrderTshirt " + NS0 + "><name>" + bmp + "</name><empty/></ns0:OrderTshirt>", null),
+                Arguments.of(Operation.LIST_INVENTORY, "BMP attribute escapes and character references",
+                        "<ns0:ListInventory " + NS0 + " filter=\"" + bmpAttribute + "\"/>", null),
+                // A comment is written verbatim, so its literal reference stays text; SAAJ sends CDATA as text.
+                Arguments.of(Operation.LIST_INVENTORY, "literal references in a comment and a CDATA section",
+                        "<ns0:ListInventory " + NS0 + "><!-- " + GRINNING_FACE + " &#128512; &#x1F600; --><filter>"
+                                + "<![CDATA[" + GRINNING_FACE + " &#128512; & <]]></filter></ns0:ListInventory>",
+                        "<ns0:ListInventory " + NS0 + "><!-- " + GRINNING_FACE + " &#128512; &#x1F600; --><filter>"
+                                + GRINNING_FACE + " &amp;#128512; &amp; &lt;</filter></ns0:ListInventory>"),
+                Arguments.of(Operation.LIST_INVENTORY, "the default ListInventory element", null,
+                        "<ns0:ListInventory " + NS0 + "/>"));
+    }
+
+    // The original's CXF/Woodstox stack wrote supplementary characters as UTF-8; every other byte is SAAJ's.
+    @ParameterizedTest(name = "{0}: {1}")
+    @MethodSource("wireForms")
+    void requestIsSentInSaajsWireFormWithSupplementaryCharactersAsUtf8Bytes(Operation operation, String description,
+                                                                           String request, String expectedOrNull) {
+        stubService(soapResponse(200, operation.response));
+        TshirtServiceClient client = newClient();
+        Document document = request == null ? null : parse(request.getBytes(UTF_8));
+
+        if (operation == Operation.ORDER_TSHIRT) {
+            client.orderTshirt(document);
+        }
+        else {
+            client.listInventory(document);
+        }
+
+        String start = operation == Operation.ORDER_TSHIRT ? ORDER_ENVELOPE_START : LIST_INVENTORY_ENVELOPE_START;
+        String expected = start + (expectedOrNull == null ? request : expectedOrNull) + ENVELOPE_END;
+        LoggedRequest sent = singlePost();
+        assertThat(new String(sent.getBody(), UTF_8)).isEqualTo(expected);
+        assertThat(sent.getBody()).isEqualTo(expected.getBytes(UTF_8));
+        assertThat(sent.getHeader("Content-Length")).isEqualTo(String.valueOf(sent.getBody().length));
+        assertThat(sent.containsHeader("Transfer-Encoding")).isFalse();
+        assertThat(sent.getHeader("Content-Type")).isEqualToIgnoringCase(TEXT_XML);
+    }
+
+    static Stream<Arguments> characterReferenceRewrites() {
+        return Stream.of(
+                Arguments.of("decimal reference", "<a>&#128512;</a>", "<a>" + GRINNING_FACE + "</a>"),
+                Arguments.of("hexadecimal reference", "<a>&#x1F600;&#x1f600;</a>",
+                        "<a>" + GRINNING_FACE + GRINNING_FACE + "</a>"),
+                Arguments.of("leading zeros", "<a>&#0128512;&#x0001F600;</a>",
+                        "<a>" + GRINNING_FACE + GRINNING_FACE + "</a>"),
+                Arguments.of("lowest and highest supplementary code points", "<a b=\"&#65536;\">&#1114111;</a>",
+                        "<a b=\"" + Character.toString(0x10000) + "\">" + Character.toString(0x10FFFF) + "</a>"),
+                Arguments.of("between multi-byte characters", "\u00fc&#128512;\u65e5",
+                        "\u00fc" + GRINNING_FACE + "\u65e5"),
+                Arguments.of("after a closed comment, CDATA section and instruction",
+                        "<!--x-->&#128512;<![CDATA[x]]>&#128512;<?x?>&#128512;",
+                        "<!--x-->" + GRINNING_FACE + "<![CDATA[x]]>" + GRINNING_FACE + "<?x?>" + GRINNING_FACE),
+                Arguments.of("empty comment", "<!---->&#128512;", "<!---->" + GRINNING_FACE));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("characterReferenceRewrites")
+    void supplementaryCharacterReferencesBecomeUtf8Bytes(String description, String xml, String expected) {
+        byte[] rewritten = TshirtServiceClient.encodeSupplementaryCharacterReferences(xml.getBytes(UTF_8));
+
+        assertThat(rewritten).isEqualTo(expected.getBytes(UTF_8));
+    }
+
+    // Only references the serializer wrote for characters outside the BMP change; everything else is kept as sent.
+    @ParameterizedTest(name = "[{0}]")
+    @ValueSource(strings = {
+            "", "&", "&#", "&#x", "&#;", "&#x;", "&#128512", "&#x1F600", "&#X1F600;", "&#12a;", "&# 128512;",
+            "&#13;&#10;&#9;&#127;&#65535;&#xFFFF;", "&#1114112;", "&#x110000;", "&#99999999999999999999;",
+            "&amp;#128512;", "<!-- &#128512; -->", "<![CDATA[&#128512;]]>", "<?pi &#128512;?>",
+            "<?xml version=\"1.0\"?>", "<!-- &#128512;", "<![CDATA[&#128512;", "<?pi &#128512;", "<!-->&#128512;-->",
+            "<a>\uD83D\uDE00 \u00fc \u65e5</a>"})
+    void everyOtherByteIsKept(String xml) {
+        byte[] bytes = xml.getBytes(UTF_8);
+
+        assertThat(TshirtServiceClient.encodeSupplementaryCharacterReferences(bytes)).isSameAs(bytes);
     }
 }

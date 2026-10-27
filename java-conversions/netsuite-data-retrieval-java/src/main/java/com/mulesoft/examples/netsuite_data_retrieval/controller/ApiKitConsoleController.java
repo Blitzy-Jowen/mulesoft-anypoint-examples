@@ -59,7 +59,8 @@ import org.springframework.web.util.UriUtils;
  * <p>Served under the API base path {@code apikit.base-path} (default {@code /api}) with the console path
  * {@code apikit.console-path} (default {@code console}):
  * <ul>
- *   <li>{@code <base>/console}: 301 to {@code <base>/console/};</li>
+ *   <li>{@code <base>/console}: 301 to the absolute URL of {@code <base>/console/}, built from the request's
+ *       scheme and {@code Host} header and followed by its query string;</li>
  *   <li>{@code <base>/console/} and {@code <base>/console/index.html}: the console page, its RAML source pointed
  *       at {@code ./?raml} and its attribute placeholder replaced by the handler's options;</li>
  *   <li>{@code <base>/console/<file>}: the console's scripts, styles, fonts and images from the classpath tree
@@ -68,16 +69,18 @@ import org.springframework.web.util.UriUtils;
  *       with an {@code Accept} header naming {@code application/raml+yaml}: the RAML of {@code apikit.raml}
  *       with its {@code baseUri} set to the listener URL, whose host is the {@code Host} header's name only
  *       when that is a legal DNS name, IPv4 address or IPv6 address and the listener socket's local address
- *       otherwise;</li>
+ *       otherwise, and whose port is the listener socket's local port on the console paths and the
+ *       {@code Host} header's port, none when the header names none, on {@code <base>/};</li>
  *   <li>{@code GET <base>/<include>} and {@code GET <base>/console/<include>}: each file the RAML
  *       {@code !include}s, so the console resolves includes relative to the RAML it loaded.</li>
  * </ul>
  * The console paths answer every method alike, a non-standard one such as {@code PROPFIND} included, because
  * the original listener declares no {@code allowedMethods} and {@code ConsoleHandler} never read the method;
- * only {@code RamlDescriptorHandler} required a GET, so the RAML answers GET (and HEAD) alone and any other
- * method on {@code <base>/console} or {@code <base>/console/} gets the redirect or the page. The console
- * paths are mapped without a method, which Spring matches for every method but a plain OPTIONS request, so
- * each also has an explicit OPTIONS mapping that gives that request the same response.
+ * only {@code RamlDescriptorHandler} required a GET, so the RAML answers GET alone on {@code <base>/} and GET
+ * (and HEAD) alone on the console paths, and any other method on {@code <base>/console} or
+ * {@code <base>/console/} gets the redirect or the page. The console paths are mapped without a method, which
+ * Spring matches for every method but a plain OPTIONS request, so each also has an explicit OPTIONS mapping
+ * that gives that request the same response.
  *
  * <p>Every miss throws {@link ApiKitNotFoundException}, which SC-3 answers with APIkit's 404 body. The class
  * maps no pattern broader than these, so unknown resources and methods under the base path still reach the
@@ -93,15 +96,14 @@ import org.springframework.web.util.UriUtils;
  *       files are {@code application/octet-stream};</li>
  *   <li>the page's RAML source is {@code ./?raml}, while {@code ConsoleHandler} with its RAML 0.8 parser wrote
  *       {@code ./?};</li>
- *   <li>the redirect's {@code Location} is the relative path {@code <base>/console/}, while
- *       {@code ConsoleHandler} wrote an absolute URL built from the scheme, the {@code Host} header and the
- *       request path;</li>
- *   <li>a {@code Host} header naming no legal DNS name, IPv4 address or IPv6 address gives the RAML's
- *       {@code baseUri} the local address of the listener socket, while APIkit copied the {@code Host} header
- *       into it unchanged;</li>
- *   <li>a HEAD request is answered as the GET without its body, the RAML included, while
- *       {@code RamlDescriptorHandler} served the RAML to GET alone, so APIkit answered such a HEAD with the
- *       redirect or the console page on the console paths and with its 404 on {@code <base>/}.</li>
+ *   <li>a {@code Host} header naming no legal DNS name, IPv4 address or IPv6 address gives the redirect's
+ *       {@code Location} and the RAML's {@code baseUri} the local address and local port of the listener
+ *       socket, and one whose legal name is followed by anything other than nothing, a bare {@code :} or
+ *       {@code :} and a port number up to 65535 gives them that name with the local port, while APIkit copied
+ *       what the {@code Host} header carried into them unchanged;</li>
+ *   <li>a HEAD request on the console paths is answered as the GET without its body, the RAML included,
+ *       while {@code RamlDescriptorHandler} served the RAML to GET alone, so APIkit answered such a HEAD with
+ *       the redirect or the console page.</li>
  * </ul>
  *
  * <p>Every RAML-backed project carries a copy that differs from this one in the {@code package} line and the
@@ -168,6 +170,12 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     /** Longest host name, without the optional trailing {@code .} of an absolute name. */
     private static final int MAX_HOST_NAME_LENGTH = 253;
 
+    /** The port part of a {@code Host} header: {@code :} and 1 to 5 ASCII digits. */
+    private static final Pattern HOST_HEADER_PORT = Pattern.compile(":[0-9]{1,5}");
+
+    /** Largest TCP port number. */
+    private static final int MAX_PORT = 65535;
+
     /** Host of the RAML's {@code baseUri} when neither the {@code Host} header nor the socket names a legal one. */
     private static final String LOOPBACK_HOST = "127.0.0.1";
 
@@ -223,9 +231,10 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     }
 
     /**
-     * {@code RamlDescriptorHandler} on the API root: the RAML to a GET (or HEAD) whose {@code Accept} header
-     * names {@code application/raml+yaml}. Every other request to {@code <base>/} is the unknown resource it
-     * was for APIkit.
+     * {@code RamlDescriptorHandler} on the API root: the RAML of {@link #routerRaml} to a GET whose
+     * {@code Accept} header names {@code application/raml+yaml}. Every other request to {@code <base>/}, a HEAD
+     * included, is the unknown resource it was for APIkit, whose handler took GET alone and left every other
+     * method to the router.
      *
      * <p>Mapped without a method, so that every method but OPTIONS, a non-standard one such as
      * {@code PROPFIND} included, reaches it and a non-RAML request answers APIkit's 404 rather than a 405;
@@ -235,8 +244,8 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
      */
     @RequestMapping("${apikit.base-path:/api}/")
     public ResponseEntity<byte[]> apiRoot(HttpServletRequest request) {
-        if (isGetOrHead(request) && wantsRaml(request)) {
-            return raml(request);
+        if (isGet(request) && wantsRaml(request)) {
+            return routerRaml(request);
         }
         throw new ApiKitNotFoundException(NOT_FOUND_MESSAGE);
     }
@@ -257,10 +266,11 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
 
     /**
      * The console path without its trailing slash, for every method: the RAML when a GET (or HEAD) asks for
-     * it, otherwise a 301 whose {@code Location} is the relative path {@code <base>/console/}, preceded by the
-     * servlet context path and followed by the query string when there is one. The path is built from the
-     * configured console path alone, so neither the {@code Host} header nor the raw request path reaches the
-     * header.
+     * it, otherwise a 301 whose {@code Location} is the absolute URL {@code ConsoleHandler} wrote: the request's
+     * scheme, the {@link #requestAuthority authority} the {@code Host} header names, the servlet context path,
+     * {@code <base>/console/} and the query string when there is one. The path is built from the configured
+     * console path alone and the authority from a validated host and port, so neither the raw request path nor
+     * any other byte of the {@code Host} header reaches the header.
      *
      * <p>Written to the servlet response and committed before the method returns, because the 301 has no
      * body to commit it: the servlet fills a response still open after an OPTIONS request with an
@@ -278,7 +288,9 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
             return;
         }
         String contextPath = request.getContextPath();
-        StringBuilder location = new StringBuilder(contextPath == null ? "" : contextPath)
+        StringBuilder location = new StringBuilder(request.getScheme()).append("://")
+                .append(requestAuthority(request))
+                .append(contextPath == null ? "" : contextPath)
                 .append(UriUtils.encodePath(consolePrefix, StandardCharsets.UTF_8)).append('/');
         String query = request.getQueryString();
         if (query != null && !query.isEmpty()) {
@@ -496,15 +508,30 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     }
 
     /**
-     * The RAML with its {@code baseUri} set to the URL of the listener that received {@code request}: its
-     * scheme, a host, its local port and the base path. The host is the name the {@code Host} header carries
-     * only when that is a legal DNS name, IPv4 address or IPv6 address; any other name, an absent one or a
-     * {@code Host} header the server cannot parse falls back to the local address of the listener socket, so
-     * no other header byte reaches the unquoted YAML scalar.
+     * The RAML of the console paths, with its {@code baseUri} set to the URL of the listener that received
+     * {@code request} as {@code getApikitRamlConsole} built it: its scheme, a host, its local port and the base
+     * path. The host is the name the {@code Host} header carries only when that is a legal DNS name, IPv4
+     * address or IPv6 address; any other name, an absent one or a {@code Host} header the server cannot parse
+     * falls back to the local address of the listener socket, so no other header byte reaches the unquoted YAML
+     * scalar.
      */
     private ResponseEntity<byte[]> raml(HttpServletRequest request) {
         String listenerUri = request.getScheme() + "://" + hostLiteral(listenerHost(request)) + ":"
                 + request.getLocalPort() + basePath;
+        return ramlWithBaseUri(listenerUri);
+    }
+
+    /**
+     * The RAML of the API root, with its {@code baseUri} set to the URL {@code getApikitRaml} built: the
+     * request's scheme, the {@link #requestAuthority authority} the {@code Host} header names, its port
+     * included and none added when it names none, and the base path.
+     */
+    private ResponseEntity<byte[]> routerRaml(HttpServletRequest request) {
+        return ramlWithBaseUri(request.getScheme() + "://" + requestAuthority(request) + basePath);
+    }
+
+    /** The RAML with its {@code baseUri} set to {@code listenerUri}, as {@code application/raml+yaml}. */
+    private ResponseEntity<byte[]> ramlWithBaseUri(String listenerUri) {
         return ok(withBaseUri(listenerUri).getBytes(StandardCharsets.UTF_8), RAML_MEDIA_TYPE, true);
     }
 
@@ -618,6 +645,15 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     private static boolean isGetOrHead(HttpServletRequest request) {
         String method = request.getMethod();
         return "GET".equals(method) || "HEAD".equals(method);
+    }
+
+    /**
+     * {@code RamlDescriptorHandler}'s method test on the API root: the method, upper-cased, is GET, so HEAD is
+     * not.
+     */
+    private static boolean isGet(HttpServletRequest request) {
+        String method = request.getMethod();
+        return method != null && "GET".equals(method.toUpperCase(Locale.ROOT));
     }
 
     /** The content type {@code ConsoleHandler} gave a file of this name. */
@@ -737,6 +773,49 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
             localAddress = localAddress.substring(0, localAddress.indexOf('%'));
         }
         return isLegalHost(localAddress) ? localAddress : LOOPBACK_HOST;
+    }
+
+    /**
+     * The authority of the request URL {@code ConsoleHandler} and {@code getApikitRaml} copied from the
+     * {@code Host} header: the {@link #listenerHost host}, bracketed when it is an IPv6 address, then the
+     * header's port. The header is split as Undertow splits it for {@link HttpServletRequest#getServerName}: a
+     * bracketed name ends at the first {@code ]}, any other at the first {@code :}. After a legal name, nothing or
+     * a bare {@code :} adds no port, as an empty port means the scheme's default, and {@code :} with 1 to 5
+     * digits up to {@link #MAX_PORT} adds that port; an absent or blank header, an illegal name, an unclosed
+     * {@code [} and anything else after the name add the listener socket's local port instead, so no header
+     * byte but a legal name and a port number reaches the URL.
+     */
+    private static String requestAuthority(HttpServletRequest request) {
+        String host = hostLiteral(listenerHost(request));
+        String localPort = ":" + request.getLocalPort();
+        String header = request.getHeader(HttpHeaders.HOST);
+        if (header == null || header.isBlank()) {
+            return host + localPort;
+        }
+        String name;
+        String port;
+        if (header.startsWith("[")) {
+            int close = header.indexOf(']');
+            if (close < 0) {
+                return host + localPort;
+            }
+            name = header.substring(1, close);
+            port = header.substring(close + 1);
+        } else {
+            int colon = header.indexOf(':');
+            name = colon < 0 ? header : header.substring(0, colon);
+            port = colon < 0 ? "" : header.substring(colon);
+        }
+        if (!isLegalHost(name)) {
+            return host + localPort;
+        }
+        if (port.isEmpty() || ":".equals(port)) {
+            return host;
+        }
+        if (HOST_HEADER_PORT.matcher(port).matches() && Integer.parseInt(port.substring(1)) <= MAX_PORT) {
+            return host + port;
+        }
+        return host + localPort;
     }
 
     /**

@@ -2,10 +2,12 @@ package com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 import java.io.IOException;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -29,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.web.embedded.undertow.UndertowServletWebServerFactory;
 import org.springframework.boot.web.server.WebServer;
 import org.springframework.boot.web.server.WebServerFactoryCustomizer;
@@ -40,10 +43,16 @@ import org.springframework.mock.web.MockFilterConfig;
 import org.springframework.mock.web.MockHttpServletMapping;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.mock.web.MockRequestDispatcher;
 import org.springframework.mock.web.MockServletContext;
 import org.springframework.test.util.TestSocketUtils;
 
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.HttpTestClient;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 
 /**
  * Tests SC-10: {@link PortRoutingFilter} scoping each request to the routes of the listener that received it, and the
@@ -64,6 +73,12 @@ class PortRoutingFilterTest {
 
     private static final String NO_LISTENER_CONTENT_TYPE = "text/plain;charset=UTF-8";
     private static final String APP_SERVLET = "appServlet";
+    private static final String MAPPED_SERVLET = "mappedServlet";
+
+    /** Personal and secret segments a caller can put in any path, which no routing log line may repeat. */
+    private static final String PERSONAL_SEGMENT = "alice@example.com";
+    private static final String SECRET_SEGMENT = "tok-SENTINEL";
+    private static final String SENTINEL_SEGMENTS = "/" + PERSONAL_SEGMENT + "/" + SECRET_SEGMENT;
 
     /** {@code /svc/**} stays with the servlet the container mapped; {@code /app/**} is forwarded to appServlet. */
     private static final List<ListenerPorts.Route> MAIN_ROUTES = List.of(
@@ -234,6 +249,60 @@ class PortRoutingFilterTest {
         assertThat(chain.getRequest()).isSameAs(request);
         assertThat(response.getStatus()).isEqualTo(HttpServletResponse.SC_OK);
         assertThat(response.getContentAsByteArray()).isEmpty();
+    }
+
+    static Stream<Arguments> routingDecisions() {
+        Supplier<PortRoutingFilter> unrouted = () -> new PortRoutingFilter(List.of(), Map.of());
+        Supplier<PortRoutingFilter> routed = () -> new PortRoutingFilter(MAIN_ROUTES, ADDITIONAL_ROUTES);
+        return Stream.of(
+                Arguments.of(Named.of("served unrouted", unrouted), "/users" + SENTINEL_SEGMENTS,
+                        "Port " + MAIN + " serves every path; the request continues unrouted"),
+                Arguments.of(Named.of("no-listener 404", routed), "/users" + SENTINEL_SEGMENTS,
+                        "No route on port " + MAIN + " matches the request path; answering 404"),
+                Arguments.of(Named.of("kept on the mapped servlet", routed), "/svc" + SENTINEL_SEGMENTS,
+                        "Port " + MAIN + " serves the request through " + MAPPED_SERVLET
+                                + " as mapped, by route [/svc/**]"),
+                Arguments.of(Named.of("forwarded to its servlet", routed), "/app" + SENTINEL_SEGMENTS,
+                        "Port " + MAIN + " forwards the request from " + MAPPED_SERVLET + " to " + APP_SERVLET
+                                + ", by route [/app/**]"));
+    }
+
+    /**
+     * The log oracle is a Logback {@link ListAppender} on the filter's logger, attached at DEBUG for the one request
+     * and detached with the logger's level restored afterwards.
+     */
+    @ParameterizedTest(name = "{0}: logged with the port and route, never the path")
+    @MethodSource("routingDecisions")
+    void routingDecisionIsLoggedWithoutTheRequestPath(Supplier<PortRoutingFilter> construction, String uri,
+            String expectedMessage) throws Exception {
+        servletContext.registerNamedDispatcher(APP_SERVLET, new MockRequestDispatcher(APP_SERVLET));
+        PortRoutingFilter routing = initialised(construction.get());
+        MockHttpServletRequest request = request(MAIN, "GET", uri, null);
+        request.setHttpServletMapping(new MockHttpServletMapping("", "/", MAPPED_SERVLET, MappingMatch.DEFAULT));
+        Logger logger = (Logger) LoggerFactory.getLogger(PortRoutingFilter.class);
+        Level previousLevel = logger.getLevel();
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        logger.setLevel(Level.DEBUG);
+        try {
+            routing.doFilter(request, response, chain);
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+            logger.setLevel(previousLevel);
+        }
+
+        assertThat(appender.list)
+                .extracting(ILoggingEvent::getLevel, ILoggingEvent::getFormattedMessage)
+                .contains(tuple(Level.DEBUG, expectedMessage));
+        assertThat(appender.list).allSatisfy(event -> {
+            assertThat(event.getFormattedMessage()).doesNotContain(PERSONAL_SEGMENT, SECRET_SEGMENT);
+            Object[] arguments = event.getArgumentArray();
+            assertThat(arguments == null ? List.of() : Arrays.asList(arguments))
+                    .allSatisfy(argument -> assertThat(String.valueOf(argument))
+                            .doesNotContain(PERSONAL_SEGMENT, SECRET_SEGMENT));
+        });
     }
 
     @Test

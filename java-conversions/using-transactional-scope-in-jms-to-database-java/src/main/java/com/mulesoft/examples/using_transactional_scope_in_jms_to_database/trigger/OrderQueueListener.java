@@ -46,15 +46,26 @@ public class OrderQueueListener {
     public static final String CONNECTOR_NAME = "Active_MQ";
 
     /**
-     * Text of Mule's {@code MessageRedeliveredException} as the original README shows it: message ID, redelivery
-     * count, endpoint URI, {@code maxRedelivery}, connector name and the simple name of the JMS message class.
+     * SLF4J message pattern of Mule's {@code MessageRedeliveredException} text. Its six {@code {}} placeholders take,
+     * in order, the message ID, redelivery count, endpoint URI, {@code maxRedelivery}, connector name and the simple
+     * name of the JMS message class; rendered, the text is identical to the line the original README shows.
      */
-    public static final String REDELIVERY_EXCEEDED_FORMAT = "Message with id \"%s\" has been redelivered %d times on endpoint \"%s\", which exceeds the maxRedelivery setting of %d on the connector \"%s\". Message payload is of type: %s";
+    public static final String REDELIVERY_EXCEEDED_FORMAT = "Message with id \"{}\" has been redelivered {} times on endpoint \"{}\", which exceeds the maxRedelivery setting of {} on the connector \"{}\". Message payload is of type: {}";
 
     private static final Logger log = LoggerFactory.getLogger(OrderQueueListener.class);
 
     /** JMS-defined property carrying the 1-based delivery attempt. */
     private static final String DELIVERY_COUNT_PROPERTY = "JMSXDeliveryCount";
+
+    /**
+     * Largest bytes-message body accepted, 1 MiB; an {@code order} document is about 100 bytes. A bytes body whose
+     * declared length is negative or above this bound is rejected before any buffer is allocated, so the
+     * {@code long} length can neither wrap nor truncate when narrowed to an {@code int}, nor drive an allocation
+     * that exhausts the heap. The rejection propagates like every other failure: the session rolls back, the broker
+     * redelivers up to {@code maxRedelivery} times and the redelivery guard then consumes the message unread. That
+     * is the outcome an accepted body has too, because the transactional scope's component always throws.
+     */
+    private static final int MAX_BODY_BYTES = 1_048_576;
 
     private final OrderXmlMapper orderXmlMapper;
 
@@ -93,9 +104,10 @@ public class OrderQueueListener {
      * transactional scope.
      *
      * @param message the delivery, a text or bytes message holding an {@code order} document
-     * @throws Exception unchanged: a {@link JMSException} reading the message, the
-     *         {@link IllegalArgumentException} of an unsupported message type or a document the mapper rejects,
-     *         or whatever the transactional scope throws (in practice {@code MyException("exception customized")})
+     * @throws Exception unchanged: a {@link JMSException} reading the message or reading fewer bytes than a bytes
+     *         message declares, the {@link IllegalArgumentException} of an unsupported message type, of a bytes
+     *         body length outside 0 to {@code MAX_BODY_BYTES} or of a document the mapper rejects, or whatever the
+     *         transactional scope throws (in practice {@code MyException("exception customized")})
      */
     @JmsListener(destination = "${jms.inbound-queue:in}", containerFactory = "jmsListenerContainerFactory")
     public void onMessage(Message message) throws Exception {
@@ -103,14 +115,14 @@ public class OrderQueueListener {
                 ? message.getIntProperty(DELIVERY_COUNT_PROPERTY) : 1;
         int redeliveryCount = deliveryCount - 1;
         if (redeliveryCount > maxRedelivery) {
-            log.error(String.format(REDELIVERY_EXCEEDED_FORMAT, message.getJMSMessageID(), redeliveryCount,
-                    "jms://" + inboundQueue, maxRedelivery, CONNECTOR_NAME, message.getClass().getSimpleName()));
+            log.error(REDELIVERY_EXCEEDED_FORMAT, message.getJMSMessageID(), redeliveryCount, "jms://" + inboundQueue,
+                    maxRedelivery, CONNECTOR_NAME, message.getClass().getSimpleName());
             return;
         }
 
         String text = extractText(message);
         Order order = orderXmlMapper.toOrder(text);
-        log.info("XXXXXXX order: " + order);
+        log.info("XXXXXXX order: {}", order);
         orderTransactionService.process(order);
     }
 
@@ -118,17 +130,31 @@ public class OrderQueueListener {
      * The message body as text: a text message's text, or a bytes message's body decoded as UTF-8.
      *
      * @param message the delivery
-     * @return the body text
-     * @throws JMSException when the body cannot be read
-     * @throws IllegalArgumentException for any other message type
+     * @return the body text, empty for a bytes message with an empty body
+     * @throws JMSException when the body cannot be read, or when fewer bytes are read than a bytes message declares
+     * @throws IllegalArgumentException for any other message type, or for a bytes message whose declared body length
+     *         is negative or above {@code MAX_BODY_BYTES}
      */
     private static String extractText(Message message) throws JMSException {
         if (message instanceof TextMessage textMessage) {
             return textMessage.getText();
         }
         if (message instanceof BytesMessage bytesMessage) {
-            byte[] bytes = new byte[(int) bytesMessage.getBodyLength()];
-            bytesMessage.readBytes(bytes);
+            long length = bytesMessage.getBodyLength();
+            if (length < 0 || length > MAX_BODY_BYTES) {
+                throw new IllegalArgumentException("Unsupported JMS BytesMessage body length: " + length
+                        + " bytes (supported: 0 to " + MAX_BODY_BYTES + ")");
+            }
+            if (length == 0) {
+                // Left unread: readBytes answers -1 on an empty body; the mapper rejects the empty text itself.
+                return "";
+            }
+            byte[] bytes = new byte[(int) length];
+            int read = bytesMessage.readBytes(bytes);
+            if (read != length) {
+                throw new JMSException("Incomplete JMS BytesMessage body: read " + Math.max(read, 0) + " of "
+                        + length + " declared bytes");
+            }
             return new String(bytes, StandardCharsets.UTF_8);
         }
         throw new IllegalArgumentException("Unsupported JMS message type: " + message.getClass().getName());

@@ -223,9 +223,30 @@ public class CorrelatedReplyRabbitTemplate extends RabbitTemplate {
     }
 
     /**
+     * Logs a message one of {@link RabbitTemplate}'s receive or reply paths took, at DEBUG, as its prefix and its
+     * body's byte count only. Spring AMQP's own line is the whole {@link Message}: a short textual body and every
+     * property, application headers included. A received message's body and headers come from whoever published it
+     * and may carry credentials or personal data, so none of them is logged, and neither are its correlation id and
+     * reply queue.
+     *
+     * @param prefix  what the message is, as {@link RabbitTemplate} names it ({@code "Received: "} or
+     *                {@code "Reply: "})
+     * @param message the message taken, or {@code null} when none arrived
+     */
+    @Override
+    protected void logReceived(String prefix, Message message) {
+        if (message == null) {
+            log.debug("{}no message", prefix);
+        } else {
+            log.debug("{}{} bytes", prefix, message.getBody().length);
+        }
+    }
+
+    /**
      * Publishes the prepared request and waits for its correlated reply, as Spring AMQP's {@code exchangeMessages}
      * does: a mandatory request is tagged so that its return fails the wait when no returns callback is set, and a
-     * timed-out wait is reported to {@link #replyTimedOut(String)}.
+     * timed-out wait is reported to {@link #replyTimedOut(String)}. The outcome is logged at DEBUG as the reply's
+     * byte count, or that none arrived, never as the reply's content.
      *
      * @param channel         the request's channel, already consuming from the reply queue
      * @param exchange        the exchange the request is published to
@@ -250,9 +271,11 @@ public class CorrelatedReplyRabbitTemplate extends RabbitTemplate {
         try {
             doSend(channel, exchange, routingKey, message, mandatory, correlationData);
             Message reply = awaitReply(pendingReply);
-            logReceived("Reply: ", reply);
             if (reply == null) {
+                log.debug("No correlated reply within the reply timeout");
                 replyTimedOut(message.getMessageProperties().getCorrelationId());
+            } else {
+                log.debug("Correlated reply received: {} bytes", reply.getBody().length);
             }
             return reply;
         } finally {

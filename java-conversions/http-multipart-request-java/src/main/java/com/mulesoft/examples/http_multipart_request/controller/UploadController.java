@@ -19,8 +19,6 @@ import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.Part;
 
 import org.springframework.web.HttpRequestMethodNotSupportedException;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestPart;
@@ -36,6 +34,17 @@ import com.mulesoft.examples.http_multipart_request.service.UploadService;
  *   <li>{@code httpMultipartRequestFlow}, {@code allowedMethods="POST" path="/uploadFile"} with a response builder of
  *       status {@code 200} and reason phrase {@code File was uploaded.} (xml:13-29): {@link #upload}.</li>
  * </ul>
+ *
+ * <p>One handler, {@link #uploadFile}, admits both listeners' methods ignoring letter case, as Mule 3.8's
+ * {@code MethodRequestMatcher} lower-cased the configured and the incoming method before comparing them: {@code get}
+ * and {@code Get} render the form, {@code post} and {@code Post} store the upload. Every other method on
+ * {@code /uploadFile}, {@code HEAD}, {@code OPTIONS}, {@code TRACE} and lower-case {@code put} included, gets the 405
+ * {@code Method not allowed for endpoint: /uploadFile} of {@code GlobalExceptionHandler}, and neither flow runs.
+ *
+ * <p>When a request carries several parts named {@code file}, the last one is uploaded: Mule 3.8's
+ * {@code HttpPartDataSource} put the parts into a {@code HashMap} keyed by part name, so each later {@code file} part
+ * replaced the earlier one in {@code inboundAttachments}, whereas Undertow's {@code getPart("file")} returns the
+ * first.
  *
  * <p>The class only binds the request and writes the service's result. The form template, the file name taken from
  * the part's {@code Content-Disposition}, the ERROR log of its {@code Content-Type}, the stored file and the reason
@@ -53,8 +62,17 @@ public class UploadController {
 
     private static final String UPLOAD_PATH = "/uploadFile";
 
+    /** {@code allowedMethods} of the {@code httpRenderFlow} listener. */
+    private static final String FORM_METHOD = "GET";
+
+    /** {@code allowedMethods} of the {@code httpMultipartRequestFlow} listener. */
+    private static final String UPLOAD_METHOD = "POST";
+
     /** The methods the two {@code /uploadFile} listeners accept together. */
-    private static final List<String> UPLOAD_METHODS = List.of("GET", "POST");
+    private static final List<String> UPLOAD_METHODS = List.of(FORM_METHOD, UPLOAD_METHOD);
+
+    /** Name of the multipart part the upload flow reads, {@code inboundAttachments['file']} of the original. */
+    private static final String FILE_PART = "file";
 
     private final UploadService uploadService;
 
@@ -66,14 +84,71 @@ public class UploadController {
     }
 
     /**
+     * The two {@code /uploadFile} listeners: runs {@link #uploadForm} for {@code GET} and {@link #upload} for
+     * {@code POST}, each compared with the request's method ignoring letter case, and rejects every other method with
+     * the listeners' 405 before either flow runs.
+     *
+     * <p>The mapping declares no method, so that the method can be compared with {@code allowedMethods} ignoring
+     * case; it matches every method but {@code OPTIONS}, which {@link #rejectUnsupportedMethod} takes, and the check
+     * here rejects {@code HEAD}, which Spring MVC would otherwise answer through a {@code GET} mapping, and
+     * {@code TRACE}, which reaches the dispatcher because {@code application.yml} sets
+     * {@code spring.mvc.dispatch-trace-request: true}.
+     *
+     * <p>The parts named {@code file} are bound by Spring's multipart resolution in arrival order, and {@link #upload}
+     * receives the last of them, the one Mule 3.8 kept under that name. The binding is optional on purpose: Spring
+     * resolves it to {@code null} both when the request has no {@code file} part and when the body is not multipart,
+     * and the service then fails with the 500 the original's failing expression produced, instead of the 400 a
+     * required part would raise before the flow runs.
+     *
+     * @param fileParts the multipart parts named {@code file} in arrival order, or {@code null} when the request
+     *                  carries none
+     * @param request   the request, whose method selects the listener
+     * @param response  the response the form or the uploaded content is written to
+     * @throws HttpRequestMethodNotSupportedException when the method is neither {@code GET} nor {@code POST} in any
+     *                                                letter case
+     * @throws IOException                            if the part cannot be read, the file cannot be stored or the
+     *                                                response cannot be written
+     */
+    @RequestMapping(UPLOAD_PATH)
+    public void uploadFile(@RequestPart(name = FILE_PART, required = false) List<Part> fileParts,
+                           HttpServletRequest request, HttpServletResponse response)
+            throws HttpRequestMethodNotSupportedException, IOException {
+        String method = request.getMethod();
+        if (FORM_METHOD.equalsIgnoreCase(method)) {
+            uploadForm(response);
+        } else if (UPLOAD_METHOD.equalsIgnoreCase(method)) {
+            upload(lastPart(fileParts), response);
+        } else {
+            throw new HttpRequestMethodNotSupportedException(method, UPLOAD_METHODS);
+        }
+    }
+
+    /**
+     * Rejects {@code OPTIONS} on {@code /uploadFile}, which neither original listener accepted, with the 405 of
+     * {@code GlobalExceptionHandler}.
+     *
+     * <p>A mapping without methods does not match {@code OPTIONS}, so without this one Spring MVC would answer it
+     * itself with 200 and an {@code Allow} header; the explicit match keeps the handler mapping from reaching its
+     * default {@code OPTIONS} handler. {@code PreflightDispatchConfig} dispatches a CORS pre-flight here as the plain
+     * {@code OPTIONS} request it is. This match is exact, so {@code options} in any other letter case reaches
+     * {@link #uploadFile}, which rejects it as it rejects every method other than {@code GET} and {@code POST}.
+     *
+     * @param request the rejected request
+     * @throws HttpRequestMethodNotSupportedException always
+     */
+    @RequestMapping(path = UPLOAD_PATH, method = RequestMethod.OPTIONS)
+    public void rejectUnsupportedMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(request.getMethod(), UPLOAD_METHODS);
+    }
+
+    /**
      * {@code httpRenderFlow}: 200 with {@code uploadFile.html} byte for byte and no Content-Type, because the flow's
      * {@code parse-template} sets none.
      *
      * @param response the response the form is written to
      * @throws IOException if the form cannot be written
      */
-    @GetMapping(UPLOAD_PATH)
-    public void uploadForm(HttpServletResponse response) throws IOException {
+    private void uploadForm(HttpServletResponse response) throws IOException {
         byte[] body = uploadService.uploadForm().getBytes(StandardCharsets.UTF_8);
         response.setStatus(HttpServletResponse.SC_OK);
         writeBody(response, body);
@@ -85,37 +160,28 @@ public class UploadController {
      * service sets the reason phrase {@code File was uploaded.} once the file is stored; it is applied again when the
      * response commits, so the status set here keeps it.
      *
-     * <p>The servlet {@link Part} is bound rather than a {@code MultipartFile}, so the service reads the raw
-     * {@code Content-Disposition} and {@code Content-Type} part headers the flow's expressions read (xml:19-23). The
-     * part is optional on purpose: Spring resolves it to {@code null} both when the request has no {@code file} part
-     * and when the body is not multipart, and the service then fails with the 500 the original's failing expression
-     * produced, instead of the 400 a required part would raise before the flow runs.
+     * <p>The servlet {@link Part} is passed rather than a {@code MultipartFile}, so the service reads the raw
+     * {@code Content-Disposition} and {@code Content-Type} part headers the flow's expressions read (xml:19-23).
      *
      * @param file     the multipart part {@code file}, or {@code null} when the request carries none
      * @param response the response the uploaded content is written to
      * @throws IOException if the part cannot be read, the file cannot be stored or the response cannot be written
      */
-    @PostMapping(UPLOAD_PATH)
-    public void upload(@RequestPart(name = "file", required = false) Part file, HttpServletResponse response)
-            throws IOException {
+    private void upload(Part file, HttpServletResponse response) throws IOException {
         byte[] body = uploadService.upload(file);
         response.setStatus(HttpServletResponse.SC_OK);
         writeBody(response, body);
     }
 
     /**
-     * Rejects {@code HEAD} and {@code OPTIONS} on {@code /uploadFile}, which neither original listener accepted, with
-     * the 405 of {@code GlobalExceptionHandler}. Without this mapping Spring MVC would answer {@code HEAD} through
-     * {@link #uploadForm} and {@code OPTIONS} itself, both with 200; an explicit {@code HEAD} mapping takes precedence
-     * over the implicit match of the GET mapping. Every other method outside GET and POST is rejected by the handler
-     * mapping itself.
+     * The part the upload flow reads among those named {@code file}: the last, since Mule 3.8's {@code HashMap} of
+     * parts by name kept the last one put under a name.
      *
-     * @param request the rejected request
-     * @throws HttpRequestMethodNotSupportedException always
+     * @param parts the parts named {@code file} in arrival order, or {@code null}
+     * @return the last part, or {@code null} when {@code parts} is {@code null} or empty
      */
-    @RequestMapping(path = UPLOAD_PATH, method = {RequestMethod.HEAD, RequestMethod.OPTIONS})
-    public void rejectUnsupportedMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
-        throw new HttpRequestMethodNotSupportedException(request.getMethod(), UPLOAD_METHODS);
+    private static Part lastPart(List<Part> parts) {
+        return parts == null || parts.isEmpty() ? null : parts.get(parts.size() - 1);
     }
 
     /** Writes {@code bytes} with their {@code Content-Length} to the output stream, never to the writer. */

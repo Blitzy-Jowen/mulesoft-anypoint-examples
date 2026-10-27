@@ -8,12 +8,14 @@
 
 package com.mulesoft.examples.http_oauth_provider.controller;
 
+import java.util.List;
 import java.util.Map;
 
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -42,7 +44,9 @@ import com.mulesoft.examples.http_oauth_provider.service.OAuthProviderService.OA
  * <p>Error precedence: an {@link OAuthError} is answered by {@link #oauthError}, which Spring resolves before any
  * {@code @ControllerAdvice}. No other exception type is claimed here, so a method other than GET, HEAD or POST
  * still reaches the generic handler's 405 {@code Method not allowed for endpoint: /token}, and any other failure
- * its 500. Which port serves {@code /token} is decided by the port-routing filter, not here.
+ * its 500. {@code OPTIONS}, which Spring MVC would otherwise answer itself with 200 and an {@code Allow} header, is
+ * mapped explicitly to {@link #rejectOptions} so that it gets the same 405, a CORS pre-flight included. Which port
+ * serves {@code /token} is decided by the port-routing filter, not here.
  *
  * <p>The token body's keys and order, the error statuses and bodies, and the cache headers are Tier 2A
  * verification points: a fixture captured from the original provider governs.
@@ -51,6 +55,10 @@ import com.mulesoft.examples.http_oauth_provider.service.OAuthProviderService.OA
 public class TokenController {
 
     private static final String PRAGMA_NO_CACHE = "no-cache";
+
+    /** The methods {@link #token} serves, named by the 405 {@link #rejectOptions} raises. */
+    private static final List<String> SUPPORTED_METHODS =
+            List.of(RequestMethod.GET.name(), RequestMethod.POST.name());
 
     private final OAuthProviderService service;
 
@@ -91,6 +99,19 @@ public class TokenController {
                 .cacheControl(CacheControl.noStore())
                 .header(HttpHeaders.PRAGMA, PRAGMA_NO_CACHE)
                 .body(token.toJsonBody());
+    }
+
+    /**
+     * Rejects {@code OPTIONS /token} with the 405 of {@code GlobalExceptionHandler} that every method other than GET,
+     * HEAD and POST receives. A method-restricted mapping does not match {@code OPTIONS}, so without this one Spring
+     * MVC would answer it itself, with 200 and an {@code Allow} header.
+     *
+     * @throws HttpRequestMethodNotSupportedException always, answered with 405 {@code text/plain}
+     *                                                {@code Method not allowed for endpoint: /token}
+     */
+    @RequestMapping(path = "/token", method = RequestMethod.OPTIONS)
+    public void rejectOptions() throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(RequestMethod.OPTIONS.name(), SUPPORTED_METHODS);
     }
 
     /**

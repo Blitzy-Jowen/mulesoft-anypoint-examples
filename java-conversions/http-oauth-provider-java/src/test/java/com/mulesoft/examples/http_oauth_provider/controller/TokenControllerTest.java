@@ -25,6 +25,8 @@ import java.util.StringJoiner;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
@@ -245,14 +247,20 @@ class TokenControllerTest {
         assertOAuthError(resp, 400, "invalid_grant");
     }
 
-    @Test
-    void deleteTokenIsMethodNotAllowed() {
-        HttpTestClient.Response resp = provider.delete("/token");
+    /**
+     * A method outside GET and POST gets the listener's 405 without an {@code Allow} header; {@code OPTIONS} is
+     * answered by the same 405 rather than by Spring MVC's own 200 with {@code Allow}.
+     */
+    @ParameterizedTest(name = "{0} /token")
+    @ValueSource(strings = {"DELETE", "OPTIONS"})
+    void unsupportedMethodOnTokenIsMethodNotAllowed(String method) {
+        HttpTestClient.Response resp = provider.send(method, "/token", null, null);
 
         assertThat(resp.status()).as("%s", resp).isEqualTo(405);
         assertThat(resp.reason()).isEqualTo("Method Not Allowed");
         assertMediaType(resp, MediaType.TEXT_PLAIN);
         assertThat(resp.bodyAsString()).isEqualTo(METHOD_NOT_ALLOWED_BODY);
+        assertThat(resp.header("Allow")).as("%s", resp).isNull();
     }
 
     /** The redirect URI the codes are issued for: the resource listener's {@code /redirect}, as in the original. */

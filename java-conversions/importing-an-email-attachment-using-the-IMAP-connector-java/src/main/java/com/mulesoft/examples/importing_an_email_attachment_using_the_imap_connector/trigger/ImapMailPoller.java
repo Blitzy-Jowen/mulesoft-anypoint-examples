@@ -10,10 +10,16 @@ package com.mulesoft.examples.importing_an_email_attachment_using_the_imap_conne
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.StringJoiner;
 import java.util.TreeMap;
+import java.util.regex.Pattern;
 
 import jakarta.activation.DataHandler;
 import jakarta.mail.BodyPart;
@@ -28,6 +34,7 @@ import jakarta.mail.Store;
 import jakarta.mail.internet.MimeMessage;
 import jakarta.mail.internet.MimeUtility;
 
+import org.eclipse.angus.mail.iap.ProtocolException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -53,6 +60,16 @@ import com.mulesoft.examples.importing_an_email_attachment_using_the_imap_connec
  *
  * <p>An unreachable or rejecting mailbox does not stop the application: each failed poll is logged at ERROR and the
  * next scheduled poll connects again. Every poll opens its own {@link Session}, never the JVM-global default one.
+ * Its connection has a connect, a read and a write deadline ({@code imap.connect-timeout}, {@code imap.read-timeout},
+ * {@code imap.write-timeout}, 10 s each), so a server that stops answering during the TLS handshake, the greeting,
+ * LOGIN, SELECT or a FETCH ends that step with a timeout, handled as any other failure of it, instead of holding the
+ * synchronized poll and every later one; no operation is retried.
+ *
+ * <p>The poller's own diagnostics carry a fixed description of the failed operation, the folder name, host, port or
+ * message number, and the class names along the failure's cause chain; never an exception message, a cause's
+ * message, a stack trace, the user, the password or message content, because mail authentication, MIME parsing and
+ * import failures can quote any of them in their messages and causes. The {@code Received:} INFO line of
+ * {@link AttachmentImportService} is the original flow's logger, not one of these diagnostics.
  */
 @Component
 public class ImapMailPoller {
@@ -61,38 +78,76 @@ public class ImapMailPoller {
 
     private static final String PROTOCOL = "imaps";
 
+    /** The most exception types one diagnostic names; a longer cause chain is cut off. */
+    private static final int MAX_EXCEPTION_TYPES = 10;
+
+    /** The jakarta.mail session properties through which Angus Mail applies the three socket deadlines. */
+    private static final String CONNECT_TIMEOUT_PROPERTY = "mail.imaps.connectiontimeout";
+    private static final String READ_TIMEOUT_PROPERTY = "mail.imaps.timeout";
+    private static final String WRITE_TIMEOUT_PROPERTY = "mail.imaps.writetimeout";
+
+    /** A deadline as accepted: ASCII decimal digits only, so no sign, blank, hexadecimal or other notation. */
+    private static final Pattern DECIMAL_DIGITS = Pattern.compile("[0-9]+");
+
     private final AttachmentImportService attachmentImportService;
     private final String host;
     private final int port;
     private final String user;
     private final String password;
     private final String folderName;
+    private final int connectTimeout;
+    private final int readTimeout;
+    private final int writeTimeout;
     private final Map<String, String> sessionProperties;
 
     /**
      * @param attachmentImportService the rest of the original flow, run once per received message
      * @param environment             source of {@code imap.properties}, extra jakarta.mail session properties such as
-     *                                trust or timeout settings
+     *                                trust settings; an entry for {@code mail.imaps.connectiontimeout},
+     *                                {@code mail.imaps.timeout} or {@code mail.imaps.writetimeout} replaces the
+     *                                matching deadline below
      * @param host                    the original endpoint's {@code host}, from {@code imap.host}
      * @param port                    the original endpoint's {@code port} (993, implicit TLS), from {@code imap.port}
      * @param user                    the original endpoint's {@code user}, from {@code imap.user}
      * @param password                the original endpoint's {@code password}, from {@code imap.password}
      * @param folderName              the polled folder, from {@code imap.folder}; Mule's default {@code mailboxFolder}
+     * @param connectTimeout          ms allowed for opening the TCP connection, from {@code imap.connect-timeout};
+     *                                10000 by default, the original endpoint's {@code responseTimeout}
+     * @param readTimeout             ms allowed for each socket read (TLS handshake, greeting and every command
+     *                                reply), from {@code imap.read-timeout}; 10000 by default
+     * @param writeTimeout            ms allowed for each socket write, from {@code imap.write-timeout}; 10000 by
+     *                                default
+     * @throws IllegalArgumentException naming the offending key, when one of the three deadlines or an
+     *                                  {@code imap.properties} entry replacing one is not a positive decimal whole
+     *                                  number within int range (0 or a negative value would mean no deadline);
+     *                                  the poller is then never created, so it never polls
      */
     public ImapMailPoller(AttachmentImportService attachmentImportService, Environment environment,
             @Value("${imap.host:}") String host, @Value("${imap.port:993}") int port,
             @Value("${imap.user:}") String user, @Value("${imap.password:}") String password,
-            @Value("${imap.folder:INBOX}") String folderName) {
+            @Value("${imap.folder:INBOX}") String folderName,
+            @Value("${imap.connect-timeout:10000}") String connectTimeout,
+            @Value("${imap.read-timeout:10000}") String readTimeout,
+            @Value("${imap.write-timeout:10000}") String writeTimeout) {
         this.attachmentImportService = attachmentImportService;
         this.host = host;
         this.port = port;
         this.user = user;
         this.password = password;
         this.folderName = folderName;
+        this.connectTimeout = positiveMillis("imap.connect-timeout", connectTimeout);
+        this.readTimeout = positiveMillis("imap.read-timeout", readTimeout);
+        this.writeTimeout = positiveMillis("imap.write-timeout", writeTimeout);
         // An empty YAML map (imap.properties: {}) contributes no property, so it binds as absent.
         this.sessionProperties = Map.copyOf(Binder.get(environment)
                 .bind("imap.properties", Bindable.mapOf(String.class, String.class))
                 .orElseGet(Map::of));
+        for (String deadline : List.of(CONNECT_TIMEOUT_PROPERTY, READ_TIMEOUT_PROPERTY, WRITE_TIMEOUT_PROPERTY)) {
+            String replacement = this.sessionProperties.get(deadline);
+            if (replacement != null) {
+                positiveMillis("imap.properties[" + deadline + "]", replacement);
+            }
+        }
     }
 
     /**
@@ -122,7 +177,8 @@ public class ImapMailPoller {
                 folder = store.getFolder(folderName);
                 folder.open(Folder.READ_WRITE);
             } catch (MessagingException | RuntimeException e) {
-                log.error("Failed to connect to IMAP folder {} on {}:{}", folderName, host, port, e);
+                log.error("Failed to connect to IMAP folder {} on {}:{} {}", folderName, host, port,
+                        exceptionTypes(e));
                 return 0;
             }
 
@@ -130,7 +186,8 @@ public class ImapMailPoller {
             try {
                 messages = folder.getMessages();
             } catch (MessagingException | RuntimeException e) {
-                log.error("Failed to read the messages of IMAP folder {} on {}:{}", folderName, host, port, e);
+                log.error("Failed to read the messages of IMAP folder {} on {}:{} {}", folderName, host, port,
+                        exceptionTypes(e));
                 return 0;
             }
 
@@ -146,13 +203,50 @@ public class ImapMailPoller {
         }
     }
 
-    private Properties sessionProperties() {
+    /**
+     * The properties of one poll's session: protocol, host, port and the three socket deadlines, then every
+     * {@code imap.properties} entry, which therefore replaces a deadline it names (with a value the constructor has
+     * checked is positive).
+     */
+    Properties sessionProperties() {
         Properties properties = new Properties();
         properties.setProperty("mail.store.protocol", PROTOCOL);
         properties.setProperty("mail.imaps.host", host);
         properties.setProperty("mail.imaps.port", String.valueOf(port));
+        properties.setProperty(CONNECT_TIMEOUT_PROPERTY, String.valueOf(connectTimeout));
+        properties.setProperty(READ_TIMEOUT_PROPERTY, String.valueOf(readTimeout));
+        properties.setProperty(WRITE_TIMEOUT_PROPERTY, String.valueOf(writeTimeout));
         properties.putAll(sessionProperties);
         return properties;
+    }
+
+    /**
+     * Reads a socket deadline the way Angus Mail will apply it, refusing every value it would apply as no deadline
+     * (0, a negative value, or text it cannot parse, which it silently reads as -1) or read in another notation.
+     *
+     * @param key   the configuration key the value came from, named in the refusal
+     * @param value the configured value
+     * @return the deadline in ms, at least 1
+     * @throws IllegalArgumentException when the value is not a decimal whole number from 1 to
+     *                                  {@link Integer#MAX_VALUE}
+     */
+    private static int positiveMillis(String key, String value) {
+        String refusal = key + " must be a positive number of milliseconds (a decimal whole number from 1 to "
+                + Integer.MAX_VALUE + ")";
+        if (value == null || !DECIMAL_DIGITS.matcher(value).matches()) {
+            throw new IllegalArgumentException(refusal);
+        }
+        int millis;
+        try {
+            millis = Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            // Only reachable with more digits than an int holds.
+            throw new IllegalArgumentException(refusal, e);
+        }
+        if (millis <= 0) {
+            throw new IllegalArgumentException(refusal);
+        }
+        return millis;
     }
 
     /**
@@ -176,7 +270,7 @@ public class ImapMailPoller {
             invoked = true;
             attachmentImportService.importAttachments(attachments);
         } catch (Exception e) {
-            log.error("Error processing IMAP message {}", message.getMessageNumber(), e);
+            log.error("Error processing IMAP message {} {}", message.getMessageNumber(), exceptionTypes(e));
         }
         return invoked;
     }
@@ -255,15 +349,43 @@ public class ImapMailPoller {
             try {
                 folder.close(true);
             } catch (MessagingException | RuntimeException e) {
-                log.warn("Failed to close IMAP folder {} on {}:{}", folderName, host, port, e);
+                log.warn("Failed to close IMAP folder {} on {}:{} {}", folderName, host, port, exceptionTypes(e));
             }
         }
         if (store != null && store.isConnected()) {
             try {
                 store.close();
             } catch (MessagingException | RuntimeException e) {
-                log.warn("Failed to close the IMAP store for {}:{}", host, port, e);
+                log.warn("Failed to close the IMAP store for {}:{} {}", host, port, exceptionTypes(e));
             }
         }
+    }
+
+    /**
+     * Identifies a failure for a diagnostic by its exception types alone, outermost first, for example
+     * {@code (jakarta.mail.MessagingException <- java.net.SocketTimeoutException)}: the class name of every
+     * throwable along the {@link Throwable#getCause()} chain. Where that chain ends at an Angus Mail IMAP
+     * {@link ProtocolException}, which keeps the I/O failure behind a lost connection in its synthetic response
+     * rather than as its cause, the walk continues with that failure. A throwable already listed ends the walk, and a
+     * chain of more than {@value #MAX_EXCEPTION_TYPES} types is cut off with {@code ...}. No message is read.
+     */
+    private static String exceptionTypes(Throwable failure) {
+        StringJoiner types = new StringJoiner(" <- ", "(", ")");
+        Set<Throwable> listed = Collections.newSetFromMap(new IdentityHashMap<>());
+        Throwable current = failure;
+        while (current != null && listed.add(current)) {
+            if (listed.size() > MAX_EXCEPTION_TYPES) {
+                types.add("...");
+                break;
+            }
+            types.add(current.getClass().getName());
+            Throwable cause = current.getCause();
+            if (cause == null && current instanceof ProtocolException protocolFailure
+                    && protocolFailure.getResponse() != null) {
+                cause = protocolFailure.getResponse().getException();
+            }
+            current = cause;
+        }
+        return types.toString();
     }
 }

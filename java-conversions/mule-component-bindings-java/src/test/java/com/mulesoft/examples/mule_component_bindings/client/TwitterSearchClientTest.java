@@ -33,6 +33,7 @@ import java.io.InputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -51,9 +52,13 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.mule_component_bindings.config.StockStatsProperties;
+import com.mulesoft.examples.mule_component_bindings.mapper.TwitterResponseMapper;
+import com.mulesoft.examples.mule_component_bindings.model.Tweet;
+import com.mulesoft.examples.mule_component_bindings.service.TwitterSearchService;
 
 import twitter4j.HttpClientConfiguration;
 import twitter4j.JSONException;
@@ -69,9 +74,10 @@ import twitter4j.conf.ConfigurationBuilder;
  * with the configured OAuth credentials and returns the parsed statuses, and sends no date bound it is not given;
  * the twitter4j instance is built on the first search, so construction needs no credentials, and is reused
  * afterwards; a rejected search or a response without {@code search_metadata} raises {@link TwitterException},
- * a rejection carrying Twitter's status and error code and never sent twice; the configuration pins 10 s connect
- * and read timeouts and no HTTP retry whatever twitter4j would otherwise inherit; and an upstream that never
- * answers fails the search once, after the 10 s read timeout, with a {@link SocketTimeoutException} cause.
+ * a rejection carrying Twitter's status and error code and never sent twice; Spring binds the search service's
+ * {@link TwitterSearchService.RawSearch} port to this client; the configuration pins 10 s connect and read timeouts
+ * and no HTTP retry whatever twitter4j would otherwise inherit; and an upstream that never answers fails the search
+ * once, after the 10 s read timeout, with a {@link SocketTimeoutException} cause.
  */
 class TwitterSearchClientTest {
 
@@ -177,6 +183,34 @@ class TwitterSearchClientTest {
 
         assertThat(ex).hasCauseInstanceOf(JSONException.class);
         wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
+    }
+
+    @Test
+    void springBindsTheSearchServicePortToThisClient() {
+        wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(okJson(SEARCH_RESPONSE)));
+
+        new ApplicationContextRunner()
+                .withBean(StockStatsProperties.class, TwitterSearchClientTest::properties)
+                .withUserConfiguration(TwitterSearchClient.class, TwitterResponseMapper.class,
+                        TwitterSearchService.class)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context.getBean(TwitterSearchService.RawSearch.class))
+                            .isSameAs(context.getBean(TwitterSearchClient.class));
+
+                    // The bound service's search of the binding flow reaches Twitter through this client.
+                    List<Tweet> tweets = context.getBean(TwitterSearchService.class)
+                            .search("AAPL", new SimpleDateFormat("yyyy-MM-dd").parse("2014-10-26"), 100, 1);
+
+                    assertThat(tweets).extracting(Tweet::getId, Tweet::getText).containsExactly(
+                            tuple("529013410513453056", "$AAPL closes higher"),
+                            tuple("529784356710236160", "$AAPL up"));
+                });
+        wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json"))
+                .withQueryParam("q", equalTo("$AAPL"))
+                .withQueryParam("since", equalTo("2014-10-26"))
+                .withQueryParam("until", equalTo("2014-11-05")));
+        assertThat(wm.getAllServeEvents()).hasSize(1);
     }
 
     static Stream<Arguments> externalTwitter4jConfigurations() {

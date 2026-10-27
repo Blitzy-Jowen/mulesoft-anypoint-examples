@@ -12,8 +12,11 @@ import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -31,12 +34,22 @@ import com.mulesoft.examples.mule_component_bindings.model.Tweet;
  * about it, classified by sentiment. Ported from {@code StockStatsResourceImpl}.
  *
  * <p>Failures are {@link ResponseStatusException}s whose reason is the plain-text body the original
- * {@code WebApplicationException} carried: 400 for invalid input, 500 with the failure's own message otherwise.
+ * {@code WebApplicationException} carried: 400 for invalid input, 500 with the failure's own message otherwise. A
+ * 500 is logged at ERROR by exception type alone.
  */
 @Service
 public class StockStatsService {
 
 	private static final Logger log = LoggerFactory.getLogger(StockStatsService.class);
+
+	/** Most causes the error log line names before it ends with {@link #MORE_CAUSES_MARKER}. */
+	private static final int CAUSE_LOG_LIMIT = 10;
+	/** Separates a class name in the error log line from the class name of its cause. */
+	private static final String CAUSE_SEPARATOR = " <- ";
+	/** Ends the error log line in place of the causes beyond {@link #CAUSE_LOG_LIMIT}. */
+	private static final String MORE_CAUSES_MARKER = "...";
+	/** Ends the error log line where a cause repeats one already named. */
+	private static final String CIRCULAR_CAUSE_MARKER = "[circular]";
 
 	private static final String DATE_FORMAT = "yyyy-MM-dd";
 	// Not final: the setters below let callers replace a collaborator, as the original bean's properties did;
@@ -94,7 +107,12 @@ public class StockStatsService {
 					break;
 				}
 				if (tweets.size() > maxResults) {
-					// Unguarded, as in the original: null stats here fail the request with a 500.
+					// Null stats here fail the request with a 500, as dereferencing them did in the original. The NPE
+					// is thrown explicitly and without a message because one the JVM raises carries a helpful
+					// message naming this code, which the original runtime never produced; the 500 body stays empty.
+					if (stockStats == null) {
+						throw new NullPointerException();
+					}
 					stockStats.getSocialStats().setMoreTweets(true);
 					break;
 				}
@@ -119,7 +137,9 @@ public class StockStatsService {
 		} catch (ResponseStatusException e) {
 			throw e;
 		} catch (Throwable e) {
-			log.error("Error searching stock stats", e);
+			// Only type identifiers are logged: the failure's messages and those of its causes can quote upstream
+			// response text, such as the tweets of a Sentiment140 body the JSON parser could not read.
+			log.error("Error searching stock stats: {}", exceptionTypes(e));
 			throw createResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, e.getMessage());
 		}
 	}
@@ -130,6 +150,33 @@ public class StockStatsService {
 	 */
 	static ResponseStatusException createResponseStatusException(HttpStatus status, String message) {
 		return new ResponseStatusException(status, message);
+	}
+
+	/**
+	 * Returns the type identifiers of {@code e} without any of its text: its class name, then the class name of
+	 * each cause, separated by {@code " <- "}. The walk stops at a cause already named, marked {@code [circular]},
+	 * and after {@value #CAUSE_LOG_LIMIT} causes, marked {@code ...}, so cyclic and very deep chains terminate.
+	 * Messages, suppressed exceptions and stack traces are left out.
+	 */
+	private static String exceptionTypes(Throwable e) {
+		StringBuilder out = new StringBuilder(e.getClass().getName());
+		Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<Throwable, Boolean>());
+		named.add(e);
+		int causes = 0;
+		for (Throwable cause = e.getCause(); cause != null; cause = cause.getCause()) {
+			out.append(CAUSE_SEPARATOR);
+			if (causes == CAUSE_LOG_LIMIT) {
+				out.append(MORE_CAUSES_MARKER);
+				break;
+			}
+			if (!named.add(cause)) {
+				out.append(CIRCULAR_CAUSE_MARKER);
+				break;
+			}
+			out.append(cause.getClass().getName());
+			causes++;
+		}
+		return out.toString();
 	}
 
 	public StockService getStockService() {

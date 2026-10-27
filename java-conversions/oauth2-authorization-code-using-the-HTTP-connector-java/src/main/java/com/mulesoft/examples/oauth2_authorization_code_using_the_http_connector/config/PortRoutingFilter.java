@@ -51,7 +51,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
  *
  * <p>The routes are copied when the filter is created and never change afterwards, and the one {@link AntPathMatcher}
  * is safe for concurrent use, so a single instance serves every listener concurrently. Each routing decision is
- * logged at DEBUG.
+ * logged at DEBUG with the port, the servlet names and the matching route's patterns, never the request path, which
+ * can carry personal or secret segments.
  */
 public class PortRoutingFilter extends OncePerRequestFilter {
 
@@ -94,7 +95,7 @@ public class PortRoutingFilter extends OncePerRequestFilter {
         int port = request.getLocalPort();
         List<ListenerPorts.Route> routes = additionalRoutesByPort.getOrDefault(port, mainRoutes);
         if (routes.isEmpty()) {
-            log.debug("Port {} serves every path; {} continues unrouted", port, request.getRequestURI());
+            log.debug("Port {} serves every path; the request continues unrouted", port);
             chain.doFilter(request, response);
             return;
         }
@@ -102,7 +103,7 @@ public class PortRoutingFilter extends OncePerRequestFilter {
         String path = pathWithinApplication(request);
         ListenerPorts.Route route = matchingRoute(routes, path);
         if (route == null) {
-            log.debug("No route on port {} matches {}; answering 404", port, path);
+            log.debug("No route on port {} matches the request path; answering 404", port);
             writeNoListener(response, path);
             return;
         }
@@ -110,7 +111,7 @@ public class PortRoutingFilter extends OncePerRequestFilter {
         String mappedServlet = mappedServletName(request);
         String targetServlet = StringUtils.hasText(route.servlet()) ? route.servlet().trim() : null;
         if (targetServlet == null || targetServlet.equals(mappedServlet)) {
-            log.debug("Port {} serves {} through {} as mapped, by route {}", port, path, mappedServlet,
+            log.debug("Port {} serves the request through {} as mapped, by route {}", port, mappedServlet,
                     route.patterns());
             chain.doFilter(request, response);
             return;
@@ -121,7 +122,7 @@ public class PortRoutingFilter extends OncePerRequestFilter {
             throw new IllegalStateException("No servlet named '" + targetServlet + "' is registered to serve " + path
                     + " on port " + port + " (route " + route.patterns() + ")");
         }
-        log.debug("Port {} forwards {} from {} to {}, by route {}", port, path, mappedServlet, targetServlet,
+        log.debug("Port {} forwards the request from {} to {}, by route {}", port, mappedServlet, targetServlet,
                 route.patterns());
         dispatcher.forward(new DefaultMappingRequest(request, targetServlet, path), response);
     }

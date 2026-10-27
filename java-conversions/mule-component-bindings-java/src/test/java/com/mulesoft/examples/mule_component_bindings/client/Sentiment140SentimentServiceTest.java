@@ -176,17 +176,22 @@ class Sentiment140SentimentServiceTest {
         assertThat(tweets.get(0).getSentiment()).isNull();
     }
 
-    @Test
-    void unknownResponseIdRaisesRuntimeException() {
-        wm.stubFor(post(urlEqualTo("/bulkClassifyJson"))
-                .willReturn(okJson("{\"data\":[{\"id\":\"99\",\"polarity\":4}]}")));
+    // An id no tweet was sent with, a result without an id, and a numeric id, which has no textual value.
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"data\":[{\"id\":\"99\",\"polarity\":4}]}", "{\"data\":[{\"polarity\":4}]}",
+            "{\"data\":[{\"id\":1,\"polarity\":4}]}"})
+    void unknownResponseIdRaisesRuntimeException(String responseBody) {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson")).willReturn(okJson(responseBody)));
         List<Tweet> tweets = List.of(tweet("1", "I love it"));
         Sentiment140SentimentService service = newService();
 
-        // The original looks the id up and calls setSentiment on the null result; that NPE is wrapped as well.
-        assertThatThrownBy(() -> service.classify(tweets))
-                .isExactlyInstanceOf(RuntimeException.class)
-                .hasCauseInstanceOf(NullPointerException.class);
+        // The original looks the id up and calls setSentiment on the null result; that NPE is wrapped as well. Its
+        // NPE had no message, so the wrapper's message, which the 500 body carries, names only the NPE's class.
+        Throwable thrown = catchThrowable(() -> service.classify(tweets));
+
+        assertThat(thrown).isExactlyInstanceOf(RuntimeException.class)
+                .hasMessage("java.lang.NullPointerException")
+                .cause().isExactlyInstanceOf(NullPointerException.class).hasMessage(null);
         assertThat(tweets.get(0).getSentiment()).isNull();
     }
 

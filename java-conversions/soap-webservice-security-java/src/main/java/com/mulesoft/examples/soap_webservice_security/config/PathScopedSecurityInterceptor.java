@@ -66,10 +66,12 @@ import org.w3c.dom.Document;
  * security header, so a {@code mustUnderstand} header there gets Spring WS's MustUnderstand fault, as CXF answered a
  * service without WS-Security.
  * <p>
- * Deliberately neither a {@code SmartEndpointInterceptor} nor a component: endpoint mappings pick up smart
- * interceptors and the web-service configuration registers this one after the envelope styler, so a second
- * registration would validate each request twice. Policies are immutable, and WSS4J state is created per request, so
- * one instance serves concurrent requests.
+ * Deliberately neither a {@code SmartEndpointInterceptor} nor a component, and on no endpoint mapping: the
+ * web-service configuration's message receiver runs it once per request, before any endpoint is selected, so an
+ * encrypted body is decrypted before its operation is chosen and a body root no endpoint maps is checked too; any
+ * further registration would validate each request twice. That receiver also consults {@link #understands} for
+ * every mapped chain, the unknown-operation fallback included. Policies are immutable, and WSS4J state is created per
+ * request, so one instance serves concurrent requests.
  * <p>
  * Compatibility with the original success cases is configured per path through {@link PathPolicy}, and exactly one
  * fallback is needed: {@code /services/saml} must have {@code validateSamlSubjectConfirmation} set to {@code false}.

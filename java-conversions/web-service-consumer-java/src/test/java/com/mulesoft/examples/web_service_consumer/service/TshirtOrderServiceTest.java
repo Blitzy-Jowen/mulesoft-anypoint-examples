@@ -218,9 +218,10 @@ class TshirtOrderServiceTest {
     }
 
     @Test
-    void listInventoryReturnsNullWhenServiceReturnsNoPayload() throws Exception {
-        // The unstubbed mock answers null, the client's result for a response without a Body child.
-        assertThat(service.listInventory(null)).isNull();
+    void listInventoryReturnsJsonNullWhenServiceReturnsNoPayload() throws Exception {
+        // The unstubbed mock answers null, the client's result for a response without a Body child; the selector
+        // then yields null, which the DataWeave JSON writer writes as the literal null.
+        assertThat(service.listInventory(null)).isEqualTo("null");
 
         verify(client, times(1)).listInventory(isNull());
         verifyNoMoreInteractions(client);

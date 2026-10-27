@@ -17,9 +17,12 @@ import java.net.ServerSocket;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
 import org.springframework.test.annotation.DirtiesContext;
@@ -229,14 +232,23 @@ class AuthorizationControllerTest {
                 .doesNotContain("value=\"wrong\"");
     }
 
-    @Test
-    void putAuthorizeIsMethodNotAllowed() {
-        HttpTestClient.Response resp = provider.put(AUTHORIZE, FORM, loginForm(OWNER_PASSWORD));
+    /**
+     * The login form submitted with a method outside GET and POST gets the listener's 405 without an {@code Allow}
+     * header and logs nobody in; {@code OPTIONS} is answered by the same 405 rather than by Spring MVC's own 200
+     * with {@code Allow}.
+     */
+    @ParameterizedTest(name = "{0} /authorize")
+    @ValueSource(strings = {"PUT", "OPTIONS"})
+    void unsupportedMethodOnAuthorizeIsMethodNotAllowed(String method) {
+        HttpTestClient.Response resp = provider.send(method, AUTHORIZE, Map.of("Content-Type", FORM),
+                loginForm(OWNER_PASSWORD).getBytes(StandardCharsets.UTF_8));
 
         assertThat(resp.status()).as("%s", resp).isEqualTo(405);
         assertThat(resp.reason()).isEqualTo("Method Not Allowed");
         assertMediaType(resp, MediaType.TEXT_PLAIN);
         assertThat(resp.bodyAsString()).isEqualTo("Method not allowed for endpoint: /authorize");
+        assertThat(resp.header("Allow")).as("%s", resp).isNull();
+        assertThat(resp.header("Location")).as("%s", resp).isNull();
     }
 
     @Test

@@ -17,13 +17,19 @@ import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Stream;
+
+import javax.xml.parsers.DocumentBuilderFactory;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -37,9 +43,15 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
+import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.web_service_consumer.client.TshirtServiceClient;
 import com.mulesoft.examples.web_service_consumer.support.HttpTestClient;
 
@@ -56,7 +68,8 @@ import com.mulesoft.examples.web_service_consumer.support.HttpTestClient;
  * them.
  *
  * <p>Covered per endpoint: the happy path with the exact DataWeave 1.0 JSON, every method being accepted (neither
- * listener declares {@code allowedMethods}), and the platform-default 500 for unreadable input, a SOAP fault and a
+ * listener declares {@code allowedMethods}), a body sent with a form-urlencoded {@code Content-Type} reaching the
+ * flow as the caller sent it, and the platform-default 500 for unreadable input, a SOAP fault and a
  * connectivity failure, none of which the flows catch or retry. Unserved paths get the no-listener 404. The
  * original {@code WebServiceConsumerIT} contains-assertions are ported separately in {@code WebServiceConsumerTest}.
  */
@@ -74,6 +87,16 @@ class TshirtControllerTest {
     private static final String DEMO_API_KEY = "abc12345";
 
     private static final String JSON = "application/json";
+
+    private static final String FORM = "application/x-www-form-urlencoded";
+
+    private static final String SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/";
+
+    private static final String TSHIRT_NS = "http://mulesoft.org/tshirt-service";
+
+    /** A {@code ListInventory} request with content, so it cannot be mistaken for the empty one sent without a body. */
+    private static final String INVENTORY_REQUEST =
+            "<ns0:ListInventory xmlns:ns0=\"http://mulesoft.org/tshirt-service\"><size>L</size></ns0:ListInventory>";
 
     private static final String ORDER_RESPONSE_PREFIXED =
             "<ns2:OrderTshirtResponse xmlns:ns2=\"http://mulesoft.org/tshirt-service\">"
@@ -249,6 +272,39 @@ class TshirtControllerTest {
         upstream.verify(1, postRequestedFor(anyUrl()).withHeader("SOAPAction", equalTo(INVENTORY_ACTION)));
     }
 
+    // A form Content-Type does not turn the body into form parameters: the XML the caller sent is the SOAP body.
+    @ParameterizedTest(name = "{0} /inventory")
+    @ValueSource(strings = {"POST", "PUT", "PATCH", "DELETE"})
+    void inventoryBodyWithFormContentTypeIsSentAsTheSoapBodyUnchanged(String method) throws Exception {
+        stub(INVENTORY_ACTION, 200, INVENTORY_RESPONSE);
+
+        HttpTestClient.Response response = client().send(method, "/inventory", Map.of("Content-Type", FORM),
+                INVENTORY_REQUEST.getBytes(StandardCharsets.UTF_8));
+
+        assertJsonOk(response, INVENTORY_JSON);
+        Element sent = soapBodyChildOfTheOnlyRequest(INVENTORY_ACTION);
+        assertThat(sent.getNamespaceURI()).isEqualTo(TSHIRT_NS);
+        assertThat(sent.getLocalName()).isEqualTo("ListInventory");
+        assertThat(childTexts(sent)).containsExactlyEntriesOf(Map.of("size", "L"));
+    }
+
+    // A form Content-Type does not turn the body into form parameters: the order mapper reads message.json as sent.
+    @ParameterizedTest(name = "{0} /orders")
+    @ValueSource(strings = {"POST", "PUT", "PATCH", "DELETE"})
+    void ordersBodyWithFormContentTypeReachesTheOrderMapperUnchanged(String method) throws Exception {
+        stub(ORDER_ACTION, 200, ORDER_RESPONSE_PREFIXED);
+
+        HttpTestClient.Response response = client().send(method, "/orders", Map.of("Content-Type", FORM),
+                message());
+
+        assertJsonOk(response, ORDER_JSON);
+        Element sent = soapBodyChildOfTheOnlyRequest(ORDER_ACTION);
+        assertThat(sent.getNamespaceURI()).isEqualTo(TSHIRT_NS);
+        assertThat(sent.getLocalName()).isEqualTo("OrderTshirt");
+        assertThat(childTexts(sent)).containsExactlyEntriesOf(
+                new ObjectMapper().readValue(message(), new TypeReference<LinkedHashMap<String, String>>() { }));
+    }
+
     /** A truncated JSON order, and an unterminated XML element where {@code /inventory} expects a SOAP body. */
     static Stream<Arguments> unreadableBodies() {
         return Stream.of(
@@ -344,6 +400,45 @@ class TshirtControllerTest {
     private static String envelope(String bodyContent) {
         return "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body>"
                 + bodyContent + "</soap:Body></soap:Envelope>";
+    }
+
+    /**
+     * The one element inside the SOAP 1.1 {@code Body} of the only request the upstream received, after checking that
+     * exactly one request arrived and that it carried {@code soapAction}.
+     */
+    private static Element soapBodyChildOfTheOnlyRequest(String soapAction) throws Exception {
+        List<LoggedRequest> requests = upstream.findAll(postRequestedFor(anyUrl()));
+        assertThat(requests).hasSize(1);
+        assertThat(requests.get(0).getHeader("SOAPAction")).isEqualTo(soapAction);
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+        Document envelope = factory.newDocumentBuilder().parse(new ByteArrayInputStream(requests.get(0).getBody()));
+        NodeList bodies = envelope.getElementsByTagNameNS(SOAP_NS, "Body");
+        assertThat(bodies.getLength()).as(requests.get(0).getBodyAsString()).isEqualTo(1);
+        List<Element> children = childElements((Element) bodies.item(0));
+        assertThat(children).as(requests.get(0).getBodyAsString()).hasSize(1);
+        return children.get(0);
+    }
+
+    /** Each child element of {@code parent} as local name to text, in document order. */
+    private static Map<String, String> childTexts(Element parent) {
+        Map<String, String> texts = new LinkedHashMap<>();
+        for (Element child : childElements(parent)) {
+            texts.put(child.getLocalName(), child.getTextContent());
+        }
+        return texts;
+    }
+
+    private static List<Element> childElements(Element parent) {
+        List<Element> elements = new ArrayList<>();
+        NodeList nodes = parent.getChildNodes();
+        for (int i = 0; i < nodes.getLength(); i++) {
+            if (nodes.item(i) instanceof Element element) {
+                elements.add(element);
+            }
+        }
+        return elements;
     }
 
     private static String inventoryItem(String productCode, String size, String description, String count) {

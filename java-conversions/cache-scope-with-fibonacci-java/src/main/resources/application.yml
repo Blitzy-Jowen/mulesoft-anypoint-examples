@@ -19,7 +19,8 @@ spring:
     formcontent:
       filter:
         # FormContentFilter would consume PUT/PATCH/DELETE form bodies before controller/FibonacciController
-        # reads the raw payload the favicon wildcard-filter is evaluated on (cache-scope.xml:45-49)
+        # reads the raw body it builds the listener payload from (a form body's decoded map, or the listener's
+        # 400 for one it cannot decode), the payload the favicon wildcard-filter is evaluated on (cache-scope.xml:45-49)
         enabled: false
   autoconfigure:
     exclude:

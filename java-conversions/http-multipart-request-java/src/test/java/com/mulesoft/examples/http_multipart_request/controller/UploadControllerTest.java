@@ -1,0 +1,340 @@
+/**
+ * MuleSoft Examples
+ * Copyright 2014 MuleSoft, Inc.
+ *
+ * This product includes software developed at
+ * MuleSoft, Inc. (http://www.mulesoft.com/).
+ */
+
+package com.mulesoft.examples.http_multipart_request.controller;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+
+import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
+
+/**
+ * Wire-level test of {@link UploadController}, the two {@code /uploadFile} listeners of
+ * {@code http-multipart-request.xml} ({@code allowedMethods="GET"}, xml:6-11, and {@code allowedMethods="POST"},
+ * xml:13-29), with the whole application on Undertow at a random port and requests sent through ST-1
+ * {@link HttpTestClient}, so status line, headers and body bytes are asserted as the listener writes them.
+ *
+ * <p>The cases cover what the listeners decide before and around the flows: methods admitted ignoring letter case, as
+ * Mule 3.8's {@code MethodRequestMatcher} compared them; every other method answered with the listeners' 405; the
+ * last of several parts named {@code file} uploaded, as Mule 3.8's {@code HashMap} of parts by name kept it; and a
+ * request without a {@code file} part answered with the 500 of the failing file-name expression. Uploads are stored in
+ * a {@link TempDir}, never in the {@code /tmp} the original fixed, and the directory is emptied before each case.
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+class UploadControllerTest {
+
+    private static final String PATH = "/uploadFile";
+
+    private static final String BOUNDARY = "upload-controller-boundary-0001";
+
+    private static final String CRLF = "\r\n";
+
+    private static final String MULTIPART_CONTENT_TYPE = "multipart/form-data; boundary=" + BOUNDARY;
+
+    /** {@code Content-Length} of the carried {@code uploadFile.html}, byte-equal to the original's template. */
+    private static final int FORM_LENGTH = 348;
+
+    private static final byte[] METHOD_NOT_ALLOWED_BODY =
+            "Method not allowed for endpoint: /uploadFile".getBytes(StandardCharsets.UTF_8);
+
+    private static final byte[] MISSING_PART_BODY =
+            "{ \"message\": \"Multipart part 'file' is not present in the request\" }".getBytes(StandardCharsets.UTF_8);
+
+    @TempDir
+    static Path uploadDir;
+
+    @LocalServerPort
+    private int port;
+
+    @Value("${upload.directory}")
+    private String uploadDirectory;
+
+    /** Points the upload flow's {@code file:outbound-endpoint} directory at the class's temporary directory. */
+    @DynamicPropertySource
+    static void uploadDirectory(DynamicPropertyRegistry registry) {
+        registry.add("upload.directory", () -> uploadDir.toString());
+    }
+
+    @BeforeEach
+    void emptyUploadDirectory() throws IOException {
+        try (Stream<Path> entries = Files.walk(uploadDir)) {
+            for (Path entry : entries.sorted(Comparator.reverseOrder()).toList()) {
+                if (!entry.equals(uploadDir)) {
+                    Files.delete(entry);
+                }
+            }
+        }
+    }
+
+    @Test
+    void uploadsAreStoredInTheTemporaryDirectory() {
+        assertEquals(uploadDir.toString(), uploadDirectory);
+    }
+
+    @ParameterizedTest(name = "{0} /uploadFile")
+    @ValueSource(strings = {"GET", "get", "Get", "gEt"})
+    void getInAnyLetterCaseRendersTheUploadForm(String method) throws IOException {
+        byte[] form = classpathBytes("/uploadFile.html");
+
+        HttpTestClient.Response response = client().send(method, PATH, null, null);
+
+        assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
+        assertNull(response.header("Content-Type"), response::toString);
+        assertEquals(String.valueOf(FORM_LENGTH), response.header("Content-Length"), response::toString);
+        assertEquals(FORM_LENGTH, form.length);
+        assertArrayEquals(form, response.body(), response::toString);
+        assertEquals(List.of(), storedFiles());
+    }
+
+    @ParameterizedTest(name = "{0} /uploadFile")
+    @ValueSource(strings = {"POST", "post", "Post", "pOsT"})
+    void postInAnyLetterCaseStoresAndEchoesTheFilePart(String method) throws IOException {
+        String fileName = "upload-" + method + ".txt";
+        byte[] content = ("uploaded with " + method).getBytes(StandardCharsets.UTF_8);
+
+        HttpTestClient.Response response = client().send(method, PATH, multipartHeaders(),
+                multipart(new BodyPart("file", fileName, "text/plain", content)));
+
+        assertEquals("HTTP/1.1 200 File was uploaded.", response.statusLine(), response::toString);
+        assertNull(response.header("Content-Type"), response::toString);
+        assertArrayEquals(content, response.body(), response::toString);
+        assertEquals(List.of(fileName), storedFiles());
+        assertArrayEquals(content, Files.readAllBytes(uploadDir.resolve(fileName)));
+    }
+
+    /**
+     * Methods neither listener accepts; each request carries a {@code file} part, so a flow that ran would store it.
+     * {@code HEAD} in any letter case is covered by the two body-less cases below.
+     */
+    @ParameterizedTest(name = "{0} /uploadFile")
+    @ValueSource(strings = {"PUT", "put", "DELETE", "Delete", "PATCH", "patch", "TRACE", "trace", "OPTIONS",
+            "options", "Options"})
+    void otherMethodsGetTheListenerMethodNotAllowed(String method) throws IOException {
+        HttpTestClient.Response response = client().send(method, PATH, multipartHeaders(),
+                multipart(new BodyPart("file", "rejected.txt", "text/plain", bytes("rejected"))));
+
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertEquals("text/plain", response.header("Content-Type"), response::toString);
+        assertArrayEquals(METHOD_NOT_ALLOWED_BODY, response.body(), response::toString);
+        assertEquals(List.of(), storedFiles());
+    }
+
+    @Test
+    void headGetsTheListenerMethodNotAllowedWithoutABody() throws IOException {
+        HttpTestClient.Response response = client().send("HEAD", PATH, null, null);
+
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertEquals(0, response.body().length, response::toString);
+        assertEquals(List.of(), storedFiles());
+    }
+
+    /**
+     * {@code HEAD} in other letter cases reaches the controller, which rejects it as it rejects {@code PUT}, while
+     * Undertow, comparing method tokens ignoring case, sends that 405 as the response to a {@code HEAD}: the head with
+     * the {@code Content-Type} and the {@code Content-Length} of the omitted body, and no body. ST-1 omits the body
+     * for the exact token {@code HEAD} only, so the exchange is read here to the end of the stream.
+     */
+    @ParameterizedTest(name = "{0} /uploadFile")
+    @ValueSource(strings = {"head", "Head"})
+    void headInOtherLetterCasesGetsTheListenerMethodNotAllowedWithoutABody(String method) throws IOException {
+        String raw = new String(sendWithoutRequestBody(method), StandardCharsets.ISO_8859_1);
+
+        int headEnd = raw.indexOf(CRLF + CRLF);
+        assertTrue(headEnd > 0, raw);
+        assertEquals(headEnd + 2 * CRLF.length(), raw.length(), raw);
+        List<String> lines = List.of(raw.substring(0, headEnd).split(CRLF));
+        assertEquals("HTTP/1.1 405 Method Not Allowed", lines.get(0), raw);
+        assertTrue(lines.stream().anyMatch(line -> line.equalsIgnoreCase("Content-Type: text/plain")), raw);
+        assertTrue(lines.stream().anyMatch(line -> line.equalsIgnoreCase(
+                "Content-Length: " + METHOD_NOT_ALLOWED_BODY.length)), raw);
+        assertEquals(List.of(), storedFiles());
+    }
+
+    /**
+     * Requests carrying several parts named {@code file}, the last one being the expected upload, with the method in
+     * two letter cases.
+     */
+    private static Stream<Arguments> repeatedFileParts() {
+        return Stream.of(
+                Arguments.of("POST", List.of(
+                        new BodyPart("file", "first.txt", "text/plain", bytes("AAA")),
+                        new BodyPart("file", "second.txt", "text/plain", bytes("BBB")))),
+                Arguments.of("post", List.of(
+                        new BodyPart("file", "first.txt", "text/plain", bytes("AAA")),
+                        new BodyPart("description", null, null, bytes("between the files")),
+                        new BodyPart("file", "third.txt", "application/octet-stream", bytes("CCC")))),
+                Arguments.of("Post", List.of(
+                        new BodyPart("file", "one.txt", "text/plain", bytes("111")),
+                        new BodyPart("file", "two.txt", "text/plain", bytes("222")),
+                        new BodyPart("file", "three.txt", "text/plain", bytes("333")),
+                        new BodyPart("description", null, null, bytes("after the files")))));
+    }
+
+    @ParameterizedTest(name = "{0} /uploadFile with parts {1}")
+    @MethodSource("repeatedFileParts")
+    void lastOfSeveralFilePartsIsStoredAndEchoed(String method, List<BodyPart> parts) throws IOException {
+        BodyPart last = parts.stream().filter(part -> part.name().equals("file")).reduce((first, second) -> second)
+                .orElseThrow();
+
+        HttpTestClient.Response response = client().send(method, PATH, multipartHeaders(),
+                multipart(parts.toArray(BodyPart[]::new)));
+
+        assertEquals("HTTP/1.1 200 File was uploaded.", response.statusLine(), response::toString);
+        assertNull(response.header("Content-Type"), response::toString);
+        assertArrayEquals(last.content(), response.body(), response::toString);
+        assertEquals(List.of(last.fileName()), storedFiles());
+        assertArrayEquals(last.content(), Files.readAllBytes(uploadDir.resolve(last.fileName())));
+    }
+
+    /** Requests without a {@code file} part: a multipart body of another part only, and a plain text body. */
+    private static Stream<Arguments> requestsWithoutFilePart() {
+        byte[] descriptionOnly = multipart(new BodyPart("description", null, null, bytes("no file here")));
+        return Stream.of(
+                Arguments.of("POST", MULTIPART_CONTENT_TYPE, descriptionOnly),
+                Arguments.of("post", MULTIPART_CONTENT_TYPE, descriptionOnly),
+                Arguments.of("Post", "text/plain", bytes("file uploaded")));
+    }
+
+    @ParameterizedTest(name = "{0} /uploadFile with Content-Type {1}")
+    @MethodSource("requestsWithoutFilePart")
+    void uploadWithoutFilePartGetsTheUnhandledExceptionResponse(String method, String contentType, byte[] body)
+            throws IOException {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", contentType);
+
+        HttpTestClient.Response response = client().send(method, PATH, headers, body);
+
+        assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
+        String responseType = response.header("Content-Type");
+        assertNotNull(responseType, response::toString);
+        assertTrue(responseType.startsWith("application/json"), response::toString);
+        assertArrayEquals(MISSING_PART_BODY, response.body(), response::toString);
+        assertEquals(List.of(), storedFiles());
+    }
+
+    private HttpTestClient client() {
+        return HttpTestClient.localhost(port);
+    }
+
+    /**
+     * Sends {@code <method> /uploadFile HTTP/1.1} with {@code Host} and {@code Connection: close} and no body over a
+     * new socket, and returns every byte the server writes before it closes the connection.
+     */
+    private byte[] sendWithoutRequestBody(String method) throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            OutputStream out = socket.getOutputStream();
+            out.write(bytes(method + " " + PATH + " HTTP/1.1" + CRLF
+                    + "Host: localhost:" + port + CRLF
+                    + "Connection: close" + CRLF
+                    + CRLF));
+            out.flush();
+            return socket.getInputStream().readAllBytes();
+        }
+    }
+
+    private static Map<String, String> multipartHeaders() {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", MULTIPART_CONTENT_TYPE);
+        return headers;
+    }
+
+    /**
+     * A {@code multipart/form-data} body with delimiter {@link #BOUNDARY}: each part's {@code Content-Disposition}
+     * (with {@code filename} when the part has one), its {@code Content-Type} when it has one, a blank line and its
+     * content, every line ended by CRLF, then the closing delimiter line.
+     */
+    private static byte[] multipart(BodyPart... parts) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (BodyPart part : parts) {
+            StringBuilder head = new StringBuilder()
+                    .append("--").append(BOUNDARY).append(CRLF)
+                    .append("Content-Disposition: form-data; name=\"").append(part.name()).append('"');
+            if (part.fileName() != null) {
+                head.append("; filename=\"").append(part.fileName()).append('"');
+            }
+            head.append(CRLF);
+            if (part.contentType() != null) {
+                head.append("Content-Type: ").append(part.contentType()).append(CRLF);
+            }
+            head.append(CRLF);
+            out.writeBytes(bytes(head.toString()));
+            out.writeBytes(part.content());
+            out.writeBytes(bytes(CRLF));
+        }
+        out.writeBytes(bytes("--" + BOUNDARY + "--" + CRLF));
+        return out.toByteArray();
+    }
+
+    private static byte[] bytes(String text) {
+        return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static byte[] classpathBytes(String resource) throws IOException {
+        try (InputStream in = UploadControllerTest.class.getResourceAsStream(resource)) {
+            assertNotNull(in, resource);
+            return in.readAllBytes();
+        }
+    }
+
+    /** Names of the entries of the upload directory, sorted. */
+    private static List<String> storedFiles() throws IOException {
+        try (Stream<Path> entries = Files.list(uploadDir)) {
+            return entries.map(entry -> entry.getFileName().toString()).sorted().toList();
+        }
+    }
+
+    /**
+     * One part of a multipart body.
+     *
+     * @param name        the part name of its {@code Content-Disposition}
+     * @param fileName    its {@code filename}, or {@code null} for a text field
+     * @param contentType its {@code Content-Type}, or {@code null} for none
+     * @param content     its content bytes
+     */
+    record BodyPart(String name, String fileName, String contentType, byte[] content) {
+
+        /** The part as {@code name=fileName} for test names. */
+        @Override
+        public String toString() {
+            return fileName == null ? name : name + "=" + fileName;
+        }
+    }
+}

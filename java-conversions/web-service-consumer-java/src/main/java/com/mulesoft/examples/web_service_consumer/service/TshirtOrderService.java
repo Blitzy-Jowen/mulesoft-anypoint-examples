@@ -89,8 +89,9 @@ public class TshirtOrderService {
      *
      * @param body the raw request body sent to {@code /inventory}; {@code null} or empty sends the empty
      *        {@code ListInventory} request, anything else is sent as the SOAP body
-     * @return the DataWeave JSON of the {@code ListInventoryResponse} content, or {@code null} when the service
-     *         returned no {@code ListInventoryResponse}
+     * @return the DataWeave JSON of the {@code ListInventoryResponse} content, never {@code null}; the JSON literal
+     *         {@code null} when the service returned no payload, another root or an empty
+     *         {@code ListInventoryResponse}
      * @throws IllegalArgumentException when a non-empty body is not well-formed XML or declares a DOCTYPE; raised
      *         before the service is called
      */

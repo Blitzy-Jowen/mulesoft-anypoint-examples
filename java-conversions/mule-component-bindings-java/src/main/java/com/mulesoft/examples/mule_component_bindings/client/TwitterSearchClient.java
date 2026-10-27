@@ -11,6 +11,7 @@ package com.mulesoft.examples.mule_component_bindings.client;
 import org.springframework.stereotype.Component;
 
 import com.mulesoft.examples.mule_component_bindings.config.StockStatsProperties;
+import com.mulesoft.examples.mule_component_bindings.service.TwitterSearchService;
 
 import twitter4j.Query;
 import twitter4j.QueryResult;
@@ -34,7 +35,7 @@ import twitter4j.conf.ConfigurationBuilder;
  * twitter4j's own defaults of 20 s and 120 s, which external twitter4j configuration could also change.
  */
 @Component
-public class TwitterSearchClient {
+public class TwitterSearchClient implements TwitterSearchService.RawSearch {
 
 	/**
 	 * Connect timeout of every Twitter call, in milliseconds: the Mule default response timeout, which also bounded
@@ -67,6 +68,7 @@ public class TwitterSearchClient {
 	 * @throws TwitterException when Twitter rejects or fails the search; propagated unchanged to the caller's
 	 *                          original error handling
 	 */
+	@Override
 	public QueryResult search(String query, String since, String until) throws TwitterException {
 		Query q = new Query(query);
 		if (since != null) {

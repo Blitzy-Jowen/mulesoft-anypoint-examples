@@ -34,10 +34,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
 import org.apache.qpid.server.SystemLauncher;
+import org.assertj.core.api.InstanceOfAssertFactories;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -58,6 +60,9 @@ import org.springframework.amqp.rabbit.connection.CachingConnectionFactory;
 import org.springframework.amqp.rabbit.connection.PublisherCallbackChannel;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.logging.LogLevel;
+import org.springframework.boot.logging.LoggerConfiguration;
+import org.springframework.boot.logging.LoggingSystem;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
@@ -87,8 +92,8 @@ import com.rabbitmq.client.ShutdownSignalException;
  * default exchange, as any client allowed to publish on the broker can. The reply timeout is
  * {@value #REPLY_TIMEOUT_MILLIS} ms here, inside ST-1's 10 s read timeout. The remaining cases call a template of
  * their own directly, for the parts of the exchange {@code POST /} cannot reach: the converter and after-receive
- * post-processors, rejected request properties, an abnormal channel shutdown and the broker's return of a mandatory
- * request.
+ * post-processors, rejected request properties, an abnormal channel shutdown, the broker's return of a mandatory
+ * request and the received-message log line of {@code RabbitTemplate}'s other receive paths.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         // Pins the listener to the address ST-1 connects to, whatever server.address the project sets.
@@ -121,6 +126,29 @@ class CorrelatedReplyRabbitTemplateTest {
     private static final String CORRELATED_BODY = "CORRELATED-REPLY";
 
     private static final String FORGED_BODY_PREFIX = "FORGED-REPLY-";
+
+    /*
+     * Test-only markers that must never reach the log, each placed where a reply's publisher controls the content:
+     * the body, an application header's name and value, the correlation id and the reply queue.
+     */
+    private static final String BODY_MARKER = "BODY-SECRET-MARKER";
+
+    private static final String HEADER_NAME_MARKER = "HEADERNAME-SECRET-MARKER";
+
+    private static final String HEADER_VALUE_MARKER = "HEADERVALUE-SECRET-MARKER";
+
+    private static final String CORRELATION_ID_MARKER = "CORRELATIONID-SECRET-MARKER";
+
+    private static final String REPLY_TO_MARKER = "REPLYTO-SECRET-MARKER";
+
+    /**
+     * A JSON body within {@link Message}'s default 50-byte rendering limit, which {@code Message.toString()} would
+     * therefore print as text.
+     */
+    private static final String SECRET_REPLY_BODY = "{\"password\":\"" + BODY_MARKER + "\"}";
+
+    /** The prefix {@link org.springframework.amqp.rabbit.core.RabbitTemplate}'s receive operations log with. */
+    private static final String RECEIVED_PREFIX = "Received: ";
 
     @TempDir
     static Path qpidWorkDir;
@@ -273,6 +301,22 @@ class CorrelatedReplyRabbitTemplateTest {
                 assertThat(output.getOut()).doesNotContain(forgedCorrelationId);
             }
         }
+    }
+
+    @Test
+    @DisplayName("at DEBUG, the correlated reply is logged as its byte count only, never its body or headers, and is"
+            + " returned unchanged")
+    void correlatedReplyIsLoggedAsItsByteCountOnly(CapturedOutput output) throws Exception {
+        CompletableFuture<Responded> responder = answerNextRequest(Reply.correlatedWithSecrets());
+
+        HttpTestClient.Response response = atTemplateDebugLevel(() -> post("{\"ITEM_ID\": \"secret-bearing\"}"));
+
+        responder.get(REQUEST_WAIT_SECONDS, TimeUnit.SECONDS);
+        assertThat(response.status()).isEqualTo(200);
+        assertThat(response.bodyAsString()).isEqualTo(SECRET_REPLY_BODY);
+        assertThat(output.getOut())
+                .contains("Correlated reply received: " + bytes(SECRET_REPLY_BODY).length + " bytes")
+                .doesNotContain(BODY_MARKER, HEADER_NAME_MARKER, HEADER_VALUE_MARKER);
     }
 
     @Test
@@ -453,6 +497,26 @@ class CorrelatedReplyRabbitTemplateTest {
                 .isEqualTo(true);
     }
 
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(ReceivedMessage.class)
+    @DisplayName("at DEBUG, RabbitTemplate's received-message log line gives only its prefix and the message's byte"
+            + " count, or that there was no message")
+    void receivedMessageIsLoggedAsItsByteCountOnly(ReceivedMessage received, CapturedOutput output) {
+        CorrelatedReplyRabbitTemplate template = new CorrelatedReplyRabbitTemplate();
+
+        atTemplateDebugLevel(() -> {
+            template.logReceived(RECEIVED_PREFIX, received.message.get());
+            return null;
+        });
+
+        assertThat(output.getOut().lines().filter(line -> line.contains(RECEIVED_PREFIX)))
+                .singleElement(InstanceOfAssertFactories.STRING)
+                .endsWith(RECEIVED_PREFIX + received.loggedAs);
+        assertThat(output.getOut())
+                .doesNotContain(BODY_MARKER, HEADER_NAME_MARKER, HEADER_VALUE_MARKER, CORRELATION_ID_MARKER,
+                        REPLY_TO_MARKER);
+    }
+
     /**
      * Takes the next request off {@code sales_queue} on the responder's thread and publishes the given messages to
      * its {@code reply_to} through the default exchange, in order, each after its delay.
@@ -476,6 +540,8 @@ class CorrelatedReplyRabbitTemplateTest {
                     publishedCorrelationIds.add(correlationId);
                     AMQP.BasicProperties properties = new AMQP.BasicProperties.Builder()
                             .correlationId(correlationId)
+                            .contentType(reply.contentType())
+                            .headers(reply.headers())
                             .build();
                     replyChannel.basicPublish("", request.properties().getReplyTo(), properties,
                             bytes(reply.body()));
@@ -510,6 +576,41 @@ class CorrelatedReplyRabbitTemplateTest {
 
     private HttpTestClient.Response post(String body) {
         return new HttpTestClient(LOOPBACK, httpPort).post("/", "application/json", body);
+    }
+
+    /**
+     * Runs the action with the template's logger category at DEBUG, the level of its received-message lines, and
+     * restores the category's configured level afterwards, so that no other case logs at DEBUG.
+     *
+     * @param action the action to run
+     * @param <T>    the type of its result
+     * @return the action's result
+     */
+    private static <T> T atTemplateDebugLevel(Supplier<T> action) {
+        LoggingSystem loggingSystem = LoggingSystem.get(CorrelatedReplyRabbitTemplateTest.class.getClassLoader());
+        String category = CorrelatedReplyRabbitTemplate.class.getName();
+        LoggerConfiguration configuration = loggingSystem.getLoggerConfiguration(category);
+        LogLevel configuredLevel = configuration == null ? null : configuration.getConfiguredLevel();
+        loggingSystem.setLogLevel(category, LogLevel.DEBUG);
+        try {
+            return action.get();
+        } finally {
+            loggingSystem.setLogLevel(category, configuredLevel);
+        }
+    }
+
+    /**
+     * A short JSON message carrying a marker in its body, in an application header's name and value, in its
+     * correlation id and in its reply queue: everything {@code Message.toString()} renders.
+     */
+    private static Message secretBearingMessage() {
+        return MessageBuilder.withBody(bytes(SECRET_REPLY_BODY))
+                .setContentType(MessageProperties.CONTENT_TYPE_JSON)
+                .setHeader(HEADER_NAME_MARKER, "plain")
+                .setHeader("x-api-token", HEADER_VALUE_MARKER)
+                .setCorrelationId(CORRELATION_ID_MARKER)
+                .setReplyTo(REPLY_TO_MARKER)
+                .build();
     }
 
     private static byte[] bytes(String text) {
@@ -551,21 +652,49 @@ class CorrelatedReplyRabbitTemplateTest {
         }
     }
 
+    /** A message RabbitTemplate's receive and reply paths hand to {@code logReceived}, and how it must be logged. */
+    enum ReceivedMessage {
+        SECRET_BEARING_MESSAGE(CorrelatedReplyRabbitTemplateTest::secretBearingMessage,
+                bytes(SECRET_REPLY_BODY).length + " bytes"),
+        NO_MESSAGE(() -> null, "no message");
+
+        private final Supplier<Message> message;
+
+        private final String loggedAs;
+
+        ReceivedMessage(Supplier<Message> message, String loggedAs) {
+            this.message = message;
+            this.loggedAs = loggedAs;
+        }
+    }
+
     /**
      * One message the responder publishes to the request's {@code reply_to}.
      *
      * @param delayMillis     the pause before it is published, in milliseconds
      * @param correlationIdOf derives its correlation id, or {@code null} for none, from the request's
      * @param body            its body
+     * @param contentType     its {@code content_type}, or {@code null} for none
+     * @param headers         its application headers, or {@code null} for none
      */
-    private record Reply(long delayMillis, UnaryOperator<String> correlationIdOf, String body) {
+    private record Reply(long delayMillis, UnaryOperator<String> correlationIdOf, String body, String contentType,
+            Map<String, Object> headers) {
 
         static Reply correlated(long delayMillis) {
-            return new Reply(delayMillis, UnaryOperator.identity(), CORRELATED_BODY);
+            return new Reply(delayMillis, UnaryOperator.identity(), CORRELATED_BODY, null, null);
         }
 
         static Reply forged(Forgery forgery) {
-            return new Reply(0L, forgery.correlationIdOf, FORGED_BODY_PREFIX + forgery.name());
+            return new Reply(0L, forgery.correlationIdOf, FORGED_BODY_PREFIX + forgery.name(), null, null);
+        }
+
+        /**
+         * The correlated reply, as a short JSON body with a marker in it and application headers with a marker in a
+         * name and in a value, so that a rendering of the reply would print all three.
+         */
+        static Reply correlatedWithSecrets() {
+            return new Reply(0L, UnaryOperator.identity(), SECRET_REPLY_BODY, MessageProperties.CONTENT_TYPE_JSON,
+                    Map.of(HEADER_NAME_MARKER, "plain", "x-api-token", HEADER_VALUE_MARKER));
         }
     }
 

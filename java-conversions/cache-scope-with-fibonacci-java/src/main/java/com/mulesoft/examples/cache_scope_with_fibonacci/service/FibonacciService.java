@@ -55,7 +55,12 @@ public class FibonacciService {
      * Runs the flow for one request.
      *
      * @param n             the raw query parameter {@code n}, or null when absent
-     * @param body          the raw request body as a string, possibly null or empty
+     * @param payload       the listener's payload, one of three kinds: {@code null} for a request without a body
+     *                      or with a multipart body, the original's {@code NullPayload}; a {@link java.util.Map} of
+     *                      the decoded parameters of a form-urlencoded body, the original's {@code ParameterMap};
+     *                      or the text of any other body. Only the text {@value #FAVICON} fails the favicon
+     *                      filter: a map, even one naming that path, and {@code null} pass it, as the original's
+     *                      map and null payloads did
      * @param nocacheHeader true when the request carried a {@code nocache} HTTP header, which Mule 3 exposed as the
      *                      inbound property read by the {@code ee:cache} filter (cache-scope.xml:63)
      * @param nocacheQuery  true when the query string carried a {@code nocache} parameter with any value, the MEL
@@ -63,10 +68,11 @@ public class FibonacciService {
      * @return the reply body and the {@code cost} header value
      * @throws IllegalArgumentException when {@code n} is present but not a number
      */
-    public FibonacciReply handle(String n, String body, boolean nocacheHeader, boolean nocacheQuery) {
-        // The wildcard-filter tests the message payload (the request body), not the request path. A rejected
-        // message ends the flow with no payload: 200 with an empty body. Tier 2A verification point.
-        if (FAVICON.equals(body)) {
+    public FibonacciReply handle(String n, Object payload, boolean nocacheHeader, boolean nocacheQuery) {
+        // The wildcard-filter tests the message payload, not the request path; only a text payload can equal the
+        // pattern. A rejected message ends the flow with no payload: 200 with an empty body. Tier 2A verification
+        // point.
+        if (FAVICON.equals(payload)) {
             return new FibonacciReply("", null);
         }
 

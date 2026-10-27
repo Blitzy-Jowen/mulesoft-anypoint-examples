@@ -9,12 +9,16 @@
 package com.mulesoft.examples.using_transactional_scope_in_jms_to_database.config;
 
 import jakarta.jms.ConnectionFactory;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
 import javax.sql.DataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.core.NestedExceptionUtils;
+import org.springframework.core.NestedCheckedException;
+import org.springframework.core.NestedRuntimeException;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jms.config.DefaultJmsListenerContainerFactory;
 import org.springframework.jms.core.JmsTemplate;
@@ -76,8 +80,12 @@ public class TransactionConfig {
     /**
      * Container factory for the listener on queue {@code in}: one consumer receiving in a locally transacted
      * session. When the listener throws, the container rolls the session back before the error handler runs,
-     * so the error handler only logs the failure, and logs only the type and throw site of its most specific
-     * cause, never a message or stack trace: those can carry rejected order values and SQL or connection detail.
+     * so the error handler only logs the failure, at ERROR, as Mule's default exception strategy did: the type,
+     * message and throw site of the failure {@code describedFailure} selects, as
+     * {@code JMS listener failed: <type>: <message> at <class.method:line>}, or without {@code : <message>} when
+     * that failure has none. Each part passes through {@code logSafe}, so it stays on one line and within 256
+     * characters plus the truncation marker. The throwable itself is never logged, at any level: a stack trace
+     * spans lines and its cause messages can quote a rejected order value.
      *
      * @param connectionFactory Boot's Artemis {@code ConnectionFactory}, shared with {@link #jmsTemplate}
      * @return the session-transacted listener container factory
@@ -88,8 +96,14 @@ public class TransactionConfig {
         factory.setConnectionFactory(connectionFactory);
         factory.setSessionTransacted(true);
         factory.setErrorHandler(t -> {
-            Throwable cause = NestedExceptionUtils.getMostSpecificCause(t);
-            log.error("JMS listener failed: {} at {}", logSafe(typeName(cause)), logSafe(throwSite(cause)));
+            Throwable failure = describedFailure(t);
+            String message = failure.getMessage();
+            if (message != null) {
+                log.error("JMS listener failed: {}: {} at {}", logSafe(typeName(failure)), logSafe(message),
+                        logSafe(throwSite(failure)));
+            } else {
+                log.error("JMS listener failed: {} at {}", logSafe(typeName(failure)), logSafe(throwSite(failure)));
+            }
         });
         return factory;
     }
@@ -108,6 +122,40 @@ public class TransactionConfig {
         template.setSessionTransacted(true);
         template.setPubSubDomain(false);
         return template;
+    }
+
+    /**
+     * The failure the error handler describes: {@code failure} itself, or the first throwable below the Spring
+     * framework wrappers around it.
+     *
+     * <p>The container hands the error handler a {@code ListenerExecutionFailedException} around whatever the
+     * listener threw, and that may itself be a Spring translation: a {@code DataAccessException} such as
+     * {@code BadSqlGrammarException}, a {@code JmsException} or a {@code TransactionException}. Since Spring 6 the
+     * message of such a {@link NestedRuntimeException} or {@link NestedCheckedException} no longer includes its
+     * cause's message, so each wrapper that has a cause is passed through. The first throwable below them is the
+     * one the application, the JDBC driver or the JDK raised, and its message names the failure. The descent stops
+     * there rather than at the root cause: the mapper's {@code IllegalArgumentException} names the rejected element
+     * but never its text, whereas the {@code NumberFormatException} at the end of its cause chain quotes the
+     * rejected value.
+     *
+     * <p>A wrapper without a cause is described itself. A cause chain that loops back on itself ends the descent
+     * at the last wrapper reached before the loop closes.
+     *
+     * @param failure the throwable the container passed to the error handler
+     * @return the throwable whose type, message and throw site are logged
+     */
+    private static Throwable describedFailure(Throwable failure) {
+        Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        visited.add(failure);
+        Throwable current = failure;
+        while (current instanceof NestedRuntimeException || current instanceof NestedCheckedException) {
+            Throwable cause = current.getCause();
+            if (cause == null || !visited.add(cause)) {
+                break;
+            }
+            current = cause;
+        }
+        return current;
     }
 
     /**

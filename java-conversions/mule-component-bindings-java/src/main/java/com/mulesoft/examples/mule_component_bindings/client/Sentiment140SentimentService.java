@@ -159,6 +159,13 @@ public class Sentiment140SentimentService implements SentimentService {
 				}
 
 				Tweet tweet = idToTweet.get(id);
+				// An id no tweet was sent with, or a result without a textual id, fails the call as dereferencing
+				// the null lookup did. The NPE is thrown explicitly and without a message because one the JVM
+				// raises carries a helpful message naming this code, which the original runtime never produced;
+				// the wrapper's message, and so the 500 body, stays exactly java.lang.NullPointerException.
+				if (tweet == null) {
+					throw new NullPointerException();
+				}
 				tweet.setSentiment(sentiment);
 			}
 

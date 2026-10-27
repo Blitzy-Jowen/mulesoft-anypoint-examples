@@ -116,7 +116,10 @@ public class WsSecurityConfig {
         return Collections.unmodifiableMap(policies);
     }
 
-    /** Inbound enforcement of {@link #pathPolicies}; registered with Spring WS by {@code WebServiceConfig}. */
+    /**
+     * Inbound enforcement of {@link #pathPolicies}; run once per request, before endpoint selection, by the message
+     * receiver of {@code WebServiceConfig}.
+     */
     @Bean
     public PathScopedSecurityInterceptor pathScopedSecurityInterceptor(
             @Qualifier("pathPolicies") Map<String, PathPolicy> pathPolicies) {

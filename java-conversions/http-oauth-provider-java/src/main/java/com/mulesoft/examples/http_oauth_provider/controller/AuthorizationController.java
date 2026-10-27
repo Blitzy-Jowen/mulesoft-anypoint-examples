@@ -9,6 +9,7 @@
 package com.mulesoft.examples.http_oauth_provider.controller;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -19,10 +20,12 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
+import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.servlet.ModelAndView;
 import org.springframework.web.servlet.view.RedirectView;
@@ -48,6 +51,9 @@ import com.mulesoft.examples.http_oauth_provider.service.ResourceOwnerAuthentica
  *   <li>An invalid authorization request on either method: the {@link OAuthError}'s status, {@code
  *       application/json} {@code {"error":...,"error_description":...}} and its {@code WWW-Authenticate} value
  *       when it has one.</li>
+ *   <li>{@code OPTIONS /authorize}, a CORS pre-flight included: the 405 {@code Method not allowed for endpoint:
+ *       /authorize} that every method other than GET, HEAD and POST gets, raised by {@link #rejectOptions} because
+ *       Spring MVC would otherwise answer {@code OPTIONS} itself with 200 and an {@code Allow} header.</li>
  * </ul>
  *
  * <p>The class only binds request input and shapes the response: client, redirect-URI, scope and code decisions
@@ -74,6 +80,10 @@ public class AuthorizationController {
 
     /** The message the login page shows after a rejected login: a UI text, not a credential. */
     private static final String INVALID_CREDENTIALS = "Invalid username or password";
+
+    /** The methods {@link #loginPage} and {@link #login} serve, named by the 405 {@link #rejectOptions} raises. */
+    private static final List<String> SUPPORTED_METHODS =
+            List.of(RequestMethod.GET.name(), RequestMethod.POST.name());
 
     private final OAuthProviderService service;
 
@@ -152,7 +162,20 @@ public class AuthorizationController {
     }
 
     /**
-     * Answers an invalid authorization request raised by either handler method of this controller.
+     * Rejects {@code OPTIONS /authorize} with the 405 of {@code GlobalExceptionHandler} that every method other than
+     * GET, HEAD and POST receives. Method-restricted mappings do not match {@code OPTIONS}, so without this one Spring
+     * MVC would answer it itself, with 200 and an {@code Allow} header.
+     *
+     * @throws HttpRequestMethodNotSupportedException always, answered with 405 {@code text/plain}
+     *                                                {@code Method not allowed for endpoint: /authorize}
+     */
+    @RequestMapping(method = RequestMethod.OPTIONS)
+    public void rejectOptions() throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(RequestMethod.OPTIONS.name(), SUPPORTED_METHODS);
+    }
+
+    /**
+     * Answers an invalid authorization request raised by {@link #loginPage} or {@link #login}.
      *
      * @param err the error {@link OAuthProviderService} threw
      * @return the error's status, {@code application/json} body {@code {"error":...,"error_description":...}}

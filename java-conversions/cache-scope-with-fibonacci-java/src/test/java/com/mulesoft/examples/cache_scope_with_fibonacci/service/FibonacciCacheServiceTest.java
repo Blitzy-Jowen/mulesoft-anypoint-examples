@@ -13,19 +13,32 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.caffeine.CaffeineCache;
 import org.springframework.cache.caffeine.CaffeineCacheManager;
 import org.springframework.cache.support.SimpleCacheManager;
+import org.springframework.test.util.ReflectionTestUtils;
 
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.mulesoft.examples.cache_scope_with_fibonacci.model.FibonacciResult;
 
 /**
@@ -42,12 +55,24 @@ import com.mulesoft.examples.cache_scope_with_fibonacci.model.FibonacciResult;
  *
  * <p>The scope's logger runs once per computed (not cached) invocation, so log counts are compared as deltas
  * around each call and stay independent of other output in the same JVM.
+ *
+ * <p>Access to an entry is synchronized per key: a concurrent invocation for a key being computed waits and then
+ * receives the stored result with cost 0, while an invocation whose cache filter rejects the message takes no lock.
  */
 @ExtendWith(OutputCaptureExtension.class)
 class FibonacciCacheServiceTest {
 
     /** The scope's {@code logger message="aaa: #[]"}, whose empty MEL expression renders null. */
     private static final String LOG_MARKER = "aaa: null";
+
+    /** Bound on every wait of the concurrency tests, so a deadlock or a lock left held fails instead of hanging. */
+    private static final long TIMEOUT_SECONDS = 10;
+
+    /** How long the concurrency tests watch waiting invocations before releasing the one holding the key. */
+    private static final long OBSERVATION_MILLIS = 200;
+
+    /** Concurrent requests per concurrency test. */
+    private static final int THREADS = 10;
 
     private Cache cache;
 
@@ -181,8 +206,147 @@ class FibonacciCacheServiceTest {
         assertEquals(11, computed.cost());
     }
 
+    @Test
+    void concurrentColdRequestsForOneKeyComputeItOnceAndTheOthersReceiveTheStoredResult(CapturedOutput output)
+            throws Exception {
+        GatedCache gated = new GatedCache("15");
+        FibonacciCacheService gatedService = new FibonacciCacheService(cacheManagerOf(gated));
+        ExecutorService pool = Executors.newFixedThreadPool(THREADS);
+        try {
+            int before = logCount(output);
+            Future<FibonacciResult> first = pool.submit(() -> gatedService.calculate("15", true, true));
+            assertTrue(gated.entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS), "the first request looks up key 15");
+            List<Future<FibonacciResult>> others = new ArrayList<>();
+            for (int i = 1; i < THREADS; i++) {
+                others.add(pool.submit(() -> gatedService.calculate("15", true, true)));
+            }
+
+            Thread.sleep(OBSERVATION_MILLIS);
+            assertTrue(others.stream().noneMatch(Future::isDone), "the others wait while key 15 is being computed");
+            gated.release.countDown();
+
+            assertEquals(new FibonacciResult("610", 16), first.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            for (Future<FibonacciResult> other : others) {
+                assertEquals(new FibonacciResult("610", 0), other.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            }
+            assertEquals(16, logCount(output) - before, "each key from 0 to 15 is computed exactly once");
+            assertEquals(new FibonacciResult("610", 16), gated.get("15", FibonacciResult.class));
+            assertTrue(lockRegistry(gatedService).isEmpty(), "no lock entry outlives its invocations");
+        } finally {
+            gated.release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void bypassingInvocationNeitherWaitsForNorTakesTheKeysLock() throws Exception {
+        GatedCache gated = new GatedCache("15");
+        FibonacciCacheService gatedService = new FibonacciCacheService(cacheManagerOf(gated));
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<FibonacciResult> holder = pool.submit(() -> gatedService.calculate("15", true, true));
+            assertTrue(gated.entered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS), "the holder looks up key 15");
+
+            // cold 14 costs 15, 13 is then a hit at cost 0, plus 1; nothing is stored under 15
+            Future<FibonacciResult> bypass = pool.submit(() -> gatedService.calculate("15", false, true));
+            assertEquals(new FibonacciResult("610", 16), bypass.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertFalse(holder.isDone(), "the holder still holds key 15");
+            gated.release.countDown();
+
+            // the holder misses, and both children are hits stored by the bypassing invocation
+            assertEquals(new FibonacciResult("610", 1), holder.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            assertTrue(lockRegistry(gatedService).isEmpty(), "no lock entry outlives its invocations");
+        } finally {
+            gated.release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void concurrentRequestsForOverlappingKeysCompleteAndComputeEachKeyOnce(CapturedOutput output) throws Exception {
+        // ascending then descending, so requests lock overlapping keys while others hold them
+        List<Integer> numbers = new ArrayList<>();
+        for (int n = 10; n <= 19; n++) {
+            numbers.add(n);
+        }
+        for (int n = 19; n >= 10; n--) {
+            numbers.add(n);
+        }
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(numbers.size());
+        try {
+            int before = logCount(output);
+            List<Future<FibonacciResult>> results = new ArrayList<>();
+            for (int n : numbers) {
+                results.add(pool.submit(() -> {
+                    start.await();
+                    return service.calculate(Integer.toString(n), true, true);
+                }));
+            }
+            start.countDown();
+
+            for (int i = 0; i < numbers.size(); i++) {
+                FibonacciResult result = results.get(i).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                assertEquals(fibonacci(numbers.get(i)), result.value(), "Fibonacci(" + numbers.get(i) + ")");
+            }
+            assertEquals(20, logCount(output) - before, "each key from 0 to 19 is computed exactly once");
+        } finally {
+            start.countDown();
+            pool.shutdownNow();
+        }
+        for (int n = 0; n <= 19; n++) {
+            assertEquals(fibonacci(n), cache.get(Integer.toString(n), FibonacciResult.class).value(), "stored " + n);
+        }
+        assertTrue(lockRegistry(service).isEmpty(), "no lock entry outlives its invocations");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "abc, java.lang.IllegalArgumentException",
+        "2.5, java.lang.IllegalArgumentException",
+        "99999999999, java.lang.ArithmeticException"
+    })
+    void failedInvocationReleasesTheKeysLock(String key, Class<? extends Throwable> failure) throws Exception {
+        assertThrows(failure, () -> service.calculate(key, true, true));
+        assertTrue(lockRegistry(service).isEmpty(), "the failed invocation left no lock entry");
+
+        // A lock left held would block another thread, whereas the failing thread itself could re-enter it.
+        ExecutorService other = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> retry = other.submit(() -> assertThrows(failure, () -> service.calculate(key, true, true)));
+            retry.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } finally {
+            other.shutdownNow();
+        }
+        assertFalse(present(key));
+    }
+
     private boolean present(String key) {
         return cache.get(key) != null;
+    }
+
+    /** The service's per-key lock registry, read reflectively because the service exposes no view of it. */
+    private static Map<?, ?> lockRegistry(FibonacciCacheService target) {
+        return (Map<?, ?>) ReflectionTestUtils.getField(target, "keyLocks");
+    }
+
+    private static CacheManager cacheManagerOf(Cache fibonacciCache) {
+        SimpleCacheManager cacheManager = new SimpleCacheManager();
+        cacheManager.setCaches(List.of(fibonacciCache));
+        cacheManager.afterPropertiesSet();
+        return cacheManager;
+    }
+
+    /** The Fibonacci number of {@code n >= 0}, as the flow renders it. */
+    private static String fibonacci(int n) {
+        long current = 0;
+        long next = 1;
+        for (int i = 0; i < n; i++) {
+            long sum = current + next;
+            current = next;
+            next = sum;
+        }
+        return Long.toString(current);
     }
 
     private static int logCount(CapturedOutput output) {
@@ -192,5 +356,42 @@ class FibonacciCacheServiceTest {
             count++;
         }
         return count;
+    }
+
+    /**
+     * The {@value FibonacciCacheService#CACHE_NAME} cache over Caffeine, whose first lookup of one key signals
+     * {@code entered} and then waits for {@code release}, so a test can act while an invocation is inside that key's
+     * lookup.
+     */
+    private static final class GatedCache extends CaffeineCache {
+
+        private final String gatedKey;
+
+        private final AtomicBoolean firstLookup = new AtomicBoolean(true);
+
+        private final CountDownLatch entered = new CountDownLatch(1);
+
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        GatedCache(String gatedKey) {
+            super(FibonacciCacheService.CACHE_NAME, Caffeine.newBuilder().build());
+            this.gatedKey = gatedKey;
+        }
+
+        @Override
+        public <T> T get(Object key, Class<T> type) {
+            if (gatedKey.equals(key) && firstLookup.compareAndSet(true, false)) {
+                entered.countDown();
+                try {
+                    if (!release.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("The lookup of key " + gatedKey + " was never released");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted in the lookup of key " + gatedKey, e);
+                }
+            }
+            return super.get(key, type);
+        }
     }
 }

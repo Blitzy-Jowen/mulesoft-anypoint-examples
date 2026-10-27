@@ -16,6 +16,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
+import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -113,17 +116,93 @@ class ApiKitConsoleControllerTest {
         ramlDir = ramlLocation.substring(0, ramlLocation.lastIndexOf('/') + 1);
     }
 
-    /** {@code ConsoleHandler} redirects the console path without its trailing slash to the console root. */
+    /**
+     * {@code ConsoleHandler} redirects the console path without its trailing slash to the absolute URL of the
+     * console root, built from the scheme and the {@code Host} header.
+     */
     @Test
     void consoleWithoutTrailingSlashRedirects() {
         HttpTestClient.Response response = client.get(consoleRoot);
 
         assertEquals(301, response.status(), response::toString);
         assertEquals("Moved Permanently", response.reason(), response::toString);
-        String location = response.header("Location");
-        assertNotNull(location, response::toString);
-        assertTrue(location.endsWith(consoleRoot + "/"),
-                () -> "Location " + location + " does not end with " + consoleRoot + "/\n" + response);
+        assertEquals("http://localhost:" + port + consoleRoot + "/", response.header("Location"),
+                response::toString);
+    }
+
+    /**
+     * A {@code Host} header with a legal name keeps its port, or its lack of one, where APIkit copied the header:
+     * in the redirect's {@code Location}, its query string kept, and in the {@code baseUri} of the API root's
+     * RAML. The console's own RAML keeps the listener's local port, as {@code getApikitRamlConsole} did.
+     */
+    @ParameterizedTest(name = "Host: {0}")
+    @CsvSource({
+            "example.com:9999,  example.com:9999,  example.com",
+            "localhost:18080,   localhost:18080,   localhost",
+            "example.com,       example.com,       example.com",
+            "example.com:,      example.com,       example.com",
+            "[::1]:9999,        [::1]:9999,        [::1]",
+            "[::1],             [::1],             [::1]"
+    })
+    void hostHeaderAuthorityIsKept(String hostHeader, String authority, String hostLiteral) {
+        Map<String, String> host = Map.of("Host", hostHeader);
+
+        HttpTestClient.Response redirect = client.get(consoleRoot + "?foo=bar", host);
+        assertEquals(301, redirect.status(), redirect::toString);
+        assertEquals("http://" + authority + consoleRoot + "/?foo=bar", redirect.header("Location"),
+                redirect::toString);
+
+        HttpTestClient.Response routerRaml = client.get(basePath + "/", Map.of("Host", hostHeader,
+                "Accept", RAML_MEDIA_TYPE));
+        assertEquals(200, routerRaml.status(), routerRaml::toString);
+        assertEquals("http://" + authority + basePath, baseUri(routerRaml), routerRaml::toString);
+
+        HttpTestClient.Response consoleRaml = client.get(consoleRoot + "/?raml", host);
+        assertEquals(200, consoleRaml.status(), consoleRaml::toString);
+        assertEquals("http://" + hostLiteral + ":" + port + basePath, baseUri(consoleRaml), consoleRaml::toString);
+    }
+
+    /**
+     * A {@code Host} header whose port is no port number up to 65535 keeps its legal name with the listener's
+     * local port, and one with an illegal name gives the listener socket's loopback address and local port, so
+     * the rejected bytes reach neither the redirect's {@code Location} nor the API root's RAML.
+     */
+    @ParameterizedTest(name = "Host: {0}")
+    @CsvSource({
+            "example.com:99999,  example.com, 99999",
+            "example.com:65536,  example.com, 65536",
+            "example.com:abc,    example.com, abc",
+            "example.com:80:80,  example.com, :80:80",
+            "'bad!host:9999',    ,            bad!host",
+            "'[abc:9999',        ,            abc"
+    })
+    void illegalHostHeaderFallsBackToListenerSocket(String hostHeader, String keptName, String rejected)
+            throws UnknownHostException {
+        HttpTestClient.Response redirect = client.get(consoleRoot + "?foo=bar", Map.of("Host", hostHeader));
+        assertEquals(301, redirect.status(), redirect::toString);
+        String location = redirect.header("Location");
+        assertNotNull(location, redirect::toString);
+        assertListenerUrl(location, keptName, rejected, consoleRoot + "/?foo=bar");
+
+        HttpTestClient.Response routerRaml = client.get(basePath + "/", Map.of("Host", hostHeader,
+                "Accept", RAML_MEDIA_TYPE));
+        assertEquals(200, routerRaml.status(), routerRaml::toString);
+        assertListenerUrl(baseUri(routerRaml), keptName, rejected, basePath);
+    }
+
+    /**
+     * {@code RamlDescriptorHandler} served the API root's RAML to GET alone, so a HEAD asking for it falls through
+     * to APIkit's 404.
+     */
+    @Test
+    void headOfApiRootIsResourceNotFound() {
+        HttpTestClient.Response response = client.send("HEAD", basePath + "/", Map.of("Accept", RAML_MEDIA_TYPE),
+                null);
+
+        assertEquals(404, response.status(), response::toString);
+        assertEquals("Not Found", response.reason(), response::toString);
+        assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
+        assertFalse(response.header("Content-Type").contains(RAML_MEDIA_TYPE), response::toString);
     }
 
     /**
@@ -272,6 +351,33 @@ class ApiKitConsoleControllerTest {
         assertTrue(LINE_BREAK.splitAsStream(body).anyMatch(baseUri::equals),
                 () -> "no line '" + baseUri + "' in the RAML\n" + response);
         assertEquals(firstLine(ramlText()), firstLine(body), response::toString);
+    }
+
+    /** The value of the RAML's first {@code baseUri:} line. */
+    private static String baseUri(HttpTestClient.Response response) {
+        String prefix = "baseUri: ";
+        String line = LINE_BREAK.splitAsStream(response.bodyAsString()).filter(text -> text.startsWith(prefix))
+                .findFirst().orElse(null);
+        assertNotNull(line, () -> "no baseUri line in the RAML\n" + response);
+        return line.substring(prefix.length());
+    }
+
+    /**
+     * {@code url} is this listener's {@code http} URL ending in {@code pathAndQuery}, with the local port, the
+     * host {@code keptName} or, when that is {@code null}, a loopback address, and without {@code rejected}.
+     */
+    private void assertListenerUrl(String url, String keptName, String rejected, String pathAndQuery)
+            throws UnknownHostException {
+        assertFalse(url.contains(rejected), () -> url + " contains the rejected " + rejected);
+        assertTrue(url.endsWith(":" + port + pathAndQuery), () -> url + " does not end with :" + port + pathAndQuery);
+        URI uri = URI.create(url);
+        assertEquals("http", uri.getScheme(), url);
+        assertEquals(port, uri.getPort(), url);
+        if (keptName != null) {
+            assertEquals(keptName, uri.getHost(), url);
+        } else {
+            assertTrue(InetAddress.getByName(uri.getHost()).isLoopbackAddress(), () -> url + " names no loopback");
+        }
     }
 
     private static void assertContentType(HttpTestClient.Response response, String expected) {

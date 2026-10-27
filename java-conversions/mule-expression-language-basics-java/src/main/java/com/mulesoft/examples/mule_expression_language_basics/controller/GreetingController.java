@@ -8,18 +8,21 @@
 
 package com.mulesoft.examples.mule_expression_language_basics.controller;
 
+import java.io.IOException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
+import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 
 import com.mulesoft.examples.mule_expression_language_basics.service.GreetingService;
 
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.InvalidMediaTypeException;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -49,22 +52,24 @@ import org.springframework.web.bind.annotation.RestController;
  * included, and no mapping declares {@code produces}, {@code consumes}, {@code params} or {@code headers}: any
  * {@code Accept}, {@code Content-Type} or body is accepted rather than answered with 406, 415 or 400. {@code OPTIONS}
  * runs the flow like every other method, returning the same reply and, for {@code greet3} to {@code greet6}, writing
- * the same file. {@code TRACE} does too, because {@code application.yml} sets
- * {@code spring.mvc.dispatch-trace-request: true}; the committed reply keeps the servlet's {@code message/http} echo
- * off the wire. A {@code HEAD} reply carries the headers without the body. Paths match exactly: {@code /greet1/},
- * {@code /greet1.json}, {@code /} or {@code /greet7} fall through to the no-listener 404 of
- * {@code GlobalExceptionHandler}.
+ * the same file; a CORS pre-flight, an {@code OPTIONS} request carrying {@code Origin} and
+ * {@code Access-Control-Request-Method}, does the same, because {@code config/PreflightDispatchConfig} dispatches it
+ * as a plain {@code OPTIONS} request and no CORS policy applies. {@code TRACE} does too, because
+ * {@code application.yml} sets {@code spring.mvc.dispatch-trace-request: true}; the complete, committed reply keeps
+ * the servlet's {@code message/http} echo of the request off the wire. A {@code HEAD} reply carries the headers
+ * without the body.
+ * Paths match exactly: {@code /greet1/}, {@code /greet1.json}, {@code /} or {@code /greet7} fall through to the
+ * no-listener 404 of {@code GlobalExceptionHandler}.
  *
- * <p>Every reply is a 200 with {@code Content-Type: text/plain;charset=UTF-8}, preset on the entity so Spring writes
- * the String without consulting {@code Accept}. The header is a Tier 2A verification point of the conversion plan:
- * should a captured fixture of the original show another value, such as {@code application/csv} after
- * {@code greet4}'s DataWeave step, or none, only {@code TEXT_PLAIN_UTF8} changes.
+ * <p>Every reply is a 200 carrying the reply's UTF-8 bytes with their {@code Content-Length} and no
+ * {@code Content-Type}: each flow ends in a {@code set-payload} that declares no MIME type, and the Mule listener sent
+ * no Content-Type for such a payload. The reply is written to the servlet response directly, so no message converter
+ * adds one and {@code Accept} is never consulted. The absent header is a Tier 2A verification point of the
+ * conversion plan: should a captured fixture of the original show a value, such as {@code application/csv} after
+ * {@code greet4}'s DataWeave step, only {@link #ok(HttpServletResponse, String)} changes.
  */
 @RestController
 public class GreetingController {
-
-    /** Content-Type of every reply: {@code text/plain;charset=UTF-8}. */
-    private static final MediaType TEXT_PLAIN_UTF8 = new MediaType(MediaType.TEXT_PLAIN, StandardCharsets.UTF_8);
 
     /** Key of {@code http.query.params} every query-driven flow greets with. */
     private static final String USERNAME = "username";
@@ -85,13 +90,13 @@ public class GreetingController {
     /**
      * {@code greetingFlow1} ({@code greeting.xml:7-11}) for every method except {@code OPTIONS}.
      *
-     * @param request the request, whose raw query string supplies {@code username}
-     * @return 200 {@code Hello <username>}
+     * @param request  the request, whose raw query string supplies {@code username}
+     * @param response the response 200 {@code Hello <username>} is written to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping("/greet1")
-    public ResponseEntity<String> greet1(HttpServletRequest request) throws Exception {
-        return ok(greetingService.greet1(queryParams(request).get(USERNAME)));
+    public void greet1(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        ok(response, greetingService.greet1(queryParams(request).get(USERNAME)));
     }
 
     /**
@@ -99,154 +104,217 @@ public class GreetingController {
      * {@code OPTIONS}, which Spring MVC would otherwise answer itself with an {@code Allow} header and no body; the
      * Mule listener ran the flow for {@code OPTIONS} too.
      *
-     * @param request the request, whose raw query string supplies {@code username}
-     * @return the reply of {@link #greet1(HttpServletRequest)}
+     * @param request  the request, whose raw query string supplies {@code username}
+     * @param response the response the reply of {@link #greet1(HttpServletRequest, HttpServletResponse)} is written
+     *                 to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping(path = "/greet1", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> greet1Options(HttpServletRequest request) throws Exception {
-        return greet1(request);
+    public void greet1Options(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        greet1(request, response);
     }
 
     /**
      * {@code greetingFlow2} ({@code greeting.xml:15-26}) for every method except {@code OPTIONS}.
      *
-     * @param request the request, whose raw query string supplies {@code username}
-     * @return 200 {@code No username provided} for an empty username, otherwise {@code Hello <username>}
+     * @param request  the request, whose raw query string supplies {@code username}
+     * @param response the response 200 {@code No username provided} for an empty username, otherwise
+     *                 {@code Hello <username>}, is written to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping("/greet2")
-    public ResponseEntity<String> greet2(HttpServletRequest request) throws Exception {
-        return ok(greetingService.greet2(queryParams(request).get(USERNAME)));
+    public void greet2(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        ok(response, greetingService.greet2(queryParams(request).get(USERNAME)));
     }
 
     /**
      * {@code greetingFlow2} for {@code OPTIONS}, which the method-less mapping does not match.
      *
-     * @param request the request, whose raw query string supplies {@code username}
-     * @return the reply of {@link #greet2(HttpServletRequest)}
+     * @param request  the request, whose raw query string supplies {@code username}
+     * @param response the response the reply of {@link #greet2(HttpServletRequest, HttpServletResponse)} is written
+     *                 to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping(path = "/greet2", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> greet2Options(HttpServletRequest request) throws Exception {
-        return greet2(request);
+    public void greet2Options(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        greet2(request, response);
     }
 
     /**
      * {@code docs-greetingFlow3} ({@code greeting.xml:30-37}) for every method except {@code OPTIONS}: the service
      * writes {@code <username>, <age>, <age > 18>} to a new file.
      *
-     * @param request the request, whose raw query string supplies {@code username} and {@code age}
-     * @return 200 {@code Hello <username>}
+     * @param request  the request, whose raw query string supplies {@code username} and {@code age}
+     * @param response the response 200 {@code Hello <username>} is written to
      * @throws Exception whatever the service raises, such as the failed comparison of a non-numeric {@code age},
      *                   left to {@code GlobalExceptionHandler}
      */
     @RequestMapping("/greet3")
-    public ResponseEntity<String> greet3(HttpServletRequest request) throws Exception {
+    public void greet3(HttpServletRequest request, HttpServletResponse response) throws Exception {
         Map<String, String> query = queryParams(request);
-        return ok(greetingService.greet3(query.get(USERNAME), query.get(AGE)));
+        ok(response, greetingService.greet3(query.get(USERNAME), query.get(AGE)));
     }
 
     /**
      * {@code docs-greetingFlow3} for {@code OPTIONS}, which the method-less mapping does not match.
      *
-     * @param request the request, whose raw query string supplies {@code username} and {@code age}
-     * @return the reply of {@link #greet3(HttpServletRequest)}
+     * @param request  the request, whose raw query string supplies {@code username} and {@code age}
+     * @param response the response the reply of {@link #greet3(HttpServletRequest, HttpServletResponse)} is written
+     *                 to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping(path = "/greet3", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> greet3Options(HttpServletRequest request) throws Exception {
-        return greet3(request);
+    public void greet3Options(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        greet3(request, response);
     }
 
     /**
      * {@code docs-greetingFlow4} ({@code greeting.xml:41-60}) for every method except {@code OPTIONS}: the service
      * writes the header-less DataWeave CSV line {@code <username>,<age>,<age_of>} to a new file.
      *
-     * @param request the request, whose raw query string supplies {@code username} and {@code age}
-     * @return 200 {@code Hello <username>}
+     * @param request  the request, whose raw query string supplies {@code username} and {@code age}
+     * @param response the response 200 {@code Hello <username>} is written to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping("/greet4")
-    public ResponseEntity<String> greet4(HttpServletRequest request) throws Exception {
+    public void greet4(HttpServletRequest request, HttpServletResponse response) throws Exception {
         Map<String, String> query = queryParams(request);
-        return ok(greetingService.greet4(query.get(USERNAME), query.get(AGE)));
+        ok(response, greetingService.greet4(query.get(USERNAME), query.get(AGE)));
     }
 
     /**
      * {@code docs-greetingFlow4} for {@code OPTIONS}, which the method-less mapping does not match.
      *
-     * @param request the request, whose raw query string supplies {@code username} and {@code age}
-     * @return the reply of {@link #greet4(HttpServletRequest)}
+     * @param request  the request, whose raw query string supplies {@code username} and {@code age}
+     * @param response the response the reply of {@link #greet4(HttpServletRequest, HttpServletResponse)} is written
+     *                 to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping(path = "/greet4", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> greet4Options(HttpServletRequest request) throws Exception {
-        return greet4(request);
+    public void greet4Options(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        greet4(request, response);
     }
 
     /**
      * {@code docs-greetingFlow5} ({@code greeting.xml:64-71}) for every method except {@code OPTIONS}: the service
      * reads {@code /user/username} and {@code /user/age} from the XML body and writes them to a new file.
      *
-     * <p>The body is bound as bytes whatever its {@code Content-Type}, absent included, because
-     * {@code ByteArrayHttpMessageConverter} reads every media type; the service detects the XML encoding itself. An
-     * empty body is bound as {@code null}, which the service rejects.
+     * <p>The body is bound by {@link #listenerBody(HttpServletRequest)}, alike for every method: an empty or
+     * form-urlencoded body as {@code null}, which the service rejects with its 500, and any other body as its bytes
+     * whatever its {@code Content-Type}, absent included; the service detects the XML encoding itself.
      *
-     * @param body the request body, or {@code null} when the request has none
-     * @return 200 {@code Hello <username>}
+     * @param request  the request, whose body is the XML document
+     * @param response the response 200 {@code Hello <username>} is written to
      * @throws Exception whatever the service raises, such as the parse failure of a malformed document, left to
      *                   {@code GlobalExceptionHandler}
      */
     @RequestMapping("/greet5")
-    public ResponseEntity<String> greet5(@RequestBody(required = false) byte[] body) throws Exception {
-        return ok(greetingService.greet5(body));
+    public void greet5(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        ok(response, greetingService.greet5(listenerBody(request)));
     }
 
     /**
      * {@code docs-greetingFlow5} for {@code OPTIONS}, which the method-less mapping does not match.
      *
-     * @param body the request body, or {@code null} when the request has none
-     * @return the reply of {@link #greet5(byte[])}
+     * @param request  the request, whose body is the XML document
+     * @param response the response the reply of {@link #greet5(HttpServletRequest, HttpServletResponse)} is written
+     *                 to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping(path = "/greet5", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> greet5Options(@RequestBody(required = false) byte[] body) throws Exception {
-        return greet5(body);
+    public void greet5Options(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        greet5(request, response);
     }
 
     /**
      * {@code greetingFlow6} ({@code greeting.xml:75-83}) for every method except {@code OPTIONS}: the service parses
      * the JSON body to an object, reads {@code username} and {@code age} and writes them to a new file.
      *
-     * <p>The body is bound as bytes whatever its {@code Content-Type}, absent included; an empty body is bound as
-     * {@code null}, which the service rejects.
+     * <p>The body is bound by {@link #listenerBody(HttpServletRequest)}, alike for every method: an empty or
+     * form-urlencoded body as {@code null}, which the service rejects with its 500, and any other body as its bytes
+     * whatever its {@code Content-Type}, absent included.
      *
-     * @param body the request body, or {@code null} when the request has none
-     * @return 200 {@code Hello <username>}
+     * @param request  the request, whose body is the JSON document
+     * @param response the response 200 {@code Hello <username>} is written to
      * @throws Exception whatever the service raises, such as the parse failure of malformed JSON, left to
      *                   {@code GlobalExceptionHandler}
      */
     @RequestMapping("/greet6")
-    public ResponseEntity<String> greet6(@RequestBody(required = false) byte[] body) throws Exception {
-        return ok(greetingService.greet6(body));
+    public void greet6(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        ok(response, greetingService.greet6(listenerBody(request)));
     }
 
     /**
      * {@code greetingFlow6} for {@code OPTIONS}, which the method-less mapping does not match.
      *
-     * @param body the request body, or {@code null} when the request has none
-     * @return the reply of {@link #greet6(byte[])}
+     * @param request  the request, whose body is the JSON document
+     * @param response the response the reply of {@link #greet6(HttpServletRequest, HttpServletResponse)} is written
+     *                 to
      * @throws Exception whatever the service raises, left to {@code GlobalExceptionHandler}
      */
     @RequestMapping(path = "/greet6", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> greet6Options(@RequestBody(required = false) byte[] body) throws Exception {
-        return greet6(body);
+    public void greet6Options(HttpServletRequest request, HttpServletResponse response) throws Exception {
+        greet6(request, response);
     }
 
-    /** Wraps a flow's reply in the 200 every listener answered with. */
-    private static ResponseEntity<String> ok(String body) {
-        return ResponseEntity.ok().contentType(TEXT_PLAIN_UTF8).body(body);
+    /**
+     * Writes the 200 every listener answered a flow's reply with: the reply's UTF-8 bytes with their
+     * {@code Content-Length} and no {@code Content-Type}. Every caller passes the reply the service already
+     * returned, so nothing is written before the flow has completed and an exception still finds an uncommitted
+     * response for the 500 of {@code GlobalExceptionHandler}. The flushed reply is complete and committed, so
+     * {@code FrameworkServlet} adds neither the {@code message/http} echo of a {@code TRACE} nor the {@code Allow}
+     * header of an {@code OPTIONS} request.
+     *
+     * @param response the response the reply is written to
+     * @param reply    the flow's reply
+     * @throws IOException when writing the reply fails
+     */
+    private static void ok(HttpServletResponse response, String reply) throws IOException {
+        byte[] bytes = reply.getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        response.setContentLength(bytes.length);
+        ServletOutputStream stream = response.getOutputStream();
+        stream.write(bytes);
+        stream.flush();
+    }
+
+    /**
+     * Binds the body {@code greet5} and {@code greet6} read as the payload the Mule 3.8 listener handed their flows,
+     * the same way for every method:
+     * <ul>
+     *   <li>an empty body: {@code null}, the listener's {@code NullPayload};</li>
+     *   <li>a {@code Content-Type} of {@code application/x-www-form-urlencoded}, whatever its parameters:
+     *       {@code null}. The listener turned such a body into its map of form parameters for every method, which
+     *       {@code xpath()} cannot evaluate and {@code json-to-object-transformer} cannot read, so the flow failed
+     *       with a 500 before writing a file; the service rejects {@code null} the same way. The exact text of the
+     *       Mule failure is a Tier 2A verification point;</li>
+     *   <li>any other body, whatever its {@code Content-Type}, absent or unparseable included: its bytes.</li>
+     * </ul>
+     *
+     * <p>The body is read from the servlet stream, in full for every request, rather than through
+     * {@code @RequestBody}, which rebuilds a form-urlencoded {@code POST} body from the container's parsed parameters
+     * but hands the same body sent with {@code PUT} through unchanged, so the outcome would depend on the method.
+     *
+     * @param request the request whose {@code Content-Type} header and body are read
+     * @return the body bytes, or {@code null} when the body is empty or form-urlencoded
+     * @throws IOException when reading the request body fails
+     */
+    private static byte[] listenerBody(HttpServletRequest request) throws IOException {
+        byte[] body = request.getInputStream().readAllBytes();
+        if (body.length == 0) {
+            return null;
+        }
+        String contentType = request.getHeader(HttpHeaders.CONTENT_TYPE);
+        boolean formUrlEncoded;
+        try {
+            formUrlEncoded = contentType != null
+                    && MediaType.APPLICATION_FORM_URLENCODED
+                            .equalsTypeAndSubtype(MediaType.parseMediaType(contentType));
+        } catch (InvalidMediaTypeException e) {
+            // An unparseable Content-Type declares no form, so the body reaches the flow as it came.
+            formUrlEncoded = false;
+        }
+        return formUrlEncoded ? null : body;
     }
 
     /**

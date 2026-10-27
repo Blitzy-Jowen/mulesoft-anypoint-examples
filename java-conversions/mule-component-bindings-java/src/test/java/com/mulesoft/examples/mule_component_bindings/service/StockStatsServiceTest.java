@@ -19,15 +19,20 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
@@ -43,14 +48,21 @@ import org.mockito.Captor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.mule_component_bindings.exception.InvalidStockSymbol;
 import com.mulesoft.examples.mule_component_bindings.model.Sentiment;
 import com.mulesoft.examples.mule_component_bindings.model.SocialStats;
 import com.mulesoft.examples.mule_component_bindings.model.StockStats;
 import com.mulesoft.examples.mule_component_bindings.model.Tweet;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 
 /**
  * Unit test of {@link StockStatsService}, the port of
@@ -58,12 +70,16 @@ import com.mulesoft.examples.mule_component_bindings.model.Tweet;
  * (400 with the original plain-text reasons, the date parsed leniently as {@code yyyy-MM-dd}), the Stocklytics
  * lookup and its invalid-symbol 400, the Twitter paging (pages of 100 from page 1 until an empty page or more than
  * 1000 tweets, then trimmed to 1000), the Sentiment140 classification and the tweet counts, and the 500 carrying the
- * failure's own message for any other throwable. The three bound services are Mockito mocks; no Spring context.
+ * failure's own message for any other throwable, logged by exception type alone. The three bound services are
+ * Mockito mocks; no Spring context.
  */
 @ExtendWith(MockitoExtension.class)
 class StockStatsServiceTest {
 
     private static final String DAY = "2012-10-26";
+
+    /** Personal data planted in upstream text; it must never reach the log. */
+    private static final String SENTINEL = "SENTINEL-PII jane.roe@example.invalid";
 
     @Mock
     private StockService stockService;
@@ -79,9 +95,29 @@ class StockStatsServiceTest {
 
     private StockStatsService service;
 
+    /** The service's logger, captured by {@link #appender} for the duration of each test. */
+    private Logger logger;
+
+    private Level previousLevel;
+
+    private ListAppender<ILoggingEvent> appender;
+
     @BeforeEach
     void setUp() {
         service = new StockStatsService(stockService, twitterService, sentimentService);
+        logger = (Logger) LoggerFactory.getLogger(StockStatsService.class);
+        previousLevel = logger.getLevel();
+        logger.setLevel(Level.ALL);
+        appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+    }
+
+    @AfterEach
+    void tearDown() {
+        logger.detachAppender(appender);
+        appender.stop();
+        logger.setLevel(previousLevel);
     }
 
     @ParameterizedTest
@@ -226,7 +262,8 @@ class StockStatsServiceTest {
         ResponseStatusException e = searchFailure("AAPL", DAY);
 
         assertThat(e.getStatusCode().value()).isEqualTo(500);
-        assertThat(e.getReason()).contains("getSocialStats()");
+        // The original's NullPointerException had no message, so its 500 carried none.
+        assertThat(e.getReason()).isNull();
         verifyNoInteractions(sentimentService);
     }
 
@@ -252,6 +289,45 @@ class StockStatsServiceTest {
         assertThat(e.getReason()).isEqualTo(expectedReason);
         assertThat(e.getCause()).isNull();
         collaborator.verifyLaterCollaboratorsNotCalled(this);
+    }
+
+    static Stream<Arguments> failuresCarryingUpstreamText() {
+        String io = " <- java.io.IOException";
+        return Stream.of(
+                Arguments.of(Named.of("Sentiment140 body cut off in a tweet, wrapped as the client wraps it",
+                        new RuntimeException(truncatedBodyParseFailure())),
+                        "java.lang.RuntimeException <- com.fasterxml.jackson.core.io.JsonEOFException"),
+                Arguments.of(Named.of("text in nested messages and in a suppressed exception",
+                        nestedFailureWithSuppressed()),
+                        "java.lang.IllegalStateException" + io + " <- java.lang.IllegalArgumentException"),
+                Arguments.of(Named.of("circular cause chain", circularFailure()),
+                        "java.lang.RuntimeException" + io + " <- [circular]"),
+                Arguments.of(Named.of("chain of exactly 10 causes", failureWithCauses(10)),
+                        "java.lang.RuntimeException" + io.repeat(10)),
+                Arguments.of(Named.of("chain of 11 causes", failureWithCauses(11)),
+                        "java.lang.RuntimeException" + io.repeat(10) + " <- ..."));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("failuresCarryingUpstreamText")
+    void failureIsLoggedByExceptionTypesAloneWhileThe500KeepsItsMessage(RuntimeException failure,
+            String expectedTypes) throws Exception {
+        // The planted text is in what logging the throwable itself would print: messages, causes, suppressed.
+        assertThat(printedStackTrace(failure)).contains(SENTINEL);
+        Collaborator.SENTIMENT_SERVICE.failWith(this, date(DAY), failure);
+
+        ResponseStatusException e = searchFailure("AAPL", DAY);
+
+        assertThat(e.getStatusCode().value()).isEqualTo(500);
+        assertThat(e.getReason()).isEqualTo(failure.getMessage());
+        assertThat(appender.list).hasSize(1);
+        ILoggingEvent event = appender.list.get(0);
+        assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+        assertThat(event.getMessage()).isEqualTo("Error searching stock stats: {}");
+        assertThat(event.getArgumentArray()).containsExactly(expectedTypes);
+        assertThat(event.getFormattedMessage()).isEqualTo("Error searching stock stats: " + expectedTypes)
+                .doesNotContain(SENTINEL);
+        assertThat(event.getThrowableProxy()).isNull();
     }
 
     @Test
@@ -374,6 +450,43 @@ class StockStatsServiceTest {
 
     private static List<String> ids(int count) {
         return IntStream.range(0, count).mapToObj(String::valueOf).toList();
+    }
+
+    /** What a default {@link ObjectMapper} throws for a Sentiment140 body that ends inside a tweet's text. */
+    private static Throwable truncatedBodyParseFailure() {
+        String truncatedBody = "{\"data\":[{\"id\":\"1\",\"text\":\"$AAPL " + SENTINEL;
+        return catchThrowable(() -> new ObjectMapper().readTree(truncatedBody));
+    }
+
+    /** A failure whose own message, nested causes and suppressed exception all quote the planted text. */
+    private static RuntimeException nestedFailureWithSuppressed() {
+        IllegalStateException failure = new IllegalStateException("classify failed for " + SENTINEL,
+                new IOException("read " + SENTINEL, new IllegalArgumentException("tweet " + SENTINEL)));
+        failure.addSuppressed(new TimeoutException("close " + SENTINEL));
+        return failure;
+    }
+
+    /** A failure whose cause names the failure again as its own cause. */
+    private static RuntimeException circularFailure() {
+        RuntimeException failure = new RuntimeException("outer " + SENTINEL);
+        failure.initCause(new IOException("inner " + SENTINEL, failure));
+        return failure;
+    }
+
+    /** A failure above a chain of {@code causes} distinct {@link IOException}s, each quoting the planted text. */
+    private static RuntimeException failureWithCauses(int causes) {
+        Throwable cause = null;
+        for (int depth = causes; depth >= 1; depth--) {
+            cause = new IOException("cause " + depth + " " + SENTINEL, cause);
+        }
+        return new RuntimeException("outer " + SENTINEL, cause);
+    }
+
+    /** What {@link Throwable#printStackTrace()} prints for {@code failure}. */
+    private static String printedStackTrace(Throwable failure) {
+        StringWriter out = new StringWriter();
+        failure.printStackTrace(new PrintWriter(out, true));
+        return out.toString();
     }
 
     private static Date date(String s) throws ParseException {

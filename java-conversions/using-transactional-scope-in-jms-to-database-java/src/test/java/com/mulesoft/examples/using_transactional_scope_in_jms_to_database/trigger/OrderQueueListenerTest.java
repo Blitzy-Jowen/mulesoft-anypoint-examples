@@ -30,7 +30,9 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.sql.SQLSyntaxErrorException;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -47,7 +49,10 @@ import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -56,6 +61,8 @@ import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.RecoverableDataAccessException;
+import org.springframework.jdbc.BadSqlGrammarException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.test.context.ActiveProfiles;
@@ -82,7 +89,8 @@ import com.mulesoft.examples.using_transactional_scope_in_jms_to_database.servic
  *       insert and the receive.</li>
  * </ul>
  * The broker-free cases call a listener built around a mocked {@link OrderTransactionService} with mocked JMS
- * messages, covering the redelivery guard's boundary and the message types.
+ * messages, covering the redelivery guard's boundary, the message types, and the bytes body's length bound, empty
+ * body and incomplete read.
  *
  * <p>The class-level configuration and the spy set are those of {@code service/OrderTransactionServiceTest}, so the
  * two classes share one cached Spring context. Every output assertion reads only what was written after
@@ -124,9 +132,19 @@ class OrderQueueListenerTest {
     /** An {@code order} document whose root is never closed. */
     private static final String MALFORMED_XML = "<order><itemId>1</itemId>";
 
+    /** A rejected value that must never reach the log. */
+    private static final String SENTINEL = "SENTINEL_7f3a";
+
+    /** A well-formed {@code order} document whose {@code customerId} holds {@link #SENTINEL}. */
+    private static final String SENTINEL_ORDER_XML = "<order><itemId>1</itemId><itemUnits>2</itemUnits><customerId>"
+            + SENTINEL + "</customerId></order>";
+
     private static final String PROCESSED = "processed";
 
     private static final String DELIVERY_COUNT = "JMSXDeliveryCount";
+
+    /** The listener's private {@code MAX_BODY_BYTES}: the largest bytes-message body it accepts, 1 MiB. */
+    private static final int MAX_BODY_BYTES = 1_048_576;
 
     private static final Duration MAX_WAIT = Duration.ofSeconds(30);
 
@@ -175,7 +193,7 @@ class OrderQueueListenerTest {
         String flowOutput = outputSinceBaseline();
         assertEquals(3, occurrences(flowOutput, INFO_LINE));
         assertEquals(3, matches(INFO_LOG_LINE, flowOutput));
-        assertEquals(3, occurrences(flowOutput, ROLLBACK_LOG + "MyException at "),
+        assertEquals(3, occurrences(flowOutput, ROLLBACK_LOG + "MyException: exception customized at "),
                 "each processed delivery must roll back on the component's MyException");
         assertTrue(flowOutput.contains(EXCEEDED_FRAGMENT));
         assertEquals(1, matches(EXCEEDED_ERROR_LINE, flowOutput));
@@ -184,9 +202,15 @@ class OrderQueueListenerTest {
         assertEquals(1, occurrences(outputSinceBaseline(), EXCEEDED_MARKER));
     }
 
-    @Test
-    void malformedXmlIsRolledBackWithoutTouchingDatabase() throws Exception {
-        jmsTemplate.convertAndSend(IN, MALFORMED_XML);
+    /**
+     * A document the mapper rejects fails before the flow's logger and the database. Each rolled-back delivery logs
+     * the mapper's own message, which names a rejected element but never quotes the document or the rejected text.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("rejectedDocuments")
+    void rejectedDocumentIsRolledBackWithoutTouchingDatabase(String document, String expectedLog, String forbidden)
+            throws Exception {
+        jmsTemplate.convertAndSend(IN, document);
 
         awaitRedeliveryLimit();
 
@@ -196,14 +220,32 @@ class OrderQueueListenerTest {
         String flowOutput = outputSinceBaseline();
         assertFalse(flowOutput.contains("XXXXXXX order:"), "the document fails before the flow's logger");
         assertEquals(3, occurrences(flowOutput, ROLLBACK_LOG));
+        assertEquals(3, occurrences(flowOutput, expectedLog));
+        assertFalse(output.getAll().contains(forbidden), "the log must never carry " + forbidden);
         assertTrue(flowOutput.contains(EXCEEDED_FRAGMENT));
         assertNull(drainTemplate(1000).receive(OUT));
         assertEquals(1, occurrences(outputSinceBaseline(), EXCEEDED_MARKER));
     }
 
-    @Test
-    void insertFailureRollsBackBeforeTestComponent() throws Exception {
-        doThrow(new DataIntegrityViolationException("boom")).when(orderRepository).insert(any());
+    static Stream<Arguments> rejectedDocuments() {
+        return Stream.of(
+                Arguments.of(Named.of("malformed XML", MALFORMED_XML),
+                        ROLLBACK_LOG + "IllegalArgumentException: Failed to convert XML to Order: ", MALFORMED_XML),
+                Arguments.of(Named.of("well-formed order whose customerId is not an integer", SENTINEL_ORDER_XML),
+                        ROLLBACK_LOG + "IllegalArgumentException: Failed to convert XML to Order: element customerId "
+                                + "does not hold an integer at ",
+                        SENTINEL));
+    }
+
+    /**
+     * A failing insert rolls back before the component runs. Each rolled-back delivery logs the type and message of
+     * the failure below the Spring wrappers, escaped onto one line and cut at 256 characters.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("insertFailures")
+    void insertFailureRollsBackBeforeTestComponent(RuntimeException failure, String expectedLog, String forbidden)
+            throws Exception {
+        doThrow(failure).when(orderRepository).insert(any());
 
         jmsTemplate.convertAndSend(IN, messageXml());
 
@@ -214,10 +256,38 @@ class OrderQueueListenerTest {
         assertEquals(0, rowCount());
         String flowOutput = outputSinceBaseline();
         assertEquals(3, occurrences(flowOutput, INFO_LINE));
-        assertEquals(3, occurrences(flowOutput, ROLLBACK_LOG + "DataIntegrityViolationException at "));
+        assertEquals(3, occurrences(flowOutput, expectedLog));
+        assertFalse(flowOutput.contains(forbidden), "the log must never carry " + forbidden);
         assertTrue(flowOutput.contains(EXCEEDED_FRAGMENT));
         assertNull(drainTemplate(1000).receive(OUT));
         assertEquals(1, occurrences(outputSinceBaseline(), EXCEEDED_MARKER));
+    }
+
+    static Stream<Arguments> insertFailures() {
+        String longMessage = "long message " + "0123456789".repeat(30);
+        DataIntegrityViolationException cyclic = new DataIntegrityViolationException("outer");
+        cyclic.initCause(new RecoverableDataAccessException("inner", cyclic));
+        return Stream.of(
+                Arguments.of(Named.of("Spring exception without cause", new DataIntegrityViolationException("boom")),
+                        ROLLBACK_LOG + "DataIntegrityViolationException: boom at ",
+                        "ListenerExecutionFailedException"),
+                Arguments.of(Named.of("Spring wrapper around the driver's exception",
+                        new BadSqlGrammarException("PreparedStatementCallback",
+                                "insert into orders(item_id, item_units, customer_id) values (?, ?, ?)",
+                                new SQLSyntaxErrorException("Table 'company.orders' doesn't exist"))),
+                        ROLLBACK_LOG + "SQLSyntaxErrorException: Table 'company.orders' doesn't exist at ",
+                        "bad SQL grammar"),
+                Arguments.of(Named.of("message with CR and LF",
+                        new DataIntegrityViolationException("first\r\nERROR forged line")),
+                        ROLLBACK_LOG + "DataIntegrityViolationException: first\\u000D\\u000AERROR forged line at ",
+                        "\nERROR forged line"),
+                Arguments.of(Named.of("message longer than 256 characters",
+                        new DataIntegrityViolationException(longMessage)),
+                        ROLLBACK_LOG + "DataIntegrityViolationException: " + longMessage.substring(0, 256) + "... at ",
+                        longMessage),
+                Arguments.of(Named.of("cause chain of Spring wrappers looping back on itself", cyclic),
+                        ROLLBACK_LOG + "RecoverableDataAccessException: inner at ",
+                        "DataIntegrityViolationException: outer"));
     }
 
     /**
@@ -264,11 +334,15 @@ class OrderQueueListenerTest {
 
     static Stream<Named<Message>> deliveriesWithinRedeliveryLimit() throws Exception {
         String xml = messageXml();
+        int xmlLength = xml.getBytes(StandardCharsets.UTF_8).length;
+        byte[] largestBody = (xml + " ".repeat(MAX_BODY_BYTES - xmlLength)).getBytes(StandardCharsets.UTF_8);
         return Stream.of(
                 Named.of("text message, delivery count 3 (redelivery count 2, the limit)", textMessage(3, xml)),
                 Named.of("text message without JMSXDeliveryCount (first delivery)", textMessage(null, xml)),
                 Named.of("bytes message holding message.xml as UTF-8",
-                        bytesMessage(1, xml.getBytes(StandardCharsets.UTF_8))));
+                        bytesMessage(1, xml.getBytes(StandardCharsets.UTF_8))),
+                Named.of("bytes message of exactly 1048576 bytes (message.xml padded with trailing spaces)",
+                        bytesMessage(1, largestBody)));
     }
 
     @Test
@@ -301,6 +375,62 @@ class OrderQueueListenerTest {
         verify(service, never()).process(any());
     }
 
+    /**
+     * A declared body length outside 0 to {@code MAX_BODY_BYTES} is rejected before a buffer is allocated or a byte
+     * is read: -1 (negative), the bound plus one, 2^31 (wrapped negative by an {@code int} cast), 2^32 + 90 (truncated
+     * by that cast to the 90 bytes of {@code message.xml}, so only a prefix would be read) and {@code Long.MAX_VALUE}.
+     */
+    @ParameterizedTest(name = "declared length {0}")
+    @ValueSource(longs = {-1L, MAX_BODY_BYTES + 1L, Integer.MAX_VALUE + 1L, (1L << 32) + 90L, Long.MAX_VALUE})
+    void bytesBodyLengthOutsideBoundIsRejectedUnread(long declaredLength) throws Exception {
+        OrderTransactionService service = mock(OrderTransactionService.class);
+        BytesMessage message = bytesMessage(1, declaredLength, messageXml().getBytes(StandardCharsets.UTF_8), 0);
+        OrderQueueListener listener = standaloneListener(service);
+
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> listener.onMessage(message));
+
+        assertEquals("Unsupported JMS BytesMessage body length: " + declaredLength + " bytes (supported: 0 to "
+                + MAX_BODY_BYTES + ")", failure.getMessage());
+        verify(message, never()).readBytes(any(byte[].class));
+        verify(service, never()).process(any());
+    }
+
+    /**
+     * A read returning fewer bytes than the body declares fails the delivery instead of decoding the bytes that
+     * arrived; -1 is the provider's end-of-body answer and is reported as 0 bytes read.
+     */
+    @ParameterizedTest(name = "readBytes answers {0}")
+    @CsvSource({"-1, 0", "0, 0", "40, 40", "89, 89"})
+    void incompleteBytesBodyReadIsRejected(int readResult, int bytesRead) throws Exception {
+        OrderTransactionService service = mock(OrderTransactionService.class);
+        byte[] xml = messageXml().getBytes(StandardCharsets.UTF_8);
+        BytesMessage message = bytesMessage(1, xml.length, Arrays.copyOf(xml, bytesRead), readResult);
+        OrderQueueListener listener = standaloneListener(service);
+
+        JMSException failure = assertThrows(JMSException.class, () -> listener.onMessage(message));
+
+        assertEquals("Incomplete JMS BytesMessage body: read " + bytesRead + " of " + xml.length + " declared bytes",
+                failure.getMessage());
+        verify(message, times(1)).readBytes(any(byte[].class));
+        verify(service, never()).process(any());
+    }
+
+    /** An empty bytes body is never read, since a provider answers -1, and the mapper rejects the empty text. */
+    @Test
+    void emptyBytesBodyIsRejectedByMapperUnread() throws Exception {
+        OrderTransactionService service = mock(OrderTransactionService.class);
+        BytesMessage message = bytesMessage(1, 0L, new byte[0], -1);
+        OrderQueueListener listener = standaloneListener(service);
+
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> listener.onMessage(message));
+
+        assertEquals("Failed to convert XML to Order: input is empty", failure.getMessage());
+        verify(message, never()).readBytes(any(byte[].class));
+        verify(service, never()).process(any());
+    }
+
     /** The listener as the context builds it from {@code application.yml}: {@code maxRedelivery} 2, queue in. */
     private static OrderQueueListener standaloneListener(OrderTransactionService service) {
         return new OrderQueueListener(new OrderXmlMapper(), service, 2, IN);
@@ -316,13 +446,22 @@ class OrderQueueListenerTest {
     }
 
     private static BytesMessage bytesMessage(int deliveryCount, byte[] body) throws JMSException {
+        return bytesMessage(deliveryCount, body.length, body, body.length);
+    }
+
+    /**
+     * A bytes message declaring {@code declaredLength} bytes whose {@code readBytes} copies as much of {@code body}
+     * as the buffer holds and answers {@code readResult}, as a provider reporting a short or empty read would.
+     */
+    private static BytesMessage bytesMessage(int deliveryCount, long declaredLength, byte[] body, int readResult)
+            throws JMSException {
         BytesMessage message = mock(BytesMessage.class);
         stubDeliveryCount(message, deliveryCount);
-        when(message.getBodyLength()).thenReturn((long) body.length);
+        when(message.getBodyLength()).thenReturn(declaredLength);
         doAnswer(invocation -> {
             byte[] target = invocation.getArgument(0);
-            System.arraycopy(body, 0, target, 0, body.length);
-            return body.length;
+            System.arraycopy(body, 0, target, 0, Math.min(body.length, target.length));
+            return readResult;
         }).when(message).readBytes(any(byte[].class));
         return message;
     }

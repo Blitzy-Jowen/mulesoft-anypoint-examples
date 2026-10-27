@@ -1,6 +1,8 @@
 package com.mulesoft.examples.soap_webservice_security.config;
 
+import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -33,10 +35,14 @@ import org.springframework.oxm.mime.MimeContainer;
 import org.springframework.util.ObjectUtils;
 import org.springframework.util.xml.StaxUtils;
 import org.springframework.ws.config.annotation.WsConfigurer;
+import org.springframework.ws.context.MessageContext;
 import org.springframework.ws.server.EndpointInterceptor;
+import org.springframework.ws.server.EndpointInvocationChain;
 import org.springframework.ws.server.endpoint.adapter.method.MarshallingPayloadMethodProcessor;
 import org.springframework.ws.server.endpoint.adapter.method.MethodReturnValueHandler;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
+import org.springframework.ws.soap.server.SoapEndpointInvocationChain;
+import org.springframework.ws.soap.server.SoapMessageDispatcher;
 import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 
@@ -46,17 +52,21 @@ import org.w3c.dom.Node;
  * {@code /services/username}, {@code /services/signed}, {@code /services/encrypted}, {@code /services/saml} and
  * {@code /services/signedsaml}, none of them declaring {@code allowedMethods}.
  * <ul>
- *   <li>Every response and fault of the annotation-mapped endpoints is restyled into CXF's envelope form by
- *       {@link SoapEnvelopeStyleInterceptor}, and every request is checked against its path's WS-Security action set
- *       by {@link PathScopedSecurityInterceptor} (see {@link #addInterceptors(List)} for their order).</li>
+ *   <li>Every request is checked against its path's WS-Security action set by {@link PathScopedSecurityInterceptor}
+ *       once, before any endpoint is selected, and only then dispatched, on the payload that check leaves: the
+ *       decrypted body on {@code /services/encrypted}. A request whose body root no endpoint maps is therefore
+ *       checked too (see {@link #messageReceiver()}). Every response and fault, the security faults included, is
+ *       restyled into CXF's envelope form by {@link SoapEnvelopeStyleInterceptor}.</li>
  *   <li>The two {@code model.soap} wrappers are written by {@link #greeterMarshaller()}, both in endpoint responses
  *       and in the outbound requests of the secured clients, so every payload root reads
  *       {@code <ns2:greetResponse xmlns:ns2="http://security.example.mule.mulesoft.com/">} as CXF wrote it.</li>
- *   <li>{@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory and the listener boundary by their
- *       bean names, {@value #MESSAGE_FACTORY_BEAN_NAME} and {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME}.</li>
+ *   <li>{@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory, the listener boundary and the
+ *       message receiver by their bean names, {@value #MESSAGE_FACTORY_BEAN_NAME},
+ *       {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME} and {@value #MESSAGE_RECEIVER_BEAN_NAME}.</li>
  *   <li>{@code GET <listener path>?wsdl} serves {@value #GREETER_WSDL} on each of the six paths, as CXF published
  *       the Greeter WSDL on each, through {@link WsdlQueryPublisher}; no {@code WsdlDefinition} or {@code XsdSchema}
- *       bean exists, so the servlet never publishes a second copy.</li>
+ *       bean exists, so the servlet never publishes a second copy. The publisher is a filter that answers before the
+ *       servlet, so metadata stays anonymous on the secured paths.</li>
  * </ul>
  * No {@code WebServiceTemplate} bean is defined: each secured client type needs its own securing interceptor, so the
  * client builds one template per type over {@link #greeterMarshaller()}.
@@ -73,6 +83,9 @@ public class WebServiceConfig implements WsConfigurer {
 
     /** Name under which {@code MessageDispatcherServlet} looks up the adapter that receives every SOAP request. */
     public static final String MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME = "messageReceiverHandlerAdapter";
+
+    /** Name under which {@code MessageDispatcherServlet} looks up the receiver it hands every SOAP request to. */
+    public static final String MESSAGE_RECEIVER_BEAN_NAME = "messageReceiver";
 
     /** Name of the marshaller of the {@code greet} and {@code greetResponse} wrappers. */
     public static final String GREETER_MARSHALLER_BEAN_NAME = "greeterMarshaller";
@@ -95,7 +108,7 @@ public class WebServiceConfig implements WsConfigurer {
     /**
      * @param styler              the CXF envelope styler applied to every endpoint response and fault
      * @param securityInterceptor the inbound WS-Security enforcement of the six paths, defined by
-     *                            {@link WsSecurityConfig}
+     *                            {@link WsSecurityConfig} and run by {@link #messageReceiver()}
      * @param greeterMarshaller   the managed {@link #greeterMarshaller()} bean; that bean method is static, so
      *                            injecting it here creates no cycle
      */
@@ -107,19 +120,18 @@ public class WebServiceConfig implements WsConfigurer {
     }
 
     /**
-     * Reaches Boot's annotation-driven endpoint mappings, the only place either interceptor is registered: neither is
-     * a {@code SmartEndpointInterceptor}, and a second registration would validate or restyle a message twice. The
-     * mappings also ask the security interceptor whether it understands a {@code mustUnderstand} header, so a
-     * {@code wsse:Security} header is accepted on exactly the secured paths.
+     * Registers the envelope styler on Boot's annotation-driven endpoint mappings, its only registration there: it is
+     * not a {@code SmartEndpointInterceptor}, and a second registration would restyle a message twice. The
+     * unknown-operation fallback mapping carries the styler itself.
      * <p>
-     * The styler comes first. When the security interceptor rejects a request it writes the fault and returns
-     * {@code false}, and the dispatcher then runs {@code handleFault} in reverse order from that interceptor down to
-     * the first one, so the styler restyles the security fault last, after which nothing changes the response.
+     * The security interceptor is deliberately absent from every mapping. A mapping's interceptors run only after
+     * that mapping has selected an endpoint from the body as it arrived, so they could neither decrypt a body before
+     * its operation is chosen nor check a request no endpoint maps; {@link #messageReceiver()} runs it once per
+     * request, before endpoint selection, instead.
      */
     @Override
     public void addInterceptors(List<EndpointInterceptor> interceptors) {
         interceptors.add(styler);
-        interceptors.add(securityInterceptor);
     }
 
     /**
@@ -160,6 +172,17 @@ public class WebServiceConfig implements WsConfigurer {
     }
 
     /**
+     * The receiver the servlet hands every SOAP request to once the listener boundary has read it: the path's
+     * WS-Security policy first, then Spring WS dispatch (see {@link SecurityFirstMessageDispatcher}). Like the
+     * servlet's default receiver, it collects every endpoint mapping, endpoint adapter and exception resolver bean of
+     * the context when the context is set on it.
+     */
+    @Bean(name = MESSAGE_RECEIVER_BEAN_NAME)
+    public SoapMessageDispatcher messageReceiver() {
+        return new SecurityFirstMessageDispatcher(securityInterceptor, styler);
+    }
+
+    /**
      * Binds the two document/literal-wrapped operation elements and writes them as CXF did (see
      * {@link CxfStyleJaxb2Marshaller}); output stays unformatted, so marshalled payloads are as compact as CXF's.
      */
@@ -190,6 +213,101 @@ public class WebServiceConfig implements WsConfigurer {
         registration.addUrlPatterns("/*");
         registration.setDispatcherTypes(DispatcherType.REQUEST);
         return registration;
+    }
+
+    /**
+     * A {@link SoapMessageDispatcher} that enforces the request path's WS-Security policy before any endpoint mapping
+     * is consulted, as each original {@code cxf:ws-security} interceptor ran before CXF bound the message to an
+     * operation.
+     * <p>
+     * Spring WS selects the endpoint from the body root as it arrived and runs only the selected mapping's
+     * interceptors, and its dispatch step cannot be overridden. An encrypted body, whose root is
+     * {@code xenc:EncryptedData}, could therefore never select {@code greet}, and a body root no endpoint maps would
+     * reach the unknown-operation fallback, which carries no security, unchecked. {@link #receive} instead runs the
+     * security interceptor on the message itself first:
+     * <ul>
+     *   <li>a rejected request already carries the fault the interceptor wrote; it is restyled into CXF's envelope
+     *       form and answered without dispatch, so no endpoint mapping, adapter or exception resolver sees it;</li>
+     *   <li>an accepted request is dispatched on the processed message, whose body WSS4J has decrypted in place, so
+     *       the operation is selected on the payload the endpoint reads.</li>
+     * </ul>
+     * The security interceptor is on no mapping, so no request is validated twice. Spring's {@code mustUnderstand}
+     * check still asks it whether it understands each header, for every mapped chain, the unknown-operation fallback
+     * included: the {@code wsse:Security} header WSS4J-based clients mark {@code mustUnderstand="1"} by default is
+     * understood on exactly the secured paths, and an unsecured path keeps Spring's MustUnderstand fault.
+     * <p>
+     * Spring WS's dispatcher constructor loads the default strategies of the runtime class from
+     * {@code WebServiceConfig.SecurityFirstMessageDispatcher.properties} beside it, which therefore carries the
+     * entries of Spring's {@code SoapMessageDispatcher.properties}. Holds no per-request state, so the one instance
+     * serves concurrent requests.
+     */
+    static final class SecurityFirstMessageDispatcher extends SoapMessageDispatcher {
+
+        private final PathScopedSecurityInterceptor securityInterceptor;
+        private final SoapEnvelopeStyleInterceptor styler;
+
+        /**
+         * @param securityInterceptor the path-scoped enforcement run before endpoint selection
+         * @param styler              the CXF envelope styler applied to a security fault answered without dispatch
+         * @throws NullPointerException if either argument is {@code null}
+         */
+        SecurityFirstMessageDispatcher(PathScopedSecurityInterceptor securityInterceptor,
+                SoapEnvelopeStyleInterceptor styler) {
+            this.securityInterceptor = Objects.requireNonNull(securityInterceptor, "securityInterceptor");
+            this.styler = Objects.requireNonNull(styler, "styler");
+        }
+
+        /**
+         * Enforces the path's policy, then dispatches an accepted request; a rejected one is answered with the fault
+         * the security interceptor wrote. No endpoint is selected at this point, so both interceptors are called
+         * without one, and the security interceptor's completion callback follows on either outcome, as dispatch
+         * calls it for an interceptor that ran.
+         */
+        @Override
+        public void receive(MessageContext messageContext) throws Exception {
+            boolean accepted = securityInterceptor.handleRequest(messageContext, null);
+            try {
+                if (accepted) {
+                    super.receive(messageContext);
+                }
+                else {
+                    styler.handleFault(messageContext, null);
+                }
+            }
+            catch (Exception ex) {
+                securityInterceptor.afterCompletion(messageContext, null, ex);
+                throw ex;
+            }
+            securityInterceptor.afterCompletion(messageContext, null, null);
+        }
+
+        /**
+         * Spring's {@code mustUnderstand} check, run against a copy of the mapped chain that also holds the security
+         * interceptor, so the check asks it whether it understands each header. The copy keeps the chain's SOAP
+         * actors or roles and its ultimate-receiver flag, and serves the check alone: dispatch runs the mapping's own
+         * interceptors only.
+         */
+        @Override
+        protected boolean handleRequest(EndpointInvocationChain mappedEndpoint, MessageContext messageContext) {
+            EndpointInterceptor[] mapped = mappedEndpoint.getInterceptors();
+            EndpointInterceptor[] checked;
+            if (mapped == null) {
+                checked = new EndpointInterceptor[] { securityInterceptor };
+            }
+            else {
+                checked = Arrays.copyOf(mapped, mapped.length + 1);
+                checked[mapped.length] = securityInterceptor;
+            }
+            EndpointInvocationChain headerCheckChain;
+            if (mappedEndpoint instanceof SoapEndpointInvocationChain soapChain) {
+                headerCheckChain = new SoapEndpointInvocationChain(soapChain.getEndpoint(), checked,
+                        soapChain.getActorsOrRoles(), soapChain.isUltimateReceiver());
+            }
+            else {
+                headerCheckChain = new EndpointInvocationChain(mappedEndpoint.getEndpoint(), checked);
+            }
+            return super.handleRequest(headerCheckChain, messageContext);
+        }
     }
 
     /**

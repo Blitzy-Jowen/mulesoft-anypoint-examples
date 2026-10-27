@@ -16,6 +16,8 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.util.Collections;
+import java.util.Map;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -66,16 +68,36 @@ class FibonacciServiceTest {
         verifyNoInteractions(cacheService);
     }
 
-    // A null body is the absent request body, which the filter passes like any text other than "/favicon.ico".
+    /**
+     * A null payload (no body, or a multipart body) and a form body's parameter map, even one naming the path, pass
+     * the filter like any text other than {@code "/favicon.ico"}.
+     *
+     * @param payload the listener payload the filter tests
+     */
     @ParameterizedTest
     @NullSource
-    @ValueSource(strings = {"/FAVICON.ICO", "x/favicon.ico"})
-    void filterMatchesOnlyTheExactCaseSensitiveText(String body) {
+    @MethodSource("payloadsTheFilterPasses")
+    void filterMatchesOnlyTheExactCaseSensitiveText(Object payload) {
         when(cacheService.calculate("10", true, true)).thenReturn(new FibonacciResult("55", 11));
 
-        assertEquals(new FibonacciReply("Fibonacci(10) = 55\nCOST: 11", 11), service.handle("10", body, false, false));
+        assertEquals(new FibonacciReply("Fibonacci(10) = 55\nCOST: 11", 11),
+                service.handle("10", payload, false, false));
         verify(cacheService).calculate("10", true, true);
         verifyNoMoreInteractions(cacheService);
+    }
+
+    /**
+     * @return non-null listener payloads other than the text {@code /favicon.ico}: near-miss texts and form
+     *         parameter maps
+     */
+    static Stream<Object> payloadsTheFilterPasses() {
+        return Stream.of(
+                "/FAVICON.ICO",
+                "x/favicon.ico",
+                // The form body "/favicon.ico": one bare name, whose value is null.
+                Collections.singletonMap("/favicon.ico", null),
+                Map.of("icon", "/favicon.ico"),
+                Map.of());
     }
 
     @ParameterizedTest

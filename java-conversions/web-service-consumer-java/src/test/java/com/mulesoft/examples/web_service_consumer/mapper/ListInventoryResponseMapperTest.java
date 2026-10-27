@@ -27,7 +27,8 @@ import org.junit.jupiter.params.provider.MethodSource;
  * {@code %output application/json}): the {@code ListInventoryResponse} root in the T-shirt namespace is selected
  * whatever its prefix, and its content, not the wrapper, is written as DataWeave 1.0 JSON with one repeated
  * {@code "inventory"} key per item in document order and string leaves; a document whose root misses the selector,
- * an empty root and a {@code null} document all yield {@code null}.
+ * an empty root and a {@code null} document all yield the JSON literal {@code null}, the DataWeave JSON writer's
+ * rendering of a selector that yields null.
  *
  * <p>The sample is the original example's {@code sample_data/ListInventoryResponse.xml}, inlined because that file
  * is a Studio preview input and is not carried. The mapper is built directly over a real {@link DwXmlToJson} and
@@ -160,6 +161,7 @@ class ListInventoryResponseMapperTest {
 
     static Stream<Arguments> responsesTheSelectorMisses() {
         return Stream.of(
+                Arguments.of("null document", null),
                 Arguments.of("another root", "<OrderTshirtResponse><orderId>1</orderId></OrderTshirtResponse>"),
                 Arguments.of("ListInventoryResponse in another namespace",
                         "<x:ListInventoryResponse xmlns:x=\"urn:other\"><inventory><productCode>1</productCode>"
@@ -173,13 +175,8 @@ class ListInventoryResponseMapperTest {
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("responsesTheSelectorMisses")
-    void responseTheSelectorMissesOrThatIsEmptyYieldsNull(String variant, String xml) {
-        assertThat(mapper.toJson(reader.parse(xml))).isNull();
-    }
-
-    @Test
-    void nullDocumentYieldsNull() {
-        assertThat(mapper.toJson(null)).isNull();
+    void responseTheSelectorMissesOrThatIsEmptyIsWrittenAsJsonNull(String variant, String xml) {
+        assertThat(mapper.toJson(xml == null ? null : reader.parse(xml))).isEqualTo("null");
     }
 
     @Test

@@ -18,8 +18,17 @@ imap:
   folder: INBOX                    # Mule's default mailboxFolder
   check-frequency: 100             # ms between polls; original imaps:connector checkFrequency (imap-to-xml.xml:5)
   initial-delay: 0                 # ms before the first poll
+  # Socket deadlines of every poll's IMAPS connection, in ms: connecting (TLS handshake excluded), each read (TLS
+  # handshake, greeting, LOGIN, SELECT and FETCH replies) and each write. 10000 is the original endpoint's
+  # responseTimeout="10000" (imap-to-xml.xml:10), the 10 s convention of the POP3 and SMTP conversions. Each must be
+  # a positive whole number: 0 or a negative value would mean no deadline, so the poller refuses to start with one.
+  connect-timeout: 10000
+  read-timeout: 10000
+  write-timeout: 10000
   # Extra jakarta.mail session properties, none by default. A key containing dots must be written in bracket
-  # notation so the dots stay inside the map key, e.g. "[mail.imaps.ssl.trust]": "*".
+  # notation so the dots stay inside the map key, e.g. "[mail.imaps.ssl.trust]": "*". An entry for
+  # mail.imaps.connectiontimeout, mail.imaps.timeout or mail.imaps.writetimeout replaces the matching deadline above
+  # and must likewise be a positive whole number of ms.
   properties: {}
 
 orders:

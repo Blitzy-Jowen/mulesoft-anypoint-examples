@@ -16,8 +16,10 @@ import static org.mockito.Mockito.verify;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import com.icegreen.greenmail.configuration.GreenMailConfiguration;
 import com.icegreen.greenmail.junit5.GreenMailExtension;
@@ -33,6 +35,9 @@ import jakarta.mail.util.ByteArrayDataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
@@ -58,6 +63,11 @@ import org.springframework.test.context.DynamicPropertySource;
  * empty 200 and no mail. The error cases are the platform defaults of SC-1, since the flow declares no exception
  * strategy: the JSON 500 for a one-word employee name, malformed XML and a failed SMTP send, and the no-listener
  * 404 for any other path.
+ *
+ * <p>{@code TRACE}, {@code OPTIONS} and CORS pre-flights run the flow as well and get exactly the {@code POST} reply,
+ * complete with its {@code Content-Length}: no {@code message/http} echo of the request headers, its
+ * {@code Authorization} value included, no {@code Allow} header and no {@code Access-Control-*} or {@code Vary}
+ * header, because the listener applied no CORS policy.
  *
  * <p>The mail sender is a spy over the real bean, so every request sends through GreenMail unless a test stubs the
  * send to fail; the spy's default reset restores the real behaviour after each test. The single GreenMail server
@@ -88,6 +98,17 @@ class EmployeeReportControllerTest {
 
     /** The original test's request body: Chava Puckett, Quentin Puckett and Mona Sosa. */
     private static final byte[] MESSAGE = classpathBytes("message.xml");
+
+    /** A body whose {@code //employee} selects nothing. */
+    private static final String NO_EMPLOYEES = "<root><employees/></root>";
+
+    /** The reply's Content-Type: the form converter's generated boundary and no other parameter. */
+    private static final String MULTIPART_CONTENT_TYPE = "multipart/form-data;boundary=[-_0-9A-Za-z]+";
+
+    /** A marker in the shape of a bearer credential, which the servlet's TRACE echo would repeat; not a credential. */
+    private static final String AUTHORIZATION = "Bearer employee-report-trace-sentinel";
+
+    private static final String ORIGIN = "https://example.invalid";
 
     // A dynamic port instead of GreenMail's fixed 3025, so concurrent builds and the project's other GreenMail
     // tests never contend for one port. The server starts before the Spring context and serves every test.
@@ -200,6 +221,84 @@ class EmployeeReportControllerTest {
     }
 
     /**
+     * Method and headers of requests the listener answers with the flow's own reply: {@code POST}, {@code TRACE} and
+     * {@code OPTIONS} carrying an {@code Authorization} value the servlet's {@code TRACE} echo would repeat, and CORS
+     * pre-flights asking for each method, which run the flow like any {@code OPTIONS} request.
+     */
+    private static Stream<Arguments> flowRequests() {
+        Stream<Arguments> plain = Stream.of("POST", "TRACE", "OPTIONS").map(method -> Arguments.of(method,
+                headers("Content-Type", "application/xml", "Authorization", AUTHORIZATION)));
+        Stream<Arguments> preflights = Stream.of("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE")
+                .map(requestedMethod -> Arguments.of("OPTIONS", headers("Origin", ORIGIN,
+                        "Access-Control-Request-Method", requestedMethod, "Content-Type", "application/xml")));
+        Stream<Arguments> preflightWithHeaders = Stream.of(Arguments.of("OPTIONS", headers("Origin", ORIGIN,
+                "Access-Control-Request-Method", "POST",
+                "Access-Control-Request-Headers", "authorization, content-type",
+                "Content-Type", "application/xml", "Authorization", AUTHORIZATION)));
+        return Stream.of(plain, preflights, preflightWithHeaders).flatMap(arguments -> arguments);
+    }
+
+    /**
+     * The report reply is complete when the handler returns, so {@code FrameworkServlet} appends no {@code TRACE}
+     * echo and adds no {@code Allow} header, and a pre-flight gets no CORS processing.
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("flowRequests")
+    void messageXmlGetsTheCompleteCsvReportForEveryMethod(String method, Map<String, String> headers)
+            throws Exception {
+        HttpTestClient.Response response = client.send(method, "/", headers, MESSAGE);
+
+        assertCsvReport(response);
+        assertThat(response.header("Content-Type")).as(response::toString).matches(MULTIPART_CONTENT_TYPE);
+        assertThat(response.headers("Transfer-Encoding")).as(response::toString).isEmpty();
+        assertThat(response.header("Content-Length")).as(response::toString)
+                .isEqualTo(Integer.toString(response.body().length));
+        assertNoServletOrCorsAdditions(response);
+        assertThat(greenMail.waitForIncomingEmail(DELIVERY_TIMEOUT_MS, 1)).isTrue();
+        assertThat(greenMail.getReceivedMessages()).hasSize(1);
+    }
+
+    /** The empty reply is completed with {@code Content-Length: 0} as well, so nothing replaces or extends it. */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("flowRequests")
+    void bodyWithoutEmployeesGetsTheCompleteEmpty200ForEveryMethod(String method, Map<String, String> headers) {
+        HttpTestClient.Response response = client.send(method, "/", headers, utf8(NO_EMPLOYEES));
+
+        assertStatus(response, 200, "OK");
+        assertThat(response.body()).as(response::toString).isEmpty();
+        assertThat(response.header("Content-Length")).as(response::toString).isEqualTo("0");
+        assertThat(response.header("Content-Type")).as(response::toString).isNull();
+        assertNoServletOrCorsAdditions(response);
+        assertThat(greenMail.getReceivedMessages()).isEmpty();
+    }
+
+    /** A pre-flight to a path no listener serves gets the no-listener 404 like any other request. */
+    @Test
+    void preflightToUnknownPathReturnsNoListener404() {
+        HttpTestClient.Response response = client.send("OPTIONS", "/other",
+                headers("Origin", ORIGIN, "Access-Control-Request-Method", "POST"), null);
+
+        assertStatus(response, 404, "Not Found");
+        assertContentTypeStartsWith(response, "text/plain");
+        assertThat(response.bodyAsString()).as(response::toString).isEqualTo("No listener for endpoint: /other");
+        assertNoServletOrCorsAdditions(response);
+    }
+
+    /** {@code HEAD} runs the flow too; its reply declares the length of the report entity it does not carry. */
+    @Test
+    void headWithMessageXmlDeclaresTheReportWithoutBodyAndMailsTheReport() {
+        HttpTestClient.Response response = client.send("HEAD", "/", XML, MESSAGE);
+
+        assertStatus(response, 200, "OK");
+        assertThat(response.header("Content-Type")).as(response::toString).matches(MULTIPART_CONTENT_TYPE);
+        assertThat(Long.parseLong(response.header("Content-Length"))).as(response::toString)
+                .isGreaterThan(CSV.length());
+        assertThat(response.body()).as(response::toString).isEmpty();
+        assertThat(greenMail.waitForIncomingEmail(DELIVERY_TIMEOUT_MS, 1)).isTrue();
+        assertThat(greenMail.getReceivedMessages()).hasSize(1);
+    }
+
+    /**
      * Asserts the 200 {@code multipart/form-data} reply whose single part is the {@code employees.csv} attachment of
      * the original flow (attachments.xml:35), typed {@code text/plain} and holding exactly {@link #CSV}.
      */
@@ -228,6 +327,36 @@ class EmployeeReportControllerTest {
 
     private static void assertContentTypeStartsWith(HttpTestClient.Response response, String mediaType) {
         assertThat(response.header("Content-Type")).as(response::toString).isNotNull().startsWith(mediaType);
+    }
+
+    /**
+     * Asserts that the reply carries nothing the servlet's own {@code TRACE} or {@code OPTIONS} handling or Spring's
+     * CORS processing would add: no {@code message/http} Content-Type, no echoed request line, no
+     * {@link #AUTHORIZATION} value anywhere, no {@code Allow}, {@code Access-Control-*} or {@code Vary} header.
+     */
+    private static void assertNoServletOrCorsAdditions(HttpTestClient.Response response) {
+        assertThat(String.valueOf(response.header("Content-Type"))).as(response::toString)
+                .doesNotStartWith("message/http");
+        assertThat(response.bodyAsString()).as(response::toString)
+                .doesNotContain("TRACE / HTTP/1.1")
+                .doesNotContain(AUTHORIZATION);
+        assertThat(response.headers()).as(response::toString)
+                .noneMatch(header -> header.getValue().contains(AUTHORIZATION))
+                .noneMatch(header -> header.getKey().equalsIgnoreCase("Allow")
+                        || header.getKey().equalsIgnoreCase("Vary")
+                        || header.getKey().regionMatches(true, 0, "Access-Control-", 0, "Access-Control-".length()));
+    }
+
+    /** Request headers from alternating names and values, sent in the order given. */
+    private static Map<String, String> headers(String... namesAndValues) {
+        if (namesAndValues.length % 2 != 0) {
+            throw new IllegalArgumentException("every header name needs a value");
+        }
+        Map<String, String> headers = new LinkedHashMap<>();
+        for (int i = 0; i < namesAndValues.length; i += 2) {
+            headers.put(namesAndValues[i], namesAndValues[i + 1]);
+        }
+        return headers;
     }
 
     private static byte[] utf8(String text) {
