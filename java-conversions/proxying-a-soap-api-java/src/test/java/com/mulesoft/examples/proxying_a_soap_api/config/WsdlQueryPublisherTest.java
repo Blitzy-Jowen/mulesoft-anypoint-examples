@@ -352,7 +352,7 @@ class WsdlQueryPublisherTest {
     /**
      * Boots the consuming application, found by package scan, and serves every WSDL and schema its
      * {@link FilterRegistrationBean}-installed publishers registered, so each one is readable and its whole closure
-     * resolves offline.
+     * resolves offline. A consumer that publishes no metadata installs no publisher and has nothing to serve.
      */
     @Nested
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.MOCK)
@@ -369,9 +369,10 @@ class WsdlQueryPublisherTest {
                     .filter(WsdlQueryPublisher.class::isInstance)
                     .map(WsdlQueryPublisher.class::cast)
                     .toList();
-            assertThat(publishers).as("WsdlQueryPublisher filters installed by FilterRegistrationBean").isNotEmpty();
-            assertThat(publishers.stream().mapToLong(publisher -> publisher.registrations().size()).sum())
-                    .isGreaterThanOrEqualTo(1);
+            // No publisher at all is a valid consumer: one whose SOAP listeners accept POST only publishes no metadata,
+            // and a publishing consumer's endpoint tests assert its ?wsdl. An installed publisher must serve something.
+            assertThat(publishers).as("WsdlQueryPublisher filters installed by FilterRegistrationBean")
+                    .allMatch(publisher -> !publisher.registrations().isEmpty(), "holds at least one registration");
 
             for (WsdlQueryPublisher publisher : publishers) {
                 for (WsdlQueryPublisher.Registration registration : publisher.registrations()) {

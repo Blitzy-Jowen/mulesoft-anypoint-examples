@@ -138,6 +138,8 @@ class ImportingAnEmailAttachmentUsingTheIMAPConnectorTest {
     private static final String EXPECTED_ORDERS_XML_SHA256 =
             "c5d9c000e8caa4640d880c08c0f9b75ab2010991b8cf3a93840760af55a906ee";
     private static final int EXPECTED_ORDER_COUNT = 2;
+    /** GreenMail's 2 s default start-up wait is too short for the IMAPS TLS context on shared, loaded build hosts. */
+    private static final long SERVER_STARTUP_TIMEOUT_MS = 30_000;
 
     /**
      * One server for the whole class. Its ports are allocated dynamically, never GreenMail's fixed test ports,
@@ -145,8 +147,7 @@ class ImportingAnEmailAttachmentUsingTheIMAPConnectorTest {
      * combined here. Plain SMTP accepts unauthenticated delivery, so no STARTTLS or login is needed to send.
      */
     @RegisterExtension
-    static final GreenMailExtension GREEN_MAIL = new GreenMailExtension(
-            ServerSetup.dynamicPort(new ServerSetup[] {ServerSetupTest.SMTP, ServerSetupTest.IMAPS}))
+    static final GreenMailExtension GREEN_MAIL = new GreenMailExtension(smtpAndImaps())
             .withConfiguration(GreenMailConfiguration.aConfig()
                     .withUser(RECEIVER, RECEIVER, RECEIVER_PASSWORD)
                     .withUser(SENDER, SENDER, SENDER_PASSWORD))
@@ -245,6 +246,19 @@ class ImportingAnEmailAttachmentUsingTheIMAPConnectorTest {
         for (File file : outputFiles()) {
             Files.deleteIfExists(file.toPath());
         }
+    }
+
+    /**
+     * GreenMail's SMTP and IMAPS test setups on dynamic ports, each allowed {@link #SERVER_STARTUP_TIMEOUT_MS} to
+     * start. {@code dynamicPort} returns copies, so the shared {@link ServerSetupTest} presets stay unchanged.
+     */
+    private static ServerSetup[] smtpAndImaps() {
+        ServerSetup[] setups =
+                ServerSetup.dynamicPort(new ServerSetup[] {ServerSetupTest.SMTP, ServerSetupTest.IMAPS});
+        for (ServerSetup setup : setups) {
+            setup.setServerStartupTimeout(SERVER_STARTUP_TIMEOUT_MS);
+        }
+        return setups;
     }
 
     /** The entries of {@link #outputDir}; none when the directory is absent. */

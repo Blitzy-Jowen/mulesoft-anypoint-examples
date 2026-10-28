@@ -301,8 +301,9 @@ public class ImapMailPoller {
 
     /**
      * Mule 3.8's {@code MailUtils.getAttachments}: recurses into {@code multipart/mixed} parts and names every other
-     * part by its description, decoded file name, disposition or running index, in that order of preference. The
-     * index counter is local to each multipart level, as in the original.
+     * part by its description, decoded file name, disposition or running index, in that order of preference, then
+     * makes the name unique as {@link #uniqueName(String, Map)} does. The index counter is local to each multipart
+     * level and advances only when a part is named by it, as in the original.
      */
     private static void collect(Multipart multipart, Map<String, Part> result) throws MessagingException, IOException {
         int index = 0;
@@ -322,13 +323,23 @@ public class ImapMailPoller {
             } else {
                 key = String.valueOf(index++);
             }
-            // Duplicate names get Mule's "<index>_" prefix; the exact keys Mule produced here are a Tier 2A
-            // verification point.
-            if (result.containsKey(key)) {
-                key = String.valueOf(index++) + "_" + key;
-            }
-            result.put(key, part);
+            result.put(uniqueName(key, result), part);
         }
+    }
+
+    /**
+     * Mule 3.8.0's {@code MailUtils.getAttachmentName}: a name already taken becomes the first {@code <n>_<name>},
+     * for n = 0, 1, 2, ..., that is still free. Its counter is its own, not the part index of {@code collect}.
+     */
+    private static String uniqueName(String key, Map<String, Part> taken) {
+        if (!taken.containsKey(key)) {
+            return key;
+        }
+        int n = 0;
+        while (taken.containsKey(n + "_" + key)) {
+            n++;
+        }
+        return n + "_" + key;
     }
 
     private static String decodedFileName(String fileName) {

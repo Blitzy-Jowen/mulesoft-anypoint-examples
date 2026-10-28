@@ -9,17 +9,23 @@
 package com.mulesoft.examples.importing_an_email_attachment_using_the_imap_connector.trigger;
 
 import static java.nio.charset.StandardCharsets.US_ASCII;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.BufferedReader;
@@ -30,18 +36,23 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -51,48 +62,80 @@ import java.util.stream.Stream;
 
 import jakarta.activation.DataHandler;
 import jakarta.mail.AuthenticationFailedException;
+import jakarta.mail.Flags;
 import jakarta.mail.Folder;
 import jakarta.mail.Message;
 import jakarta.mail.MessagingException;
+import jakarta.mail.Part;
 import jakarta.mail.Session;
 import jakarta.mail.Store;
+import jakarta.mail.Transport;
+import jakarta.mail.internet.InternetAddress;
+import jakarta.mail.internet.MimeBodyPart;
 import jakarta.mail.internet.MimeMessage;
+import jakarta.mail.internet.MimeMultipart;
+import jakarta.mail.util.ByteArrayDataSource;
 
 import org.eclipse.angus.mail.iap.ProtocolException;
 import org.eclipse.angus.mail.iap.Response;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Named;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 
+import com.icegreen.greenmail.store.FolderException;
 import com.icegreen.greenmail.util.DummySSLServerSocketFactory;
 import com.icegreen.greenmail.util.GreenMail;
 import com.icegreen.greenmail.util.GreenMailUtil;
 import com.icegreen.greenmail.util.ServerSetup;
 import com.icegreen.greenmail.util.ServerSetupTest;
 
+import com.mulesoft.examples.importing_an_email_attachment_using_the_imap_connector.ImportingAnEmailAttachmentUsingTheIMAPConnectorApplication;
 import com.mulesoft.examples.importing_an_email_attachment_using_the_imap_connector.service.AttachmentImportService;
 
 /**
- * Unit test of {@link ImapMailPoller}, the replacement of the original {@code imaps:inbound-endpoint} of
- * {@code imap-to-xml.xml}. The poller is constructed directly, with a {@link MockEnvironment} for
- * {@code imap.properties} and a Mockito {@link AttachmentImportService}, or, where its {@code @Value} defaults are
- * under test, by a plain Spring context without scheduling; no Spring Boot application is started.
+ * Trigger test of {@link ImapMailPoller}, the replacement of the original {@code imaps:inbound-endpoint} of
+ * {@code imap-to-xml.xml}, which stands in for an endpoint test because the example has no HTTP listener. The poller
+ * is constructed directly, with a {@link MockEnvironment} for {@code imap.properties} and a Mockito
+ * {@link AttachmentImportService}, or, where its {@code @Value} defaults are under test, by a plain Spring context
+ * without scheduling. Only {@link AsWiredByTheTestProfile} starts the Spring Boot application, under the
+ * {@code test} profile, to poll as the application wires the poller. No test relies on the scheduled poll: each calls
+ * {@link ImapMailPoller#pollOnce()}.
+ *
+ * <p>Mailbox behaviour: one GreenMail SMTP + IMAPS server on dynamically allocated ports serves the whole class and
+ * is emptied before each test that uses it. Mail is sent over SMTP as the original integration test sent it. The
+ * cases cover the original mail (a CSV attachment named {@code report}), messages already flagged {@code \Seen} or
+ * {@code \Deleted}, a mail without attachments, an import failure, an unreachable port, a rejected password and the
+ * attachment naming of Mule 3.8's {@code MailUtils}.
  *
  * <p>Socket deadlines: the connect, read and write deadlines default to the original endpoint's 10 s
  * {@code responseTimeout}, follow their dedicated keys and positive {@code imap.properties} entries, and refuse at
@@ -124,6 +167,23 @@ class ImapMailPollerTest {
     private static final String SENTINEL_PASSWORD = "sentinel-pw-41c9";
     private static final String SENTINEL_CONTENT = "sentinel-content-b58e";
 
+    // The GreenMail users of application-test.yml (imap.* and smtp.*): test-only literals, never real accounts.
+    private static final String RECEIVER = "receiver@localhost";
+    private static final String RECEIVER_PASSWORD = "receiver-test-pw";
+    private static final String SENDER = "sender@localhost";
+    private static final String SENDER_PASSWORD = "sender-test-pw";
+    /** The subject of the original integration test's mail. */
+    private static final String SUBJECT = "This is the IMAP Subject Line!";
+    /** GreenMail's 2 s default start-up wait is too short for the IMAPS TLS context on shared, loaded build hosts. */
+    private static final long SERVER_STARTUP_TIMEOUT_MS = 30_000;
+
+    /**
+     * The class-wide mailbox. Its ports are allocated at start, never fixed, because concurrent builds share the host.
+     * Started and stopped by plain class lifecycle methods rather than GreenMailExtension, whose before-all callback
+     * would run again for each nested class and replace the running server.
+     */
+    private static GreenMail mailbox;
+
     private final AttachmentImportService service = mock(AttachmentImportService.class);
     private final Session session = mock(Session.class);
     private final Store store = mock(Store.class);
@@ -134,6 +194,19 @@ class ImapMailPollerTest {
     private Level savedPollerLevel;
     private ListAppender<ILoggingEvent> pollerEvents;
     private ListAppender<ILoggingEvent> allEvents;
+
+    @BeforeAll
+    static void startMailbox() {
+        mailbox = new GreenMail(smtpAndImaps());
+        mailbox.start();
+        mailbox.setUser(RECEIVER, RECEIVER, RECEIVER_PASSWORD);
+        mailbox.setUser(SENDER, SENDER, SENDER_PASSWORD);
+    }
+
+    @AfterAll
+    static void stopMailbox() {
+        mailbox.stop();
+    }
 
     @BeforeEach
     void captureLogs() {
@@ -353,8 +426,7 @@ class ImapMailPollerTest {
 
     @Test
     void pollsAGreenMailMailboxWithinTheDefaultDeadlines() throws Exception {
-        GreenMail greenMail = new GreenMail(
-                ServerSetup.dynamicPort(new ServerSetup[] {ServerSetupTest.SMTP, ServerSetupTest.IMAPS}));
+        GreenMail greenMail = new GreenMail(smtpAndImaps());
         greenMail.start();
         try {
             greenMail.setUser("poller@localhost", "poller@localhost", "poller-test-pw");
@@ -461,6 +533,19 @@ class ImapMailPollerTest {
                 FOLDER, deadline, deadline, deadline);
     }
 
+    /**
+     * GreenMail's SMTP and IMAPS test setups on dynamic ports, each allowed {@link #SERVER_STARTUP_TIMEOUT_MS} to
+     * start. {@code dynamicPort} returns copies, so the shared {@link ServerSetupTest} presets stay unchanged.
+     */
+    private static ServerSetup[] smtpAndImaps() {
+        ServerSetup[] setups =
+                ServerSetup.dynamicPort(new ServerSetup[] {ServerSetupTest.SMTP, ServerSetupTest.IMAPS});
+        for (ServerSetup setup : setups) {
+            setup.setServerStartupTimeout(SERVER_STARTUP_TIMEOUT_MS);
+        }
+        return setups;
+    }
+
     /** {@code imap.properties} trusting the self-signed certificate GreenMail's TLS socket factory presents. */
     private static MockEnvironment trustingEnvironment() {
         return new MockEnvironment()
@@ -560,6 +645,364 @@ class ImapMailPollerTest {
                 setMessageNumber(number);
             }
         };
+    }
+
+    @Test
+    @DisplayName("poll() is scheduled with the original checkFrequency of 100 ms; "
+            + "pollOnce() is a public synchronized int")
+    void pollIsScheduledWithOriginalCheckFrequency() throws NoSuchMethodException {
+        // The class literal, not a bean, so no proxy hides the annotation.
+        Scheduled scheduled = ImapMailPoller.class.getDeclaredMethod("poll").getAnnotation(Scheduled.class);
+
+        assertThat(scheduled).isNotNull();
+        assertThat(scheduled.fixedDelayString()).isEqualTo("${imap.check-frequency:100}");
+        assertThat(scheduled.initialDelayString()).isEqualTo("${imap.initial-delay:0}");
+        Method pollOnce = ImapMailPoller.class.getDeclaredMethod("pollOnce");
+        assertThat(Modifier.isPublic(pollOnce.getModifiers())).isTrue();
+        assertThat(Modifier.isSynchronized(pollOnce.getModifiers())).isTrue();
+        assertThat(pollOnce.getReturnType()).isEqualTo(int.class);
+    }
+
+    /** Cases against the class-wide GreenMail mailbox, each with a poller constructed for it. */
+    @Nested
+    @DisplayName("polling a GreenMail IMAPS mailbox")
+    class PollingAGreenMailMailbox {
+
+        @BeforeEach
+        void emptyMailbox() throws FolderException {
+            mailbox.purgeEmailFromAllMailboxes();
+        }
+
+        @Test
+        @DisplayName("a message already flagged \\Seen is not handed to the service and stays in the mailbox")
+        void seenMessageIsSkipped() throws Exception {
+            send(reportMail());
+            setFlag(0, Flags.Flag.SEEN);
+
+            assertThat(mailboxPoller(RECEIVER_PASSWORD).pollOnce()).isZero();
+
+            verifyNoInteractions(service);
+            assertThat(inboxCount()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("a message already flagged \\Deleted is not handed to the service")
+        void deletedMessageIsSkipped() throws Exception {
+            send(reportMail());
+            setFlag(0, Flags.Flag.DELETED);
+
+            // The poll's closing expunge may remove the message, so the mailbox is not inspected afterwards.
+            assertThat(mailboxPoller(RECEIVER_PASSWORD).pollOnce()).isZero();
+
+            verifyNoInteractions(service);
+        }
+
+        @Test
+        @DisplayName("a mail without attachments reaches the service with an empty HashMap and is expunged")
+        void plainTextMailReachesServiceWithEmptyMap() throws Exception {
+            ImportCalls calls = new ImportCalls();
+            doAnswer(calls).when(service).importAttachments(any());
+            MimeMessage plain = newMessage();
+            plain.setText("plain body");
+            send(plain);
+
+            // Rejecting the empty map is AttachmentImportService's behaviour, tested there; the service is mocked here.
+            assertThat(mailboxPoller(RECEIVER_PASSWORD).pollOnce()).isEqualTo(1);
+
+            verify(service).importAttachments(any());
+            assertThat(calls.map(0)).isExactlyInstanceOf(HashMap.class).isEmpty();
+            assertThat(inboxCount()).isZero();
+        }
+
+        @Test
+        @DisplayName("an import failure is logged at ERROR, the next message is still processed and both are expunged")
+        void serviceFailureIsLoggedAndPollContinues() throws Exception {
+            ImportCalls calls = new ImportCalls();
+            doThrow(new IllegalStateException("boom")).doAnswer(calls).when(service).importAttachments(any());
+            send(reportMail(), reportMail());
+            ImapMailPoller poller = mailboxPoller(RECEIVER_PASSWORD);
+            int[] processed = new int[1];
+
+            assertThatCode(() -> processed[0] = poller.pollOnce()).doesNotThrowAnyException();
+
+            // pollOnce counts the messages handed to the service, whether or not the import succeeded.
+            assertThat(processed[0]).isEqualTo(2);
+            verify(service, times(2)).importAttachments(any());
+            assertThat(calls.bytes(0, "report")).isEqualTo(deliveredOverSmtp(inputCsv()));
+            // The poller's diagnostics name the failure by its exception types and never attach the throwable, whose
+            // message could quote mail content (the log-safety rule of ImapMailPoller).
+            assertThat(errorMessages())
+                    .containsExactly("Error processing IMAP message 1 (java.lang.IllegalStateException)");
+            assertThat(pollerEvents.list).allSatisfy(event -> assertThat(event.getThrowableProxy()).isNull());
+            // Both messages were flagged \Deleted before the service ran, so the closing expunge removed both.
+            assertThat(inboxCount()).isZero();
+        }
+
+        @Test
+        @DisplayName("an unreachable IMAPS port is logged at ERROR and the poll returns 0 without throwing")
+        void unreachablePortIsLoggedAndPollReturnsZero() throws Exception {
+            int closedPort;
+            // A port just released on the loopback interface refuses connections; a fixed port might be in use.
+            try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+                closedPort = probe.getLocalPort();
+            }
+            ImapMailPoller poller = new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1", closedPort,
+                    RECEIVER, RECEIVER_PASSWORD, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE);
+
+            assertThat(assertDoesNotThrow(poller::pollOnce)).isZero();
+
+            verifyNoInteractions(service);
+            assertThat(errorMessages()).singleElement().asString()
+                    .startsWith("Failed to connect to IMAP folder INBOX on 127.0.0.1:" + closedPort + " (")
+                    .contains("java.net.ConnectException");
+        }
+
+        @Test
+        @DisplayName("a rejected password is logged at ERROR, the poll returns 0 and the mail stays in the mailbox")
+        void wrongPasswordIsLoggedAndNothingIsConsumed() throws Exception {
+            send(reportMail());
+            ImapMailPoller poller = mailboxPoller("wrong-password");
+
+            assertThat(assertDoesNotThrow(poller::pollOnce)).isZero();
+
+            verifyNoInteractions(service);
+            assertThat(errorMessages()).containsExactly("Failed to connect to IMAP folder INBOX on 127.0.0.1:"
+                    + mailbox.getImaps().getPort() + " (jakarta.mail.AuthenticationFailedException)");
+            assertThat(inboxCount()).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("attachment names follow Mule 3.8 MailUtils: description, file name, disposition, index; "
+                + "multipart/mixed flattened; a taken name gets the first free n_ prefix")
+        void attachmentKeysFollowMule38MailUtils() throws Exception {
+            MimeBodyPart described = textPart("p1");
+            described.setDescription("described");
+            described.setFileName("ignored.csv");
+            MimeBodyPart named = textPart("p2");
+            named.setFileName("named.csv");
+            MimeBodyPart inline = textPart("p3");
+            inline.setDisposition(Part.INLINE);
+            MimeBodyPart nestedNamed = textPart("n1");
+            nestedNamed.setFileName("nested.csv");
+            MimeBodyPart nested = new MimeBodyPart();
+            nested.setContent(new MimeMultipart("mixed", nestedNamed, textPart("n2")));
+            MimeBodyPart duplicate = textPart("p6");
+            duplicate.setFileName("dup.csv");
+            MimeBodyPart secondDuplicate = textPart("p7");
+            secondDuplicate.setFileName("dup.csv");
+            MimeMessage message = newMessage();
+            message.setContent(new MimeMultipart(described, named, inline, textPart("p4"), nested, duplicate,
+                    secondDuplicate));
+            ImportCalls calls = new ImportCalls();
+            doAnswer(calls).when(service).importAttachments(any());
+            send(message);
+
+            assertThat(mailboxPoller(RECEIVER_PASSWORD).pollOnce()).isEqualTo(1);
+
+            ArgumentCaptor<Map<String, DataHandler>> captor = attachmentMapCaptor();
+            verify(service).importAttachments(captor.capture());
+            assertThat(captor.getValue()).isExactlyInstanceOf(HashMap.class).isSameAs(calls.map(0));
+            // Expected from Mule 3.8.0 MailUtils.getAttachments and getAttachmentName: the index of unnamed parts is
+            // local to each multipart level ("0" at the top, "0" again inside the nested multipart/mixed), and a name
+            // already taken becomes the first free "<n>_<name>" with n counted from 0 ("0_0", "0_dup.csv").
+            assertThat(calls.texts(0)).containsExactlyInAnyOrderEntriesOf(Map.of(
+                    "described", "p1",
+                    "named.csv", "p2",
+                    "inline", "p3",
+                    "0", "p4",
+                    "nested.csv", "n1",
+                    "0_0", "n2",
+                    "dup.csv", "p6",
+                    "0_dup.csv", "p7"));
+        }
+
+        private ImapMailPoller mailboxPoller(String password) {
+            return new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1", mailbox.getImaps().getPort(),
+                    RECEIVER, password, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE);
+        }
+    }
+
+    /**
+     * The happy path through the poller the application itself wires: the {@code test} profile's
+     * {@code application-test.yml} supplies host, user, password, the GreenMail trust settings and the held-back
+     * scheduled poll, and only the port GreenMail bound is registered here.
+     */
+    @Nested
+    @SpringBootTest(classes = ImportingAnEmailAttachmentUsingTheIMAPConnectorApplication.class)
+    @ActiveProfiles("test")
+    @DisplayName("as wired by the application under the test profile")
+    class AsWiredByTheTestProfile {
+
+        @MockBean
+        AttachmentImportService importService;
+
+        @Autowired
+        ImapMailPoller poller;
+
+        @DynamicPropertySource
+        static void mailboxPort(DynamicPropertyRegistry registry) {
+            registry.add("imap.port", () -> mailbox.getImaps().getPort());
+        }
+
+        @BeforeEach
+        void emptyMailbox() throws FolderException {
+            mailbox.purgeEmailFromAllMailboxes();
+        }
+
+        @Test
+        @DisplayName("the original test's mail hands its CSV attachment to the service, is expunged and polled once")
+        void pollOnceHandsCsvAttachmentToServiceAndExpunges() throws Exception {
+            byte[] input = inputCsv();
+            assertThat(input).as("main resource /input.csv").hasSize(57);
+            ImportCalls calls = new ImportCalls();
+            doAnswer(calls).when(importService).importAttachments(any());
+            send(reportMail());
+
+            assertThat(poller.pollOnce()).isEqualTo(1);
+
+            verify(importService).importAttachments(any());
+            assertThat(calls.map(0)).isExactlyInstanceOf(HashMap.class).containsOnlyKeys("report");
+            assertThat(calls.bytes(0, "report")).isEqualTo(deliveredOverSmtp(input));
+            assertThat(inboxCount()).as("flagged \\Deleted and expunged").isZero();
+            assertThat(poller.pollOnce()).isZero();
+            verifyNoMoreInteractions(importService);
+            assertThat(errorMessages()).isEmpty();
+        }
+    }
+
+    /** A new mail from the sender to the receiver with the original test's subject. */
+    private static MimeMessage newMessage() throws MessagingException {
+        MimeMessage message = new MimeMessage(GreenMailUtil.getSession(mailbox.getSmtp().getServerSetup()));
+        message.setFrom(new InternetAddress(SENDER));
+        message.addRecipient(Message.RecipientType.TO, new InternetAddress(RECEIVER));
+        message.setSubject(SUBJECT);
+        return message;
+    }
+
+    /**
+     * The original integration test's mail: a single-part multipart holding {@code input.csv} as
+     * {@code application/octet-stream} under the file name {@code report}.
+     */
+    private static MimeMessage reportMail() throws MessagingException, IOException {
+        MimeBodyPart report = new MimeBodyPart();
+        report.setDataHandler(new DataHandler(new ByteArrayDataSource(inputCsv(), "application/octet-stream")));
+        report.setFileName("report");
+        MimeMessage message = newMessage();
+        message.setContent(new MimeMultipart(report));
+        return message;
+    }
+
+    private static MimeBodyPart textPart(String text) throws MessagingException {
+        MimeBodyPart part = new MimeBodyPart();
+        part.setText(text);
+        return part;
+    }
+
+    /** The main resource {@code input.csv}, the original test's attachment. */
+    private static byte[] inputCsv() throws IOException {
+        try (InputStream csv = ImapMailPollerTest.class.getResourceAsStream("/input.csv")) {
+            assertThat(csv).as("main resource /input.csv").isNotNull();
+            return csv.readAllBytes();
+        }
+    }
+
+    /**
+     * The bytes the mailbox holds for an attachment sent as the original test sent it. Jakarta Mail gives all-ASCII
+     * {@code application/octet-stream} content the 7bit transfer encoding, and SMTP carries 7bit content with CRLF
+     * line ends, so each LF of {@code input.csv} arrives as CRLF.
+     */
+    private static byte[] deliveredOverSmtp(byte[] sent) {
+        return new String(sent, US_ASCII).replace("\n", "\r\n").getBytes(US_ASCII);
+    }
+
+    /** Sends each mail over GreenMail's SMTP, authenticated as the sender like the original test, and awaits them. */
+    private static void send(MimeMessage... messages) throws MessagingException {
+        for (MimeMessage message : messages) {
+            Transport.send(message, SENDER, SENDER_PASSWORD);
+        }
+        assertThat(mailbox.waitForIncomingEmail(5000, messages.length)).as("mail delivered").isTrue();
+    }
+
+    private static int inboxCount() throws MessagingException {
+        Store store = mailbox.getImaps().createStore();
+        store.connect(RECEIVER, RECEIVER_PASSWORD);
+        try {
+            Folder inbox = store.getFolder(FOLDER);
+            inbox.open(Folder.READ_ONLY);
+            try {
+                return inbox.getMessageCount();
+            } finally {
+                inbox.close(false);
+            }
+        } finally {
+            store.close();
+        }
+    }
+
+    /** Sets {@code flag} on the inbox message at 0-based {@code index}, closing without expunge. */
+    private static void setFlag(int index, Flags.Flag flag) throws MessagingException {
+        Store store = mailbox.getImaps().createStore();
+        store.connect(RECEIVER, RECEIVER_PASSWORD);
+        try {
+            Folder inbox = store.getFolder(FOLDER);
+            inbox.open(Folder.READ_WRITE);
+            try {
+                inbox.getMessage(index + 1).setFlag(flag, true);
+            } finally {
+                inbox.close(false);
+            }
+        } finally {
+            store.close();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ArgumentCaptor<Map<String, DataHandler>> attachmentMapCaptor() {
+        return ArgumentCaptor.forClass(Map.class);
+    }
+
+    /**
+     * Records every attachment map handed to the service and reads each attachment's bytes during the call, while the
+     * poll that produced it is still running.
+     */
+    private static final class ImportCalls implements Answer<Path> {
+
+        private final List<Map<String, DataHandler>> maps = new CopyOnWriteArrayList<>();
+        private final List<Map<String, byte[]>> contents = new CopyOnWriteArrayList<>();
+
+        @Override
+        public Path answer(InvocationOnMock invocation) throws IOException {
+            Map<String, DataHandler> attachments = invocation.getArgument(0);
+            Map<String, byte[]> read = new TreeMap<>();
+            for (Map.Entry<String, DataHandler> attachment : attachments.entrySet()) {
+                try (InputStream content = attachment.getValue().getInputStream()) {
+                    read.put(attachment.getKey(), content.readAllBytes());
+                }
+            }
+            maps.add(attachments);
+            contents.add(read);
+            return Path.of("orders.xml");
+        }
+
+        /** The map exactly as the service received it in answered call {@code call}. */
+        Map<String, DataHandler> map(int call) {
+            assertThat(maps).as("answered service calls").hasSizeGreaterThan(call);
+            return maps.get(call);
+        }
+
+        byte[] bytes(int call, String name) {
+            assertThat(contents).as("answered service calls").hasSizeGreaterThan(call);
+            assertThat(contents.get(call)).containsKey(name);
+            return contents.get(call).get(name);
+        }
+
+        /** Every attachment of answered call {@code call} as UTF-8 text, by name. */
+        Map<String, String> texts(int call) {
+            assertThat(contents).as("answered service calls").hasSizeGreaterThan(call);
+            Map<String, String> texts = new TreeMap<>();
+            contents.get(call).forEach((name, content) -> texts.put(name, new String(content, UTF_8)));
+            return texts;
+        }
     }
 
     /**
