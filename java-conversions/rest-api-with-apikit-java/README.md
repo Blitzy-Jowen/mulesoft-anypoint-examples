@@ -13,9 +13,9 @@ This project holds the reference implementation of four shared components, regis
 
 ## Original example
 
-`rest-api-with-apikit/src/main/app/rest-api-with-apikit.xml` has one listener, `0.0.0.0:${http.port}` path `/api/*` with `http.port=8080` (`mule-app.properties`). It hands every request to an `apikit:router` over `leagues.raml` (RAML 0.8, `baseUri: http://localhost:8080/api`, console enabled at `console`). The router dispatches to nine backend flows, one per RAML resource and method. Each flow calls the Spring bean `org.mule.examples.leagues.LeagueAPI`, and an `apikit:mapping-exception-strategy` answers failures with five fixed JSON bodies. The original README's Studio procedure is replaced by the Maven and Spring Boot commands of [Build and run](#build-and-run).
+`rest-api-with-apikit/src/main/app/rest-api-with-apikit.xml` has one listener, `0.0.0.0:${http.port}` path `/api/*` with `http.port=8080` (`mule-app.properties`). It hands every request to an `apikit:router` over `leagues.raml` (RAML 0.8, `baseUri: http://localhost:8080/api`, console enabled at `console`). The router dispatches to nine backend flows, one per RAML resource and method. Each flow calls the Spring bean `org.mule.examples.leagues.LeagueAPI`, and an `apikit:mapping-exception-strategy` answers failures with five fixed JSON bodies. The original README's Studio procedure is replaced by the Maven and Spring Boot commands of [Build, run and test](#build-run-and-test).
 
-## Endpoints
+## Endpoints and triggers
 
 Base URL `http://localhost:8080/api`, the RAML `baseUri`. Every API request and response body is `application/json`. The RAML contract is compared resource by resource in the root [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) (section 1: 9 of 9 rows match).
 
@@ -36,6 +36,7 @@ Base URL `http://localhost:8080/api`, the RAML `baseUri`. Every API request and 
 - No RAML resource declares HEAD, OPTIONS, PATCH or TRACE. Every undeclared method gets the APIkit 405, HEAD and OPTIONS included (each controller maps them explicitly so Spring does not answer them itself). A CORS pre-flight is answered like any other OPTIONS request, with no `Access-Control-*` header (`config/PreflightDispatchConfig`), because the original listener applied no CORS policy.
 - Under `/api`, a method token in lower or mixed case (`get`, `Post`) is routed as its upper-case form (`config/ApiKitMethodCaseFilter`), as the APIkit router lower-cased the method before routing.
 - Under `/api`, the `Accept` header of each GET is negotiated as the APIkit router negotiated it (`config/ApiKitAcceptNegotiator`, a port of `RestContentTypeParser.bestMatch`). The negotiation runs in each RAML action after its URI and query parameter validation and before the flow, as APIkit did. A header that gives `application/json` quality 0, such as `application/json;q=0` or `text/xml, application/json;q=0`, gets the APIkit 406, an unknown team or match included; with a `teamId`, `homeTeamId` or `awayTeamId` that is not 3 characters long it gets the APIkit 400 instead. `*/*;q=0` is still accepted, because APIkit weighed a `*/*` range with the declared type's own quality.
+- The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
 ### APIkit console and RAML descriptor
 
@@ -51,7 +52,7 @@ The original enabled the console (`apikit:config consoleEnabled="true" consolePa
 
 A miss under the console path is answered with the APIkit 404. The class Javadoc of `ApiKitConsoleController` lists where these bytes are plan decisions rather than recorded original output (for example, the jar's `console/` tree is served rather than `console2/`, and the RAML is served as its raw file rather than re-dumped). Each is a Tier 2A verification point.
 
-## Error responses
+### Error responses
 
 | Status | Content-Type | Body (exact bytes) | When | Handler |
 |---|---|---|---|---|
@@ -69,20 +70,20 @@ A miss under the console path is answered with the APIkit 404. The class Javadoc
 - The 409 body, the no-listener 404 and the 500 are plan defaults rather than recorded original output (AAP 0.4.7). Each is a Tier 2A verification point: a captured fixture that shows different bytes governs.
 - Advice precedence: `LeagueExceptionHandler` (`@Order(0)`), then `ApiKitExceptionHandler`, then `GlobalExceptionHandler` last.
 
-## Configuration
+## Configuration keys
 
-Every key of `src/main/resources/application.yml`:
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to:
 
-| Key | Default | Original | Notes |
-|---|---|---|---|
-| `http.port` | `8080` | `http.port=8080` in `mule-app.properties` (name unchanged) | listener port, bound by `server.port`; the POST `Location` header uses the running server's port and falls back to this value |
-| `server.port` | `${http.port:8080}` | `http:listener-config port="${http.port}"` | set `http.port` rather than this key |
-| `apikit.base-path` | `/api` | listener path `/api/*` | API base path for the APIkit mappings, the console and the method-case filter |
-| `apikit.raml` | `leagues.raml` | `apikit:config raml="leagues.raml"` | classpath RAML read by the console and the schema validator |
-| `apikit.console-path` | `console` | `apikit:config consolePath="console"` | console path below the base path |
-| `spring.web.resources.add-mappings` | `false` | — | no static resource handler, so unknown paths reach the APIkit 404 or the no-listener 404 |
-| `spring.mvc.dispatch-trace-request` | `true` | — | TRACE reaches the APIkit 405, as the listener declares no `allowedMethods` |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | — | no Boot `/error` endpoint; `/error` gets the no-listener 404 |
+| Key | Type | Default | Original | Notes |
+|---|---|---|---|---|
+| `http.port` | `int` | `8080` | `http.port=8080` in `mule-app.properties` (name unchanged) | listener port, bound by `server.port`; the POST `Location` header uses the running server's port and falls back to this value |
+| `server.port` | `Integer` | `${http.port:8080}` | `http:listener-config port="${http.port}"` | set `http.port` rather than this key |
+| `apikit.base-path` | `String` | `/api` | listener path `/api/*` | API base path for the APIkit mappings, the console and the method-case filter |
+| `apikit.raml` | `String` | `leagues.raml` | `apikit:config raml="leagues.raml"` | classpath RAML read by the console and the schema validator |
+| `apikit.console-path` | `String` | `console` | `apikit:config consolePath="console"` | console path below the base path |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | — | no static resource handler, so unknown paths reach the APIkit 404 or the no-listener 404 |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | — | TRACE reaches the APIkit 405, as the listener declares no `allowedMethods` |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | — | no Boot `/error` endpoint; `/error` gets the no-listener 404 |
 
 - The original uses no secret, host, account or credential, so the configuration has no TODO placeholder, and the project has no `application-test.yml` or `application-it.yml`. No original key was renamed.
 - The host is not configured: Spring Boot binds all interfaces, as the original `host="0.0.0.0"` did.
@@ -103,7 +104,7 @@ Every key of `src/main/resources/application.yml`:
 | Console and RAML descriptor (`consoleEnabled="true"`) | `controller/ApiKitConsoleController` and `src/main/resources/apikit-console/**` |
 | `src/main/resources/leagues.raml`, `schemas/*.json`, `examples/*.json`, `teams.json` | copied byte for byte to the same relative paths in `src/main/resources/` |
 
-## Behaviour kept, stubbed or externalized
+## Behaviours stubbed or externalized
 
 - **League data.** At start-up `LeagueAPI` loads the 20 teams of `teams.json` and builds a double round robin of 380 matches. Each pairing has a first-round leg dated 7 or 6 days before start-up, with random scores of 0 to 4 goals, and an unplayed second-round leg dated 1 day before or 1 day after start-up. Every match is at 18:00 local time. State lives in memory and is lost on restart, as in the original Spring bean. Scores and standings therefore differ from run to run.
 - **JSON renderings** (`mapper/LeagueJsonMapper`), both compact, with properties in field-declaration order:
@@ -114,7 +115,7 @@ Every key of `src/main/resources/application.yml`:
 - **Stubbed or externalized:** nothing. The original reaches no external system and holds no credential.
 - **Tier 2A verification points** beyond the error defaults above: a body with a property its schema does not list passes validation but is rejected by the reader with the generic 500 (`LeagueJsonMapper` Javadoc), and the console variations listed in `ApiKitConsoleController`.
 
-## Build and run
+## Build, run and test
 
 Prerequisites: JDK 17, Maven 3.9.x and access to Maven Central. No Mule runtime, licence or credential is needed. Run from `java-conversions/rest-api-with-apikit-java/`:
 

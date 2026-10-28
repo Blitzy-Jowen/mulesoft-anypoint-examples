@@ -35,13 +35,22 @@ import org.springframework.stereotype.Component;
  *       the select {@code typeId} override.</li>
  * </ul>
  *
- * <p>Missing and invalid values fail late: the application context starts with every credential placeholder empty,
- * and only a call that needs a value ({@link #accountHost()}, {@link #resolvedBaseUrl()}, {@link #tokenUrl()} and the
- * {@code require...} methods) throws {@link IllegalStateException} naming the missing or invalid key. An account
- * that is not a single DNS label and a base URL that is not an absolute {@code http}/{@code https} URL with a host
- * and no user info, query or fragment are rejected there, before any URL is built from them, so neither can redirect
- * the token request or the API calls; the message never repeats the configured value. That is why the class carries
- * no validation annotation and no start-up check.
+ * <p>A missing or invalid account, OAuth or base-URL value fails late: the application context starts with every
+ * credential placeholder empty, and only a call that needs a value ({@link #accountHost()},
+ * {@link #resolvedBaseUrl()}, {@link #tokenUrl()}, the {@code require...} methods, and {@code NetsuiteTokenProvider}
+ * for a private key it cannot load) throws {@link IllegalStateException} naming the missing or invalid key. An
+ * account that is not a single DNS label and a base URL that is not an absolute {@code http}/{@code https} URL with a
+ * host and no user info, query or fragment are rejected there, before any URL is built from them, so neither can
+ * redirect the token request or the API calls; the message never repeats the configured value.
+ *
+ * <p>The timeouts and the time zone are checked at start-up instead. A value that does not convert to a
+ * {@link Duration} or a {@link ZoneId} fails binding, which stops start-up. A timeout shorter than 1 ms, or longer
+ * than {@link Integer#MAX_VALUE} milliseconds (connect) or {@link Long#MAX_VALUE} milliseconds (read), stops start-up
+ * with an {@link IllegalStateException} naming the key when {@code NetsuiteTokenProvider} and
+ * {@code NetsuiteRestClient} are created, because both build their transport with
+ * {@code NetsuiteRestClient.connector(NetsuiteProperties)}, which checks the range. The class itself carries no
+ * validation annotation and no start-up check: the account, OAuth and base-URL checks wait for first use, and the
+ * timeout range check runs in the clients.
  */
 @Component
 @ConfigurationProperties(prefix = "netsuite")

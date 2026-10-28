@@ -17,9 +17,9 @@ The project carries these shared components, copied from their reference impleme
 
 `testing-apikit-with-munit/src/main/app/api.xml`, the only flow file (`config.resources=api.xml`), has one listener, `0.0.0.0:${http.port}` path `api/*` (`api.xml:9,39`). `mule-app.properties` is empty, so the original fixes no port; its README asks the user to set one, for example 8080. The `api-main` flow hands every request to an `apikit:router` (`api.xml:38-43`) over `api.raml` (RAML 0.8, `title: Sample API`, no `baseUri`, console enabled at `console`). The router's `apikit:config` maps the four methods of `/munit` to four flows (`api.xml:3-8`), each of which only sets a string payload (`api.xml:45-60`). An `apikit:mapping-exception-strategy` answers failures with five fixed JSON bodies (`api.xml:10-36`).
 
-The MUnit suite `src/test/munit/api-test-suite.xml` imports `api.xml`, mocks nothing (`mock-connectors="false" mock-inbounds="false"`) and calls the running API with an `http:request-config` on `localhost:${http.port}`, `basePath="api"`. Its four tests `api-test-get`, `api-test-post`, `api-test-put` and `api-test-delete` assert the status code and the payload of each method (`api-test-suite.xml:15-45`). The original README's Studio procedure (Exchange import, Studio console, MUnit view) is replaced by the Maven and Spring Boot commands of [Build and run](#build-and-run).
+The MUnit suite `src/test/munit/api-test-suite.xml` imports `api.xml`, mocks nothing (`mock-connectors="false" mock-inbounds="false"`) and calls the running API with an `http:request-config` on `localhost:${http.port}`, `basePath="api"`. Its four tests `api-test-get`, `api-test-post`, `api-test-put` and `api-test-delete` assert the status code and the payload of each method (`api-test-suite.xml:15-45`). The original README's Studio procedure (Exchange import, Studio console, MUnit view) is replaced by the Maven and Spring Boot commands of [Build, run and test](#build-run-and-test).
 
-## Endpoints
+## Endpoints and triggers
 
 Base URL `http://localhost:8081/api`. The RAML declares no `baseUri` and the original fixes no port, so `http.port` defaults to 8081; start with `--http.port=8080` to match the original README's example. The RAML contract is compared method by method in the root [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) (section 2: 4 of 4 rows match).
 
@@ -36,6 +36,7 @@ Base URL `http://localhost:8081/api`. The RAML declares no `baseUri` and the ori
 - **Undeclared methods.** No RAML method declares HEAD, OPTIONS, PATCH or TRACE. Each gets the APIkit 405; `MunitController.headOrOptions` maps HEAD and OPTIONS explicitly so Spring does not answer them itself. A CORS pre-flight is answered like any other OPTIONS request, with no `Access-Control-*` header (`config/PreflightDispatchConfig`), because the original listener applied no CORS policy.
 - **Method case.** Under `/api`, a method token in lower or mixed case (`get`, `Post`) is routed as its upper-case form (`config/ApiKitMethodCaseFilter`), as the APIkit router lower-cased the method before routing.
 - **Accept negotiation.** The `Accept` header of each of the four methods is negotiated as the APIkit router negotiated it (`config/ApiKitAcceptNegotiator`, a port of `RestContentTypeParser.bestMatch`). The negotiation runs in each RAML action after its URI and query parameter validation and before the flow, as APIkit did; `/munit` declares no parameter, so in GET it follows the HEAD rejection and elsewhere it is the first step. A header that gives `application/json` quality 0, such as `application/json;q=0`, gets the APIkit 406. `*/*;q=0` is still accepted, because APIkit weighed a `*/*` range with the declared type's own quality.
+- **Triggers.** The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
 ### APIkit console and RAML descriptor
 
@@ -52,7 +53,7 @@ The original enabled the console (`apikit:config consoleEnabled="true" consolePa
 - The RAML has no `!include`, so no include files are served.
 - A miss under the console path is answered with the APIkit 404. The class Javadoc of `ApiKitConsoleController` lists where these bytes are plan decisions rather than recorded original output (for example, the jar's `console/` tree is served rather than `console2/`, and the RAML is served as its raw file rather than re-dumped). Each is a Tier 2A verification point.
 
-## Error responses
+### Error responses
 
 | Status | Content-Type | Body (exact bytes) | When | Handler |
 |---|---|---|---|---|
@@ -69,21 +70,21 @@ The original enabled the console (`apikit:config consoleEnabled="true" consolePa
 - The four flows only set literals and cannot fail, so the 500 is reachable only through a platform fault. It and the no-listener 404 are plan defaults rather than recorded original output (AAP 0.4.7), and each is a Tier 2A verification point: a captured fixture that shows different bytes governs.
 - Advice precedence: `ApiKitExceptionHandler` (`@Order(Ordered.LOWEST_PRECEDENCE - 1)`), then `GlobalExceptionHandler` last. The original has no exception branch of its own, so the project has no example-specific handler.
 
-## Configuration
+## Configuration keys
 
-Every key of `src/main/resources/application.yml`:
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to, and the `http.port` placeholder it reads but does not set:
 
-| Key | Default | Original | Notes |
-|---|---|---|---|
-| `http.port` | `8081` | `http:listener-config port="${http.port}"`; `mule-app.properties` is empty (name unchanged) | listener port, bound by `server.port`; the original fixes none, so 8081 is the plan default (AAP 0.4.9) |
-| `server.port` | `${http.port:8081}` | — | set `http.port` rather than this key |
-| `apikit.base-path` | `/api` | listener path `api/*` | API base path for the controller, the APIkit mappings, the console and the method-case filter |
-| `apikit.raml` | `api/api.raml` | `apikit:config raml="api.raml"` (file under `src/main/api/`) | classpath RAML served by the console and the RAML descriptor |
-| `apikit.console-path` | `console` | `apikit:config consolePath="console"` | console path below the base path |
-| `spring.application.name` | `testing-apikit-with-munit-java` | — | application name in the log |
-| `spring.web.resources.add-mappings` | `false` | — | no static resource handler, so unknown paths reach the APIkit 404 or the no-listener 404 |
-| `spring.mvc.dispatch-trace-request` | `true` | — | TRACE reaches the APIkit 405, as the listener declares no `allowedMethods` |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | — | no Boot `/error` endpoint; `/error` gets the no-listener 404 |
+| Key | Type | Default | Original | Notes |
+|---|---|---|---|---|
+| `http.port` | `int` | not set in `application.yml`; `server.port: ${http.port:8081}` falls back to `8081` | `http:listener-config port="${http.port}"`; `mule-app.properties` is empty (name unchanged) | placeholder only, not a key of `application.yml`: an optional listener-port override (`--http.port=<port>`, `-Dhttp.port=<port>` or `HTTP_PORT`), bound only through `server.port`; the original fixes none, so 8081 is the plan default (AAP 0.4.9) |
+| `server.port` | `Integer` | `${http.port:8081}` | — | set `http.port` rather than this key |
+| `apikit.base-path` | `String` | `/api` | listener path `api/*` | API base path for the controller, the APIkit mappings, the console and the method-case filter |
+| `apikit.raml` | `String` | `api/api.raml` | `apikit:config raml="api.raml"` (file under `src/main/api/`) | classpath RAML served by the console and the RAML descriptor |
+| `apikit.console-path` | `String` | `console` | `apikit:config consolePath="console"` | console path below the base path |
+| `spring.application.name` | `String` | `testing-apikit-with-munit-java` | — | application name in the log |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | — | no static resource handler, so unknown paths reach the APIkit 404 or the no-listener 404 |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | — | TRACE reaches the APIkit 405, as the listener declares no `allowedMethods` |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | — | no Boot `/error` endpoint; `/error` gets the no-listener 404 |
 
 - The original uses no secret, host, account or credential, so the configuration has no TODO placeholder, and the project has no `application-test.yml`, `application-it.yml` or other credentials file. No original key was renamed.
 - The host is not configured: Spring Boot binds all interfaces, as the original `host="0.0.0.0"` did.
@@ -105,7 +106,7 @@ Every key of `src/main/resources/application.yml`:
 | `src/main/api/api.raml` | `src/main/resources/api/api.raml`, byte for byte |
 | `src/test/munit/api-test-suite.xml` | `src/test/java/.../ApiTestSuiteTest` ([Tests](#tests)) |
 
-## Behaviour kept, stubbed or externalized
+## Behaviours stubbed or externalized
 
 - **Behaviour kept.** Every `/munit` method answers its constant payload with its RAML status. The application holds no state and reaches no external system.
 - **Stubbed or externalized:** nothing beyond the platform surfaces reproduced above (console, RAML descriptor, APIkit error mappings). The original holds no credential.
@@ -113,7 +114,7 @@ Every key of `src/main/resources/application.yml`:
 - **Not applicable:** the Studio and Anypoint content of the original README (Exchange import, Studio console, MUnit view) and the MUnit "musts", which [Tests](#tests) maps to the Spring Boot test context.
 - **Known deviations.** The main classes of SC-1, SC-3 and SC-17 are identical to the reference copies apart from the package; inserting `baseUri` into a RAML that has none, and serving no include for a RAML without `!include`, are the reference implementation's own generic behaviour. One test copy is adjusted: in `controller/ApiKitConsoleControllerTest`, `firstRamlIncludeIsServedRelativeToConsole` passes without a request when the RAML declares no `!include`, where the reference copy skips by assumption, because no test of this project may report skipped.
 
-## Build and run
+## Build, run and test
 
 Prerequisites: JDK 17, Maven 3.9.x and access to Maven Central. No Mule runtime, licence or credential is needed. Run from `java-conversions/testing-apikit-with-munit-java/`:
 

@@ -152,7 +152,7 @@ Original-to-new key map (also in the root `DECISIONS.md`):
 
 The SuiteTalk SOAP login is replaced following Oracle's schedule: REST + OAuth 2.0 for new integrations from release 2026.1, no new SOAP integrations from 2027.1, SOAP disabled in 2028.2.
 
-- `config/NetsuiteProperties` binds the `netsuite.*` keys. Missing or invalid values fail on first use with an `IllegalStateException` naming the key, never repeating the configured value.
+- `config/NetsuiteProperties` binds the `netsuite.*` keys. A missing or invalid account, OAuth or base-URL value (an unreadable or PKCS#1 private key included) fails on first use with an `IllegalStateException` naming the key, never repeating the configured value. The timeouts and the time zone are checked at start-up instead: a value that does not convert fails binding, and a timeout shorter than 1 ms, or longer than 2147483647 ms (connect) or 9223372036854775807 ms (read), stops start-up when the NetSuite clients are created, with an `IllegalStateException` naming the key. The time zone is bound, and so checked, even though this flow reads no date.
 - The unit tests use the Spring profile `test` (`src/test/resources/application-test.yml`): dummy account and OAuth identifiers, a 2 s read timeout, and `netsuite.base-url` and the private key supplied by each test (WireMock and a key generated for the run). None authenticates anywhere.
 - Supply the values through the environment, never in a committed file:
 

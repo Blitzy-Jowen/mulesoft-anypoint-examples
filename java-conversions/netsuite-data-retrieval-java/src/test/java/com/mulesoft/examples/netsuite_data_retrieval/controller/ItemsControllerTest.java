@@ -18,14 +18,8 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
-import java.io.IOException;
 import java.net.ConnectException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -57,7 +51,7 @@ import org.springframework.test.context.ActiveProfiles;
  * {@code /api/*} listener (netsuite-data-retrieval/src/main/app/netsuite-api.xml:54-78).
  *
  * <p>The whole application runs on Undertow on a random port with {@link NetsuiteSearchService} mocked, so no
- * NetSuite host or credential is involved. Every request but {@code HEAD} goes through ST-1 {@link HttpTestClient},
+ * NetSuite host or credential is involved. Every request goes through ST-1 {@link HttpTestClient},
  * so the status code, Undertow's reason phrase, {@code Content-Type} and the body bytes are asserted as written to
  * the wire:
  * <ul>
@@ -243,24 +237,19 @@ class ItemsControllerTest {
     }
 
     /**
-     * HEAD goes through the JDK client, which reads no body for it, because the 405 announces the
-     * {@code Content-Length} of a body a HEAD response never carries; HTTP/1.1 is forced so no h2c upgrade is
-     * attempted.
+     * HEAD goes through ST-1 like every other request: the client reads no body for a HEAD response, so the
+     * exchange ends at the empty line after the headers. APIkit's 405 answers with its bare {@code application/json}
+     * type and announces the {@code Content-Length} of its 405 body, while no body bytes are sent.
      */
     @Test
-    void headReturns405() throws IOException, InterruptedException {
-        HttpClient httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .connectTimeout(Duration.ofMillis(HttpTestClient.TIMEOUT_MILLIS))
-                .build();
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + ITEMS + "?quantity=1"))
-                .method("HEAD", HttpRequest.BodyPublishers.noBody())
-                .timeout(Duration.ofMillis(HttpTestClient.TIMEOUT_MILLIS))
-                .build();
+    void headReturns405() {
+        HttpTestClient.Response response = client.send("HEAD", ITEMS + "?quantity=1", null, null);
 
-        HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
-
-        assertEquals(405, response.statusCode(), () -> response.headers().map().toString());
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertEquals(List.of(MediaType.APPLICATION_JSON_VALUE), response.headers("Content-Type"), response::toString);
+        assertEquals(0, response.body().length, response::toString);
+        assertEquals(List.of(String.valueOf(METHOD_NOT_ALLOWED.getBytes(StandardCharsets.UTF_8).length)),
+                response.headers("Content-Length"), response::toString);
         verifyNoInteractions(searchService);
     }
 

@@ -11,17 +11,9 @@ package com.mulesoft.examples.testing_apikit_with_munit.controller;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -42,7 +34,7 @@ import com.mulesoft.examples.testing_apikit_with_munit.support.HttpTestClient;
  * Wire-level test of {@link MunitController}, the RAML resource {@code /munit} of {@code api/api.raml} served on
  * the original {@code api/*} listener (testing-apikit-with-munit/src/main/app/api.xml:38-60).
  *
- * <p>The whole application runs on Undertow on a random port and every request but {@code HEAD} goes through ST-1
+ * <p>The whole application runs on Undertow on a random port and every request goes through ST-1
  * {@link HttpTestClient}, so the status code, the reason phrase, {@code Content-Type} and the body bytes are
  * asserted as the listener writes them:
  * <ul>
@@ -153,27 +145,20 @@ class MunitControllerTest {
     }
 
     /**
-     * HEAD goes through the JDK client, which reads no body for it, and is forced to HTTP/1.1 so no h2c upgrade is
-     * attempted. The JSON {@code Content-Type} shows that APIkit's 405 mapping answered rather than a Spring default.
+     * HEAD goes through ST-1 like every other request: the client reads no body for a HEAD response, so the exchange
+     * ends at the empty line after the headers. APIkit's 405 mapping answers, not a Spring default: the raw status
+     * line, exactly one bare {@code application/json} {@code Content-Type} and no body bytes. The
+     * {@code Content-Length} announced is the length of the 405 mapping's body, which is not sent.
      */
     @Test
-    void headReturns405() throws IOException, InterruptedException {
-        HttpClient httpClient = HttpClient.newBuilder()
-                .version(HttpClient.Version.HTTP_1_1)
-                .connectTimeout(Duration.ofMillis(HttpTestClient.TIMEOUT_MILLIS))
-                .build();
-        HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + BASE))
-                .method("HEAD", HttpRequest.BodyPublishers.noBody())
-                .timeout(Duration.ofMillis(HttpTestClient.TIMEOUT_MILLIS))
-                .build();
+    void headReturns405() {
+        HttpTestClient.Response response = client.send("HEAD", BASE, null, null);
 
-        HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
-
-        assertEquals(405, response.statusCode(), () -> response.headers().map().toString());
-        String contentType = response.headers().firstValue("Content-Type").orElse(null);
-        assertNotNull(contentType, () -> "no Content-Type in " + response.headers().map());
-        assertTrue(MediaType.parseMediaType(contentType).equalsTypeAndSubtype(MediaType.APPLICATION_JSON),
-                () -> "Content-Type " + contentType);
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertMediaType(response, MediaType.APPLICATION_JSON_VALUE);
+        assertEquals(0, response.body().length, response::toString);
+        assertEquals(List.of(String.valueOf(METHOD_NOT_ALLOWED.getBytes(StandardCharsets.UTF_8).length)),
+                response.headers("Content-Length"), response::toString);
     }
 
     /** Each declared method with the request body it is sent with ({@code null} for none). */
@@ -218,7 +203,7 @@ class MunitControllerTest {
 
         assertEquals(404, response.status(), response::toString);
         assertEquals("Not Found", response.reason(), response::toString);
-        assertMediaType(response, MediaType.TEXT_PLAIN);
+        assertMediaType(response, MediaType.TEXT_PLAIN_VALUE);
         assertArrayEquals("No listener for endpoint: /other".getBytes(StandardCharsets.UTF_8), response.body(),
                 response::toString);
     }
@@ -228,7 +213,7 @@ class MunitControllerTest {
                                            String expectedBody) {
         assertEquals(status, response.status(), response::toString);
         assertEquals(reason, response.reason(), response::toString);
-        assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertMediaType(response, MediaType.APPLICATION_JSON_VALUE);
         assertArrayEquals(expectedBody.getBytes(StandardCharsets.UTF_8), response.body(), response::toString);
     }
 
@@ -238,19 +223,8 @@ class MunitControllerTest {
         assertJsonResponse(response, status, reason, body);
     }
 
-    /**
-     * The response's {@code Content-Type} is present and names {@code expected}'s type and subtype; a charset
-     * parameter, which a message converter may append, must be UTF-8.
-     */
-    private static void assertMediaType(HttpTestClient.Response response, MediaType expected) {
-        String contentType = response.header("Content-Type");
-        assertNotNull(contentType, () -> "no Content-Type in " + response);
-        MediaType actual = MediaType.parseMediaType(contentType);
-        assertTrue(actual.equalsTypeAndSubtype(expected),
-                () -> "expected " + expected + " but got Content-Type " + contentType + " in " + response);
-        Charset charset = actual.getCharset();
-        if (charset != null) {
-            assertEquals(StandardCharsets.UTF_8, charset, () -> "Content-Type " + contentType);
-        }
+    /** Exactly one {@code Content-Type} header, equal to the bare {@code expected} with no parameter appended. */
+    private static void assertMediaType(HttpTestClient.Response response, String expected) {
+        assertEquals(List.of(expected), response.headers("Content-Type"), response::toString);
     }
 }

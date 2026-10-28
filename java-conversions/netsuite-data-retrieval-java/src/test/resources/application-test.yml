@@ -1,15 +1,20 @@
-# Spring profile "test" for the credential-free unit tier, activated by @ActiveProfiles("test") in the
-# controller tests and NetsuiteApiTest.
+# Spring profile "test" for the credential-free unit tier, activated by @ActiveProfiles("test") in NetsuiteApiTest,
+# controller/CustomersControllerTest, ItemsControllerTest and OpportunitiesControllerTest,
+# config/ApiKitAcceptNegotiationListenerTest, config/PreflightDispatchListenerTest and the nested RequestLogging
+# tests of config/ApplicationLogLevelsTest.
 #
 # Every value below is a test dummy that fills a placeholder left empty in src/main/resources/application.yml;
 # none is a NetSuite credential and none authenticates anywhere.
 #
-# Deliberately absent, because each test registers them through its @DynamicPropertySource:
+# Deliberately absent, because only config/ApplicationLogLevelsTest, the one test under this profile that calls the
+# real SC-16 client, needs them, and it registers both through its @DynamicPropertySource:
 #   netsuite.base-url               the base URL of the test's in-process WireMock server
 #   netsuite.oauth.private-key-path an RSA key the test generates into a temporary file
+# NetsuiteApiTest (@MockBean NetsuiteRestClient) and the other tests (@MockBean NetsuiteSearchService) need neither.
 #
-# The production read timeout stays 10 s in application.yml; it is shortened here only so that the
-# upstream-timeout (503) case against WireMock's fixed delay finishes quickly.
+# The production read timeout stays 10 s in application.yml; it is 2 s here, which bounds the WireMock calls of
+# config/ApplicationLogLevelsTest. No test under this profile waits for a delayed reply: the read-timeout 503 of
+# controller/CustomersControllerTest is thrown by its mocked NetsuiteSearchService.
 #
 # Live NetSuite credentials belong only in the git-ignored src/test/resources/application-it.yml
 # (template: application-it.yml.example).

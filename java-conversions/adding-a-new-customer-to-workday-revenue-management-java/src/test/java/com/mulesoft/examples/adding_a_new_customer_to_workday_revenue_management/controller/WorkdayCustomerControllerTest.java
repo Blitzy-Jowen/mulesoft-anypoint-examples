@@ -68,7 +68,8 @@ import com.mulesoft.examples.adding_a_new_customer_to_workday_revenue_management
  * body and for a Workday validation fault (classified {@code OTHER} and rethrown, as the flow declares no exception
  * strategy), and the three approved connector failure modes: one re-authentication and retry before the 502, a 429
  * with Workday's {@code Retry-After} and no retry, and a 503 with no retry after a read timeout. Standard reason
- * phrases are platform defaults and Tier 2A verification points, so only their presence is asserted.
+ * phrases are asserted exactly as Undertow writes them; as platform defaults they remain Tier 2A verification points,
+ * where a captured fixture would govern both the handler and this test.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
@@ -114,9 +115,6 @@ class WorkdayCustomerControllerTest {
                     + "<faultstring>" + VALIDATION_FAULT_STRING + "</faultstring>"
                     + "</SOAP-ENV:Fault>";
 
-    /** SC-9 body with APIkit spacing and a non-empty upstream message, whose text is the vendor's or the JDK's. */
-    private static final String UPSTREAM_BODY_REGEX = "\\{ \"message\": \".+\", \"upstream\": \"Workday\" \\}";
-
     /** Started before the context, so the lazy {@code wday.endpoint} supplier finds its base URL. */
     private static final WireMockServer WIREMOCK =
             new WireMockServer(WireMockConfiguration.wireMockConfig().dynamicPort());
@@ -156,8 +154,7 @@ class WorkdayCustomerControllerTest {
 
         Response response = send(method, target, customerXml());
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(200);
-        assertReasonPresent(response);
+        assertStatusLine(response, 200, "OK");
         // The flow's template set-payload declares no MIME type, so the Mule listener sent no Content-Type.
         assertThat(response.headers("Content-Type")).as("Content-Type of %s", response).isEmpty();
         assertThat(response.headers("Content-Length")).as("Content-Length of %s", response)
@@ -204,8 +201,7 @@ class WorkdayCustomerControllerTest {
     void nonPostMethodsAreRejected(String method, Map<String, String> headers) {
         Response response = http.send(method, "/", headers, new byte[0]);
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(405);
-        assertReasonPresent(response);
+        assertStatusLine(response, 405, "Method Not Allowed");
         assertMediaType(response, "text/plain");
         assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: /");
         assertThat(response.headers()).as("headers of %s", response)
@@ -219,8 +215,7 @@ class WorkdayCustomerControllerTest {
     void unknownPathIsNotFound(String method) throws IOException {
         Response response = send(method, "/other", customerXml());
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(404);
-        assertReasonPresent(response);
+        assertStatusLine(response, 404, "Not Found");
         assertMediaType(response, "text/plain");
         assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: /other");
         assertNoUpstreamCall();
@@ -230,8 +225,7 @@ class WorkdayCustomerControllerTest {
     void malformedXmlIsServerError() {
         Response response = send("POST", "/", "<root><Account><CustomerName>NAME</CustomerName>".getBytes(UTF_8));
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(500);
-        assertReasonPresent(response);
+        assertStatusLine(response, 500, "Internal Server Error");
         assertMediaType(response, "application/json");
         // The message is the JDK parser's own text, so only the APIkit-spaced shape around it is fixed.
         assertThat(response.bodyAsString()).startsWith("{ \"message\": \"").endsWith("\" }");
@@ -246,8 +240,7 @@ class WorkdayCustomerControllerTest {
 
         Response response = send("POST", "/", customerXml());
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(500);
-        assertReasonPresent(response);
+        assertStatusLine(response, 500, "Internal Server Error");
         assertMediaType(response, "application/json");
         assertThat(response.bodyAsString()).isEqualTo("{ \"message\": \"" + VALIDATION_FAULT_STRING + "\" }");
         WIREMOCK.verify(1, postRequestedFor(urlEqualTo(WORKDAY_PATH)));
@@ -260,10 +253,10 @@ class WorkdayCustomerControllerTest {
 
         Response response = send("POST", "/", customerXml());
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(502);
-        assertReasonPresent(response);
+        assertStatusLine(response, 502, "Bad Gateway");
         assertMediaType(response, "application/json");
-        assertUpstreamBody(response);
+        // Spring WS's connection error message "<reason> [<status>]" for the retry's "401 Unauthorized" from WireMock.
+        assertUpstreamBody(response, "{ \"message\": \"Unauthorized [401]\", \"upstream\": \"Workday\" }");
         assertThat(response.header("Retry-After")).isNull();
         // The rejected attempt and exactly one retry after re-authentication.
         WIREMOCK.verify(2, postRequestedFor(urlEqualTo(WORKDAY_PATH)));
@@ -278,11 +271,11 @@ class WorkdayCustomerControllerTest {
 
         Response response = send("POST", "/", customerXml());
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(429);
-        assertReasonPresent(response);
+        assertStatusLine(response, 429, "Too Many Requests");
         assertMediaType(response, "application/json");
         assertThat(response.header("Retry-After")).isEqualTo("30");
-        assertUpstreamBody(response);
+        // Spring WS's connection error message "<reason> [<status>]" for WireMock's "429 Too Many Requests".
+        assertUpstreamBody(response, "{ \"message\": \"Too Many Requests [429]\", \"upstream\": \"Workday\" }");
         WIREMOCK.verify(1, postRequestedFor(urlEqualTo(WORKDAY_PATH)));
     }
 
@@ -292,10 +285,12 @@ class WorkdayCustomerControllerTest {
 
         Response response = send("POST", "/", customerXml());
 
-        assertThat(response.status()).as("status of %s", response).isEqualTo(503);
-        assertReasonPresent(response);
+        assertStatusLine(response, 503, "Service Unavailable");
         assertMediaType(response, "application/json");
-        assertUpstreamBody(response);
+        // The first message of the cause chain: Spring WS's WebServiceTemplate prefixes "I/O error: " to the message
+        // of the JDK's SocketTimeoutException, "Read timed out". The classifier's neutral "Workday did not respond in
+        // time" applies only to a chain that carries no message, which the client tests' upstreamMessage cases cover.
+        assertUpstreamBody(response, "{ \"message\": \"I/O error: Read timed out\", \"upstream\": \"Workday\" }");
         assertThat(response.header("Retry-After")).isNull();
         // WireMock journals the request before it starts the delay, and a retry would have been sent before the 503.
         WIREMOCK.verify(1, postRequestedFor(urlEqualTo(WORKDAY_PATH)));
@@ -349,13 +344,15 @@ class WorkdayCustomerControllerTest {
                 .isEqualTo(typeSubtype);
     }
 
-    private static void assertReasonPresent(Response response) {
-        assertThat(response.reason()).as("reason phrase of %s", response).isNotNull().isNotBlank();
+    /** Compares the raw status line, {@code HTTP/1.1 <status> <reason>}, exactly as Undertow wrote it. */
+    private static void assertStatusLine(Response response, int status, String reason) {
+        assertThat(response.statusLine()).as("status line of %s", response)
+                .isEqualTo("HTTP/1.1 " + status + " " + reason);
     }
 
-    /** {@code { "message": "<upstream message>", "upstream": "Workday" }} with a non-empty message. */
-    private static void assertUpstreamBody(Response response) {
-        assertThat(response.bodyAsString()).as("body of %s", response).matches(UPSTREAM_BODY_REGEX);
+    /** Compares the SC-9 body byte for byte with {@code expected} encoded as UTF-8. */
+    private static void assertUpstreamBody(Response response, String expected) {
+        assertThat(response.body()).as("body of %s", response).isEqualTo(expected.getBytes(UTF_8));
     }
 
     private static void assertNoUpstreamCall() {

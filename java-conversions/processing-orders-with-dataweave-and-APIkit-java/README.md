@@ -22,9 +22,9 @@ Every other shared class is a copy, identical apart from the package, together w
 - **`currency.xml`, the Currency API.** One listener, `0.0.0.0:${http.port}` path `/api/*` (`currency.xml:3,33`), hands every request to an `apikit:router` over `currency.raml` (RAML 0.8, `baseUri: http://localhost:8081/api/`, console enabled at `console`, `currency.xml:4`). The router dispatches `GET /currencies` to the flow `get:/currencies:currency-config`, whose only processor is `<parse-template location="currency.json"/>` (`currency.xml:37-39`). An `apikit:mapping-exception-strategy` answers failures with five fixed JSON bodies (`currency.xml:5-31`).
 - **`books.xml`, the order flow `OrderFlow`** (`books.xml:7-43`). A `file:inbound-endpoint` polls `src/main/resources/input` (`books.xml:8`). An `enricher` stores the response of `GET http://localhost:${http.port}/api/currencies` (request config `HTTP_Request_Configuration`, `books.xml:3-5`) in `flowVars.currencies` (`books.xml:9-11`). One `dw:transform-message` runs two DataWeave 1.0 scripts on the same input: `dw:set-payload` builds the orders JSON (`books.xml:14-29`) and `dw:set-variable variableName="report"` builds the CSV report (`books.xml:30-37`). Two `file:outbound-endpoint`s write `orders.json`, then `report.csv`, to `src/main/resources/output` (`books.xml:39-42`).
 
-`mule-app.properties` is empty, so the original sets no `http.port`. The original README's Studio procedure is replaced by the Maven and Spring Boot commands of [Build and run](#build-and-run). That README also says the file endpoint "polls the input folder every ten seconds", which does not match the flow: the endpoint declares no `pollingFrequency`, so the Mule file connector's default of 1000 ms applied, and this project keeps it.
+`mule-app.properties` is empty, so the original sets no `http.port`. The original README's Studio procedure is replaced by the Maven and Spring Boot commands of [Build, run and test](#build-run-and-test). That README also says the file endpoint "polls the input folder every ten seconds", which does not match the flow: the endpoint declares no `pollingFrequency`, so the Mule file connector's default of 1000 ms applied, and this project keeps it.
 
-## Endpoints
+## Endpoints and triggers
 
 ### HTTP API
 
@@ -56,7 +56,7 @@ A miss under the console path is answered with the APIkit 404. The class Javadoc
 
 ### Order file trigger
 
-`trigger/OrderFileTrigger` replaces the flow's `file:inbound-endpoint` (`books.xml:8`). Every `orders.polling-frequency` milliseconds (default 1000, counted from the end of one poll to the start of the next) it polls `orders.input-dir` (default `src/main/resources/input`, relative to the working directory) through SC-5 `FileInboundPoller`:
+`trigger/OrderFileTrigger` replaces the flow's `file:inbound-endpoint` (`books.xml:8`). At the `orders.polling-frequency` interval (default 1000 ms; given in milliseconds or as an ISO-8601 duration, and counted from the end of one poll to the start of the next) it polls `orders.input-dir` (default `src/main/resources/input`, relative to the working directory) through SC-5 `FileInboundPoller`:
 
 1. The input directory is created when missing. Its regular files are taken in directory-listing order, unsorted and unfiltered, and each is marked in process so that no overlapping poll takes it twice. A file that cannot be read stays in place for the next poll.
 2. `service/OrderFlowService.process` runs the flow on the file's bytes, in the original processor order:
@@ -74,7 +74,7 @@ Transformation rules (AAP 0.7.1):
 
 Both outputs are written through SC-4 in DataWeave 1.0's byte format. For the bundled input they are byte-identical to the original's committed outputs, carried unchanged as `src/test/resources/expected/orders.json` (793 bytes) and `expected/report.csv` (68 bytes).
 
-## Error responses
+### Error responses
 
 | Status | Content-Type | Body (exact bytes) | When | Handler |
 |---|---|---|---|---|
@@ -91,24 +91,24 @@ Both outputs are written through SC-4 in DataWeave 1.0's byte format. For the bu
 - Advice precedence: `ApiKitExceptionHandler` (`Ordered.LOWEST_PRECEDENCE - 1`), then `GlobalExceptionHandler` last.
 - The order flow has no HTTP caller, so its failures never reach these handlers. They end as the ERROR log of the [order file trigger](#order-file-trigger).
 
-## Configuration
+## Configuration keys
 
-Every key of `src/main/resources/application.yml`, and the `http.port` placeholder it reads:
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to, and the `http.port` placeholder it reads but does not set:
 
-| Key | Default | Original | Notes |
-|---|---|---|---|
-| `http.port` | not set, so `8081` applies | `${http.port}` in `currency.xml:3` (listener) and `books.xml:3` (request config); `mule-app.properties` sets no value (name unchanged) | listener port, bound by `server.port`; `CurrencyClient` calls the running listener's port and falls back to this value |
-| `server.port` | `${http.port:8081}` | `http:listener-config port="${http.port}"` | set `http.port` rather than this key |
-| `apikit.base-path` | `/api` | listener path `/api/*` | API base path for the controller, the APIkit mappings, the console and the method-case filter |
-| `apikit.raml` | `api/currency.raml` | `apikit:config raml="currency.raml"` | classpath RAML served by the console and read by the schema validator |
-| `apikit.console-path` | `console` | `apikit:config consolePath="console"` | console path below the base path |
-| `orders.input-dir` | `src/main/resources/input` | `file:inbound-endpoint path` (`books.xml:8`) | directory the trigger polls; a relative path resolves against the working directory |
-| `orders.output-dir` | `src/main/resources/output` | `file:outbound-endpoint path` (`books.xml:39,42`) | directory `orders.json` and `report.csv` are written to |
-| `orders.polling-frequency` | `1000` | none declared, so the Mule file connector's default | milliseconds between the end of one poll and the start of the next; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
-| `spring.application.name` | `processing-orders-with-dataweave-and-APIkit-java` | — | application name in log lines |
-| `spring.web.resources.add-mappings` | `false` | — | no static resource handler, so unknown paths reach the APIkit 404 or the no-listener 404 |
-| `spring.mvc.dispatch-trace-request` | `true` | — | TRACE reaches the APIkit 405, as the listener declares no `allowedMethods` |
-| `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | — | no Boot `/error` endpoint; `/error` gets the no-listener 404 |
+| Key | Type | Default | Original | Notes |
+|---|---|---|---|---|
+| `http.port` | `int` | not set in `application.yml`; `server.port: ${http.port:8081}` falls back to `8081` | `${http.port}` in `currency.xml:3` (listener) and `books.xml:3` (request config); `mule-app.properties` sets no value (name unchanged) | an optional override (`--http.port`, `-Dhttp.port` or `HTTP_PORT`), not a key of `application.yml`; listener port, bound by `server.port`; `CurrencyClient` calls the running listener's port and falls back to this value |
+| `server.port` | `Integer` | `${http.port:8081}` | `http:listener-config port="${http.port}"` | set `http.port` rather than this key |
+| `apikit.base-path` | `String` | `/api` | listener path `/api/*` | API base path for the controller, the APIkit mappings, the console and the method-case filter |
+| `apikit.raml` | `String` | `api/currency.raml` | `apikit:config raml="currency.raml"` | classpath RAML served by the console and read by the schema validator |
+| `apikit.console-path` | `String` | `console` | `apikit:config consolePath="console"` | console path below the base path |
+| `orders.input-dir` | `String` (a directory path) | `src/main/resources/input` | `file:inbound-endpoint path` (`books.xml:8`) | directory the trigger polls; a relative path resolves against the working directory |
+| `orders.output-dir` | `String` (a directory path) | `src/main/resources/output` | `file:outbound-endpoint path` (`books.xml:39,42`) | directory `orders.json` and `report.csv` are written to |
+| `orders.polling-frequency` | `String` | `1000` (milliseconds) | none declared, so the Mule file connector's default | the pause between the end of one poll and the start of the next. The value is either a positive whole number of milliseconds (`1000`) or a positive ISO-8601 duration (`PT1S`): as `@Scheduled(fixedDelayString)` reads it, it is a duration when its first or second character is `P` or `p` and milliseconds otherwise, with no trimming. A zero, negative or unreadable value stops start-up with an `IllegalArgumentException` whose message names the key and the value: `Invalid orders.polling-frequency value "<value>": the polling frequency must be a positive number of milliseconds or a positive ISO-8601 duration` |
+| `spring.application.name` | `String` | `processing-orders-with-dataweave-and-APIkit-java` | — | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | — | no static resource handler, so unknown paths reach the APIkit 404 or the no-listener 404 |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | — | TRACE reaches the APIkit 405, as the listener declares no `allowedMethods` |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | — | no Boot `/error` endpoint; `/error` gets the no-listener 404 |
 
 - The original uses no secret, host, account or credential, so the configuration has no TODO placeholder, and the project has no `application-test.yml` or `application-it.yml`.
 - Original-to-new key map: `http.port` keeps its name. The literal paths of `books.xml` became `orders.input-dir` and `orders.output-dir`, the connector's default frequency became `orders.polling-frequency`, and the `apikit:config` attributes became the three `apikit.*` keys. No original key was renamed.
@@ -137,7 +137,7 @@ Every key of `src/main/resources/application.yml`, and the `http.port` placehold
 | `src/main/api/currency.raml`, `currency-schema.json`; `src/main/resources/currency.json`, `orders.xml`, `orders.xsd` | `src/main/resources/api/currency.raml`, `api/currency-schema.json`, `currency.json`, `orders.xml`, `orders.xsd`, byte for byte |
 | `src/main/resources/orders.json`, `report.csv` (the committed DataWeave outputs the original IT compares with) | `src/test/resources/expected/orders.json`, `expected/report.csv`, byte for byte |
 
-## Behaviour kept, stubbed or externalized
+## Behaviours stubbed or externalized
 
 - **Currency API.** `currency.json` is served exactly as the original rendered it, including its spacing and missing trailing newline.
 - **Order flow failures.** The original flow declares no logger and no exception strategy, so `OrderFlowService` catches nothing: a failed currency call, an XML document that is not well formed, a price, ratio or year that is not a number, or a failed write ends the flow, `FileInboundPoller` logs it at ERROR and the input file is still deleted. A failure in either script writes no file, and a failed `orders.json` write leaves `report.csv` unattempted.
@@ -151,7 +151,7 @@ Every key of `src/main/resources/application.yml`, and the `http.port` placehold
 - **Not applicable:** the Studio and Anypoint content of the original README (Exchange import, global-element editing, documentation export).
 - **Stubbed or externalized:** nothing is stubbed. The original reaches no external system beyond its own Currency API and holds no credential; the input and output directories and the polling frequency are configurable.
 
-## Build and run
+## Build, run and test
 
 Prerequisites: JDK 17, Maven 3.9.x and access to Maven Central. No Mule runtime, licence or credential is needed. Run from `java-conversions/processing-orders-with-dataweave-and-APIkit-java/`:
 
