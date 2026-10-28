@@ -17,13 +17,16 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
 import java.math.BigDecimal;
+import java.net.ServerSocket;
 import java.sql.SQLDataException;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Stream;
 
 import org.apache.derby.jdbc.EmbeddedDataSource;
@@ -43,8 +46,10 @@ import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.slf4j.LoggerFactory;
 import org.springframework.aop.interceptor.SimpleAsyncUncaughtExceptionHandler;
+import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
@@ -54,8 +59,12 @@ import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
 
+import com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.model.orders.Order;
 
 import ch.qos.logback.classic.Level;
@@ -68,7 +77,7 @@ import ch.qos.logback.core.read.ListAppender;
  * {@code order_audits} insert and its {@code choice-exception-strategy}, rollback when {@code totalValue > 5000},
  * otherwise catch and run {@code defaultErrorHandler}.
  *
- * <p>Three layers:
+ * <p>Four layers:
  * <ul>
  *   <li>Mockito, with the service built directly: the bound insert, each exception branch, the threshold condition and
  *       the form of the failure log line.</li>
@@ -76,6 +85,8 @@ import ch.qos.logback.core.read.ListAppender;
  *       order ID longer than {@code VARCHAR(256)} fails the insert with a message quoting the ID.</li>
  *   <li>{@link AsyncRollbackRoute}: a Spring context with {@code @EnableAsync}, where the failure the rollback branch
  *       rethrows reaches {@link AuditService.AsyncFailureLogging}'s handler on the executor thread.</li>
+ *   <li>{@link InApplicationContext}: the whole application, where the audit dispatched through its {@code @Async}
+ *       and {@code REQUIRES_NEW} proxy commits its row in its own JTA transaction over XA Derby.</li>
  * </ul>
  *
  * <p>Failures carry a sentinel built at run time from a random UUID, standing for a sensitive caller-supplied order
@@ -409,6 +420,91 @@ class AuditServiceTest {
         @Bean
         TaskExecutor taskExecutor() {
             return new SimpleAsyncTaskExecutor(ASYNC_THREAD_PREFIX);
+        }
+    }
+
+    /**
+     * The one-way VM {@code audit} endpoint with its own {@code xa-transaction ALWAYS_BEGIN}, in the running
+     * application: {@link AuditService#audit(Order, String)} called through the application's {@code @Async} and
+     * {@code @Transactional(REQUIRES_NEW)} proxy returns at once, and the insert commits in its own Narayana JTA
+     * transaction over the XA Derby {@code DataSource}, visible to a later read outside any transaction.
+     *
+     * <p>The application starts on free local ports with a fresh in-memory Derby database and an embedded,
+     * non-persistent Artemis server of its own, and the context is closed after the class, so it shares no port,
+     * database or broker with another test class in the JVM. Derby's log and the Narayana object store stay under the
+     * {@code target/} directories surefire sets.
+     */
+    @Nested
+    @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
+            webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+    @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+    class InApplicationContext {
+
+        /** Above the small server IDs Spring Boot's per-JVM counter and fixed test settings hand out. */
+        private static final int MIN_ARTEMIS_SERVER_ID = 1_000_000;
+
+        @Autowired
+        private AuditService proxiedAuditService;
+
+        @Autowired
+        private OrderOrchestrationService orchestration;
+
+        @Autowired
+        private JdbcTemplate jdbcTemplate;
+
+        @DynamicPropertySource
+        static void isolatedResources(DynamicPropertyRegistry registry) throws IOException {
+            int[] ports = freePorts(5);
+            String databaseName = "memory:auditServiceTest-" + UUID.randomUUID();
+            int artemisServerId = ThreadLocalRandom.current().nextInt(MIN_ARTEMIS_SERVER_ID, Integer.MAX_VALUE);
+            registry.add("server.port", () -> ports[0]);
+            // listeners.additional reads its ports through these placeholders: Spring Boot binds that list from one
+            // property source, so overriding an entry's port directly would fail binding. orders.samsung.url and
+            // orders.price.url follow ports.samsung and ports.prices; orders.soap.url names port 1080 literally.
+            registry.add("ajax.port", () -> ports[1]);
+            registry.add("ports.populate", () -> ports[2]);
+            registry.add("ports.samsung", () -> ports[3]);
+            registry.add("ports.prices", () -> ports[4]);
+            registry.add("orders.soap.url", () -> "http://localhost:" + ports[0] + "/orders");
+            registry.add("spring.datasource.xa.properties.databaseName", () -> databaseName);
+            registry.add("spring.datasource.xa.properties.createDatabase", () -> "create");
+            registry.add("spring.artemis.embedded.persistent", () -> "false");
+            registry.add("spring.artemis.embedded.server-id", () -> artemisServerId);
+        }
+
+        @Test
+        void asyncAuditCommitsRow() {
+            assertThat(AopUtils.isAopProxy(proxiedAuditService)).isTrue();
+            assertThat(orchestration.populateDatabase()).isEqualTo("db populated");
+
+            proxiedAuditService.audit(order(ORDER_ID), "02550");
+
+            await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(jdbcTemplate.queryForObject(
+                    "select count(*) from order_audits where order_id = ?", Integer.class, ORDER_ID)).isEqualTo(1));
+            // Derby converts the bound string "02550" for the integer column, as the original insert of totalValue did.
+            assertThat(jdbcTemplate.queryForObject(
+                    "select total_value from order_audits where order_id = ?", Integer.class, ORDER_ID))
+                    .isEqualTo(2550);
+            assertThat(auditLog.events()).isEmpty();
+        }
+
+        /** Distinct free local ports: every socket stays open until all are chosen, and all are closed before use. */
+        private static int[] freePorts(int count) throws IOException {
+            ServerSocket[] sockets = new ServerSocket[count];
+            try {
+                int[] ports = new int[count];
+                for (int i = 0; i < count; i++) {
+                    sockets[i] = new ServerSocket(0);
+                    ports[i] = sockets[i].getLocalPort();
+                }
+                return ports;
+            } finally {
+                for (ServerSocket socket : sockets) {
+                    if (socket != null) {
+                        socket.close();
+                    }
+                }
+            }
         }
     }
 
