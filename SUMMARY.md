@@ -16,6 +16,7 @@ The rows of `service-orchestration-and-choice-routing-java` and `web-service-con
 The rows of `service-orchestration-and-choice-routing-java` and `websphere-mq-java` were re-measured on 2026-10-28 with `mvn -B clean install` and `mvn -B test` on the tree whose SC-12 held connects claim their deliveries when their request arrives and take them only while that claim is current, the orchestration row again once its `WebServiceConfig` SAAJ transformer-factory setting and test were merged, and the Tier 1 tests total under Totals was updated to match.
 The rows of `foreach-processing-and-choice-routing-java`, `get-customer-list-from-netsuite-java`, `importing-a-CSV-file-into-Mongo-DB-java`, `netsuite-data-retrieval-java` and `soap-webservice-security-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that adds the SOAP reply edge-case and malformed-CSV tests and the NetSuite single-flight token request, bounded paging and request-free error messages.
 The row of `service-orchestration-and-choice-routing-java` and the Tier 1 tests total under Totals were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that registers Narayana's connection modifier for the embedded Derby driver and adds its concurrent-audit test.
+The rows of `hello-world-java`, `oauth2-authorization-code-using-the-HTTP-connector-java` and `service-orchestration-and-choice-routing-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-28 with `mvn -B clean package` and `mvn -B test` (`mvn -B clean install` for `oauth2-authorization-code-using-the-HTTP-connector-java`) on the tree that adds the fixture-replay engine tests of the port registry, the quiet window, the client-certificate driver and the table reset; only their test counts changed.
 
 ## Status
 
@@ -124,7 +125,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 23,897 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 23,989 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 85.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -140,7 +141,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | processing-orders-with-dataweave-and-APIkit-java | 715 / 0 / 0 / 0 | 421 of 461 | 89.5% (1309 of 1463) | — |
 | web-service-consumer-java | 520 / 0 / 0 / 1 | 447 of 457 | 97.4% (797 of 818) | — |
 | xml-only-soap-webservice-java | 419 / 0 / 0 / 1 | 644 of 657 | 91.6% (1457 of 1591) | — |
-| service-orchestration-and-choice-routing-java | 957 / 0 / 0 / 1 | 1173 of 1181 | 92.8% (2895 of 3120) | — |
+| service-orchestration-and-choice-routing-java | 977 / 0 / 0 / 1 | 1173 of 1181 | 92.8% (2895 of 3120) | — |
 | jms-message-rollback-and-redelivery-java | 63 / 0 / 0 / 1 | 77 of 78 | 98.5% (201 of 204) | — |
 | sending-json-data-to-a-jms-queue-java | 272 / 0 / 0 / 1 | 163 of 163 | 98.1% (411 of 419) | — |
 | using-transactional-scope-in-jms-to-database-java | 97 / 0 / 0 / 1 | 115 of 119 | 96.6% (229 of 237) | — |
@@ -163,7 +164,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | extracting-data-from-LDAP-directory-java | 132 / 0 / 0 / 1 | 17 of 17 | 95.4% (332 of 348) | — |
 | filtering-a-message-java | 172 / 0 / 0 / 1 | 36 of 36 | 96.7% (265 of 274) | — |
 | foreach-processing-and-choice-routing-java | 511 / 0 / 0 / 1 | 77 of 78 | 88.3% (1400 of 1585) | — |
-| hello-world-java | 452 / 0 / 0 / 1 | 2 of 2 | 96.9% (221 of 228) | — |
+| hello-world-java | 520 / 0 / 0 / 1 | 2 of 2 | 96.9% (221 of 228) | — |
 | http-multipart-request-java | 302 / 0 / 0 / 1 | 158 of 185 | 92.1% (385 of 418) | — |
 | http-oauth-provider-java | 473 / 0 / 0 / 1 | 206 of 206 | 96.6% (744 of 770) | — |
 | http-request-response-with-logger-java | 175 / 0 / 0 / 1 | 5 of 5 | 96.8% (215 of 222) | — |
@@ -177,7 +178,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | mule-component-bindings-java | 502 / 0 / 0 / 1 | 104 of 104 | 88.3% (1045 of 1183) | — |
 | mule-expression-language-basics-java | 609 / 0 / 0 / 1 | 266 of 291 | 94.2% (504 of 535) | — |
 | munit-short-tutorial-java | 164 / 0 / 0 / 1 | 16 of 16 | 97.1% (236 of 243) | — |
-| oauth2-authorization-code-using-the-HTTP-connector-java | 455 / 0 / 0 / 1 | 176 of 176 | 95.6% (905 of 947) | — |
+| oauth2-authorization-code-using-the-HTTP-connector-java | 459 / 0 / 0 / 1 | 176 of 176 | 95.6% (905 of 947) | — |
 | oauth2-client-credentials-using-the-HTTP-connector-java | 432 / 0 / 0 / 1 | 40 of 40 | 90.7% (909 of 1002) | — |
 | proxying-a-rest-api-java | 641 / 0 / 0 / 1 | 41 of 41 | 94.3% (1213 of 1287) | — |
 | proxying-a-soap-api-java | 326 / 0 / 0 / 1 | 54 of 54 | 92.8% (837 of 902) | — |

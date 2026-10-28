@@ -256,6 +256,7 @@ Test classes are relative to `src/test/java/com/mulesoft/examples/oauth2_authori
 | `config/SensitiveLogLevelsTest` | 7 | the two `logging.level` pins as bound from `application.yml`, and nothing else pinned; then, with the root and the loggers `--trace` raises at TRACE, the original browser flow over both listeners (HTTPS with the carried stores of profile `test`) against WireMock as Box, with a sentinel code, client secret and tokens: the code exchange, a Box 401 for the sentinel access token and the renewal with the sentinel refresh token. With the pins no log event holds a sentinel; without them `DispatcherServlet` writes the code, `org.apache.hc.client5.http.headers` both bearer tokens and `org.apache.hc.client5.http.wire` every sentinel, and with every pin but one exactly that category writes; the original `Redirecting user to Box login page` line is still written at INFO |
 | `exception/GlobalExceptionHandlerTest` | 64 | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes, `ErrorResponse` JSON escaping, and bounded ERROR log lines without exception messages |
 | `FixtureParityTest` | 1 (skipped) | ST-2 fixture replay (next section); skipped while no fixture is captured |
+| `FixtureParityTlsDriverTest` | 4 | ST-2's client-certificate mode against a loopback TLS server built from the carried `keystore.jks` and `trust-store` that, like `box-oauth`, requires a client certificate: a `request.tls` naming `keyStore` presents the `keystore.jks` key and gets `200 OK`, with the store types defaulted or named; a trust-store-only `tls` is refused in the handshake |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes. Its TLS mode presents the carried client certificate to the `box-oauth` listener.
 
@@ -283,10 +284,11 @@ The original IT logged in to a real Box account in PhantomJS and clicked the con
 | `get-authorization-on-http-port` | `http` | `deterministic` | HTTP 8081 `GET /authorization` | `UNVERIFIED-uncaptured` |
 | `get-web-on-https-port` | `http` | `deterministic` | HTTPS 8082 `GET /web` | `UNVERIFIED-uncaptured` |
 
-`SCENARIOS.md` gives each request in full, the `state` value included. No scenario is `unreachable`. Every scenario is unverified until Tier 2A capture runs, and two groups stay unverified after it:
+`SCENARIOS.md` gives each request in full, the `state` value included. No scenario is `unreachable`. Every scenario is unverified until Tier 2A capture runs, and one stays unverified after it:
 
 - `get-login-done-authorized` is `nondeterministic`: its body is live Box search data, and its token comes from an interactive Box login that neither the fixture's `state` nor earlier requests can seed. Its fixture omits `upstream`, so it is reported `UNVERIFIED-no-upstream` and at best compared for structure, never as byte-for-byte evidence.
-- The nine HTTPS rows need a client certificate on replay, which the copied ST-2 driver does not yet pass to ST-1. Their capture evidence is kept in `src/test/capture/<scenario>/` without a fixture, and they stay `UNVERIFIED-uncaptured` until ST-2 provides that mode.
+
+The nine HTTPS rows need a client certificate on replay. ST-2 provides it: their `request.tls` names the carried `trust-store` and, as `keyStore`, `keystore.jks`, so ST-1 presents the client key that the `box-oauth` listener requires (`FixtureParityTlsDriverTest`). Until Tier 2A capture runs they have no fixture and stay `UNVERIFIED-uncaptured`, like every other row.
 
 ## Tier status
 
@@ -296,8 +298,8 @@ The original IT logged in to a real Box account in PhantomJS and clicked the con
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install` (which includes `clean package`): `BUILD SUCCESS`; enforcer `BannedDependencies passed`; 455 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 455 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean install` (which includes `clean package`): `BUILD SUCCESS`; enforcer `BannedDependencies passed`; 459 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 459 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 176 of 176 lines of `service/BoxOAuthService` and its nested records. The project has no `mapper` package. Total project LINE coverage: 95.6% (905 of 947 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=15`, `failed=0`.
 
@@ -315,7 +317,7 @@ Tier 2A is blocked: the Mule EE runtime licence and the EE Maven repository cred
   - every `/redirectUrl` marker and text;
   - the no-listener 404s on both ports;
   - the refused handshake without a client certificate.
-- Unverified scenarios, until captured: all fifteen listed above. `get-login-done-authorized` stays unverified after capture as well (nondeterministic output), and the nine HTTPS rows until ST-2 can replay with a client certificate.
+- Unverified scenarios, until captured: all fifteen listed above. `get-login-done-authorized` stays unverified after capture as well (nondeterministic output).
 
 The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed (AAP 0.8.7).
 

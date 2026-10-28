@@ -430,6 +430,7 @@ Notes:
 | `config/WebServiceConfigTest` | `saaj.use.default.transformer.factory` set to `true` when absent, at context refresh as well, and left unchanged when already `true` or `false`; the factory it selects is the one the JAXP service lookup finds |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, Content-Types and bodies |
 | `FixtureParityTest` | ST-2 fixture replay ([Fixture parity](#fixture-parity-st-2)); skipped while no fixture is captured |
+| `FixtureParityTableResetTest` | ST-2's table handling against a real in-memory Derby database with the original DDL, as `get-populate-created` needs: the reset empties the fixture's tables that exist and leaves `orders` and `order_audits` absent when they are, alone or together, and never creates them; names resolve as unquoted identifiers in any letter case, and the decoy `ORDERXAUDITS`, which the unescaped pattern `order_audits` also matches, keeps its row; through a connection wrapper that cannot report its schema, as the Narayana JTA connection cannot, the lookup stays in the session's schema `APP`; an invalid name fails before any statement; seeding a table that does not exist fails with a clear message; the search-pattern escaping of `_`, `%` and the escape string. An engine check, not parity evidence |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
 
@@ -504,8 +505,8 @@ This is the project's row of the root [`SUMMARY.md`](../../SUMMARY.md) (AAP 0.8.
 
 The run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 957 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 957 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 977 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 977 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`, nested classes counted with their outer class: 99.3%, 1173 of 1181 lines.
   - `service`: `AjaxChannelBroker` 415 of 418, `AjaxOrderService` 35 of 35, `AuditService` 86 of 87, `InHouseOrderService` 26 of 26, `OrderOrchestrationService` 65 of 65, `PriceCacheService` 4 of 4, `ProductPriceService` 2 of 2, `SamsungOrderService` 35 of 35, `SamsungServiceImpl` 7 of 7.
   - `mapper`: `AjaxOrderXmlMapper` 73 of 73, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `DwXmlWriter` 170 of 170, `OrderRequestMapper` 6 of 6, `OrderSummaryJsonMapper` 12 of 12, `PurchaseReceiptMapper` 6 of 6, `SoapEnvelopeTransformer` 53 of 53.

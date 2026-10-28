@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
@@ -47,8 +48,12 @@ import org.springframework.context.annotation.Configuration;
 /**
  * The HTTP side of the fixture replay (ST-2): the read budget of ST-1 it sends through
  * ({@link HttpTestClient#withReadTimeout}), and the static helpers by which {@code FixtureParityTest.Replay} reads
- * {@code request.readTimeoutMillis}, {@code state.clearCaches} and {@code state.requests} and empties the
- * application's caches before the prior requests and the input.
+ * {@code request.readTimeoutMillis}, {@code state.clearCaches}, {@code state.requests} and the {@code tls} of a
+ * request, builds ST-1's TLS client from that {@code tls} and empties the application's caches before the prior
+ * requests and the input. The client factory is driven against stand-ins for ST-1 that record the {@code https}
+ * overload it calls; that the key-store client presents its key to a listener requiring a client certificate is
+ * proven by {@code FixtureParityTlsDriverTest} in oauth2-authorization-code-using-the-HTTP-connector-java, the
+ * project that carries such a listener and its stores.
  *
  * <p>ST-1 is driven against {@link DelayedServer}, a loopback server on a free port that answers only after a delay,
  * so a budget shorter than the delay must give up before the reply and a longer one must read it. The replay's
@@ -255,6 +260,10 @@ class FixtureParityHttpReplayTest {
                         "[0].portProperty must be a string"),
                 arguments("tls without its trust store", "[{\"method\": \"GET\", \"path\": \"/\", \"tls\": {}}]",
                         "[0].tls.trustStore must be a string"),
+                arguments("a tls key store password without its key store",
+                        "[{\"method\": \"GET\", \"path\": \"/\","
+                                + " \"tls\": {\"trustStore\": \"trust-store\", \"keyStorePassword\": \"p2\"}}]",
+                        "[0].tls.keyStorePassword is set without keyStore"),
                 arguments("a read budget of zero in the second request",
                         "[{\"method\": \"GET\", \"path\": \"/\"},"
                                 + " {\"method\": \"GET\", \"path\": \"/\", \"readTimeoutMillis\": 0}]",
@@ -270,6 +279,130 @@ class FixtureParityHttpReplayTest {
                 () -> FixtureParityTest.Replay.priorRequests(state, PRIOR_REQUESTS));
 
         assertEquals(PRIOR_REQUESTS + problem, failure.getMessage());
+    }
+
+    // ----- request.tls ----------------------------------------------------------------------------------------
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"{}", "{\"tls\": null}"})
+    void readsNoTlsWhenNoneIsGiven(String request) {
+        assertNull(FixtureParityTest.Replay.tls(json(request), REQUEST));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {
+            "{\"trustStore\": \"trust-store\"}",
+            "{\"trustStore\": \"trust-store\", \"type\": \"PKCS12\", \"password\": \"p1\"}",
+            "{\"trustStore\": \"trust-store\", \"keyStore\": \"keystore.jks\"}",
+            "{\"trustStore\": \"trust-store\", \"type\": \"JKS\", \"password\": \"p1\", \"keyStore\": \"keystore.jks\","
+                    + " \"keyStoreType\": \"PKCS12\", \"keyStorePassword\": \"p2\"}",
+            "{\"trustStore\": \"trust-store\", \"type\": null, \"password\": null, \"keyStore\": null,"
+                    + " \"keyStoreType\": null, \"keyStorePassword\": null}",
+    })
+    void acceptsATlsOfStringMembers(String tls) {
+        JsonNode request = json("{\"tls\": " + tls + "}");
+
+        assertSame(request.get("tls"), FixtureParityTest.Replay.tls(request, REQUEST));
+    }
+
+    static Stream<Arguments> malformedTls() {
+        return Stream.of(
+                arguments("a string instead of an object", "\"trust-store\"", " must be a JSON object"),
+                arguments("an array instead of an object", "[\"trust-store\"]", " must be a JSON object"),
+                arguments("no trust store", "{\"keyStore\": \"keystore.jks\"}", ".trustStore must be a string"),
+                arguments("a trust store that is not a string", "{\"trustStore\": 1}", ".trustStore must be a string"),
+                arguments("a type that is not a string", "{\"trustStore\": \"trust-store\", \"type\": true}",
+                        ".type must be a string"),
+                arguments("a password that is not a string", "{\"trustStore\": \"trust-store\", \"password\": 1}",
+                        ".password must be a string"),
+                arguments("a key store that is not a string", "{\"trustStore\": \"trust-store\", \"keyStore\": {}}",
+                        ".keyStore must be a string"),
+                arguments("a key store type that is not a string",
+                        "{\"trustStore\": \"trust-store\", \"keyStore\": \"keystore.jks\", \"keyStoreType\": []}",
+                        ".keyStoreType must be a string"),
+                arguments("a key store password that is not a string",
+                        "{\"trustStore\": \"trust-store\", \"keyStore\": \"keystore.jks\", \"keyStorePassword\": 1}",
+                        ".keyStorePassword must be a string"),
+                arguments("a key store type without a key store",
+                        "{\"trustStore\": \"trust-store\", \"keyStoreType\": \"JKS\"}",
+                        ".keyStoreType is set without keyStore"),
+                arguments("a key store password without a key store",
+                        "{\"trustStore\": \"trust-store\", \"keyStore\": null, \"keyStorePassword\": \"p2\"}",
+                        ".keyStorePassword is set without keyStore"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("malformedTls")
+    void rejectsAMalformedTls(String description, String tls, String problem) {
+        JsonNode request = json("{\"tls\": " + tls + "}");
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> FixtureParityTest.Replay.tls(request, REQUEST));
+
+        assertEquals(REQUEST + ".tls" + problem, failure.getMessage());
+    }
+
+    static Stream<Arguments> tlsClients() {
+        return Stream.of(
+                arguments("{\"trustStore\": \"<trust>\"}", "https(localhost, 8443, <trust>, JKS, null)"),
+                arguments("{\"trustStore\": \"<trust>\", \"type\": \"PKCS12\", \"password\": \"p1\"}",
+                        "https(localhost, 8443, <trust>, PKCS12, p1)"),
+                arguments("{\"trustStore\": \"<trust>\", \"keyStore\": \"<key>\"}",
+                        "https(localhost, 8443, <trust>, JKS, null, <key>, JKS, null)"),
+                arguments("{\"trustStore\": \"<trust>\", \"type\": \"PKCS12\", \"password\": \"p1\","
+                                + " \"keyStore\": \"<key>\", \"keyStorePassword\": \"p2\"}",
+                        "https(localhost, 8443, <trust>, PKCS12, p1, <key>, PKCS12, p2)"),
+                arguments("{\"trustStore\": \"<trust>\", \"type\": \"PKCS12\", \"keyStore\": \"<key>\","
+                                + " \"keyStoreType\": \"JKS\"}",
+                        "https(localhost, 8443, <trust>, PKCS12, null, <key>, JKS, null)"));
+    }
+
+    /**
+     * The client factory hands each {@code tls} member to the {@code https} overload it belongs to: the trust-store
+     * overload without {@code keyStore}, the key-store overload with it, {@code keyStoreType} defaulting to the
+     * effective {@code type} and every store resolved to the file ST-1 opens.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("tlsClients")
+    void theClientFactoryCallsTheOverloadTheTlsNames(String tls, String expectedCall, @TempDir Path directory)
+            throws Exception {
+        Path trustStore = Files.createFile(directory.resolve("trust.store"));
+        Path keyStore = Files.createFile(directory.resolve("key.store"));
+        JsonNode spec = json("{\"tls\": " + tls.replace("\"<trust>\"", JSON.writeValueAsString(trustStore.toString()))
+                .replace("\"<key>\"", JSON.writeValueAsString(keyStore.toString())) + "}");
+
+        Object client = FixtureParityTest.Replay.httpsClient(RecordingClient.class, 8443,
+                FixtureParityTest.Replay.tls(spec, REQUEST), REQUEST + ".tls");
+
+        assertEquals(expectedCall.replace("<trust>", trustStore.toString()).replace("<key>", keyStore.toString()),
+                client);
+    }
+
+    @Test
+    void theClientFactoryNamesAKeyStoreThatIsNeitherOnTheClasspathNorAFile(@TempDir Path directory) throws Exception {
+        Path trustStore = Files.createFile(directory.resolve("trust.store"));
+        String missing = directory.resolve("absent.store").toString();
+        JsonNode spec = json("{\"tls\": {\"trustStore\": " + JSON.writeValueAsString(trustStore.toString())
+                + ", \"keyStore\": " + JSON.writeValueAsString(missing) + "}}");
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> FixtureParityTest.Replay.httpsClient(RecordingClient.class, 8443,
+                        FixtureParityTest.Replay.tls(spec, REQUEST), REQUEST + ".tls"));
+
+        assertEquals(REQUEST + ".tls.keyStore " + missing + " is neither on the test classpath nor a file",
+                failure.getMessage());
+    }
+
+    static Stream<Arguments> clientClasses() {
+        return Stream.of(arguments(HttpTestClient.class, true), arguments(TrustOnlyClient.class, false),
+                arguments(InstanceKeyStoreClient.class, false));
+    }
+
+    /** Only a public static key-store overload of {@code https} replays a {@code tls} that names a key store. */
+    @ParameterizedTest(name = "{0} -> {1}")
+    @MethodSource("clientClasses")
+    void detectsTheKeyStoreOverloadOfTheClient(Class<?> clientClass, boolean presentsClientKeys) {
+        assertEquals(presentsClientKeys, FixtureParityTest.Replay.presentsClientKeys(clientClass));
     }
 
     // ----- helpers --------------------------------------------------------------------------------------------
@@ -302,6 +435,47 @@ class FixtureParityHttpReplayTest {
             store.store(out, "changeit".toCharArray());
         }
         return file;
+    }
+
+    /** A stand-in for ST-1 whose two {@code https} overloads return the call they received, written out. */
+    static final class RecordingClient {
+
+        private RecordingClient() {
+        }
+
+        public static String https(String host, int port, String trustStorePath, String trustStoreType,
+                String trustStorePassword) {
+            return "https(" + String.join(", ", host, String.valueOf(port), trustStorePath, trustStoreType,
+                    String.valueOf(trustStorePassword)) + ")";
+        }
+
+        public static String https(String host, int port, String trustStorePath, String trustStoreType,
+                String trustStorePassword, String keyStorePath, String keyStoreType, String keyStorePassword) {
+            return "https(" + String.join(", ", host, String.valueOf(port), trustStorePath, trustStoreType,
+                    String.valueOf(trustStorePassword), keyStorePath, keyStoreType,
+                    String.valueOf(keyStorePassword)) + ")";
+        }
+    }
+
+    /** An ST-1 copy from before the key-store overload: it has only the trust-store {@code https}. */
+    static final class TrustOnlyClient {
+
+        private TrustOnlyClient() {
+        }
+
+        public static TrustOnlyClient https(String host, int port, String trustStorePath, String trustStoreType,
+                String trustStorePassword) {
+            return new TrustOnlyClient();
+        }
+    }
+
+    /** A client whose key-store {@code https} is an instance method, which no replay can call as a factory. */
+    static final class InstanceKeyStoreClient {
+
+        public InstanceKeyStoreClient https(String host, int port, String trustStorePath, String trustStoreType,
+                String trustStorePassword, String keyStorePath, String keyStoreType, String keyStorePassword) {
+            return this;
+        }
     }
 
     /** Two cache managers, as a context with a composite or a second cache manager holds them. */

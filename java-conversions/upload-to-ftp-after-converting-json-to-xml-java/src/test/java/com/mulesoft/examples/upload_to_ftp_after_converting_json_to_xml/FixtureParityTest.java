@@ -1,6 +1,7 @@
 package com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml;
 
 import java.io.ByteArrayInputStream;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -14,8 +15,10 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
 import java.math.BigDecimal;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
@@ -31,6 +34,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
@@ -61,6 +65,7 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -113,7 +118,10 @@ import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.ApplicationContextInitializer;
+import org.springframework.context.ApplicationListener;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.SmartLifecycle;
+import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.core.convert.ConversionException;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.EnumerablePropertySource;
@@ -276,6 +284,8 @@ class FixtureParityTest {
     private static final long DRAIN_MILLIS = 100;
     private static final long NO_FURTHER_MESSAGE_MILLIS = 500;
     private static final Duration POLL_INTERVAL = Duration.ofMillis(100);
+    /** How far the comparisons of a quiet window may overrun it before the window fails as not completed. */
+    static final Duration QUIET_WINDOW_MARGIN = Duration.ofSeconds(1);
     /** {@code jakarta.jms.Session.AUTO_ACKNOWLEDGE}, written out because JMS is reached by reflection. */
     private static final int JMS_AUTO_ACKNOWLEDGE = 1;
     private static final String XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/";
@@ -293,6 +303,8 @@ class FixtureParityTest {
     private static final String GREENMAIL_CLASS = "com.icegreen.greenmail.util.GreenMail";
     private static final String SERVER_SETUP_CLASS = "com.icegreen.greenmail.util.ServerSetup";
     private static final String QPID_CLASS = "org.apache.qpid.server.SystemLauncher";
+    private static final String QPID_LISTENER_CLASS = "org.apache.qpid.server.SystemLauncherListener";
+    private static final String QPID_AMQP_PORT_CLASS = "org.apache.qpid.server.model.port.AmqpPort";
     private static final String MONGO_SERVER_CLASS = "de.bwaldvogel.mongo.MongoServer";
     private static final String MONGO_BACKEND_CLASS = "de.bwaldvogel.mongo.backend.memory.MemoryBackend";
     private static final String MONGO_TEMPLATE_CLASS = "org.springframework.data.mongodb.core.MongoTemplate";
@@ -339,8 +351,12 @@ class FixtureParityTest {
     static Path tempDir;
 
     private static final Map<String, String> STATUSES = Collections.synchronizedMap(new LinkedHashMap<>());
-    /** Ports by name; {@code ${freePort:<name>}} and the embedded servers share these names. */
-    private static final Map<String, Integer> FREE_PORTS = new HashMap<>();
+    /**
+     * Ports by name, one distinct port per name; {@code ${freePort:<name>}} and the embedded servers share these
+     * names. Created on first use, so the host's socket behaviour is probed only by a replay that allocates a port or
+     * starts the application context.
+     */
+    private static PortRegistry portRegistry;
     /** Every {@code ${dir:<name>}} and every directory a fixture's directory spec resolves to, emptied per scenario. */
     private static final Set<Path> DIRECTORIES = new LinkedHashSet<>();
     /** Server key to the class whose absence kept that embedded server from starting. */
@@ -436,6 +452,10 @@ class FixtureParityTest {
      * replay the only trigger executions are the single-run invocations the fixtures name in {@code request.invoke};
      * production code keeps its schedules. It then fails the context, so no client or store bean is ever created,
      * when the effective configuration reaches a target the replay does not own ({@link #enforceReplayBoundary}).
+     * Last, it registers the {@link PortRegistry.Handover} of the replay's port reservations, which hands them to the
+     * application's listeners just before the embedded web server binds them, and the initializer adds the
+     * {@link PortRegistry.Securing} that holds every port nothing listens on exclusively again once the context has
+     * refreshed.
      */
     static final class ReplayContextInitializer
             implements ApplicationContextInitializer<ConfigurableApplicationContext> {
@@ -446,7 +466,11 @@ class FixtureParityTest {
             applicationContext.addBeanFactoryPostProcessor(beanFactory -> {
                 suppressScheduledTriggers(beanFactory);
                 enforceReplayBoundary(environment);
+                beanFactory.registerSingleton(PortRegistry.Handover.BEAN_NAME,
+                        new PortRegistry.Handover(FixtureParityTest::portRegistry));
             });
+            applicationContext.addApplicationListener(
+                    new PortRegistry.Securing(applicationContext, FixtureParityTest::portRegistry));
         }
     }
 
@@ -893,18 +917,525 @@ class FixtureParityTest {
         return tempRoot;
     }
 
-    /** A free port, the same one for every use of {@code name}. */
+    /**
+     * The port of {@code name}: the same one for every use of the name and distinct from every other name's. It is
+     * the port an embedded server bound and published under the name, or else one {@link PortRegistry} reserves for
+     * the replay until the class ends: held exclusively until the application context starts its listeners, so
+     * neither another process nor another name takes it and a connection to it is refused, shared with the
+     * application's listeners while they bind, then left to the listener that bound it or else held exclusively
+     * again.
+     */
     static synchronized int freePort(String name) {
-        Integer port = FREE_PORTS.get(name);
-        if (port == null) {
-            try (ServerSocket socket = new ServerSocket(0)) {
-                port = socket.getLocalPort();
-            } catch (IOException e) {
-                throw new UncheckedIOException("Cannot reserve a free port for " + name, e);
-            }
-            FREE_PORTS.put(name, port);
+        return portRegistry().port(name);
+    }
+
+    /** Records the port an embedded server bound under {@code name}, before any placeholder reads the name. */
+    private static synchronized void publishPort(String name, int port) {
+        portRegistry().publish(name, port);
+    }
+
+    private static synchronized PortRegistry portRegistry() {
+        if (portRegistry == null) {
+            portRegistry = PortRegistry.forThisHost();
         }
-        return port;
+        return portRegistry;
+    }
+
+    /**
+     * The replay's ports by name: each name keeps one port, and no two names share one.
+     *
+     * <p>A port the registry allocates is reserved by an unconnected socket bound to the wildcard address, and what
+     * the registry holds for it follows the application context's start ({@link Phase}). On Linux:
+     * <ul>
+     *   <li>from its allocation until the {@link Handover}, an exclusive reservation, bound without
+     *       {@code SO_REUSEADDR}: no other socket binds the port, with {@code SO_REUSEADDR} or without it, no
+     *       ephemeral bind receives it and a connection to it is refused, so neither another process nor another
+     *       name takes it;</li>
+     *   <li>from the handover, which runs just before the embedded web server binds its listeners, until the context
+     *       has refreshed, a shared reservation on the same port, bound with {@code SO_REUSEADDR}, so a listener that
+     *       sets it, as Undertow, GreenMail, Qpid and the JDK's server sockets do, binds beside it. Only in this
+     *       window can another socket bind the port as well: one that sets {@code SO_REUSEADDR} throughout, and any
+     *       socket in the instant each swap from one reservation to the next takes;</li>
+     *   <li>from the {@link Securing}, once the context has refreshed: an exclusive reservation again where nothing
+     *       listens, so the port stays a refused connection until {@link #releaseAll} and a listener that binds only
+     *       later cannot bind it, and nothing where a listener, the application's, bound it
+     *       ({@link Hold#LISTENER_OWNED}), since a listening socket keeps every other socket off its port. A name
+     *       allocated from then on is held exclusively at once.</li>
+     * </ul>
+     * On a host that does not let such a listener bind beside a shared reservation
+     * ({@link #listenerRefusalBesideReservation}), as BSD and macOS sockets do not, the handover releases each
+     * reservation instead, with one warning, so another process can take a port until the application's listener
+     * has bound it; securing then holds each port nothing listens on exclusively again, and the ports stay distinct
+     * across names. An embedded server binds port 0 itself and {@link #publish publishes} the port it bound, so it
+     * never waits on a port chosen for it and the registry holds nothing for it.
+     *
+     * <p>Every method is synchronized, and each transition acts once: a second handover or securing changes nothing.
+     */
+    static final class PortRegistry {
+
+        /** Reservations one allocation opens before it gives up finding a port no other name holds. */
+        static final int MAX_ATTEMPTS = 32;
+
+        /** A port held for the replay until {@code handle} is closed. */
+        record Reservation(int port, Closeable handle) {
+
+            Reservation {
+                if (port < 1 || port > 65535) {
+                    throw new IllegalArgumentException("A reservation holds a port from 1 to 65535, not " + port);
+                }
+                Objects.requireNonNull(handle, "handle");
+            }
+        }
+
+        /** Opens reservations: unconnected sockets bound to the wildcard address. */
+        @FunctionalInterface
+        interface ReservationSource {
+
+            /**
+             * Opens a reservation on {@code port}, or on a port the host picks when {@code port} is 0: shared, bound
+             * with {@code SO_REUSEADDR}, or exclusive, bound without it.
+             *
+             * @throws BindException when another socket on the port keeps this one from binding it
+             * @throws IOException   when the reservation cannot be opened for another reason
+             */
+            Reservation open(int port, boolean shared) throws IOException;
+        }
+
+        /** Where the registry is in the application context's start; it only moves forward, until releaseAll. */
+        enum Phase {
+            /** Before the handover: every allocated port is held exclusively. */
+            RESERVING,
+            /** From the handover until securing: allocated ports are shared, or released, for the listeners. */
+            HANDED_OVER,
+            /** After securing: unlistened ports are held exclusively, listened ones are left to their listeners. */
+            SECURED
+        }
+
+        /** What the registry holds for a name's port. */
+        enum Hold {
+            /** Nothing: an embedded server bound the port itself and published it. */
+            PUBLISHED,
+            /** An exclusive reservation, bound without {@code SO_REUSEADDR}. */
+            EXCLUSIVE,
+            /** A shared reservation, bound with {@code SO_REUSEADDR}, beside which a listener binds. */
+            SHARED,
+            /**
+             * Nothing: the handover released the reservation, on a host where no listener binds beside a shared one,
+             * or another socket bound the port while the reservation was being shared; securing then binds it again.
+             */
+            RELEASED,
+            /** Nothing: securing found another socket, the application's listener, holding the port. */
+            LISTENER_OWNED
+        }
+
+        private final ReservationSource source;
+        private final boolean shareAtHandover;
+        private final Map<String, Integer> portsByName = new LinkedHashMap<>();
+        private final Map<Integer, String> namesByPort = new HashMap<>();
+        private final Map<String, Hold> holds = new LinkedHashMap<>();
+        private final Map<String, Reservation> reservations = new LinkedHashMap<>();
+        private Phase phase = Phase.RESERVING;
+
+        /**
+         * @param source          opens each reservation
+         * @param shareAtHandover whether the handover swaps each exclusive reservation for a shared one on the same
+         *                        port, or releases it, as on a host where no listener binds beside a shared one
+         */
+        PortRegistry(ReservationSource source, boolean shareAtHandover) {
+            this.source = Objects.requireNonNull(source, "source");
+            this.shareAtHandover = shareAtHandover;
+        }
+
+        /** Socket reservations, shared at the handover where this host lets a listener bind beside one, or released. */
+        static PortRegistry forThisHost() {
+            IOException refusal = listenerRefusalBesideReservation();
+            if (refusal != null) {
+                LOG.warn("Fixture replay: a listener cannot bind beside a shared port reservation on this host ({}),"
+                        + " so each ${freePort:<name>} reservation is released when the application context starts its"
+                        + " listeners, and another process can take the port until the application has bound it",
+                        refusal.toString());
+            }
+            return new PortRegistry(PortRegistry::openSocket, refusal == null);
+        }
+
+        /**
+         * Why a server socket with {@code SO_REUSEADDR} cannot bind beside a shared reservation that replaced an
+         * exclusive one on the same port, as the handover replaces it, on this host, or {@code null} when it binds,
+         * as on Linux. BSD and macOS sockets refuse a second wildcard bind of a port without {@code SO_REUSEPORT}.
+         */
+        static IOException listenerRefusalBesideReservation() {
+            Reservation exclusive;
+            try {
+                exclusive = openSocket(0, false);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot reserve a port to probe this host's sockets", e);
+            }
+            int port = exclusive.port();
+            release(exclusive);
+            Reservation shared;
+            try {
+                shared = openSocket(port, true);
+            } catch (IOException refused) {
+                return refused;
+            }
+            try (ServerSocket listener = new ServerSocket()) {
+                listener.setReuseAddress(true);
+                listener.bind(new InetSocketAddress(port));
+                return null;
+            } catch (IOException refused) {
+                return refused;
+            } finally {
+                release(shared);
+            }
+        }
+
+        /**
+         * An unconnected socket bound to the wildcard address on {@code port}, or on a port the host picks when it is
+         * 0, with {@code SO_REUSEADDR} when {@code shared} and without it otherwise.
+         */
+        static Reservation openSocket(int port, boolean shared) throws IOException {
+            Socket socket = new Socket();
+            try {
+                socket.setReuseAddress(shared);
+                socket.bind(new InetSocketAddress(port));
+                return new Reservation(socket.getLocalPort(), socket);
+            } catch (IOException | RuntimeException e) {
+                try {
+                    socket.close();
+                } catch (IOException closing) {
+                    e.addSuppressed(closing);
+                }
+                throw e;
+            }
+        }
+
+        /**
+         * The port of {@code name}: the one it holds, or else the port of a new exclusive reservation that no other
+         * name holds. A reservation on a port another name holds stays open while the source is asked again, so the
+         * source cannot return it a second time, and is released once the allocation ends. A name allocated between
+         * the handover and securing is handed over at once, as the handover would have handed it over.
+         *
+         * @throws IllegalStateException when {@link #MAX_ATTEMPTS} reservations in a row land on ports other names
+         *                               hold
+         * @throws UncheckedIOException  when no reservation can be opened, or the one allocated cannot be handed over
+         */
+        synchronized int port(String name) {
+            Integer known = portsByName.get(name);
+            if (known != null) {
+                return known;
+            }
+            List<Reservation> duplicates = new ArrayList<>();
+            try {
+                for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+                    Reservation reservation;
+                    try {
+                        reservation = source.open(0, false);
+                    } catch (IOException e) {
+                        throw new UncheckedIOException("Cannot reserve a port for " + name, e);
+                    }
+                    if (namesByPort.containsKey(reservation.port())) {
+                        duplicates.add(reservation);
+                        continue;
+                    }
+                    portsByName.put(name, reservation.port());
+                    namesByPort.put(reservation.port(), name);
+                    holds.put(name, Hold.EXCLUSIVE);
+                    reservations.put(name, reservation);
+                    if (phase == Phase.HANDED_OVER) {
+                        UncheckedIOException failure = handOver(name);
+                        if (failure != null) {
+                            throw failure;
+                        }
+                    }
+                    return reservation.port();
+                }
+            } finally {
+                for (Reservation duplicate : duplicates) {
+                    try {
+                        release(duplicate);
+                    } catch (UncheckedIOException e) {
+                        LOG.warn("Fixture replay: cannot release the duplicate reservation of port {}: {}",
+                                duplicate.port(), e.getCause().toString());
+                    }
+                }
+            }
+            throw new IllegalStateException("Cannot reserve a port for " + name + ": " + MAX_ATTEMPTS
+                    + " reservations in a row landed on ports other names hold " + new TreeMap<>(namesByPort));
+        }
+
+        /**
+         * Records that {@code name} is on {@code port}, a port an embedded server bound itself, so the registry holds
+         * nothing for it; publishing a name on the port it already holds changes nothing.
+         *
+         * @throws IllegalArgumentException when {@code port} is outside 1 to 65535
+         * @throws IllegalStateException    when {@code name} holds another port, or another name holds {@code port}
+         */
+        synchronized void publish(String name, int port) {
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException("Cannot publish " + name + " on port " + port
+                        + ", which is not a port from 1 to 65535");
+            }
+            Integer known = portsByName.get(name);
+            if (known != null && known != port) {
+                throw new IllegalStateException("Cannot publish " + name + " on port " + port + ": it holds port "
+                        + known);
+            }
+            String owner = namesByPort.get(port);
+            if (owner != null && !owner.equals(name)) {
+                throw new IllegalStateException("Cannot publish " + name + " on port " + port + ": " + owner
+                        + " holds it");
+            }
+            portsByName.put(name, port);
+            namesByPort.put(port, name);
+            holds.putIfAbsent(name, Hold.PUBLISHED);
+        }
+
+        /** Every port a name holds, allocated or published, whatever the registry holds for it now. */
+        synchronized Set<Integer> ports() {
+            return new TreeSet<>(namesByPort.keySet());
+        }
+
+        /** Where the registry is in the application context's start. */
+        synchronized Phase phase() {
+            return phase;
+        }
+
+        /** What the registry holds for each name's port, by name. */
+        synchronized Map<String, Hold> holds() {
+            return new TreeMap<>(holds);
+        }
+
+        /**
+         * Hands every exclusive reservation over to the application's listeners, once: it is released and, where
+         * this host lets a listener bind beside a shared reservation, a shared one is bound on the same port at once;
+         * elsewhere the port is left unheld. A port another socket binds in between is left unheld, with a warning.
+         * Published ports are untouched, and from now on a new name is handed over as it is allocated.
+         *
+         * @throws UncheckedIOException when a reservation cannot be released or shared; every other name is handed
+         *                              over first
+         */
+        synchronized void handOver() {
+            if (phase != Phase.RESERVING) {
+                return;
+            }
+            phase = Phase.HANDED_OVER;
+            UncheckedIOException failure = null;
+            for (String name : List.copyOf(reservations.keySet())) {
+                failure = combine(failure, handOver(name));
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        /**
+         * Secures every port the handover shared or released, once, after the application's listeners have bound:
+         * the shared reservation is released and an exclusive one bound on the same port at once. Where that bind
+         * succeeds nothing listens there, and the port is held exclusively until {@link #releaseAll}; where another
+         * socket keeps it off, the application's listener holds the port and the registry holds nothing for it
+         * ({@link Hold#LISTENER_OWNED}). Published ports, and reservations no handover reached, are untouched, and
+         * from now on a new name is held exclusively as it is allocated.
+         *
+         * @throws UncheckedIOException when a reservation cannot be released or bound for another reason; every other
+         *                              name is secured first
+         */
+        synchronized void secure() {
+            if (phase == Phase.SECURED) {
+                return;
+            }
+            phase = Phase.SECURED;
+            UncheckedIOException failure = null;
+            for (String name : List.copyOf(holds.keySet())) {
+                Hold hold = holds.get(name);
+                if (hold == Hold.SHARED || hold == Hold.RELEASED) {
+                    failure = combine(failure, secure(name));
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        /**
+         * Releases every held reservation, forgets every name and returns to {@link Phase#RESERVING}, so a later
+         * request allocates afresh, as in a new registry.
+         *
+         * @throws UncheckedIOException when a reservation cannot be released; every other one is released first
+         */
+        synchronized void releaseAll() {
+            UncheckedIOException failure = null;
+            for (Reservation reservation : reservations.values()) {
+                try {
+                    release(reservation);
+                } catch (UncheckedIOException e) {
+                    failure = combine(failure, e);
+                }
+            }
+            reservations.clear();
+            holds.clear();
+            portsByName.clear();
+            namesByPort.clear();
+            phase = Phase.RESERVING;
+            if (failure != null) {
+                throw failure;
+            }
+        }
+
+        /** Hands {@code name}'s exclusive reservation over; the failure to release or share it, or {@code null}. */
+        private UncheckedIOException handOver(String name) {
+            int port = portsByName.get(name);
+            UncheckedIOException failure = releaseHeld(name);
+            holds.put(name, Hold.RELEASED);
+            if (!shareAtHandover) {
+                LOG.debug("Fixture replay: port {} of {} released for the application's listeners", port, name);
+                return failure;
+            }
+            try {
+                reservations.put(name, reopen(port, true));
+                holds.put(name, Hold.SHARED);
+                LOG.debug("Fixture replay: port {} of {} shared with the application's listeners", port, name);
+            } catch (BindException taken) {
+                LOG.warn("Fixture replay: another socket bound port {} of {} while its reservation was handed over,"
+                        + " so the application may not bind it: {}", port, name, taken.toString());
+            } catch (IOException e) {
+                failure = combine(failure, new UncheckedIOException(
+                        "Cannot share port " + port + " of " + name + " with the application's listeners", e));
+            }
+            return failure;
+        }
+
+        /** Secures {@code name}'s handed-over port; the failure to release or bind it, or {@code null}. */
+        private UncheckedIOException secure(String name) {
+            int port = portsByName.get(name);
+            UncheckedIOException failure = releaseHeld(name);
+            holds.put(name, Hold.RELEASED);
+            try {
+                reservations.put(name, reopen(port, false));
+                holds.put(name, Hold.EXCLUSIVE);
+                LOG.debug("Fixture replay: port {} of {} held exclusively again; nothing listens there", port, name);
+            } catch (BindException listening) {
+                holds.put(name, Hold.LISTENER_OWNED);
+                LOG.debug("Fixture replay: port {} of {} left to the listener that holds it ({})", port, name,
+                        listening.toString());
+            } catch (IOException e) {
+                failure = combine(failure, new UncheckedIOException(
+                        "Cannot hold port " + port + " of " + name + " exclusively again", e));
+            }
+            return failure;
+        }
+
+        /** A reservation the source opened on exactly {@code port}. */
+        private Reservation reopen(int port, boolean shared) throws IOException {
+            Reservation reservation = source.open(port, shared);
+            if (reservation.port() != port) {
+                release(reservation);
+                throw new IllegalStateException("Asked to reopen port " + port + ", the reservation source opened"
+                        + " port " + reservation.port());
+            }
+            return reservation;
+        }
+
+        /** Releases the reservation {@code name} holds, if any; the failure to release it, or {@code null}. */
+        private UncheckedIOException releaseHeld(String name) {
+            Reservation reservation = reservations.remove(name);
+            if (reservation == null) {
+                return null;
+            }
+            try {
+                release(reservation);
+                return null;
+            } catch (UncheckedIOException e) {
+                return e;
+            }
+        }
+
+        private static UncheckedIOException combine(UncheckedIOException first, UncheckedIOException next) {
+            if (first == null) {
+                return next;
+            }
+            if (next != null) {
+                first.addSuppressed(next);
+            }
+            return first;
+        }
+
+        private static void release(Reservation reservation) {
+            try {
+                reservation.handle().close();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot release the reservation of port " + reservation.port(), e);
+            }
+        }
+
+        /**
+         * The Spring lifecycle that {@link #handOver hands the registry's reservations over} to the application's
+         * listeners just before the embedded web server binds them. The replay registers it as a singleton before any
+         * other singleton exists, so it starts within the context's refresh, in the phase order Spring starts every
+         * lifecycle in, and a later start, as after a stop, changes nothing.
+         */
+        static final class Handover implements SmartLifecycle {
+
+            /** The name of the singleton. */
+            static final String BEAN_NAME = "fixtureReplayPortHandover";
+
+            /**
+             * One phase before Spring Boot 3.2's web server start-stop lifecycle, {@code DEFAULT_PHASE - 2048}, whose
+             * start binds every listener of the embedded server, the main one and each additional one a project adds;
+             * Spring starts lifecycles in ascending phase order.
+             */
+            static final int PHASE = SmartLifecycle.DEFAULT_PHASE - 2049;
+
+            private final Supplier<PortRegistry> registry;
+            private volatile boolean running;
+
+            Handover(Supplier<PortRegistry> registry) {
+                this.registry = Objects.requireNonNull(registry, "registry");
+            }
+
+            @Override
+            public void start() {
+                registry.get().handOver();
+                running = true;
+            }
+
+            @Override
+            public void stop() {
+                running = false;
+            }
+
+            @Override
+            public boolean isRunning() {
+                return running;
+            }
+
+            @Override
+            public int getPhase() {
+                return PHASE;
+            }
+        }
+
+        /**
+         * {@link #secure Secures the registry's ports} once the context it was added to has refreshed, after every
+         * lifecycle, the web server's included, has started. The refresh of any other context, such as a child
+         * context whose events reach this one, changes nothing.
+         */
+        static final class Securing implements ApplicationListener<ContextRefreshedEvent> {
+
+            private final ApplicationContext context;
+            private final Supplier<PortRegistry> registry;
+
+            Securing(ApplicationContext context, Supplier<PortRegistry> registry) {
+                this.context = Objects.requireNonNull(context, "context");
+                this.registry = Objects.requireNonNull(registry, "registry");
+            }
+
+            @Override
+            public void onApplicationEvent(ContextRefreshedEvent event) {
+                if (event.getApplicationContext() == context) {
+                    registry.get().secure();
+                }
+            }
+        }
     }
 
 
@@ -947,17 +1478,24 @@ class FixtureParityTest {
             MISSING_SERVER_CLASSES.put("greenmail", GREENMAIL_CLASS);
             return;
         }
-        // Every protocol on a port named greenmail.<protocol>, so ${greenmail.<protocol>.port} is known before
-        // the application context starts.
+        // Every protocol binds port 0 and publishes the port it bound as greenmail.<protocol>, so
+        // ${greenmail.<protocol>.port} is known before the application context starts.
         Object setups = Array.newInstance(setupClass, MAIL_PROTOCOLS.size());
         for (int i = 0; i < MAIL_PROTOCOLS.size(); i++) {
-            String protocol = MAIL_PROTOCOLS.get(i);
-            Array.set(setups, i,
-                    Reflect.construct(setupClass, freePort("greenmail." + protocol), "127.0.0.1", protocol));
+            Array.set(setups, i, Reflect.construct(setupClass, 0, "127.0.0.1", MAIL_PROTOCOLS.get(i)));
         }
         Object server = Reflect.construct(greenMailClass, setups);
         Reflect.call(server, "start");
         greenMail = server;
+        for (String protocol : MAIL_PROTOCOLS) {
+            // getSmtp, getSmtps, getImap, getImaps, getPop3 and getPop3s; start() returns once each one listens.
+            Object protocolServer = Reflect.call(server,
+                    "get" + Character.toUpperCase(protocol.charAt(0)) + protocol.substring(1));
+            if (protocolServer == null) {
+                throw new IllegalStateException("GreenMail started without its " + protocol + " server");
+            }
+            publishPort("greenmail." + protocol, ((Number) Reflect.call(protocolServer, "getPort")).intValue());
+        }
         for (Fixture fixture : fixtures.values()) {
             registerMailUsers(fixture);
         }
@@ -978,7 +1516,9 @@ class FixtureParityTest {
 
     private static void startQpid() throws Exception {
         Class<?> launcherClass = Reflect.optionalClass(QPID_CLASS);
-        if (launcherClass == null) {
+        Class<?> listenerClass = Reflect.optionalClass(QPID_LISTENER_CLASS);
+        Class<?> amqpPortClass = Reflect.optionalClass(QPID_AMQP_PORT_CLASS);
+        if (launcherClass == null || listenerClass == null || amqpPortClass == null) {
             MISSING_SERVER_CLASSES.put("qpid", QPID_CLASS);
             return;
         }
@@ -1004,7 +1544,8 @@ class FixtureParityTest {
                     + " is not on the test classpath");
         }
         Map<String, Object> brokerContext = new HashMap<>();
-        brokerContext.put("qpid.amqp_port", String.valueOf(freePort("amqp")));
+        // Port 0: the broker binds a port itself, which is published as amqp once it has started.
+        brokerContext.put("qpid.amqp_port", "0");
         // Not registered for per-scenario emptying: the running broker keeps its store and logs there.
         brokerContext.put("qpid.work_dir", directory("qpid-work", false).toString());
         Map<String, Object> attributes = new HashMap<>();
@@ -1012,9 +1553,51 @@ class FixtureParityTest {
         attributes.put("initialConfigurationLocation", configuration.toExternalForm());
         attributes.put("startupLoggedToSystemOut", false);
         attributes.put("context", brokerContext);
-        Object launcher = Reflect.construct(launcherClass);
+        // The launcher hands its system configuration, through which the bound port is read, only to a listener.
+        AtomicReference<Object> systemConfig = new AtomicReference<>();
+        Object listener = Proxy.newProxyInstance(listenerClass.getClassLoader(), new Class<?>[] {listenerClass},
+                (proxy, method, args) -> {
+                    if (method.getDeclaringClass() == Object.class) {
+                        return switch (method.getName()) {
+                            case "equals" -> proxy == args[0];
+                            case "hashCode" -> System.identityHashCode(proxy);
+                            default -> "fixture replay's Qpid launcher listener";
+                        };
+                    }
+                    if (method.getName().equals("onContainerResolve") && args != null && args.length == 1) {
+                        systemConfig.set(args[0]);
+                    }
+                    return null;
+                });
+        Object launcher = Reflect.construct(launcherClass, listener);
         Reflect.call(launcher, "startup", attributes);
         qpid = launcher;
+        publishPort("amqp", boundAmqpPort(systemConfig.get(), amqpPortClass, resourceName));
+    }
+
+    /**
+     * The port the broker's AMQP port bound for {@code ${qpid.amqp_port}}, which the replay sets to 0: the initial
+     * configuration must declare exactly one AMQP port configured that way.
+     */
+    private static int boundAmqpPort(Object systemConfig, Class<?> amqpPortClass, String resourceName)
+            throws Exception {
+        if (systemConfig == null) {
+            throw new IllegalStateException("Qpid Broker-J started from " + resourceName
+                    + " without resolving its broker, so the port it bound is unknown");
+        }
+        Object broker = Reflect.call(systemConfig, "getContainer");
+        List<Integer> bound = new ArrayList<>();
+        for (Object port : (Collection<?>) Reflect.call(broker, "getPorts")) {
+            if (amqpPortClass.isInstance(port) && ((Number) Reflect.call(port, "getPort")).intValue() == 0) {
+                bound.add(((Number) Reflect.call(port, "getBoundPort")).intValue());
+            }
+        }
+        if (bound.size() != 1 || bound.get(0) < 1) {
+            throw new IllegalStateException("Qpid initial configuration " + resourceName + " must declare exactly"
+                    + " one AMQP port on ${qpid.amqp_port}, which the replay sets to 0, and the broker must have bound"
+                    + " it; the bound ports of such AMQP ports are " + bound);
+        }
+        return bound.get(0);
     }
 
     private static void startMongo() throws Exception {
@@ -1028,6 +1611,7 @@ class FixtureParityTest {
         InetSocketAddress address = (InetSocketAddress) Reflect.call(server, "bind");
         mongoServer = server;
         mongoUri = "mongodb://" + address.getHostString() + ":" + address.getPort();
+        publishPort("mongo", address.getPort());
     }
 
     private static void startLdap() throws Exception {
@@ -1064,11 +1648,13 @@ class FixtureParityTest {
         for (Map.Entry<String, String> credential : credentials.entrySet()) {
             Reflect.call(config, "addAdditionalBindCredentials", credential.getKey(), credential.getValue());
         }
-        Object listener = Reflect.callStatic(listenerClass, "createLDAPConfig", "default", freePort("ldap"));
+        // Port 0: the listener binds a port itself, which is published as ldap for ${ldap.port}.
+        Object listener = Reflect.callStatic(listenerClass, "createLDAPConfig", "default", 0);
         Reflect.call(config, "setListenerConfigs", List.of(listener));
         Object server = Reflect.construct(serverClass, config);
         Reflect.call(server, "startListening");
         ldapServer = server;
+        publishPort("ldap", ((Number) Reflect.call(server, "getListenPort")).intValue());
     }
 
     private static void attachAppender() {
@@ -1139,6 +1725,11 @@ class FixtureParityTest {
             Object server = ldapServer;
             stopQuietly("UnboundID directory server", () -> Reflect.call(server, "shutDown", true));
             ldapServer = null;
+        }
+        if (portRegistry != null) {
+            // After the servers: a reservation is released only once nothing the replay started needs it.
+            PortRegistry registry = portRegistry;
+            stopQuietly("the replay's port reservations", registry::releaseAll);
         }
         if (appender != null) {
             rootLogger.detachAppender(appender);
@@ -1250,14 +1841,14 @@ class FixtureParityTest {
         return effective;
     }
 
-    /** The loopback ports replay servers listen on: WireMock, every named free port and the embedded MongoDB. */
+    /**
+     * The loopback ports the replay listens on or holds: WireMock's and every port of the registry, each embedded
+     * server's published port and each {@code ${freePort:<name>}} port, reserved or left to the listener that bound it.
+     */
     static synchronized Set<Integer> ownedPorts() {
-        Set<Integer> owned = new TreeSet<>(FREE_PORTS.values());
+        Set<Integer> owned = new TreeSet<>(portRegistry != null ? portRegistry.ports() : Set.of());
         if (wireMock != null) {
             owned.add(wireMock.port());
-        }
-        if (mongoUri != null) {
-            owned.add(Integer.parseInt(mongoUri.substring(mongoUri.lastIndexOf(':') + 1)));
         }
         return owned;
     }
@@ -2162,8 +2753,8 @@ class FixtureParityTest {
         /**
          * {@code state.requests}, in order, each checked to have the shape of an {@code http} {@code request}:
          * {@code method} and {@code path} strings, and, when present, a {@code query} string, {@code headers},
-         * {@code body} or {@code bodyBase64}, a {@code portProperty} string, a {@code tls} object with its
-         * {@code trustStore} and a {@code readTimeoutMillis}; empty when absent or null.
+         * {@code body} or {@code bodyBase64}, a {@code portProperty} string, a {@code tls} object as {@link #tls}
+         * checks it and a {@code readTimeoutMillis}; empty when absent or null.
          */
         static List<JsonNode> priorRequests(JsonNode state, String what) {
             List<JsonNode> requests = elements(state.get("requests"), what);
@@ -2180,12 +2771,45 @@ class FixtureParityTest {
                 if (prior.hasNonNull("portProperty")) {
                     text(prior, "portProperty", where + ".portProperty");
                 }
-                if (prior.hasNonNull("tls")) {
-                    text(object(prior.get("tls"), where + ".tls"), "trustStore", where + ".tls.trustStore");
-                }
+                tls(prior, where);
                 readTimeoutMillis(prior, where);
             }
             return List.copyOf(requests);
+        }
+
+        /**
+         * The {@code tls} of a request-shaped object, the scenario's {@code request} or a prior request, checked; or
+         * {@code null} when it is absent or null, so the request goes out in plain HTTP. It is an object with a
+         * {@code trustStore} string and, each optional and when present a string, {@code type} (the type of both
+         * stores unless {@code keyStoreType} names the key store's; {@code JKS} when absent), {@code password} (of the
+         * trust store), {@code keyStore} (the client key store, whose key ST-1 presents to a listener that requires
+         * a client certificate), {@code keyStoreType} and {@code keyStorePassword} (of the key store and of its key
+         * entries). A null member counts as absent. {@code keyStoreType} and {@code keyStorePassword} describe the
+         * key store, so either one without {@code keyStore} makes the fixture invalid.
+         *
+         * @param what the object's location in the fixture, for the message of an invalid value
+         */
+        static JsonNode tls(JsonNode spec, String what) {
+            JsonNode tls = spec.get("tls");
+            if (tls == null || tls.isNull()) {
+                return null;
+            }
+            String where = what + ".tls";
+            object(tls, where);
+            text(tls, "trustStore", where + ".trustStore");
+            for (String member : List.of("type", "password", "keyStore", "keyStoreType", "keyStorePassword")) {
+                if (tls.hasNonNull(member)) {
+                    text(tls, member, where + "." + member);
+                }
+            }
+            if (!tls.hasNonNull("keyStore")) {
+                for (String member : List.of("keyStoreType", "keyStorePassword")) {
+                    if (tls.hasNonNull(member)) {
+                        throw new IllegalStateException(where + "." + member + " is set without keyStore");
+                    }
+                }
+            }
+            return tls;
         }
 
         /**
@@ -2260,9 +2884,11 @@ class FixtureParityTest {
         }
 
         /**
-         * Returns every shared server and store to the state a scenario starts from; runs before and after each. It
-         * clears no application cache and no other in-memory state of the application, so scenarios that build on one
-         * another in table order keep doing so; only a fixture's {@code state.clearCaches} empties the caches.
+         * Returns every shared server and store to the state a scenario starts from; runs before and after each. The
+         * fixture's tables that exist are emptied, and one that does not exist yet is left absent, never created
+         * ({@link #deleteTables}). It clears no application cache and no other in-memory state of the application, so
+         * scenarios that build on one another in table order keep doing so; only a fixture's
+         * {@code state.clearCaches} empties the caches.
          */
         void reset() throws Exception {
             List<Exception> failures = new ArrayList<>();
@@ -2424,12 +3050,18 @@ class FixtureParityTest {
             }
         }
 
+        /**
+         * Empties each table of {@code state.tables} and inserts its rows. Every such table must already exist
+         * ({@link #requireTable}): the replay creates no table, so a seeded table the application has not created
+         * fails the scenario before any of its rows is written.
+         */
         private void seedTables() throws Exception {
             DataSource dataSource = (DataSource) requireBean(DataSource.class, DataSource.class.getName());
             try (Connection connection = dataSource.getConnection()) {
                 confirmReplayDatabase(connection);
                 for (Map.Entry<String, JsonNode> table : entries(state.get("tables"), at("state.tables"))) {
                     String tableName = identifier(table.getKey());
+                    requireTable(connection, tableName, at("state.tables." + tableName));
                     try (Statement statement = connection.createStatement()) {
                         statement.executeUpdate("DELETE FROM " + tableName);
                     }
@@ -2462,6 +3094,12 @@ class FixtureParityTest {
             }
         }
 
+        /**
+         * Empties, for the reset, every table the fixture names in {@code state.tables} or {@code response.tables}
+         * that exists in the replay database ({@link #emptyExistingTables}), and commits. A named table that does not
+         * exist yet, such as one the scenario's own request creates, is left absent: the reset never creates or drops
+         * a table, so a scenario captured from a database without its tables starts without them.
+         */
         private void deleteTables() throws Exception {
             Set<String> tables = new LinkedHashSet<>();
             for (String section : List.of("state", "response")) {
@@ -2479,15 +3117,131 @@ class FixtureParityTest {
             }
             try (Connection connection = dataSource.getConnection()) {
                 confirmReplayDatabase(connection);
-                try (Statement statement = connection.createStatement()) {
-                    for (String table : tables) {
-                        statement.executeUpdate("DELETE FROM " + table);
-                    }
-                }
+                emptyExistingTables(connection, tables);
                 if (!connection.getAutoCommit()) {
                     connection.commit();
                 }
             }
+        }
+
+        /**
+         * Runs {@code DELETE FROM <table>} for each of {@code tables}, in order, that exists in the connection's
+         * current catalog and schema ({@link #tableExists}), and returns the tables it emptied, in that order. A table
+         * that does not exist is skipped and stays absent; no table is created or dropped. The caller confirms that
+         * the connection reaches a database the replay owns before calling it, and commits afterwards.
+         *
+         * @throws IllegalStateException when a name does not match {@code [A-Za-z0-9_]+}, before any statement runs
+         */
+        static List<String> emptyExistingTables(Connection connection, Collection<String> tables) throws SQLException {
+            List<String> names = new ArrayList<>();
+            for (String table : tables) {
+                names.add(identifier(table));
+            }
+            List<String> emptied = new ArrayList<>();
+            try (Statement statement = connection.createStatement()) {
+                for (String table : names) {
+                    if (tableExists(connection, table)) {
+                        statement.executeUpdate("DELETE FROM " + table);
+                        emptied.add(table);
+                    }
+                }
+            }
+            return emptied;
+        }
+
+        /**
+         * Fails with an {@link IllegalStateException} naming {@code what} unless {@code table} exists in the
+         * connection's current catalog and schema ({@link #tableExists}). {@code state.tables} seeds rows into tables
+         * the application creates, and the replay cannot create one, so a seeded table that does not exist is reported
+         * as a fixture the scenario cannot start from, never as the database's error on a statement.
+         */
+        static void requireTable(Connection connection, String table, String what) throws SQLException {
+            if (!tableExists(connection, table)) {
+                throw new IllegalStateException(what + " seeds rows into table " + table + ", which does not exist in"
+                        + " the replay database; state.tables seeds only tables the application has created, since the"
+                        + " replay creates no table, so " + table + " must exist before the scenario starts, created"
+                        + " when the application starts or by an earlier scenario in table order");
+            }
+        }
+
+        /**
+         * Whether {@code table}, an unquoted identifier, names a table in the connection's current catalog and schema,
+         * as an unquoted {@code DELETE FROM}, {@code INSERT INTO} or {@code SELECT * FROM} of it resolves there. The
+         * name is looked up in the case the database stores unquoted identifiers in, upper or lower case, otherwise
+         * as given; {@code _} and {@code %} are escaped with the driver's search-string escape
+         * ({@link #searchPattern}), and only a result whose {@code TABLE_NAME}, and {@code TABLE_SCHEM} when the
+         * connection reports a schema, equals the name exactly counts, so a driver without an escape string matches
+         * no other table either. A current catalog or schema the driver reports as {@code null} does not narrow the
+         * search ({@link #currentSchema}). Every table type counts, since drivers name base tables differently
+         * ({@code TABLE}, {@code BASE TABLE}).
+         */
+        static boolean tableExists(Connection connection, String table) throws SQLException {
+            DatabaseMetaData metaData = connection.getMetaData();
+            String stored = metaData.storesUpperCaseIdentifiers() ? table.toUpperCase(Locale.ROOT)
+                    : metaData.storesLowerCaseIdentifiers() ? table.toLowerCase(Locale.ROOT) : table;
+            String schema = currentSchema(connection, metaData);
+            String escape = metaData.getSearchStringEscape();
+            try (ResultSet found = metaData.getTables(connection.getCatalog(), searchPattern(schema, escape),
+                    searchPattern(stored, escape), null)) {
+                while (found.next()) {
+                    if (stored.equals(found.getString("TABLE_NAME"))
+                            && (schema == null || schema.equals(found.getString("TABLE_SCHEM")))) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /**
+         * The connection's current schema, or {@code null} when the driver reports none. A connection wrapper that
+         * does not implement {@link Connection#getSchema()}, such as Narayana's JTA connection, which throws an
+         * {@link SQLException} without a message for it, is answered by the database connection its metadata comes
+         * from, the same session; when that one cannot report it either, the schema is {@code null} and the search is
+         * not narrowed by schema.
+         */
+        private static String currentSchema(Connection connection, DatabaseMetaData metaData) throws SQLException {
+            try {
+                return connection.getSchema();
+            } catch (SQLException unsupported) {
+                Connection database = metaData.getConnection();
+                if (database == null || database == connection) {
+                    return null;
+                }
+                try {
+                    return database.getSchema();
+                } catch (SQLException alsoUnsupported) {
+                    return null;
+                }
+            }
+        }
+
+        /**
+         * {@code name} as a {@link DatabaseMetaData} search pattern that matches only itself: each {@code _} and
+         * {@code %}, and each occurrence of {@code escape} itself, is preceded by {@code escape}. A {@code null} name
+         * stays {@code null}, and without an escape string, which some drivers report, the name is returned unchanged
+         * and the caller's exact match on the results excludes what its wildcards also match.
+         */
+        static String searchPattern(String name, String escape) {
+            if (name == null || escape == null || escape.isEmpty()) {
+                return name;
+            }
+            StringBuilder pattern = new StringBuilder(name.length() + 8);
+            int index = 0;
+            while (index < name.length()) {
+                if (name.startsWith(escape, index)) {
+                    pattern.append(escape).append(escape);
+                    index += escape.length();
+                } else {
+                    char character = name.charAt(index);
+                    if (character == '_' || character == '%') {
+                        pattern.append(escape);
+                    }
+                    pattern.append(character);
+                    index++;
+                }
+            }
+            return pattern.toString();
         }
 
         /**
@@ -2761,10 +3515,12 @@ class FixtureParityTest {
 
         /**
          * Sends one request-shaped object, the scenario's {@code request} or a prior request, through ST-1 to the
-         * listener its {@code portProperty} names, in TLS mode when it carries {@code tls} and with its
-         * {@code readTimeoutMillis} as the socket read budget when it carries one, and returns the complete reply.
-         * A project without ST-1, without the listener port or, for a read budget, without
-         * {@code HttpTestClient.withReadTimeout} reports the scenario {@code UNVERIFIED-missing-driver}.
+         * listener its {@code portProperty} names, in TLS mode when it carries {@code tls} (presenting the client key
+         * of {@code tls.keyStore} when it names one) and with its {@code readTimeoutMillis} as the socket read budget
+         * when it carries one, and returns the complete reply. A project without ST-1, without the listener port, for
+         * a client key store without ST-1's key-store overload of {@code HttpTestClient.https}
+         * ({@link #presentsClientKeys}) or, for a read budget, without {@code HttpTestClient.withReadTimeout} reports
+         * the scenario {@code UNVERIFIED-missing-driver}.
          *
          * @param what the object's location in the fixture, such as {@code <scenario>: request}
          */
@@ -2776,8 +3532,13 @@ class FixtureParityTest {
             if (port == null) {
                 return missingDriver("the listener port property " + portProperty);
             }
-            Object client = spec.hasNonNull("tls")
-                    ? httpsClient(clientClass, port, object(spec.get("tls"), what + ".tls"), what + ".tls")
+            JsonNode tls = tls(spec, what);
+            if (tls != null && tls.hasNonNull("keyStore") && !presentsClientKeys(clientClass)) {
+                return missingDriver("ST-1 " + CLIENT_CLASS + "." + CLIENT_KEY_OVERLOAD + " for " + what
+                        + ".tls.keyStore");
+            }
+            Object client = tls != null
+                    ? httpsClient(clientClass, port, tls, what + ".tls")
                     : Reflect.callStatic(clientClass, "localhost", port);
             Integer readTimeout = readTimeoutMillis(spec, what);
             if (readTimeout != null) {
@@ -2824,29 +3585,71 @@ class FixtureParityTest {
             return Reflect.call(client, "send", method, target, joined, body);
         }
 
-        private Object httpsClient(Class<?> clientClass, int port, JsonNode tls, String what) throws Exception {
-            String trustStore = text(tls, "trustStore", what + ".trustStore");
-            String type = tls.hasNonNull("type") ? text(tls, "type", what + ".type") : "JKS";
-            String password = tls.hasNonNull("password") ? text(tls, "password", what + ".password") : null;
-            return Reflect.callStatic(clientClass, "https", "localhost", port, trustStorePath(trustStore, what), type,
-                    password);
+        /** ST-1's overload of {@code https} that presents a client key, as missing-driver reports name it. */
+        private static final String CLIENT_KEY_OVERLOAD = "https(String host, int port, String trustStorePath,"
+                + " String trustStoreType, String trustStorePassword, String keyStorePath, String keyStoreType,"
+                + " String keyStorePassword)";
+
+        /**
+         * Whether ST-1 {@code clientClass} has the public static key-store overload of {@code https}, the only way
+         * it presents the client key of a {@code tls.keyStore}; a copy without it replays only a {@code tls} that
+         * names no key store.
+         */
+        static boolean presentsClientKeys(Class<?> clientClass) {
+            try {
+                return Modifier.isStatic(clientClass.getMethod("https", String.class, int.class, String.class,
+                        String.class, String.class, String.class, String.class, String.class).getModifiers());
+            } catch (NoSuchMethodException absent) {
+                return false;
+            }
         }
 
-        /** The trust store resolved from the classpath first, then as a file, in the form ST-1 opens. */
-        private String trustStorePath(String trustStore, String what) throws URISyntaxException {
-            URL resource = Reflect.loader().getResource(stripLeadingSlash(trustStore));
+        /**
+         * ST-1 {@code clientClass}'s TLS client for {@code localhost:port}, built from a {@code tls} that {@link #tls}
+         * accepted. It trusts only {@code trustStore}. When {@code keyStore} is named, it is ST-1's key-store
+         * overload of {@code https}, which {@link #sendHttp} has checked for, presenting that store's client key to a
+         * listener that requires a client certificate: the key store has the type {@code keyStoreType}, else the
+         * trust store's, and is opened, its key entries included, with {@code keyStorePassword}, or with none when
+         * that is absent. Without {@code keyStore} it is ST-1's trust-store overload, which presents no client
+         * certificate.
+         *
+         * @param what the location of {@code tls} in the fixture, such as {@code <scenario>: request.tls}
+         */
+        static Object httpsClient(Class<?> clientClass, int port, JsonNode tls, String what) throws Exception {
+            String trustStore = storePath(text(tls, "trustStore", what + ".trustStore"), what + ".trustStore");
+            String type = tls.hasNonNull("type") ? text(tls, "type", what + ".type") : "JKS";
+            String password = tls.hasNonNull("password") ? text(tls, "password", what + ".password") : null;
+            if (!tls.hasNonNull("keyStore")) {
+                return Reflect.callStatic(clientClass, "https", "localhost", port, trustStore, type, password);
+            }
+            String keyStore = storePath(text(tls, "keyStore", what + ".keyStore"), what + ".keyStore");
+            String keyStoreType = tls.hasNonNull("keyStoreType")
+                    ? text(tls, "keyStoreType", what + ".keyStoreType") : type;
+            String keyStorePassword = tls.hasNonNull("keyStorePassword")
+                    ? text(tls, "keyStorePassword", what + ".keyStorePassword") : null;
+            return Reflect.callStatic(clientClass, "https", "localhost", port, trustStore, type, password, keyStore,
+                    keyStoreType, keyStorePassword);
+        }
+
+        /**
+         * A store a {@code tls} member names, resolved from the classpath first, then as a file, in the form ST-1
+         * opens.
+         *
+         * @param what the member's location in the fixture, such as {@code <scenario>: request.tls.keyStore}
+         */
+        private static String storePath(String store, String what) throws URISyntaxException {
+            URL resource = Reflect.loader().getResource(stripLeadingSlash(store));
             if (resource != null) {
                 // ST-1 tries a file before the classpath, so a classpath store is handed over as its file path,
                 // or by resource name when it sits inside a jar.
                 return "file".equals(resource.getProtocol()) ? Path.of(resource.toURI()).toString()
-                        : stripLeadingSlash(trustStore);
+                        : stripLeadingSlash(store);
             }
-            Path file = Path.of(trustStore);
+            Path file = Path.of(store);
             if (Files.isRegularFile(file)) {
                 return file.toAbsolutePath().toString();
             }
-            throw new IllegalStateException(what + ".trustStore " + trustStore
-                    + " is neither on the test classpath nor a file");
+            throw new IllegalStateException(what + " " + store + " is neither on the test classpath nor a file");
         }
 
         private void compareHttpResponse(Class<?> responseType, Object reply, int replayPort) throws Exception {
@@ -3252,7 +4055,8 @@ class FixtureParityTest {
 
         /**
          * Browses the queue, consuming nothing, until it holds exactly the expected messages in order or
-         * {@code awaitMillis} ends, then once more after {@link #NO_FURTHER_MESSAGE_MILLIS}, so a late message fails.
+         * {@code awaitMillis} ends, then keeps browsing until it has held exactly them throughout the
+         * {@link #NO_FURTHER_MESSAGE_MILLIS} quiet window ({@link #awaitQuietWindow}), so a late message fails.
          */
         private void verifyJmsQueue(BrokerDestination queue, List<Map.Entry<String, JsonNode>> expected)
                 throws Exception {
@@ -3268,8 +4072,7 @@ class FixtureParityTest {
                 }
             };
             awaitMatch(queue.toString(), check);
-            Thread.sleep(NO_FURTHER_MESSAGE_MILLIS);
-            check.run();
+            awaitQuietWindow(name + ": " + queue, Duration.ofMillis(NO_FURTHER_MESSAGE_MILLIS), check);
         }
 
         /**
@@ -3753,6 +4556,41 @@ class FixtureParityTest {
             }
         }
 
+        /**
+         * The quiet window after {@link #awaitMatch}: runs {@code check} at once and then every {@link #POLL_INTERVAL}
+         * until it has passed throughout {@code window}, so an effect that arrives late fails. A mismatch ends the
+         * window at once with the check's own {@link AssertionError}, and any other failure of the check with that
+         * failure. An interrupt ends it at the next comparison with an {@link InterruptedException}, the interrupt
+         * status cleared as {@link Thread#sleep} clears it. A window its comparisons cannot complete within
+         * {@link #QUIET_WINDOW_MARGIN} of its end fails as an {@link AssertionError} naming {@code label}.
+         *
+         * @param label the scenario and the effect compared, as {@code <scenario>: <effect>}
+         */
+        static void awaitQuietWindow(String label, Duration window, Action check) throws Exception {
+            Duration limit = window.plus(QUIET_WINDOW_MARGIN);
+            try {
+                Awaitility.await(label)
+                        .pollInSameThread()
+                        .pollDelay(Duration.ZERO)
+                        .pollInterval(POLL_INTERVAL)
+                        .during(window)
+                        .atMost(limit)
+                        .until(() -> {
+                            // Awaitility sleeps between polls uninterruptibly, so the interrupt is taken here.
+                            if (Thread.interrupted()) {
+                                throw new InterruptedException(label + " was interrupted during its "
+                                        + window.toMillis() + " ms quiet window");
+                            }
+                            check.run();
+                            return true;
+                        });
+            } catch (ConditionTimeoutException timeout) {
+                throw new AssertionError(label + " did not hold for the " + window.toMillis()
+                        + " ms quiet window: its comparisons did not complete within " + limit.toMillis() + " ms",
+                        timeout);
+            }
+        }
+
         private void checkDirectories() throws IOException {
             for (Map.Entry<String, JsonNode> entry : entries(response.get("directories"), at("response.directories"))) {
                 String what = at("response.directories." + entry.getKey());
@@ -3996,8 +4834,9 @@ class FixtureParityTest {
         /**
          * Compares the log stream with {@code response.logs} ({@link #logStreamDifference}). It polls until the
          * stream matches or {@code awaitMillis} ends, so a stream still short of its entries keeps growing, then
-         * compares once more after {@link #NO_FURTHER_MESSAGE_MILLIS}, so a further event of those loggers that
-         * arrives late fails. {@code "logs": []} names no logger, so it constrains nothing and nothing is awaited.
+         * keeps comparing until it has matched throughout the {@link #NO_FURTHER_MESSAGE_MILLIS} quiet window
+         * ({@link #awaitQuietWindow}), so a further event of those loggers that arrives late fails.
+         * {@code "logs": []} names no logger, so it constrains nothing and nothing is awaited.
          */
         private void verifyLogs() throws Exception {
             List<LogEntry> expected = logEntries(response.get("logs"), at("response.logs"));
@@ -4011,8 +4850,7 @@ class FixtureParityTest {
                 }
             };
             awaitMatch("logs", check);
-            Thread.sleep(NO_FURTHER_MESSAGE_MILLIS);
-            check.run();
+            awaitQuietWindow(name + ": logs", Duration.ofMillis(NO_FURTHER_MESSAGE_MILLIS), check);
         }
 
         /** A {@code response.logs} entry: logger category, level and message text, {@code ""} when absent. */
