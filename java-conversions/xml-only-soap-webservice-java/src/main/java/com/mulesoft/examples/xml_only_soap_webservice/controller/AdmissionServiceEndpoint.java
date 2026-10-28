@@ -8,6 +8,7 @@
 
 package com.mulesoft.examples.xml_only_soap_webservice.controller;
 
+import org.springframework.stereotype.Component;
 import org.springframework.ws.server.endpoint.annotation.Endpoint;
 import org.springframework.ws.server.endpoint.annotation.RequestPayload;
 import org.springframework.ws.server.endpoint.annotation.ResponsePayload;
@@ -43,7 +44,8 @@ import com.mulesoft.examples.xml_only_soap_webservice.service.AdmissionOrchestra
  * </ul>
  * The class holds no mutable state, so one instance serves all requests concurrently.
  */
-@Endpoint(WebServiceConfig.ADMISSION_ENDPOINT)
+@Endpoint
+@Component(WebServiceConfig.ADMISSION_ENDPOINT)
 public class AdmissionServiceEndpoint {
 
     private final AdmissionOrchestrationService service;

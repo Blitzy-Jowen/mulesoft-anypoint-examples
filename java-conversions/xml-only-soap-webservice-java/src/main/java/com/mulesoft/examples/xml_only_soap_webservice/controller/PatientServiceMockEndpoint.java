@@ -8,6 +8,7 @@
 
 package com.mulesoft.examples.xml_only_soap_webservice.controller;
 
+import org.springframework.stereotype.Component;
 import org.springframework.ws.server.endpoint.annotation.Endpoint;
 import org.springframework.ws.server.endpoint.annotation.RequestPayload;
 import org.springframework.ws.server.endpoint.annotation.ResponsePayload;
@@ -39,7 +40,8 @@ import com.mulesoft.examples.xml_only_soap_webservice.service.PatientMockService
  * </ul>
  * The class holds no mutable state, so one instance serves all requests concurrently.
  */
-@Endpoint(WebServiceConfig.PATIENT_ENDPOINT)
+@Endpoint
+@Component(WebServiceConfig.PATIENT_ENDPOINT)
 public class PatientServiceMockEndpoint {
 
     private final PatientMockService service;

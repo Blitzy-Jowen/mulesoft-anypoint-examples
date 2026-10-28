@@ -327,4 +327,3 @@ Tier 2A is blocked, as [`DECISIONS.md`](../../DECISIONS.md) section 9 records: `
 ## Licence
 
 Apache License 2.0. `LICENSE` and `NOTICE` are copied unchanged from `soap-webservice-security/`.
-

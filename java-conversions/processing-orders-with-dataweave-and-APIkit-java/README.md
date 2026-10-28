@@ -198,7 +198,7 @@ Open the console at `http://localhost:8081/api/console/`.
 | `client/CurrencyClientTest` | against WireMock: the GET path and `Accept` header, exact decimals, port resolution, and the failures for an error status, a refused connection and a body that is not JSON |
 | `mapper/OrderMapperTest`, `mapper/OrderReportMapperTest` | both scripts: the committed outputs byte for byte, the year filter, the `BigDecimal` scale, distinct authors, the report over every item, the `DECIMAL128` average, the plan defaults and the declared failures |
 | `mapper/DwJsonWriterTest`, `mapper/DwCsvWriterTest` | SC-4 reference tests: layout, value, escaping and quoting rules |
-| `trigger/FileInboundPollerTest`, `trigger/FileInboundPollerLogSafetyTest` | SC-5 reference tests: delete or move after success and after a handled failure, the in-process mark against re-entrant and concurrent polls, an unopenable file left for the next poll, missing directories created, subdirectories ignored; one-line log records that disclose no file content or exception text |
+| `trigger/FileInboundPollerTest`, `trigger/FileInboundPollerLogSafetyTest` | SC-5 reference tests: delete or move after success and after a handled failure, the in-process mark against re-entrant and concurrent polls, an unopenable file left for the next poll, a file too large to read (over the read limit, or one whose allocation fails with `OutOfMemoryError`) left in place while the other files are consumed, missing directories created, subdirectories ignored; one-line log records that disclose no file content or exception text, an `OutOfMemoryError` read failure included |
 | `service/FileOutboundWriterTest` | SC-6 reference test: directory creation, overwrite, whole-file replacement, symbolic links, permissions and failed writes |
 | `mapper/ParseTemplateRendererTest` | SC-14: template loading and expression substitution |
 | `exception/ApiKitExceptionHandlerTest`, `exception/GlobalExceptionHandlerTest` | SC-3 mappings and precedence; SC-1 defaults and log safety |
@@ -216,9 +216,9 @@ Open the console at `http://localhost:8081/api/console/`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 576 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 576 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 421 of 461 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 88.5% (1167 of 1319 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 581 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 581 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 421 of 461 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 88.5% (1170 of 1322 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project: it has no `FixtureParityTest` and no `SCENARIOS.md`. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported original assertions of `ProcessingOrdersWithDataweaveAndApikitTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 

@@ -441,4 +441,3 @@ public class WebServiceConfig implements WsConfigurer {
     }
 
 }
-

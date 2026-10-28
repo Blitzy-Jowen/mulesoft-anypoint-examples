@@ -38,8 +38,9 @@ import org.slf4j.LoggerFactory;
  *   <li>lists the regular files of the input directory in directory-listing order, unsorted, because no
  *       comparator is configured, and without filename, age or MIME filtering;</li>
  *   <li>marks each file in process, so an overlapping or re-entrant poll on the same instance skips it;</li>
- *   <li>reads the file and hands it to the {@link FileHandler}; a file that cannot be read is left in place and
- *       unmarked, so the next poll tries it again;</li>
+ *   <li>reads the file and hands it to the {@link FileHandler}; a file that cannot be read, including one too large
+ *       to hold in memory, is left in place and unmarked, so the next poll tries it again, and the poll goes on
+ *       with the next file;</li>
  *   <li>after the handler returns or throws, moves the file to the move directory under its own name
  *       (copy-and-delete when a rename fails) or, without a move directory, deletes it.</li>
  * </ol>
@@ -55,7 +56,8 @@ import org.slf4j.LoggerFactory;
  * marker, so a file name cannot forge a log record. An exception is named only by its class, the frame that threw
  * it and the classes of its causes, never by its message, a cause's message, a suppressed exception or a stack
  * trace, and it is never handed to the logger as a throwable; for a {@link FileSystemException} raised by the
- * poller's own file operations the operating system's reason is added, escaped and bounded in the same way.
+ * poller's own file operations the reason is added, escaped and bounded in the same way: the operating system's
+ * error text, or the poller's own statement of a file's size and the read limit, never a path.
  *
  * <p>It depends on the JDK and SLF4J alone, and names no project type, so that every file-triggered project can
  * copy it with only its {@code package} line changed.
@@ -81,6 +83,15 @@ public class FileInboundPoller {
     private static final String UNAVAILABLE_LOG_MARKER = "[unavailable]";
 
     private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
+    /**
+     * Largest file, in bytes, that {@link #readContent(Path)} reads: the JDK's soft maximum array length
+     * ({@code jdk.internal.util.ArraysSupport.SOFT_MAX_ARRAY_LENGTH}), the largest {@code byte[]} it allocates when
+     * it grows a buffer. A longer array may exceed the virtual machine's own limit, and
+     * {@link Files#readAllBytes(Path)} throws {@link OutOfMemoryError} for every file longer than
+     * {@link Integer#MAX_VALUE}, so a longer file is reported as unreadable before any allocation is attempted.
+     */
+    static final long MAX_CONTENT_LENGTH = Integer.MAX_VALUE - 8;
 
     /**
      * The flow a polled file is handed to. Any exception it throws is logged at ERROR by the poller, naming only
@@ -190,9 +201,16 @@ public class FileInboundPoller {
      *
      * @param file the listed file
      * @return the file's bytes
-     * @throws IOException when the file cannot be read
+     * @throws IOException when the file cannot be read, including a {@link FileSystemException} for {@code file}
+     *                     whose reason gives the file's size and {@link #MAX_CONTENT_LENGTH}, never its path, when
+     *                     the file is longer than that limit
      */
     protected byte[] readContent(Path file) throws IOException {
+        long size = Files.size(file);
+        if (size > MAX_CONTENT_LENGTH) {
+            throw new FileSystemException(file.toString(), null,
+                    "file size " + size + " bytes exceeds the read limit of " + MAX_CONTENT_LENGTH + " bytes");
+        }
         return Files.readAllBytes(file);
     }
 
@@ -210,7 +228,10 @@ public class FileInboundPoller {
             byte[] content;
             try {
                 content = readContent(path);
-            } catch (IOException | RuntimeException e) {
+            } catch (IOException | RuntimeException | OutOfMemoryError e) {
+                // OutOfMemoryError is caught here only: a file whose bytes cannot be allocated, because it is larger
+                // than the heap or grew past the size check while being read, is a file that cannot be read, and the
+                // failed allocation holds nothing once unwound.
                 LOG.warn("Could not open file {}, leaving it for the next poll: {}", safeText(path), describe(e, true));
                 return false;
             }
@@ -284,7 +305,8 @@ public class FileInboundPoller {
      * @param failure    the exception to describe
      * @param withReason whether to add {@code [reason: <reason>]} when {@code failure} is a
      *                   {@link FileSystemException} carrying a reason, which the JDK fills with the operating
-     *                   system's error text and never with the path; only the poller's own file operations pass
+     *                   system's error text and {@link #readContent(Path)} with the file's size and the read limit,
+     *                   never with the path; only the poller's own file operations pass
      *                   {@code true}, because a handler may construct such an exception with any text
      * @return the description, escaped and bounded part by part as {@link #safeText(Object)} does
      */

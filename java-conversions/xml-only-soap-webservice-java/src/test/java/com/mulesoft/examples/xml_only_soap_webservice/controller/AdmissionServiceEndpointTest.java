@@ -32,12 +32,18 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.beans.factory.annotation.AnnotatedGenericBeanDefinition;
+import org.springframework.beans.factory.support.SimpleBeanDefinitionRegistry;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.annotation.AnnotationBeanNameGenerator;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.core.annotation.AnnotationUtils;
+import org.springframework.stereotype.Component;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.ws.server.endpoint.annotation.Endpoint;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -239,6 +245,27 @@ class AdmissionServiceEndpointTest {
                 .anyMatch(key -> key.endsWith("SOA-Message-1.0.xsd"))
                 .anyMatch(key -> key.endsWith("SOA-Model-1.0.xsd"));
         assertThat(targetNamespaces).as("schema target namespaces").contains(NS0, NS1);
+    }
+
+    /**
+     * {@link WebServiceConfig}'s listener-path mapping looks this endpoint up by the bean name
+     * {@value WebServiceConfig#ADMISSION_ENDPOINT}. Spring WS does not alias {@code @Endpoint}'s value to
+     * {@code @Component}, so the name is an explicit {@code @Component} name, never the deprecated convention-based
+     * reading of the stereotype's value.
+     */
+    @Test
+    void beanNameIsTheExplicitComponentName() {
+        Class<AdmissionServiceEndpoint> type = AdmissionServiceEndpoint.class;
+
+        Endpoint endpoint = AnnotationUtils.findAnnotation(type, Endpoint.class);
+        assertThat(endpoint).as("@Endpoint on %s", type.getSimpleName()).isNotNull();
+        assertThat(endpoint.value()).as("@Endpoint value").isEmpty();
+        Component component = type.getDeclaredAnnotation(Component.class);
+        assertThat(component).as("@Component directly present on %s", type.getSimpleName()).isNotNull();
+        assertThat(component.value()).as("@Component value").isEqualTo(WebServiceConfig.ADMISSION_ENDPOINT);
+        assertThat(new AnnotationBeanNameGenerator().generateBeanName(new AnnotatedGenericBeanDefinition(type),
+                new SimpleBeanDefinitionRegistry())).as("generated bean name")
+                .isEqualTo(WebServiceConfig.ADMISSION_ENDPOINT);
     }
 
     private Response postXml(String path, byte[] body) {

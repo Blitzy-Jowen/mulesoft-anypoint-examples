@@ -3,6 +3,7 @@ package com.mulesoft.examples.import_leads_into_salesforce.trigger;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -12,6 +13,8 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -22,10 +25,15 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 /**
@@ -42,7 +50,8 @@ import org.mockito.ArgumentCaptor;
  * It therefore depends on nothing but the JDK, JUnit 5, AssertJ, Mockito and {@link FileInboundPoller}: every file
  * content is inline, every directory lives under {@link TempDir}, no order across several files is asserted because
  * directory listing is unsorted, and an unreadable file is simulated by overriding
- * {@link FileInboundPoller#readContent(Path)}, never through file permissions, which a root build ignores.
+ * {@link FileInboundPoller#readContent(Path)}, never through file permissions, which a root build ignores; only a
+ * file too large to read is real, a sparse file that takes no disk space.
  */
 class FileInboundPollerTest {
 
@@ -208,8 +217,17 @@ class FileInboundPollerTest {
         assertThat(file).doesNotExist();
     }
 
-    @Test
-    void unopenableFileIsLeftInPlaceUnmarkedAndRetriedLater() throws IOException {
+    static Stream<Arguments> readFailures() {
+        return Stream.of(
+                Arguments.of("IOException", (Supplier<Throwable>) () -> new IOException("locked")),
+                Arguments.of("SecurityException", (Supplier<Throwable>) () -> new SecurityException("locked")),
+                Arguments.of("OutOfMemoryError", (Supplier<Throwable>) () -> new OutOfMemoryError("Java heap space")));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("readFailures")
+    void unopenableFileIsLeftInPlaceUnmarkedAndRetriedLater(String label, Supplier<Throwable> failure)
+            throws IOException {
         Path in = tempDir.resolve("in");
         Path locked = write(in, "locked.csv", "id\n1\n");
         Path ok = write(in, "ok.csv", "id\n2\n");
@@ -219,7 +237,14 @@ class FileInboundPollerTest {
             @Override
             protected byte[] readContent(Path p) throws IOException {
                 if (failRead.get() && p.getFileName().toString().equals("locked.csv")) {
-                    throw new IOException("locked");
+                    Throwable thrown = failure.get();
+                    if (thrown instanceof IOException ioFailure) {
+                        throw ioFailure;
+                    }
+                    if (thrown instanceof Error error) {
+                        throw error;
+                    }
+                    throw (RuntimeException) thrown;
                 }
                 return super.readContent(p);
             }
@@ -241,6 +266,45 @@ class FileInboundPollerTest {
         assertThat(received.get(0).name()).isEqualTo("locked.csv");
         assertThat(received.get(0).content()).isEqualTo(bytes("id\n1\n"));
         assertThat(locked).doesNotExist();
+    }
+
+    /**
+     * Runs with a file one byte over the read limit, and with a 3 GiB file, past {@link Integer#MAX_VALUE}, for which
+     * {@link Files#readAllBytes(Path)} throws {@link OutOfMemoryError}.
+     */
+    @ParameterizedTest
+    @ValueSource(longs = {FileInboundPoller.MAX_CONTENT_LENGTH + 1, 3L << 30})
+    void fileTooLargeToReadIsLeftInPlaceWhileOtherFilesAreConsumed(long length) throws IOException {
+        Path in = tempDir.resolve("in");
+        Path ok = write(in, "ok.csv", "id\n2\n");
+        Path huge = in.resolve("huge.csv");
+        // Extending an empty file writes no data, so the file is sparse and takes no disk space.
+        try (RandomAccessFile file = new RandomAccessFile(huge.toFile(), "rw")) {
+            file.setLength(length);
+        }
+        List<FileInboundPoller.InboundFile> received = new CopyOnWriteArrayList<>();
+        FileInboundPoller poller = new FileInboundPoller(in, null, recordingInto(received));
+        AtomicInteger handed = new AtomicInteger(-1);
+
+        assertThatCode(() -> handed.set(poller.pollOnce())).doesNotThrowAnyException();
+
+        assertThat(handed).hasValue(1);
+        assertThat(received).extracting(FileInboundPoller.InboundFile::name).containsExactly("ok.csv");
+        assertThat(ok).doesNotExist();
+        assertThat(Files.size(huge)).isEqualTo(length);
+        // The read reports the file's size and the limit, never its path, because the reason is logged.
+        assertThatThrownBy(() -> poller.readContent(huge))
+                .isInstanceOfSatisfying(FileSystemException.class, e -> {
+                    assertThat(e.getFile()).isEqualTo(huge.toString());
+                    assertThat(e.getReason()).isEqualTo("file size " + length + " bytes exceeds the read limit of "
+                            + FileInboundPoller.MAX_CONTENT_LENGTH + " bytes");
+                });
+
+        received.clear();
+
+        assertThat(poller.pollOnce()).isZero();
+        assertThat(received).isEmpty();
+        assertThat(Files.size(huge)).isEqualTo(length);
     }
 
     @Test

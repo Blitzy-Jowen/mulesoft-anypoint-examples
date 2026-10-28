@@ -229,43 +229,50 @@ class FileInboundPollerLogSafetyTest {
         String emoji = "\uD83D\uDE00";
         return Stream.of(
                 Arguments.of("IOException repeating the path",
-                        (Function<Path, Exception>) path -> withStackTrace(
+                        (Function<Path, Throwable>) path -> withStackTrace(
                                 new IOException("Cannot read " + path + ": " + PASSWORD + "\nERROR forged-by-message")),
                         "java.io.IOException"),
                 Arguments.of("UncheckedIOException with a cause",
-                        (Function<Path, Exception>) path -> withStackTrace(new UncheckedIOException(
+                        (Function<Path, Throwable>) path -> withStackTrace(new UncheckedIOException(
                                 "Wrapped " + EMAIL, withStackTrace(new IOException(path + " " + TOKEN)))),
                         "java.io.UncheckedIOException <- java.io.IOException"),
                 Arguments.of("RuntimeException repeating the path",
-                        (Function<Path, Exception>) path -> withStackTrace(
+                        (Function<Path, Throwable>) path -> withStackTrace(
                                 new SecurityException(path + "\r\nERROR forged-by-message " + PASSWORD)),
                         "java.lang.SecurityException"),
+                Arguments.of("OutOfMemoryError for a file larger than the heap",
+                        (Function<Path, Throwable>) path -> withStackTrace(
+                                new OutOfMemoryError("Java heap space " + path + " " + PASSWORD)),
+                        "java.lang.OutOfMemoryError"),
                 Arguments.of("FileSystemException without reason",
-                        (Function<Path, Exception>) path -> withStackTrace(new NoSuchFileException(path.toString())),
+                        (Function<Path, Throwable>) path -> withStackTrace(new NoSuchFileException(path.toString())),
                         "java.nio.file.NoSuchFileException"),
                 Arguments.of("FileSystemException reason with line breaks and controls",
-                        (Function<Path, Exception>) path -> withStackTrace(new FileSystemException(path.toString(),
+                        (Function<Path, Throwable>) path -> withStackTrace(new FileSystemException(path.toString(),
                                 null, "Input/output error\u2028\u2029\u0085\u0000\t\\")),
                         "java.nio.file.FileSystemException"
                                 + " [reason: Input/output error\\u2028\\u2029\\u0085\\u0000\\t\\\\]"),
                 Arguments.of("FileSystemException reason cut before a surrogate pair",
-                        (Function<Path, Exception>) path -> withStackTrace(new FileSystemException(path.toString(),
+                        (Function<Path, Throwable>) path -> withStackTrace(new FileSystemException(path.toString(),
                                 null, "x" + emoji.repeat(200))),
                         "java.nio.file.FileSystemException [reason: x" + emoji.repeat(127) + "...[truncated]]"));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("readFailures")
-    void readFailureLogsOneSafeWarningAndLeavesTheFile(String label, Function<Path, Exception> failure,
+    void readFailureLogsOneSafeWarningAndLeavesTheFile(String label, Function<Path, Throwable> failure,
                                                        String description) throws IOException {
         Path file = writeInputFile(FORGING_NAME);
         AtomicInteger handled = new AtomicInteger();
         FileInboundPoller poller = new FileInboundPoller(inputDirectory, null, inbound -> handled.incrementAndGet()) {
             @Override
             protected byte[] readContent(Path listed) throws IOException {
-                Exception thrown = failure.apply(listed);
+                Throwable thrown = failure.apply(listed);
                 if (thrown instanceof IOException ioFailure) {
                     throw ioFailure;
+                }
+                if (thrown instanceof Error error) {
+                    throw error;
                 }
                 throw (RuntimeException) thrown;
             }

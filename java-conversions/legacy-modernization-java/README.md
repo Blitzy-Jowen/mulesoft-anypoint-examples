@@ -244,4 +244,3 @@ Tier 2A is blocked, as `DECISIONS.md` section 9 records: `Tier 2A blocked: Mule 
 ## Licence
 
 Apache License 2.0. `LICENSE` and `NOTICE` are copied unchanged from `legacy-modernization/`.
-

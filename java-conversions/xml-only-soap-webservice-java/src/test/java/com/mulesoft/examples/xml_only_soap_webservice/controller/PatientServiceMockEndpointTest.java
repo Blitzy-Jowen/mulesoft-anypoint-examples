@@ -38,12 +38,18 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.AnnotatedGenericBeanDefinition;
+import org.springframework.beans.factory.support.SimpleBeanDefinitionRegistry;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.annotation.AnnotationBeanNameGenerator;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
+import org.springframework.core.annotation.AnnotationUtils;
+import org.springframework.stereotype.Component;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.ws.server.endpoint.annotation.Endpoint;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -215,6 +221,24 @@ class PatientServiceMockEndpointTest {
                 .anySatisfy(location -> assertThat(location).endsWith("SOA-Message-1.0.xsd"))
                 .anySatisfy(location -> assertThat(location).endsWith("SOA-Model-1.0.xsd"));
         assertThat(targetNamespaceByLocation.values()).contains(NS0, NS1);
+    }
+
+    // WebServiceConfig's listener-path mapping looks this endpoint up by name. Spring WS does not alias @Endpoint's
+    // value to @Component, so the name is an explicit @Component name, never the deprecated convention-based reading
+    // of the stereotype's value.
+    @Test
+    void beanNameIsTheExplicitComponentName() {
+        Class<PatientServiceMockEndpoint> type = PatientServiceMockEndpoint.class;
+
+        Endpoint endpoint = AnnotationUtils.findAnnotation(type, Endpoint.class);
+        assertThat(endpoint).as("@Endpoint on %s", type.getSimpleName()).isNotNull();
+        assertThat(endpoint.value()).as("@Endpoint value").isEmpty();
+        Component component = type.getDeclaredAnnotation(Component.class);
+        assertThat(component).as("@Component directly present on %s", type.getSimpleName()).isNotNull();
+        assertThat(component.value()).as("@Component value").isEqualTo(WebServiceConfig.PATIENT_ENDPOINT);
+        assertThat(new AnnotationBeanNameGenerator().generateBeanName(new AnnotatedGenericBeanDefinition(type),
+                new SimpleBeanDefinitionRegistry())).as("generated bean name")
+                .isEqualTo(WebServiceConfig.PATIENT_ENDPOINT);
     }
 
     /** A one-line SOAP 1.1 request envelope with {@code ns0}/{@code ns1} declared and an empty Header. */

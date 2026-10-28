@@ -190,9 +190,9 @@ java -jar target/xml-only-soap-webservice-java-1.0.0-SNAPSHOT.jar
 | Test class | What it asserts |
 |---|---|
 | `XMLWithSoapTest` | the ported `XMLWithSoapIT` (`xml-only-soap-webservice/src/test/java/org/mule/examples/XMLWithSoapIT.java:54-65`), end to end through the in-process mocks with nothing mocked: `POST /AdmissionService` with `message.xml` returns a non-empty reply containing `<runningTotal>500</runningTotal>` and `<status>ADMITTED</status>` |
-| `controller/AdmissionServiceEndpointTest` | on the wire through ST-1, the whole application on a random port with only the clock fixed: the exact `admitSubjectResponse` with its Episode and Bill in order, the `soap:Client` fault for unreadable requests, the no-listener 404 for unserved paths, and `?wsdl` with its rewritten address and schema closure |
-| `controller/PatientServiceMockEndpointTest` | on the wire: `upsertPatientResponse` with `PatientId` = now, the Donald Duck `getPatientResponse` for every other root and for an empty Body, the `soap:Client` fault for unreadable bodies and for a plain `GET`, the 404 for sub-paths, and `?wsdl` |
-| `controller/EhrServiceMockEndpointTest` | on the wire: `createEpisodeResponse` echoing `PatientId` with the now dates, `findEpisodesResponse` for every other root, the `soap:Client` fault for requests that are not SOAP envelopes, the 404 for sub-paths, and `?wsdl` with its schema closure |
+| `controller/AdmissionServiceEndpointTest` | on the wire through ST-1, the whole application on a random port with only the clock fixed: the exact `admitSubjectResponse` with its Episode and Bill in order, the `soap:Client` fault for unreadable requests, the no-listener 404 for unserved paths, and `?wsdl` with its rewritten address and schema closure; `beanNameIsTheExplicitComponentName`: the bean name `WebServiceConfig.ADMISSION_ENDPOINT` from an explicit `@Component`, with an empty `@Endpoint` value |
+| `controller/PatientServiceMockEndpointTest` | on the wire: `upsertPatientResponse` with `PatientId` = now, the Donald Duck `getPatientResponse` for every other root and for an empty Body, the `soap:Client` fault for unreadable bodies and for a plain `GET`, the 404 for sub-paths, and `?wsdl`; `beanNameIsTheExplicitComponentName`: the bean name `WebServiceConfig.PATIENT_ENDPOINT` from an explicit `@Component`, with an empty `@Endpoint` value |
+| `controller/EhrServiceMockEndpointTest` | on the wire: `createEpisodeResponse` echoing `PatientId` with the now dates, `findEpisodesResponse` for every other root, the `soap:Client` fault for requests that are not SOAP envelopes, the 404 for sub-paths, and `?wsdl` with its schema closure; `beanNameIsTheExplicitComponentName`: the bean name `WebServiceConfig.EHR_ENDPOINT` from an explicit `@Component`, with an empty `@Endpoint` value |
 | `service/AdmissionOrchestrationServiceTest` | the flow's sequence with every collaborator mocked: the `upsertPatient` script, the PatientService call, the `createEpisode` script, the EHRService call and the response script, in that order and each once; empty and null payloads passed through; every failure propagated unchanged after one attempt, stopping the chain |
 | `service/PatientMockServiceTest`, `service/EhrMockServiceTest` | each `choice`: the `when` branch for the exact local name only (case-sensitive, prefix ignored) and the `otherwise` branch for every other name and an empty Body, then one real-mapper answer per branch on a fixed clock; the EHR mapper receives the request unchanged |
 | `mapper/AdmitSubjectResponseMapperTest` | the `admitSubjectResponse` script: `startDate` and `endDate` taken from differing upstream values, `endDate` = upstream `endDate` + 5 days, each date absent in turn, every accepted date form, the `Bill` values, and the failure for an unreadable date |
@@ -247,8 +247,8 @@ No scenario of this project is `unreachable`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 359 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 359 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 362 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 362 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 644 of 657 lines. `service` 44 of 44: `AdmissionOrchestrationService` 14 of 14, `PatientMockService` 15 of 15, `EhrMockService` 15 of 15. `mapper` 600 of 613: `AdmitSubjectResponseMapper` 123 of 123, `DwXmlWriter` 170 of 170, `EhrMockResponseMapper` 102 of 104, `CreateEpisodeRequestMapper` 90 of 95, `UpsertPatientRequestMapper` 77 of 79, `PatientMockResponseMapper` 38 of 42 (nested and anonymous classes counted with their outer class). Total project LINE coverage: 92.2% (1290 of 1399 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=10`, `failed=0`, every scenario `UNVERIFIED-uncaptured`.
 
@@ -268,4 +268,3 @@ Tier 2A is blocked, as `DECISIONS.md` section 9 records: `Tier 2A blocked: Mule 
 ## Licence
 
 Apache License 2.0. `LICENSE` and `NOTICE` are copied unchanged from `xml-only-soap-webservice/`.
-

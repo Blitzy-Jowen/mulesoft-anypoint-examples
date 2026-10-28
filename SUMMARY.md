@@ -4,7 +4,7 @@ This table reports the delivery evidence, tier by tier, for every example folder
 The request counted 57 folders: [DECISIONS.md](DECISIONS.md#1-scope-and-counts) reconciles the count (56 found, 55 delivered, 51 non-RAML parity projects) and reads the criterion "56 of 57 compile" as "every non-SAP folder present compiles".
 The four RAML-backed rows rest on the static diff in [RAML-CONTROLLER-DIFF.md](RAML-CONTROLLER-DIFF.md). Each project README repeats its row under `## Tier status`.
 
-Measured on 2026-10-28 against the tree at commit `9a4c9484`, with Temurin JDK 17.0.21 and Apache Maven 3.9.9: `mvn -B clean package` and then `mvn -B test` in each of the 55 projects, and `mvn -B verify` in the 11 connector projects.
+Measured on 2026-10-28 against the source tree of the commit that last updated these figures, with Temurin JDK 17.0.21 and Apache Maven 3.9.9: `mvn -B clean package` and then `mvn -B test` in each of the 55 projects, and `mvn -B verify` in the 11 connector projects.
 
 ## Status
 
@@ -113,7 +113,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 20,935 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 20,972 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 85.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -126,24 +126,24 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 |---|---|---|---|---|
 | rest-api-with-apikit-java | 416 / 0 / 0 / 0 | 131 of 131 | 88.7% (1072 of 1208) | — |
 | testing-apikit-with-munit-java | 267 / 0 / 0 / 0 | 13 of 13 | 80.9% (559 of 691) | — |
-| processing-orders-with-dataweave-and-APIkit-java | 576 / 0 / 0 / 0 | 421 of 461 | 88.5% (1167 of 1319) | — |
+| processing-orders-with-dataweave-and-APIkit-java | 581 / 0 / 0 / 0 | 421 of 461 | 88.5% (1170 of 1322) | — |
 | web-service-consumer-java | 500 / 0 / 0 / 1 | 449 of 459 | 97.4% (791 of 812) | — |
-| xml-only-soap-webservice-java | 359 / 0 / 0 / 1 | 644 of 657 | 92.2% (1290 of 1399) | — |
+| xml-only-soap-webservice-java | 362 / 0 / 0 / 1 | 644 of 657 | 92.2% (1290 of 1399) | — |
 | service-orchestration-and-choice-routing-java | 816 / 0 / 0 / 1 | 1149 of 1157 | 92.0% (2616 of 2842) | — |
 | jms-message-rollback-and-redelivery-java | 63 / 0 / 0 / 1 | 77 of 78 | 98.5% (201 of 204) | — |
 | sending-json-data-to-a-jms-queue-java | 272 / 0 / 0 / 1 | 163 of 163 | 98.1% (411 of 419) | — |
 | using-transactional-scope-in-jms-to-database-java | 97 / 0 / 0 / 1 | 115 of 119 | 96.6% (229 of 237) | — |
 | salesforce-data-retrieval-java | 929 / 0 / 0 / 1 | 357 of 361 | 95.8% (993 of 1036) | 2 run, 2 skipped, 0 failed, 0 errors |
-| import-contacts-into-salesforce-java | 655 / 0 / 0 / 1 | 92 of 92 | 90.6% (625 of 690) | 1 run, 1 skipped, 0 failed, 0 errors |
-| import-leads-into-salesforce-java | 740 / 0 / 0 / 1 | 330 of 335 | 96.5% (918 of 951) | 1 run, 1 skipped, 0 failed, 0 errors |
+| import-contacts-into-salesforce-java | 659 / 0 / 0 / 1 | 92 of 92 | 91.5% (634 of 693) | 1 run, 1 skipped, 0 failed, 0 errors |
+| import-leads-into-salesforce-java | 745 / 0 / 0 / 1 | 330 of 335 | 96.5% (921 of 954) | 1 run, 1 skipped, 0 failed, 0 errors |
 | authenticating-salesforce-using-oauth2-java | 780 / 0 / 0 / 1 | 93 of 93 | 95.8% (806 of 841) | 1 run, 1 skipped, 0 failed, 0 errors |
 | get-customer-list-from-netsuite-java | 600 / 0 / 0 / 1 | 257 of 261 | 95.7% (1206 of 1260) | 1 run, 1 skipped, 0 failed, 0 errors |
 | netsuite-data-retrieval-java | 1040 / 0 / 0 / 0 | 438 of 441 | 92.3% (1806 of 1956) | 3 run, 3 skipped, 0 failed, 0 errors |
 | salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 687 / 0 / 0 / 1 | 327 of 338 | 96.6% (776 of 803) | 1 run, 1 skipped, 0 failed, 0 errors |
 | salesforce-to-MySQL-DB-using-Batch-Processing-java | 713 / 0 / 0 / 1 | 351 of 362 | 96.8% (806 of 833) | 1 run, 1 skipped, 0 failed, 0 errors |
 | adding-a-new-customer-to-workday-revenue-management-java | 445 / 0 / 0 / 1 | 73 of 73 | 96.0% (582 of 606) | 1 run, 1 skipped, 0 failed, 0 errors |
-| import-contacts-into-ms-dynamics-java | 401 / 0 / 0 / 1 | 106 of 106 | 90.6% (686 of 757) | 1 run, 1 skipped, 0 failed, 0 errors |
-| dataweave-with-flowreflookup-java | 736 / 0 / 0 / 1 | 128 of 128 | 91.0% (661 of 726) | 1 run, 1 skipped, 0 failed, 0 errors |
+| import-contacts-into-ms-dynamics-java | 405 / 0 / 0 / 1 | 106 of 106 | 91.4% (695 of 760) | 1 run, 1 skipped, 0 failed, 0 errors |
+| dataweave-with-flowreflookup-java | 740 / 0 / 0 / 1 | 128 of 128 | 91.9% (670 of 729) | 1 run, 1 skipped, 0 failed, 0 errors |
 | addition-using-javascript-transformer-java | 652 / 0 / 0 / 1 | 893 of 894 | 99.2% (1124 of 1133) | — |
 | cache-scope-with-fibonacci-java | 186 / 0 / 0 / 1 | 65 of 65 | 97.5% (312 of 320) | — |
 | content-based-routing-java | 216 / 0 / 0 / 1 | 17 of 17 | 97.6% (287 of 294) | — |
@@ -157,8 +157,8 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | http-oauth-provider-java | 457 / 0 / 0 / 1 | 206 of 206 | 93.1% (685 of 736) | — |
 | http-request-response-with-logger-java | 175 / 0 / 0 / 1 | 5 of 5 | 96.8% (215 of 222) | — |
 | implementing-a-choice-exception-strategy-java | 180 / 0 / 0 / 1 | 34 of 34 | 97.8% (306 of 313) | — |
-| importing-a-CSV-file-into-Mongo-DB-java | 63 / 0 / 0 / 1 | 96 of 96 | 77.2% (200 of 259) | — |
-| importing-a-csv-file-into-ms-sharepoint-java | 73 / 0 / 0 / 1 | 69 of 69 | 76.9% (413 of 537) | — |
+| importing-a-CSV-file-into-Mongo-DB-java | 67 / 0 / 0 / 1 | 96 of 96 | 79.8% (209 of 262) | — |
+| importing-a-csv-file-into-ms-sharepoint-java | 77 / 0 / 0 / 1 | 69 of 69 | 78.1% (422 of 540) | — |
 | importing-an-email-attachment-using-the-IMAP-connector-java | 256 / 0 / 0 / 1 | 372 of 395 | 94.8% (509 of 537) | — |
 | importing-an-email-attachment-using-the-POP3-connector-java | 200 / 0 / 0 / 1 | 374 of 397 | 93.4% (479 of 513) | — |
 | legacy-modernization-java | 297 / 0 / 0 / 1 | 224 of 247 | 88.8% (985 of 1109) | — |
@@ -173,7 +173,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | querying-a-db-and-attaching-results-to-an-email-java | 269 / 0 / 0 / 1 | 137 of 139 | 98.1% (403 of 411) | — |
 | querying-a-mysql-database-java | 135 / 0 / 0 / 1 | 9 of 9 | 96.4% (214 of 222) | — |
 | scatter-gather-flow-control-java | 202 / 0 / 0 / 1 | 160 of 163 | 97.0% (384 of 396) | — |
-| sending-a-csv-file-through-email-using-smtp-java | 83 / 0 / 0 / 1 | 107 of 107 | 81.9% (236 of 288) | — |
+| sending-a-csv-file-through-email-using-smtp-java | 87 / 0 / 0 / 1 | 107 of 107 | 84.2% (245 of 291) | — |
 | sending-json-data-to-a-amqp-queue-java | 185 / 0 / 0 / 1 | 42 of 42 | 97.5% (394 of 404) | — |
 | soap-webservice-security-java | 386 / 0 / 0 / 1 | 2 of 2 | 86.2% (1382 of 1604) | — |
 | track-a-custom-business-event-java | 231 / 0 / 0 / 1 | 129 of 129 | 98.3% (345 of 351) | — |
