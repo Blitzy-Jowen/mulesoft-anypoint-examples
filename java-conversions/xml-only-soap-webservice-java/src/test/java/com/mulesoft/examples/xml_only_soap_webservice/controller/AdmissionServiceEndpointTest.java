@@ -1,0 +1,390 @@
+package com.mulesoft.examples.xml_only_soap_webservice.controller;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.net.URLDecoder;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Stream;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.transform.Source;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Named;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
+import org.springframework.test.annotation.DirtiesContext;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
+import org.xml.sax.helpers.DefaultHandler;
+import org.xmlunit.builder.Input;
+import org.xmlunit.xpath.JAXPXPathEngine;
+
+import com.mulesoft.examples.xml_only_soap_webservice.config.WebServiceConfig;
+import com.mulesoft.examples.xml_only_soap_webservice.support.HttpTestClient;
+import com.mulesoft.examples.xml_only_soap_webservice.support.HttpTestClient.Response;
+
+/**
+ * Wire-level test of {@link AdmissionServiceEndpoint}, the converted {@code admitPatientService} flow of the original
+ * {@code Hospital_Admissions_SOA.xml}: the {@code http:listener path="AdmissionService"}, which declares no
+ * {@code allowedMethods}, in front of a {@code cxf:proxy-service payload="envelope"} publishing
+ * {@code service/AdmissionService.wsdl}.
+ *
+ * <p>The whole application runs on a random port and every request goes through the raw-socket
+ * {@link HttpTestClient}, so status code, reason phrase, headers and body bytes are asserted as Undertow sent them.
+ * The admission chain calls the PatientService and EHRService mocks of the same process over HTTP, exactly as the
+ * original's {@code http:request}s targeted its own listener; nothing is mocked. The only substitution is the clock:
+ * {@link FixedClockConfig} makes every mock {@code now} equal {@link #NOW}, so the {@code Episode} values are exact.
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+class AdmissionServiceEndpointTest {
+
+    /** Every mock {@code now}: {@code 2015-01-23T04:10:20.123Z} in {@code America/Los_Angeles}. */
+    static final String NOW = "2015-01-22T20:10:20.123-08:00";
+
+    static final String SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/";
+    static final String NS0 = "http://www.mule-health.com/SOA/message/1.0";
+    static final String NS1 = "http://www.mule-health.com/SOA/model/1.0";
+    static final String WSDL_SOAP_NS = "http://schemas.xmlsoap.org/wsdl/soap/";
+    static final String XSD_NS = "http://www.w3.org/2001/XMLSchema";
+
+    /** The compact CXF envelope opening: {@code soap} prefix, no XML declaration, no {@code Header}. */
+    static final String ENVELOPE_START = "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+            + "<soap:Body>";
+    static final String ENVELOPE_END = "</soap:Body></soap:Envelope>";
+
+    static final String P = WebServiceConfig.ADMISSION_PATH;
+
+    /** The content type every request body is sent with; the original test sent no {@code SOAPAction}. */
+    static final String XML_CONTENT_TYPE = "text/xml;charset=UTF-8";
+
+    /** The schema import of {@code AdmissionService.wsdl}, which resolves only from the classpath root. */
+    static final String CLASSPATH_ROOT_IMPORT = "service/xsd/SOA-Message-1.0.xsd";
+
+    /** Upper bound of the schema-closure walk, so a rewrite loop fails the test instead of hanging it. */
+    static final int MAX_SCHEMA_FETCHES = 20;
+
+    @TestConfiguration
+    static class FixedClockConfig {
+
+        // Named testClock: a second bean named clock would override ClockConfig's, which Boot rejects.
+        @Bean
+        @Primary
+        Clock testClock() {
+            return Clock.fixed(Instant.parse("2015-01-23T04:10:20.123Z"), ZoneId.of("America/Los_Angeles"));
+        }
+    }
+
+    @LocalServerPort
+    int port;
+
+    HttpTestClient http;
+
+    @BeforeEach
+    void client() {
+        http = HttpTestClient.localhost(port);
+    }
+
+    @Test
+    void admitSubjectReturnsEpisodeAndBillInOrder() {
+        Response response = postXml(P, message());
+
+        Element root = assertSoapResponse(response);
+        assertQName(root, NS0, "ns0", "admitSubjectResponse");
+
+        List<Element> parts = children(root);
+        assertThat(parts).extracting(Element::getLocalName).containsExactly("Episode", "Bill");
+        Element episode = parts.get(0);
+        // The script keys the bill "Bill " with a trailing space; parsed XML can only carry the name Bill.
+        Element bill = parts.get(1);
+        assertQName(episode, NS1, "ns1", "Episode");
+        assertQName(bill, NS1, "ns1", "Bill");
+
+        List<Element> episodeFields = children(episode);
+        assertThat(episodeFields).extracting(Element::getLocalName)
+                .containsExactly("episodeId", "PatientId", "admission", "startDate", "endDate", "care");
+        // episodeId is the EHR mock's now; PatientId is the PatientService mock's now, carried through createEpisode.
+        assertLeaf(episodeFields.get(0), null, null, "episodeId", NOW);
+        assertLeaf(episodeFields.get(1), NS1, "ns1", "PatientId", NOW);
+        assertLeaf(episodeFields.get(2), null, null, "admission", "Elective");
+        // startDate is the upstream startDate as a date; endDate is the upstream endDate as a date plus P5D.
+        assertLeaf(episodeFields.get(3), null, null, "startDate", "2015-01-22");
+        assertLeaf(episodeFields.get(4), null, null, "endDate", "2015-01-27");
+        assertLeaf(episodeFields.get(5), null, null, "care", "Private");
+
+        // The script's initialStateEstimate governs over the initialStayEstimate of reply.xml, which no test reads.
+        List<Element> billFields = children(bill);
+        assertThat(billFields).extracting(Element::getLocalName)
+                .containsExactly("costPerNight", "initialStateEstimate", "runningTotal", "status");
+        assertLeaf(billFields.get(0), null, null, "costPerNight", "100");
+        assertLeaf(billFields.get(1), null, null, "initialStateEstimate", "5");
+        assertLeaf(billFields.get(2), null, null, "runningTotal", "500");
+        assertLeaf(billFields.get(3), null, null, "status", "ADMITTED");
+    }
+
+    /**
+     * Requests the listener boundary cannot read as a SOAP 1.1 envelope. The listener accepts every method, so a
+     * plain {@code GET} without a metadata query is read as a message too and faults, never 405.
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("unreadableRequests")
+    void unreadableRequestIsClientFault(String method, byte[] body) {
+        assertClientFault(send(method, P, body));
+    }
+
+    static Stream<Arguments> unreadableRequests() {
+        byte[] message = message();
+        return Stream.of(
+                Arguments.of("POST", Named.of("malformedXmlIsClientFault",
+                        Arrays.copyOf(message, message.length - 40))),
+                Arguments.of("POST", Named.of("emptyBodyIsClientFault", new byte[0])),
+                Arguments.of("POST", Named.of("nonEnvelopeRootIsClientFault", "<foo/>".getBytes(UTF_8))),
+                Arguments.of("GET", Named.<byte[]>of("plainGetIsReadAsMessageAndFaults", null)));
+    }
+
+    /** Paths no listener serves; the listener matches its path exactly and the query is not part of it. */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("unservedPaths")
+    void unservedPathIsNoListener(String method, String target, byte[] body, String path) {
+        assertNoListener(send(method, target, body), path);
+    }
+
+    static Stream<Arguments> unservedPaths() {
+        return Stream.of(
+                Arguments.of("GET", P + "/extra", null, "/AdmissionService/extra"),
+                Arguments.of("GET", P + "/extra?x=1", null, "/AdmissionService/extra"),
+                Arguments.of("GET", "/unknown", null, "/unknown"),
+                Arguments.of("POST", "/", message(), "/"));
+    }
+
+    @Test
+    void wsdlIsPublishedWithRewrittenAddressAndSchemaClosure() {
+        String base = "http://localhost:" + port;
+        String xsdPrefix = base + P + "?xsd=";
+
+        Response wsdl = send("GET", P + "?wsdl", null);
+        assertThat(wsdl.status()).as("%s", wsdl).isEqualTo(200);
+        assertThat(wsdl.reason()).as("%s", wsdl).isEqualTo("OK");
+        assertThat(contentType(wsdl)).startsWith("text/xml");
+        Document wsdlDocument = parse(wsdl.body());
+
+        NodeList addresses = wsdlDocument.getElementsByTagNameNS(WSDL_SOAP_NS, "address");
+        assertThat(addresses.getLength()).as("soap:address elements in %s", wsdl).isEqualTo(1);
+        assertThat(((Element) addresses.item(0)).getAttribute("location")).isEqualTo(base + P);
+        // The target namespaces legitimately start with http://www.mule-health.com; only the placeholder must go.
+        assertThat(wsdl.bodyAsString()).doesNotContain("location=\"http://www.mule-health.com\"");
+
+        List<String> wsdlReferences = schemaLocations(wsdlDocument);
+        assertThat(wsdlReferences).as("schema references of %s", wsdl).isNotEmpty();
+
+        Deque<String> pending = new ArrayDeque<>(wsdlReferences);
+        Set<String> fetched = new LinkedHashSet<>();
+        List<String> keys = new ArrayList<>();
+        Set<String> targetNamespaces = new LinkedHashSet<>();
+        while (!pending.isEmpty()) {
+            String url = pending.poll();
+            if (!fetched.add(url)) {
+                continue;
+            }
+            assertThat(fetched.size()).as("schema fetches so far: %s", fetched).isLessThanOrEqualTo(MAX_SCHEMA_FETCHES);
+            assertThat(url).as("rewritten schemaLocation").startsWith(xsdPrefix);
+            String key = URLDecoder.decode(url.substring(xsdPrefix.length()), UTF_8);
+
+            Response schema = send("GET", url.substring(base.length()), null);
+            String fallbackNote = CLASSPATH_ROOT_IMPORT.equals(key)
+                    ? " (AdmissionService.wsdl imports it relative to the classpath root, so this 200 proves the"
+                            + " classpath-root fallback of SC-11 WsdlQueryPublisher)"
+                    : "";
+            assertThat(schema.status()).as("GET %s%s: %s", url, fallbackNote, schema).isEqualTo(200);
+            assertThat(schema.reason()).as("%s", schema).isEqualTo("OK");
+            assertThat(contentType(schema)).startsWith("text/xml");
+
+            Document schemaDocument = parse(schema.body());
+            Element root = schemaDocument.getDocumentElement();
+            assertQName(root, XSD_NS, null, "schema");
+            keys.add(key);
+            targetNamespaces.add(root.getAttribute("targetNamespace"));
+            pending.addAll(schemaLocations(schemaDocument));
+        }
+
+        assertThat(keys).as("served xsd= keys")
+                .anyMatch(key -> key.endsWith("SOA-Message-1.0.xsd"))
+                .anyMatch(key -> key.endsWith("SOA-Model-1.0.xsd"));
+        assertThat(targetNamespaces).as("schema target namespaces").contains(NS0, NS1);
+    }
+
+    private Response postXml(String path, byte[] body) {
+        return send("POST", path, body);
+    }
+
+    /** A request with no body and no headers, or a body sent as {@value #XML_CONTENT_TYPE}. */
+    private Response send(String method, String target, byte[] body) {
+        if (body == null) {
+            return http.send(method, target, Map.of(), null);
+        }
+        return http.send(method, target, Map.of("Content-Type", XML_CONTENT_TYPE), body);
+    }
+
+    /** Checks the CXF-style success envelope and returns the single {@code soap:Body} child. */
+    private static Element assertSoapResponse(Response response) {
+        assertThat(response.status()).as("%s", response).isEqualTo(200);
+        assertThat(response.reason()).as("%s", response).isEqualTo("OK");
+        assertThat(contentType(response)).startsWith("text/xml");
+        assertThat(response.bodyAsString()).as("body of %s", response).startsWith(ENVELOPE_START)
+                .endsWith(ENVELOPE_END);
+
+        Document document = parse(response.body());
+        Element body = soapBody(document);
+        List<Element> payload = children(body);
+        assertThat(payload).as("soap:Body children of %s", response).hasSize(1);
+        return payload.get(0);
+    }
+
+    /** Checks the HTTP 500 {@code soap:Client} fault the listener boundary answers an unreadable request with. */
+    private static void assertClientFault(Response response) {
+        assertThat(response.status()).as("%s", response).isEqualTo(500);
+        assertThat(response.reason()).as("%s", response).isEqualTo("Internal Server Error");
+        assertThat(contentType(response)).startsWith("text/xml");
+        assertThat(response.bodyAsString()).as("body of %s", response).startsWith(ENVELOPE_START);
+
+        Document document = parse(response.body());
+        List<Element> faults = children(soapBody(document));
+        assertThat(faults).as("soap:Body children of %s", response).hasSize(1);
+        assertQName(faults.get(0), SOAP_NS, "soap", "Fault");
+
+        JAXPXPathEngine xpath = new JAXPXPathEngine();
+        xpath.setNamespaceContext(Map.of("soap", SOAP_NS));
+        Source source = Input.fromDocument(document).build();
+        assertThat(xpath.evaluate("/soap:Envelope/soap:Body/soap:Fault/faultcode", source))
+                .as("faultcode of %s", response).isEqualTo("soap:Client");
+        assertThat(xpath.evaluate("/soap:Envelope/soap:Body/soap:Fault/faultstring", source))
+                .as("faultstring of %s", response).isNotBlank();
+    }
+
+    /** Checks the listener's no-listener answer, body compared byte for byte. */
+    private static void assertNoListener(Response response, String path) {
+        assertThat(response.status()).as("%s", response).isEqualTo(404);
+        assertThat(response.reason()).as("%s", response).isEqualTo("Not Found");
+        assertThat(contentType(response)).startsWith("text/plain");
+        assertThat(response.body()).as("body bytes of %s", response)
+                .isEqualTo(("No listener for endpoint: " + path).getBytes(UTF_8));
+    }
+
+    /** The {@code soap:Envelope} root, its first child {@code soap:Body}, and no {@code soap:Header} anywhere. */
+    private static Element soapBody(Document document) {
+        Element envelope = document.getDocumentElement();
+        assertQName(envelope, SOAP_NS, "soap", "Envelope");
+        List<Element> envelopeChildren = children(envelope);
+        assertThat(envelopeChildren).as("soap:Envelope children").isNotEmpty();
+        Element body = envelopeChildren.get(0);
+        assertQName(body, SOAP_NS, "soap", "Body");
+        assertThat(document.getElementsByTagNameNS(SOAP_NS, "Header").getLength()).as("soap:Header elements")
+                .isZero();
+        return body;
+    }
+
+    private static void assertLeaf(Element element, String namespaceOrNull, String prefixOrNull, String localName,
+            String text) {
+        assertQName(element, namespaceOrNull, prefixOrNull, localName);
+        assertThat(children(element)).as("child elements of %s", localName).isEmpty();
+        assertThat(element.getTextContent()).as("text of %s", localName).isEqualTo(text);
+    }
+
+    /** Namespace URI ({@code null} for none), prefix when given, and local name of {@code element}. */
+    private static void assertQName(Element element, String namespaceOrNull, String prefixOrNull, String localName) {
+        assertThat(element.getLocalName()).as("local name of <%s>", element.getNodeName()).isEqualTo(localName);
+        assertThat(element.getNamespaceURI()).as("namespace of <%s>", element.getNodeName())
+                .isEqualTo(namespaceOrNull);
+        if (prefixOrNull != null) {
+            assertThat(element.getPrefix()).as("prefix of <%s>", element.getNodeName()).isEqualTo(prefixOrNull);
+        }
+    }
+
+    /** Element children only; the payload keeps the DataWeave writer's tab indentation as text nodes. */
+    private static List<Element> children(Element parent) {
+        List<Element> elements = new ArrayList<>();
+        for (Node node = parent.getFirstChild(); node != null; node = node.getNextSibling()) {
+            if (node instanceof Element element) {
+                elements.add(element);
+            }
+        }
+        return elements;
+    }
+
+    /** Every {@code schemaLocation} of an {@code xsd:import}, {@code xsd:include} or {@code xsd:redefine}. */
+    private static List<String> schemaLocations(Document document) {
+        List<String> locations = new ArrayList<>();
+        NodeList elements = document.getElementsByTagNameNS(XSD_NS, "*");
+        for (int i = 0; i < elements.getLength(); i++) {
+            Element element = (Element) elements.item(i);
+            String name = element.getLocalName();
+            if (("import".equals(name) || "include".equals(name) || "redefine".equals(name))
+                    && element.hasAttribute("schemaLocation")) {
+                locations.add(element.getAttribute("schemaLocation"));
+            }
+        }
+        return locations;
+    }
+
+    private static String contentType(Response response) {
+        String contentType = response.header("Content-Type");
+        assertThat(contentType).as("Content-Type of %s", response).isNotNull();
+        return contentType;
+    }
+
+    /** Namespace-aware parse with DOCTYPE declarations and external entities disabled. */
+    private static Document parse(byte[] xml) {
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newDefaultInstance();
+            factory.setNamespaceAware(true);
+            factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
+            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
+            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
+            factory.setExpandEntityReferences(false);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            // Fatal errors throw without the default handler's report on stderr.
+            builder.setErrorHandler(new DefaultHandler());
+            return builder.parse(new ByteArrayInputStream(xml));
+        } catch (ParserConfigurationException | SAXException | IOException e) {
+            throw new AssertionError("Not well-formed XML: " + new String(xml, UTF_8), e);
+        }
+    }
+
+    /** The bytes of {@code src/test/resources/message.xml}: the {@code admitSubject} envelope the original posts. */
+    private static byte[] message() {
+        try (InputStream in = AdmissionServiceEndpointTest.class.getResourceAsStream("/message.xml")) {
+            assertThat(in).as("classpath resource /message.xml").isNotNull();
+            return in.readAllBytes();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot read /message.xml", e);
+        }
+    }
+}
