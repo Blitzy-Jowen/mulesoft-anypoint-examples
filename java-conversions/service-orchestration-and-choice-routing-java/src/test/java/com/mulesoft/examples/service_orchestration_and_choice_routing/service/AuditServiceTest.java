@@ -20,13 +20,16 @@ import static org.mockito.Mockito.when;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.net.ServerSocket;
+import java.sql.DatabaseMetaData;
 import java.sql.SQLDataException;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.stream.Stream;
 
 import org.apache.derby.jdbc.EmbeddedDataSource;
@@ -49,6 +52,7 @@ import org.springframework.aop.interceptor.SimpleAsyncUncaughtExceptionHandler;
 import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -57,13 +61,18 @@ import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
 
+import com.arjuna.ats.internal.jdbc.drivers.modifiers.ConnectionModifier;
+import com.arjuna.ats.internal.jdbc.drivers.modifiers.ModifierFactory;
+import com.arjuna.ats.internal.jdbc.drivers.modifiers.SupportsMultipleConnectionsModifier;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.model.orders.Order;
 
@@ -86,7 +95,8 @@ import ch.qos.logback.core.read.ListAppender;
  *   <li>{@link AsyncRollbackRoute}: a Spring context with {@code @EnableAsync}, where the failure the rollback branch
  *       rethrows reaches {@link AuditService.AsyncFailureLogging}'s handler on the executor thread.</li>
  *   <li>{@link InApplicationContext}: the whole application, where the audit dispatched through its {@code @Async}
- *       and {@code REQUIRES_NEW} proxy commits its row in its own JTA transaction over XA Derby.</li>
+ *       and {@code REQUIRES_NEW} proxy commits its row in its own JTA transaction over XA Derby, and concurrent audits
+ *       release their Derby transactions when they complete.</li>
  * </ul>
  *
  * <p>Failures carry a sentinel built at run time from a random UUID, standing for a sensitive caller-supplied order
@@ -427,7 +437,8 @@ class AuditServiceTest {
      * The one-way VM {@code audit} endpoint with its own {@code xa-transaction ALWAYS_BEGIN}, in the running
      * application: {@link AuditService#audit(Order, String)} called through the application's {@code @Async} and
      * {@code @Transactional(REQUIRES_NEW)} proxy returns at once, and the insert commits in its own Narayana JTA
-     * transaction over the XA Derby {@code DataSource}, visible to a later read outside any transaction.
+     * transaction over the XA Derby {@code DataSource}, visible to a later read outside any transaction. Concurrent
+     * audits each release their Derby transaction and connection when their JTA transaction completes.
      *
      * <p>The application starts on free local ports with a fresh in-memory Derby database and an embedded,
      * non-persistent Artemis server of its own, and the context is closed after the class, so it shares no port,
@@ -443,6 +454,42 @@ class AuditServiceTest {
         /** Above the small server IDs Spring Boot's per-JVM counter and fixed test settings hand out. */
         private static final int MIN_ARTEMIS_SERVER_ID = 1_000_000;
 
+        /**
+         * Threads of the application's task executor, {@code spring.task.execution.pool.core-size}, in place of the
+         * default eight: two concurrent audits already contend for one pooled connection. Narayana's connection pool
+         * holds at most ten connections for the whole JVM and keeps those of a closed context, so each connection this
+         * context opens is one fewer for the contexts of later test classes.
+         */
+        private static final int AUDIT_THREADS = 2;
+
+        /** Audits dispatched at once and queued on the task executor. */
+        private static final int CONCURRENT_AUDITS = 3000;
+
+        /** Narayana's JDBC logger, which jboss-logging routes to Logback. */
+        private static final String NARAYANA_JDBC_LOGGER = "com.arjuna.ats.jdbc";
+
+        /** Narayana's {@code No modifier information found for db. Connection will be closed immediately}. */
+        private static final String NO_MODIFIER_MESSAGE_ID = "ARJUNA017008";
+
+        /**
+         * The XA connection Narayana's recovery helper opens on the data source, outside Narayana's connection pool,
+         * while a recovery scan runs.
+         */
+        private static final int RECOVERY_SCAN_CONNECTIONS = 1;
+
+        /**
+         * Most Derby transactions open once every audit has completed: {@value #AUDIT_THREADS} pooled connections and
+         * the recovery scan's, three. Narayana opens another pooled connection only while every one it holds for the
+         * data source is in use, so it holds as many as the threads that have used the database at once. While the
+         * audits run those are the audit threads alone: the test thread waits on the task executor, not the database,
+         * and its reads afterwards reuse a free pooled connection. {@code asyncAuditCommitsRow}, which shares this
+         * context, uses at most two at once, its audit and the test thread's count query, and the in-house listener
+         * receives nothing here. With no transaction in progress each connection holds exactly one Derby transaction,
+         * the idle one of its current connection, and each audit transaction left behind after its commit adds one
+         * more.
+         */
+        private static final int MAX_OPEN_DERBY_TRANSACTIONS = AUDIT_THREADS + RECOVERY_SCAN_CONNECTIONS;
+
         @Autowired
         private AuditService proxiedAuditService;
 
@@ -451,6 +498,11 @@ class AuditServiceTest {
 
         @Autowired
         private JdbcTemplate jdbcTemplate;
+
+        /** The executor {@code @Async} resolves, Spring Boot's {@code applicationTaskExecutor}. */
+        @Autowired
+        @Qualifier("applicationTaskExecutor")
+        private ThreadPoolTaskExecutor auditExecutor;
 
         @DynamicPropertySource
         static void isolatedResources(DynamicPropertyRegistry registry) throws IOException {
@@ -470,12 +522,14 @@ class AuditServiceTest {
             registry.add("spring.datasource.xa.properties.createDatabase", () -> "create");
             registry.add("spring.artemis.embedded.persistent", () -> "false");
             registry.add("spring.artemis.embedded.server-id", () -> artemisServerId);
+            registry.add("spring.task.execution.pool.core-size", () -> AUDIT_THREADS);
         }
 
         @Test
         void asyncAuditCommitsRow() {
             assertThat(AopUtils.isAopProxy(proxiedAuditService)).isTrue();
-            assertThat(orchestration.populateDatabase()).isEqualTo("db populated");
+            // The tests of this class share one context, so another of them may have created the tables first.
+            assertThat(orchestration.populateDatabase()).isIn("db populated", "table already populated");
 
             proxiedAuditService.audit(order(ORDER_ID), "02550");
 
@@ -486,6 +540,64 @@ class AuditServiceTest {
                     "select total_value from order_audits where order_id = ?", Integer.class, ORDER_ID))
                     .isEqualTo(2550);
             assertThat(auditLog.events()).isEmpty();
+        }
+
+        /**
+         * Concurrent audits, as orders under load dispatch them, each release their Derby transaction and connection
+         * when their JTA transaction completes. Narayana finds a modifier for the driver name and version the Derby
+         * connection reports, so it logs no {@code ARJUNA017008} and keeps every connection bound to its transaction
+         * until the transaction completes. A connection handed to another audit while its transaction still commits
+         * leaves an orphaned idle transaction in {@code SYSCS_DIAG.TRANSACTION_TABLE} for minutes, one per such audit.
+         *
+         * <p>The test thread waits for the audits on the task executor and reads the database only once they have
+         * finished, so it takes no pooled connection beyond those of the audit threads. Each audit's transaction runs
+         * inside its executor task, so a completed task has committed and run its completion callbacks.
+         */
+        @Test
+        void concurrentAuditsReleaseTheirDerbyTransactionsOnCompletion() {
+            assertThat(orchestration.populateDatabase()).isIn("db populated", "table already populated");
+            ThreadPoolExecutor auditPool = auditExecutor.getThreadPoolExecutor();
+            // The audit of another test of this class may still be completing. Its row has committed, so its task has
+            // started, and an idle executor means it has finished: only the audits below are counted from here.
+            await().atMost(Duration.ofSeconds(10)).until(() -> isIdle(auditPool));
+            long completedBefore = auditPool.getCompletedTaskCount();
+            String orderIdPrefix = "concurrent-" + UUID.randomUUID() + "-";
+            LogCapture narayanaJdbcLog = new LogCapture(NARAYANA_JDBC_LOGGER);
+            Integer auditRows;
+            List<Map<String, Object>> derbyTransactions;
+            try {
+                for (int i = 0; i < CONCURRENT_AUDITS; i++) {
+                    proxiedAuditService.audit(order(orderIdPrefix + i), "1");
+                }
+                // The completed count, because a task taken from the queue but not yet started is neither active
+                // nor queued.
+                await().atMost(Duration.ofSeconds(60)).until(() ->
+                        auditPool.getCompletedTaskCount() - completedBefore >= CONCURRENT_AUDITS && isIdle(auditPool));
+                auditRows = jdbcTemplate.queryForObject("select count(*) from order_audits where order_id like ?",
+                        Integer.class, orderIdPrefix + "%");
+                derbyTransactions = jdbcTemplate.queryForList("select * from syscs_diag.transaction_table");
+            } finally {
+                narayanaJdbcLog.close();
+            }
+            ConnectionModifier derbyModifier = jdbcTemplate.execute(
+                    (ConnectionCallback<ConnectionModifier>) connection -> {
+                        DatabaseMetaData metaData = connection.getMetaData();
+                        return ModifierFactory.getModifier(metaData.getDriverName(),
+                                metaData.getDriverMajorVersion(), metaData.getDriverMinorVersion());
+                    });
+
+            assertThat(auditRows).isEqualTo(CONCURRENT_AUDITS);
+            assertThat(derbyTransactions)
+                    .as("Derby transactions after %d committed audits", CONCURRENT_AUDITS)
+                    .hasSizeLessThanOrEqualTo(MAX_OPEN_DERBY_TRANSACTIONS);
+            assertThat(narayanaJdbcLog.events())
+                    .noneMatch(event -> event.getFormattedMessage().startsWith(NO_MODIFIER_MESSAGE_ID));
+            assertThat(derbyModifier).isInstanceOf(SupportsMultipleConnectionsModifier.class);
+        }
+
+        /** No task is running or queued; a task taken from the queue but not yet started counts as neither. */
+        private static boolean isIdle(ThreadPoolExecutor pool) {
+            return pool.getActiveCount() == 0 && pool.getQueue().isEmpty();
         }
 
         /** Distinct free local ports: every socket stays open until all are chosen, and all are closed before use. */
@@ -552,7 +664,16 @@ class AuditServiceTest {
         private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
 
         LogCapture(Class<?> loggerClass) {
-            logger = (Logger) LoggerFactory.getLogger(loggerClass);
+            this(loggerClass.getName());
+        }
+
+        /**
+         * Captures a logger by name, for a library logger that is not named after a class.
+         *
+         * @param loggerName the name of the logger to capture
+         */
+        LogCapture(String loggerName) {
+            logger = (Logger) LoggerFactory.getLogger(loggerName);
             previousLevel = logger.getLevel();
             logger.setLevel(Level.INFO);
             appender.start();

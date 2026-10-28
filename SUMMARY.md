@@ -15,6 +15,7 @@ The rows of the seven SC-15 Salesforce projects (`salesforce-data-retrieval-java
 The rows of `service-orchestration-and-choice-routing-java` and `web-service-consumer-java` were re-measured on 2026-10-28 with `mvn -B clean install` on the tree whose SC-4 `DwXmlToJson` reads an element without text as the empty string, and the Tier 1 tests total under Totals was updated to match.
 The rows of `service-orchestration-and-choice-routing-java` and `websphere-mq-java` were re-measured on 2026-10-28 with `mvn -B clean install` and `mvn -B test` on the tree whose SC-12 held connects claim their deliveries when their request arrives and take them only while that claim is current, the orchestration row again once its `WebServiceConfig` SAAJ transformer-factory setting and test were merged, and the Tier 1 tests total under Totals was updated to match.
 The rows of `foreach-processing-and-choice-routing-java`, `get-customer-list-from-netsuite-java`, `importing-a-CSV-file-into-Mongo-DB-java`, `netsuite-data-retrieval-java` and `soap-webservice-security-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that adds the SOAP reply edge-case and malformed-CSV tests and the NetSuite single-flight token request, bounded paging and request-free error messages.
+The row of `service-orchestration-and-choice-routing-java` and the Tier 1 tests total under Totals were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that registers Narayana's connection modifier for the embedded Derby driver and adds its concurrent-audit test.
 
 ## Status
 
@@ -123,7 +124,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 23,896 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 23,897 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 85.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -139,7 +140,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | processing-orders-with-dataweave-and-APIkit-java | 715 / 0 / 0 / 0 | 421 of 461 | 89.5% (1309 of 1463) | — |
 | web-service-consumer-java | 520 / 0 / 0 / 1 | 447 of 457 | 97.4% (797 of 818) | — |
 | xml-only-soap-webservice-java | 419 / 0 / 0 / 1 | 644 of 657 | 91.6% (1457 of 1591) | — |
-| service-orchestration-and-choice-routing-java | 956 / 0 / 0 / 1 | 1173 of 1181 | 92.8% (2890 of 3114) | — |
+| service-orchestration-and-choice-routing-java | 957 / 0 / 0 / 1 | 1173 of 1181 | 92.8% (2895 of 3120) | — |
 | jms-message-rollback-and-redelivery-java | 63 / 0 / 0 / 1 | 77 of 78 | 98.5% (201 of 204) | — |
 | sending-json-data-to-a-jms-queue-java | 272 / 0 / 0 / 1 | 163 of 163 | 98.1% (411 of 419) | — |
 | using-transactional-scope-in-jms-to-database-java | 97 / 0 / 0 / 1 | 115 of 119 | 96.6% (229 of 237) | — |

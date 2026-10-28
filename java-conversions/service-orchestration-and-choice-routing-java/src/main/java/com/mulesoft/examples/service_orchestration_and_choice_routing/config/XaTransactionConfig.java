@@ -32,6 +32,9 @@ import org.springframework.jms.core.JmsTemplate;
 import org.springframework.jms.listener.DefaultMessageListenerContainer;
 import org.springframework.transaction.PlatformTransactionManager;
 
+import com.arjuna.ats.internal.jdbc.drivers.modifiers.ModifierFactory;
+import com.arjuna.ats.internal.jdbc.drivers.modifiers.SupportsMultipleConnectionsModifier;
+
 /**
  * XA transaction infrastructure replacing the global elements of {@code fulfillment.xml} (lines 4-15 and 23):
  * <ul>
@@ -41,7 +44,9 @@ import org.springframework.transaction.PlatformTransactionManager;
  *       and the unwrapped {@code nonXaJmsConnectionFactory}.</li>
  *   <li>The {@code StandardXADataSource} bean over {@code jdbc:derby:muleEmbeddedDB;create=true}: Boot's
  *       {@code XADataSourceAutoConfiguration} builds {@code dataSource} from {@code spring.datasource.xa.*}
- *       (Derby {@code EmbeddedXADataSource}) and Narayana's {@code XADataSourceWrapper} enlists its connections.</li>
+ *       (Derby {@code EmbeddedXADataSource}) and Narayana's {@code XADataSourceWrapper} enlists its connections;
+ *       {@link #derbyConnectionModifier} registers Narayana's {@code SupportsMultipleConnectionsModifier} for Derby, so
+ *       each connection stays bound to its transaction until the transaction completes.</li>
  *   <li>{@code jbossts:transaction-manager}: the Narayana starter's {@code transactionManager}
  *       ({@code JtaTransactionManager}), with {@code narayana.default-timeout} 600 and its object store under
  *       {@code narayana.log-dir}.</li>
@@ -68,6 +73,24 @@ public class XaTransactionConfig {
 
 	/** Default Derby system home, inside the build directory so {@code muleEmbeddedDB} never lands in the project root. */
 	static final String DEFAULT_DERBY_SYSTEM_HOME = "target/derby";
+
+	/**
+	 * The driver name Derby's embedded {@code DatabaseMetaData.getDriverName()} reports, under which Narayana looks up
+	 * the modifier of each connection it enlists. Narayana's built-in modifier list has no entry for it.
+	 */
+	static final String DERBY_EMBEDDED_DRIVER_NAME = "Apache Derby Embedded JDBC Driver";
+
+	/** Narayana's version wildcard: the modifier applies to every major and minor version of the driver. */
+	static final int ANY_DRIVER_VERSION = -1;
+
+	/**
+	 * The Narayana modifier registered for Derby. It declares that the driver supports several connections per
+	 * transaction, so Narayana keeps each connection bound to its transaction and defers the close the application
+	 * requests until the transaction completes. Without a modifier Narayana logs {@code ARJUNA017008} and hands the
+	 * pooled connection to another thread while its transaction is still committing, which leaves orphaned Derby
+	 * transactions and connections behind. Its {@code Xid} and {@code XAResource.start} flags are Derby's own.
+	 */
+	static final String DERBY_CONNECTION_MODIFIER = SupportsMultipleConnectionsModifier.class.getName();
 
 	/** ActiveMQ's default redelivery delay, which the original XA connector used for the rolled-back in-house deliveries. */
 	static final long IN_HOUSE_REDELIVERY_DELAY_MS = 1000L;
@@ -96,6 +119,29 @@ public class XaTransactionConfig {
 				throw new BeanInitializationException("Cannot create the Derby system home " + home, e);
 			}
 			System.setProperty(DERBY_SYSTEM_HOME_PROPERTY, home);
+		};
+	}
+
+	/**
+	 * Registers {@link #DERBY_CONNECTION_MODIFIER} for {@link #DERBY_EMBEDDED_DRIVER_NAME}, any version, before the XA
+	 * {@code DataSource} opens its first connection. A bean factory post-processor runs before any regular bean is
+	 * instantiated, and it is static so that this configuration class is not instantiated that early. Narayana's
+	 * modifier registry is JVM-wide, so registering it again replaces the entry with an identical one. Narayana skips a
+	 * modifier it cannot instantiate without failing, so the registration is read back and the start-up fails when it
+	 * is missing.
+	 *
+	 * @return the post-processor that registers the Derby modifier with Narayana's {@code ModifierFactory}
+	 */
+	@Bean
+	public static BeanFactoryPostProcessor derbyConnectionModifier() {
+		return beanFactory -> {
+			ModifierFactory.putModifier(DERBY_EMBEDDED_DRIVER_NAME, ANY_DRIVER_VERSION, ANY_DRIVER_VERSION,
+					DERBY_CONNECTION_MODIFIER);
+			if (!(ModifierFactory.getModifier(DERBY_EMBEDDED_DRIVER_NAME, ANY_DRIVER_VERSION,
+					ANY_DRIVER_VERSION) instanceof SupportsMultipleConnectionsModifier)) {
+				throw new BeanInitializationException("Narayana did not register " + DERBY_CONNECTION_MODIFIER + " for "
+						+ DERBY_EMBEDDED_DRIVER_NAME);
+			}
 		};
 	}
 
