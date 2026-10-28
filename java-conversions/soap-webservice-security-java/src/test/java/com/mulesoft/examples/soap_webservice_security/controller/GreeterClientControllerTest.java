@@ -31,6 +31,9 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.Charset;
 import java.util.LinkedHashMap;
@@ -51,6 +54,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -58,6 +62,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.oxm.UnmarshallingFailureException;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -69,6 +74,7 @@ import com.mulesoft.examples.soap_webservice_security.SoapWebserviceSecurityAppl
 import com.mulesoft.examples.soap_webservice_security.client.SecureGreeterClient;
 import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient;
 import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient.Response;
+import com.mulesoft.examples.soap_webservice_security.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level controller test of {@link GreeterClientController}, the HTTP front of flow {@code SecurityClients}
@@ -79,12 +85,13 @@ import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient.Res
  * {@code There has been an Error processing the request} as {@code text/plain}.
  *
  * <p>The whole application runs on Undertow: the SOAP listener on a random port stands in for the original's fixed
- * services port, and the additional {@code client} listener of {@code config/ListenerPorts} on a port drawn once per
- * class stands in for the client front's. Every response is read off the socket by ST-1 {@link HttpTestClient}, so
- * the raw status line, the headers and the body bytes are asserted as sent. {@link SecureGreeterClient} is a Spring
- * spy: unless a test stubs it, each client type really calls its Greeter path on the SOAP listener, through that
- * path's WS-Security enforcement, with the demo credentials of profile {@code test}. Replies the Greeter endpoint never
- * sends come from a WireMock stand-in on a dynamic port, at which a test points the unsecure client's endpoint.
+ * services port, and the additional {@code client} listener of {@code config/ListenerPorts} on a port drawn for each
+ * load attempt of the context, and read back from it, stands in for the client front's. Every response is read off
+ * the socket by ST-1 {@link HttpTestClient}, so the raw status line, the headers and the body bytes are asserted as
+ * sent. {@link SecureGreeterClient} is a Spring spy: unless a test stubs it, each client type really calls its Greeter
+ * path on the SOAP listener, through that path's WS-Security enforcement, with the demo credentials of profile
+ * {@code test}. Replies the Greeter endpoint never sends come from a WireMock stand-in on a dynamic port, at which a
+ * test points the unsecure client's endpoint.
  *
  * <p>Covered: the six {@code when} branches end to end, the {@code otherwise} branch (unknown, case-variant, empty and
  * missing type) without any SOAP call, the catch branch for a stubbed failure, a real transport failure, a real SOAP
@@ -98,9 +105,11 @@ import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient.Res
 // The SOAP listener runs on RANDOM_PORT (@LocalServerPort) rather than a pre-allocated DEFINED_PORT: the conversion
 // maps the originals' fixed ports to RANDOM_PORT plus @DynamicPropertySource, as SoapWebserviceSecurityTest does, and a
 // random port leaves no window between choosing and binding it. Only the additional client listener, which must have
-// a concrete port, gets a drawn one.
+// a concrete port, gets a drawn one, drawn for each load attempt; PortInUseRetryingContextLoader loads the context
+// again when another process takes that port before the listener binds it.
 @SpringBootTest(classes = SoapWebserviceSecurityApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 class GreeterClientControllerTest {
 
@@ -120,12 +129,6 @@ class GreeterClientControllerTest {
 
     /** The request the original README sends to the client front: {@code /client?clientType=unsecure&name=John}. */
     private static final String UNSECURE_JOHN = "/client?clientType=unsecure&name=" + NAME;
-
-    /**
-     * Port of the {@code /client} listener, drawn once for the class so a cached context and its bound listener keep
-     * agreeing on it.
-     */
-    private static final int CLIENT_PORT = TestSocketUtils.findAvailableTcpPort();
 
     /** The Greeter path of the unsecure client. */
     private static final String UNSECURE_SERVICE_PATH = "/services/unsecure";
@@ -152,14 +155,20 @@ class GreeterClientControllerTest {
     @LocalServerPort
     private int soapPort;
 
+    /** Port of the {@code /client} listener, as the loaded context bound it. */
+    @Value("${ports.client}")
+    private int clientPort;
+
     @SpyBean
     private SecureGreeterClient secureGreeterClient;
 
+    /** Spring calls this for every load attempt of the context, so each attempt binds a newly drawn client port. */
     @DynamicPropertySource
     static void listeners(DynamicPropertyRegistry registry) {
+        int drawnClientPort = TestSocketUtils.findAvailableTcpPort();
         // listeners.additional[0].port reads ${ports.client}, so the scalar is overridden and the list keeps its
         // name, host and /client route from application.yml (a list binds from one property source only).
-        registry.add("ports.client", () -> CLIENT_PORT);
+        registry.add("ports.client", () -> drawnClientPort);
         // The outbound Greeter calls go to the SOAP listener on localhost instead of the original 0.0.0.0.
         registry.add("soap-security.client.host", () -> "localhost");
     }
@@ -232,15 +241,17 @@ class GreeterClientControllerTest {
     }
 
     @Test
-    void unreachableGreeterServiceIsAnsweredWithTheCatchStrategyPayload() {
-        // A port drawn as free and never bound: the real unsecure client fails with a transport error.
-        URI closed = URI.create("http://localhost:" + TestSocketUtils.findAvailableTcpPort() + "/services/unsecure");
-        doReturn(closed).when(secureGreeterClient).endpoint("unsecure");
+    void unreachableGreeterServiceIsAnsweredWithTheCatchStrategyPayload() throws IOException {
+        // A port held by a socket that never listens: the real unsecure client fails with a transport error.
+        try (Socket reserved = reserveRefusingPort()) {
+            URI closed = URI.create("http://localhost:" + reserved.getLocalPort() + "/services/unsecure");
+            doReturn(closed).when(secureGreeterClient).endpoint("unsecure");
 
-        Response response = clientPort().get(UNSECURE_JOHN);
+            Response response = clientPort().get(UNSECURE_JOHN);
 
-        assertTextReply(response, ERROR);
-        verify(secureGreeterClient).unsecure(NAME);
+            assertTextReply(response, ERROR);
+            verify(secureGreeterClient).unsecure(NAME);
+        }
     }
 
     @Test
@@ -430,8 +441,8 @@ class GreeterClientControllerTest {
         verifyNoInteractions(secureGreeterClient);
     }
 
-    private static HttpTestClient clientPort() {
-        return HttpTestClient.localhost(CLIENT_PORT);
+    private HttpTestClient clientPort() {
+        return HttpTestClient.localhost(clientPort);
     }
 
     private HttpTestClient soapPort() {
@@ -498,6 +509,26 @@ class GreeterClientControllerTest {
                         .regionMatches(true, 0, ACCESS_CONTROL_PREFIX, 0, ACCESS_CONTROL_PREFIX.length())),
                 response::toString);
         assertNull(response.header(HttpHeaders.VARY), response::toString);
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
     }
 
     /** The body decoded with the charset its {@code Content-Type} declares, UTF-8 when it declares none. */

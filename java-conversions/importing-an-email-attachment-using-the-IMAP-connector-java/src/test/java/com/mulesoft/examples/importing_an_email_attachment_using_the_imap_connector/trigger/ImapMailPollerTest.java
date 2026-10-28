@@ -41,6 +41,7 @@ import java.io.Writer;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
@@ -626,6 +627,26 @@ class ImapMailPollerTest {
     }
 
     /**
+     * A socket bound to a free port on 127.0.0.1 that never listens or connects: a connection to its port is refused
+     * while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
+    }
+
+    /**
      * GreenMail's SMTP and IMAPS test setups on dynamic ports, each allowed {@link #SERVER_STARTUP_TIMEOUT_MS} to
      * start. {@code dynamicPort} returns copies, so the shared {@link ServerSetupTest} presets stay unchanged.
      */
@@ -845,21 +866,20 @@ class ImapMailPollerTest {
         @Test
         @DisplayName("an unreachable IMAPS port is logged at ERROR and the poll returns 0 without throwing")
         void unreachablePortIsLoggedAndPollReturnsZero() throws Exception {
-            int closedPort;
-            // A port just released on the loopback interface refuses connections; a fixed port might be in use.
-            try (ServerSocket probe = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
-                closedPort = probe.getLocalPort();
+            // A bound socket that never listens refuses connections and keeps the port from being taken meanwhile.
+            try (Socket reserved = reserveRefusingPort()) {
+                int closedPort = reserved.getLocalPort();
+                ImapMailPoller poller = new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1", closedPort,
+                        RECEIVER, RECEIVER_PASSWORD, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE,
+                        DEFAULT_FREQUENCY);
+
+                assertThat(assertDoesNotThrow(poller::pollOnce)).isZero();
+
+                verifyNoInteractions(service);
+                assertThat(errorMessages()).singleElement().asString()
+                        .startsWith("Failed to connect to IMAP folder INBOX on 127.0.0.1:" + closedPort + " (")
+                        .contains("java.net.ConnectException");
             }
-            ImapMailPoller poller = new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1", closedPort,
-                    RECEIVER, RECEIVER_PASSWORD, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE,
-                    DEFAULT_FREQUENCY);
-
-            assertThat(assertDoesNotThrow(poller::pollOnce)).isZero();
-
-            verifyNoInteractions(service);
-            assertThat(errorMessages()).singleElement().asString()
-                    .startsWith("Failed to connect to IMAP folder INBOX on 127.0.0.1:" + closedPort + " (")
-                    .contains("java.net.ConnectException");
         }
 
         @Test

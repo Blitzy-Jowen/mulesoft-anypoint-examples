@@ -55,6 +55,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
@@ -66,6 +67,7 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.web.context.WebApplicationContext;
@@ -74,14 +76,18 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient.Response;
+import com.mulesoft.examples.http_oauth_provider.support.PortInUseRetryingContextLoader;
 
 /**
  * Tests {@link RequestBodyDrainFilter} and its {@link RequestBodyDrainRegistration} in three layers.
  *
  * <ul>
  *   <li>Wire layer: the application on Undertow, the resource listener at a random port and the SC-10 provider
- *       listener at a port reserved on the loopback interface before the context starts, since
- *       {@link PortRoutingFilter} tells the listeners apart by a concrete local port. Each case sends a body-less
+ *       listener at a port drawn on the loopback interface for every attempt to load the context, since
+ *       {@link PortRoutingFilter} tells the listeners apart by a concrete local port; an attempt that loses the drawn
+ *       port to another process before Undertow binds it is repeated on a newly drawn one
+ *       ({@link PortInUseRetryingContextLoader}), so both ports are read from the loaded context.
+ *       Each case sends a body-less
  *       {@code GET} and a {@code POST} with a 64-byte body and {@code Connection: close} pipelined in one socket
  *       write: to {@code /resources} with a valid {@code READ_RESOURCE} token and without one, to {@code /token} on
  *       the provider listener, and to paths the receiving listener does not serve, which the routing filter
@@ -103,6 +109,7 @@ import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient.Response
  * {@link HttpTestClient}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class RequestBodyDrainFilterTest {
@@ -129,7 +136,9 @@ class RequestBodyDrainFilterTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private static int providerPort;
+    /** The SC-10 provider listener's port in the loaded context. */
+    @Value("${http.provider.port}")
+    private int providerPort;
 
     @LocalServerPort
     private int port;
@@ -150,13 +159,14 @@ class RequestBodyDrainFilterTest {
 
     @DynamicPropertySource
     static void providerListenerPort(DynamicPropertyRegistry registry) {
-        // The main listener takes the random server port; the additional SC-10 listener needs a concrete one.
+        // The main listener takes the random server port; the additional SC-10 listener needs a concrete one, drawn
+        // again for every attempt to load the context.
+        int oauthProvider;
         try (ServerSocket providerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            providerPort = providerSocket.getLocalPort();
+            oauthProvider = providerSocket.getLocalPort();
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve the provider listener port", e);
+            throw new UncheckedIOException("Cannot draw the provider listener port", e);
         }
-        int oauthProvider = providerPort;
         registry.add("http.provider.port", () -> oauthProvider);
     }
 

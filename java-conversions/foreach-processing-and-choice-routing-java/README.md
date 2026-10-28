@@ -178,8 +178,9 @@ curl 'http://localhost:10080/mule/TheBank1?wsdl'
 curl 'http://localhost:18080/mule/TheCreditAgencyService?wsdl'
 ```
 
-- Running the application needs ports 11081, 18080 and 10080 to 50080 free; override them as shown under Configuration keys.
-- `mvn test` does not: the Spring tests run the main listener on a random port and pre-allocate distinct free ports for the six SOAP listeners, registered through `@DynamicPropertySource`, so no test opens a fixed port.
+- Running the application needs ports 11081, 18080 and 10080 to 50080 free; override them as shown under Configuration keys. A port in use stops start-up with `Web server failed to start. Port <n> was already in use.`
+- `mvn test` does not: the Spring tests run the main listener on a random port and draw distinct free ports for the six SOAP listeners in `@DynamicPropertySource` on every context load, so no test opens a fixed port. When another process takes a drawn port first, `support/PortInUseRetryingContextLoader` loads the context again on newly drawn ports, up to 5 attempts.
+- Surefire ends a test JVM still running after 600 seconds (`forkedProcessTimeoutInSeconds`), so a hung test fails the build instead of never finishing.
 - There is no `mvn verify` live tier: the project has no failsafe plugin and no `*IT` class, because it is not a connector project (Tier 2B `N/A`).
 - Reports land under `target/`: `surefire-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 
@@ -196,7 +197,8 @@ curl 'http://localhost:18080/mule/TheCreditAgencyService?wsdl'
 | `client/CreditAgencyClientTest`, `client/BankClientTest` | the outbound wire contract over a mocked transport (target `<basePath>/*`, `arg0` shape, `return` parsing, faults surfacing unwrapped); an empty SOAP Body failing in the client with a `NullPointerException` and a response wrapper without `return` yielding `null`, over the mocked transport and over real HTTP against WireMock, with the loan flow's outcome for each through `LoanBrokerController` (the catch branch's `Error processing loan request`, or the lowest remaining quote); and the `loanbroker.response-timeout` read timeout against a peer that never answers |
 | `config/WebServiceConfigTest` | the shared `WebServiceTemplate`: each request sent exactly once on a reset, end of stream or timeout, `Content-Length` framing, `SOAPAction: ""`, and replies, faults and HTTP errors read as expected |
 | `exception/LoanBrokerExceptionHandlerTest` | the catch branch's precedence over SC-1 and its scoping to the loan broker, the 200 `Error processing loan request` reply without `Content-Type`, and the single ERROR line |
-| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, forwarding to the named servlet, the additional listener registration, an empty TLS password named in the start-up failure |
+| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, forwarding to the named servlet, the additional listener registration, an empty TLS password named in the start-up failure; an additional port another socket holds failing server creation with `PortInUseException` before any XNIO worker exists; an unbindable host (`192.0.2.1`, a `.invalid` name) named with its port in an `IllegalStateException`; a server on port -1 neither probed nor given a worker; a port taken after the probe failing the start within 30 s instead of hanging it (`PortInUseException` with one additional listener, a `WebServerException` caused by a `BindException` with two); `destroy()` stopping the context's started server before the worker; the worker's I/O and worker threads from `server.undertow.threads.io` and `server.undertow.threads.worker` or Undertow's defaults |
+| `support/PortInUseRetryingContextLoaderTest` | SC-10 test support: a context whose additional port another socket holds on the first attempt loads on a newly drawn port, with one WARN line per lost attempt, and that listener serves on its port; only a port in use on the cause chain (`PortInUseException`, a `BindException` saying `Address already in use`) loads again; a port in use is attempted 5 times and any other failure once, then rethrown |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
 | `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server`, `soap:Client` and `soap:MustUnderstand` faults inside dispatch, the boundary faults and 405, and `?wsdl`/`?xsd=` publication with rewritten addresses |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, body bytes and the bounded ERROR log line |
@@ -211,7 +213,7 @@ Each shared component is a copy of its reference implementation with only the `p
 | ID | Files in this project | Reference implementation | Other consumers |
 |---|---|---|---|
 | SC-1 | `exception/GlobalExceptionHandler`, `exception/ErrorResponse`; test `exception/GlobalExceptionHandlerTest` | `rest-api-with-apikit-java` | every project with a Spring MVC controller |
-| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest` | **this project** | `http-oauth-provider`, `oauth2-authorization-code-using-the-HTTP-connector`, `soap-webservice-security`, `service-orchestration-and-choice-routing`, `mule-component-bindings` |
+| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest`; test support `support/PortInUseRetryingContextLoader` with `support/PortInUseRetryingContextLoaderTest` | **this project** | `http-oauth-provider`, `oauth2-authorization-code-using-the-HTTP-connector`, `soap-webservice-security`, `service-orchestration-and-choice-routing`, `mule-component-bindings` |
 | SC-11 | `config/SoapEnvelopeStyleInterceptor`, `config/WsdlQueryPublisher`, `config/SoapFaultConfig`, `config/SoapListenerBoundaryAdapter`; tests `config/SoapEnvelopeStyleInterceptorTest`, `config/WsdlQueryPublisherTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest` | **this project** | `soap-webservice-security`, `xml-only-soap-webservice`, `legacy-modernization`, `service-orchestration-and-choice-routing`; `proxying-a-soap-api` (`WsdlQueryPublisher` only) |
 | ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` | every project with an HTTP listener |
 | ST-2 | `FixtureParityTest` (test), `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` | the 51 non-RAML projects |
@@ -250,9 +252,9 @@ This project passes no POST-only path to `SoapListenerBoundaryAdapter`, because 
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 511 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 511 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 77 of 78 lines: `service/LoanBrokerService` 48 of 49, `service/Bank` 20 of 20, `service/DefaultCreditAgency` 9 of 9 (the project has no `mapper` package). Total project LINE coverage: 88.3% (1400 of 1585 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 531 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 531 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 77 of 78 lines: `service/LoanBrokerService` 48 of 49, `service/Bank` 20 of 20, `service/DefaultCreditAgency` 9 of 9 (the project has no `mapper` package). Total project LINE coverage: 88.4% (1453 of 1643 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=15`, `failed=0`; `get-root-bank5-otherwise` is `UNREACHABLE` and counted in none.
 
 ## Fallback evidence (AAP 0.8.4)

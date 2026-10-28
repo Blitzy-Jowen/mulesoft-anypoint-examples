@@ -20,11 +20,13 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
 
 import com.mulesoft.examples.foreach_processing_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.foreach_processing_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 /**
  * Port of the original example's {@code ForEachProcessingAndChoiceRoutingIT} functional test, keeping its request and
@@ -34,10 +36,13 @@ import com.mulesoft.examples.foreach_processing_and_choice_routing.support.HttpT
  * {@code Bank} and {@code rate} is asserted.
  *
  * <p>The credit agency and the five banks listen on additional Undertow listeners whose ports must be concrete and
- * unique, so this class allocates six free ports once and registers them in place of the fixed defaults 18080 and
- * 10080 to 50080; the outbound calls reach them through {@code localhost}.
+ * unique, so this class draws six free ports for each load of its context and registers them in place of the fixed
+ * defaults 18080 and 10080 to 50080; the outbound calls reach them through {@code localhost}. A port another process
+ * takes between its draw and its bind fails that load, which {@link PortInUseRetryingContextLoader} repeats on newly
+ * drawn ports.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 class ForEachProcessingAndChoiceRoutingTest {
 
     private static final String MESSAGE = "name=Muley&amount=20000&term=48&ssn=1234";
@@ -46,19 +51,21 @@ class ForEachProcessingAndChoiceRoutingTest {
     private static final List<String> SOAP_PORT_KEYS = List.of("ports.credit-agency", "ports.bank1", "ports.bank2",
             "ports.bank3", "ports.bank4", "ports.bank5");
 
-    /**
-     * One distinct free port per key, allocated once for the class: a cached context keeps its listeners bound, so a
-     * second allocation for the same context would point the clients at ports nothing listens on.
-     */
-    private static final List<Integer> SOAP_PORTS = allocateDistinctPorts(SOAP_PORT_KEYS.size());
+    /** The original's fixed listener ports, which this class never binds. */
+    private static final Set<Integer> ORIGINAL_PORTS = Set.of(11081, 18080, 10080, 20080, 30080, 40080, 50080);
 
     @LocalServerPort
     private int port;
 
+    /**
+     * Registers one distinct free port per key, drawn for this load of the context: Spring invokes this method once
+     * per load, and the clients and listeners of that context both read the registered values.
+     */
     @DynamicPropertySource
     static void soapListenerPorts(DynamicPropertyRegistry registry) {
+        List<Integer> soapPorts = allocateDistinctPorts(SOAP_PORT_KEYS.size());
         for (int i = 0; i < SOAP_PORT_KEYS.size(); i++) {
-            int soapPort = SOAP_PORTS.get(i);
+            int soapPort = soapPorts.get(i);
             registry.add(SOAP_PORT_KEYS.get(i), () -> soapPort);
         }
         // The listeners bind 0.0.0.0; the clients connect to them through the loopback name.
@@ -78,13 +85,16 @@ class ForEachProcessingAndChoiceRoutingTest {
     }
 
     /**
-     * Free TCP ports, pairwise distinct: {@link TestSocketUtils} checks each port on its own, so two calls may return
-     * the same one, which the additional listeners reject.
+     * Free TCP ports, pairwise distinct and never an original port: {@link TestSocketUtils} checks each port on its
+     * own, so two calls may return the same one, which the additional listeners reject.
      */
     private static List<Integer> allocateDistinctPorts(int count) {
         Set<Integer> ports = new LinkedHashSet<>();
         while (ports.size() < count) {
-            ports.add(TestSocketUtils.findAvailableTcpPort());
+            int candidate = TestSocketUtils.findAvailableTcpPort();
+            if (!ORIGINAL_PORTS.contains(candidate)) {
+                ports.add(candidate);
+            }
         }
         return List.copyOf(ports);
     }

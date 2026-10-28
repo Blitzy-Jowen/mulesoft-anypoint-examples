@@ -36,12 +36,14 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.HttpStatus;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -57,6 +59,7 @@ import com.mulesoft.examples.mule_component_bindings.service.TwitterSearchServic
 import com.mulesoft.examples.mule_component_bindings.service.TwitterService;
 import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient;
 import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient.Response;
+import com.mulesoft.examples.mule_component_bindings.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link StockStatsController}, the replacement of the JAX-RS resource
@@ -65,8 +68,9 @@ import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient.Resp
  * (mule-component-bindings/src/main/app/mule-component-bindings.xml:40-54).
  *
  * <p>The whole application runs on Undertow under profile {@code test}: the main listener on a random port and the
- * stock-statistics listener on a free port reserved before the context starts, because SC-10's
- * {@code PortRoutingFilter} tells the listeners apart by local port. The real {@link StockStatsService} runs over
+ * stock-statistics listener on a free port drawn for each attempt to load the context, because SC-10's
+ * {@code PortRoutingFilter} tells the listeners apart by local port; {@link PortInUseRetryingContextLoader} loads
+ * the context again when another process takes that port first. The real {@link StockStatsService} runs over
  * mocked {@link StockService}, {@link SentimentService} and {@link TwitterSearchService} (the bound
  * {@link TwitterService}), so every upstream call is recorded and none leaves the JVM. Requests go through ST-1
  * {@link HttpTestClient}, which adds no {@code Accept} or {@code Content-Type} of its own, so the status line,
@@ -78,12 +82,10 @@ import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient.Resp
  * on each input.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class StockStatsControllerTest {
-
-    /** Port of the stock-statistics listener ({@code ports.stock-stats}), reserved once for the whole class. */
-    private static final int STOCK_STATS_PORT = TestSocketUtils.findAvailableTcpPort();
 
     private static final String STOCK_STATS = "/api/stockStats";
 
@@ -109,16 +111,22 @@ class StockStatsControllerTest {
     @Autowired
     private StockStatsService stockStatsService;
 
+    /** Port of this context's stock-statistics listener. */
+    @Value("${ports.stock-stats}")
+    private int stockStatsPort;
+
     private HttpTestClient stockStats;
 
+    /** The stock-statistics listener ({@code ports.stock-stats}) on a free port drawn for each load attempt. */
     @DynamicPropertySource
     static void stockStatsPort(DynamicPropertyRegistry registry) {
-        registry.add("ports.stock-stats", () -> STOCK_STATS_PORT);
+        int drawnPort = TestSocketUtils.findAvailableTcpPort();
+        registry.add("ports.stock-stats", () -> drawnPort);
     }
 
     @BeforeEach
     void client() {
-        stockStats = HttpTestClient.localhost(STOCK_STATS_PORT);
+        stockStats = HttpTestClient.localhost(stockStatsPort);
     }
 
     @Test

@@ -146,14 +146,14 @@ The four `logging.level` keys keep the client secret, codes, tokens and the owne
 | listener platform defaults (no listener, method not allowed, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
 | Grizzly listener semantics (whole request read before the flow, no CORS policy) | `config/RequestBodyDrainFilter`, `config/RequestBodyDrainRegistration`, `config/PreflightDispatchConfig` |
 | `mule-deploy.properties`, `mule-app.properties` | `HttpOauthProviderApplication` (`@SpringBootApplication`), `src/main/resources/application.yml` |
-| `HttpOauthProviderIT`: PhantomJS browser, `MuleClient`, `DynamicPort` | `HttpOauthProviderTest`: HtmlUnit for the login form and redirect chain, ST-1 `HttpTestClient` for the bearer request, two free loopback ports reserved in `@DynamicPropertySource` |
+| `HttpOauthProviderIT`: PhantomJS browser, `MuleClient`, `DynamicPort` | `HttpOauthProviderTest`: HtmlUnit for the login form and redirect chain, ST-1 `HttpTestClient` for the bearer request, two free loopback ports drawn in `@DynamicPropertySource` on every context load |
 
 Shared components, copied with only the `package` line (and, in tests, the package-relative imports) changed, and registered in root [`DECISIONS.md`](../../DECISIONS.md), section 4:
 
 | ID | Classes | Copied from |
 |---|---|---|
 | SC-1 | `exception/GlobalExceptionHandler`, `exception/ErrorResponse`; test `exception/GlobalExceptionHandlerTest` | `rest-api-with-apikit-java` |
-| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest` | `foreach-processing-and-choice-routing-java` |
+| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest`; test support `support/PortInUseRetryingContextLoader` with `support/PortInUseRetryingContextLoaderTest` | `foreach-processing-and-choice-routing-java` |
 | ST-1 | test `support/HttpTestClient` | `rest-api-with-apikit-java` |
 | ST-2 | test `FixtureParityTest`; the format of `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` |
 | — | `config/PreflightDispatchConfig`, `config/RequestBodyDrainFilter`; test `config/PreflightDispatchConfigTest` | `hello-world-java` |
@@ -197,7 +197,7 @@ mvn spring-boot:test-run -Dspring-boot.run.profiles=test
 - There is no `mvn verify` live tier: this is not a connector project, so it has no failsafe plugin and no `*IT` class (Tier 2B `N/A`).
 - JaCoCo gate: LINE covered ratio of at least 0.80 over `service/**` and `mapper/**` (this project has no `mapper` package), checked at `prepare-package`; a lower ratio fails `mvn clean package` and `mvn clean install`. The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate`.
 - Reports: `target/surefire-reports/`, `target/site/jacoco/` (`index.html`, `jacoco.csv`) and `target/fixture-parity/summary.properties`.
-- Tests never use the default ports: the Spring tests reserve free loopback ports for both listeners (`DEFINED_PORT`), because the SC-10 provider listener needs a concrete port and the `/redirect` `Location` and payroll `uri` embed both. `FixtureParityTest` starts no application context while no fixture exists. Once fixtures are captured, it replays them with the provider listener pinned to the capture port `8081` by each fixture's `state.properties` (the `/redirect` `Location` names that port and the replay substitutes only the targeted listener's port); a `-Dhttp.provider.port` setting does not override it, so port 8081 must then be free (`SCENARIOS.md`, Notes for this project).
+- Tests never use the default ports: the Spring tests that run the application draw free loopback ports for both listeners (`DEFINED_PORT`) in `@DynamicPropertySource` on every context load, because the SC-10 provider listener needs a concrete port and the `/redirect` `Location` and payroll `uri` embed both; `config/RequestBodyDrainFilterTest` draws the provider port only and runs the resource listener on a random port. When another process takes a drawn port first, `support/PortInUseRetryingContextLoader` loads the context again on newly drawn ports, up to 5 attempts. `FixtureParityTest` starts no application context while no fixture exists. Once fixtures are captured, it replays them with the provider listener pinned to the capture port `8081` by each fixture's `state.properties` (the `/redirect` `Location` names that port and the replay substitutes only the targeted listener's port); a `-Dhttp.provider.port` setting does not override it, so port 8081 must then be free (`SCENARIOS.md`, Notes for this project).
 
 ## Tests
 
@@ -212,7 +212,8 @@ mvn spring-boot:test-run -Dspring-boot.run.profiles=test
 | `config/OAuthProviderConfigurationCheckTest` | the startup WARN names exactly the blank keys and no value; nothing is logged when every credential is configured; the application starts with blank credentials |
 | `config/SensitiveLogLevelsTest` | the whole flow under root `TRACE` and `spring.mvc.log-request-details`: the client secret, codes, tokens and owner password never reach the log |
 | `config/OAuthProviderPropertiesTest` | the `OAuthProviderProperties` and `Owner` renderings show `clientSecret` and the owner `password` as `****` when set (blank included) and empty when unset (`null` or empty), never the value; every other component keeps the generated record form in declaration order, the owner masked inside the enclosing record |
-| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, the additional listener registration, an empty TLS password named in the start-up failure |
+| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, the additional listener registration, an empty TLS password named in the start-up failure; an additional port another socket holds failing server creation with `PortInUseException` before any XNIO worker exists; an unbindable host (`192.0.2.1`, a `.invalid` name) named with its port in an `IllegalStateException`; a server on port -1 neither probed nor given a worker; a port taken after the probe failing the start within 30 s instead of hanging it (`PortInUseException` with one additional listener, a `WebServerException` caused by a `BindException` with two); `destroy()` stopping the context's started server before the worker; the worker's I/O and worker threads from `server.undertow.threads.io` and `server.undertow.threads.worker` or Undertow's defaults |
+| `support/PortInUseRetryingContextLoaderTest` | SC-10 test support: a context whose additional port another socket holds on the first attempt loads on a newly drawn port, with one WARN line per lost attempt, and that listener serves on its port; only a port in use on the cause chain (`PortInUseException`, a `BindException` saying `Address already in use`) loads again; a port in use is attempted 5 times and any other failure once, then rethrown |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type`, absent `Allow` header and bodies; `ErrorResponse` escaping; the one-line, escaped ERROR log |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS` request, first at the handler mapping, then on the wire: the token check and payroll on `/resources`, the 302 on `/redirect`, the 405 on `/authorize` and `/token`, the 404 on an unserved path, no CORS headers |
 | `config/RequestBodyDrainFilterTest` | pipelined requests behind a body-less request are all answered on both listeners, including the routing filter's own 404s; the drain filter is registered ahead of `PortRoutingFilter`; draining never changes the chain's outcome |
@@ -258,9 +259,9 @@ The scenarios, the fixture contract and the capture procedure are in [`src/test/
 
 The root `SUMMARY.md` carries the same row for this project. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; enforcer `BannedDependencies` passed; 473 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 473 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 206 of 206 lines (`service/OAuthProviderService` 182 of 182, `service/ResourceOwnerAuthenticator` 24 of 24; no `mapper` package). Total project LINE coverage: 96.6% (744 of 770 lines).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; enforcer `BannedDependencies` passed; 493 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 493 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 206 of 206 lines (`service/OAuthProviderService` 182 of 182, `service/ResourceOwnerAuthenticator` 24 of 24; no `mapper` package). Total project LINE coverage: 96.3% (797 of 828 lines).
 
 ## Fallback evidence (AAP 0.8.4)
 

@@ -54,12 +54,14 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -72,6 +74,7 @@ import com.github.tomakehurst.wiremock.stubbing.Scenario;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.mule_component_bindings.service.StockStatsService;
 import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient;
+import com.mulesoft.examples.mule_component_bindings.support.PortInUseRetryingContextLoader;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -98,13 +101,11 @@ import ch.qos.logback.core.read.ListAppender;
  * context starts and restored after the class, whose context is closed, so later test classes do not run at TRACE.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "logging.level.root=TRACE")
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext
 @ExtendWith(OutputCaptureExtension.class)
 class SecretLoggingTest {
-
-    /** Port of the stock-statistics listener ({@code ports.stock-stats}), reserved once for the whole class. */
-    private static final int STOCK_STATS_PORT = TestSocketUtils.findAvailableTcpPort();
 
     private static final String TWITTER_API_KEY = "SENTINEL_TWITTER_API_KEY";
     private static final String TWITTER_API_SECRET = "SENTINEL_TWITTER_API_SECRET";
@@ -165,14 +166,23 @@ class SecretLoggingTest {
     @LocalServerPort
     int port;
 
+    /** Port of this context's stock-statistics listener. */
+    @Value("${ports.stock-stats}")
+    int stockStatsPort;
+
     /** The three upstreams in the order a stock statistics request calls them. */
     enum Upstream {
         STOCKLYTICS, TWITTER, SENTIMENT140
     }
 
+    /**
+     * Configures every attempt to load the context: the stock-statistics listener ({@code ports.stock-stats}) on a
+     * free port drawn for that attempt, the upstreams on the WireMock stand-in and the six secrets.
+     */
     @DynamicPropertySource
     static void upstreamsAndSecrets(DynamicPropertyRegistry registry) {
-        registry.add("ports.stock-stats", () -> STOCK_STATS_PORT);
+        int drawnPort = TestSocketUtils.findAvailableTcpPort();
+        registry.add("ports.stock-stats", () -> drawnPort);
         registry.add("twitter.rest-base-url", () -> upstream.baseUrl() + "/1.1/");
         registry.add("stockstats.stocklytics-base-url", () -> upstream.baseUrl() + "/");
         registry.add("stockstats.sentiment140-base-url", () -> upstream.baseUrl() + "/");
@@ -429,7 +439,7 @@ class SecretLoggingTest {
     }
 
     private HttpTestClient stockStats() {
-        return HttpTestClient.localhost(STOCK_STATS_PORT);
+        return HttpTestClient.localhost(stockStatsPort);
     }
 
     private static LoggerContext loggerContext() {

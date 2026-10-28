@@ -34,13 +34,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.HttpTestClient;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.PortInUseRetryingContextLoader;
 
 /**
  * Port of the original {@code HttpAuthorizationCodeWebIT}: a browser starts at {@code /web}, completes Box's
@@ -53,10 +56,14 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * plain HTTP to the main listener and to WireMock, and over HTTPS, presenting the {@code TLS_Context} client
  * certificate the listener requires, to the {@code box-oauth} listener.
  *
- * <p>Both listeners run on free ports reserved here, never on the original 8081 and 8082. The HTTPS listener is an
- * additional Undertow listener that needs a concrete port, so the main one runs on a defined port too.
+ * <p>Both listeners run on free ports drawn for each load of the context, never on the original 8081 and 8082, and
+ * WireMock on a port of its own choosing. The HTTPS listener is an additional Undertow listener that needs a concrete
+ * port, so the main one runs on a defined port too. A drawn port is only free when it is drawn: when another process
+ * binds one first, {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports, so the test
+ * reads both ports from the loaded context.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 public class HttpAuthorizationCodeWebTest {
@@ -80,25 +87,19 @@ public class HttpAuthorizationCodeWebTest {
     private static final String TOKEN_PATH = "/api/oauth2/token";
     private static final String SEARCH_PATH = "/2.0/search";
 
-    /** Main listener ({@code /web}, {@code /web/loginDone}), plain HTTP. */
-    private static final int MAIN_PORT;
-    /** {@code box-oauth} listener ({@code /authorization}, {@code /redirectUrl}), HTTPS with client certificate. */
-    private static final int HTTPS_PORT;
-    /** The WireMock stand-in for Box. */
-    private static final int WIREMOCK_PORT;
-
-    // Must stay above BOX: static fields initialize in textual order and BOX reads WIREMOCK_PORT.
-    static {
-        int[] ports = reserveFreePorts(3);
-        MAIN_PORT = ports[0];
-        HTTPS_PORT = ports[1];
-        WIREMOCK_PORT = ports[2];
-    }
-
+    /** The WireMock stand-in for Box, started before the context on a port it binds itself. */
     @RegisterExtension
     static final WireMockExtension BOX = WireMockExtension.newInstance()
-            .options(wireMockConfig().port(WIREMOCK_PORT))
+            .options(wireMockConfig().dynamicPort())
             .build();
+
+    /** Main listener ({@code /web}, {@code /web/loginDone}), plain HTTP. */
+    @LocalServerPort
+    private int mainPort;
+
+    /** {@code box-oauth} listener ({@code /authorization}, {@code /redirectUrl}), HTTPS with client certificate. */
+    @Value("${ports.box-oauth}")
+    private int httpsPort;
 
     @Value("${box.id}")
     private String boxClientId;
@@ -116,25 +117,26 @@ public class HttpAuthorizationCodeWebTest {
     private String keyStorePassword;
 
     /**
-     * Moves both listeners to the reserved ports and every Box URL to WireMock. The HTTPS port is set through
-     * {@code ports.box-oauth} rather than {@code listeners.additional[0].port}: overriding one element of that list
-     * here would replace the whole list and drop the listener's TLS settings and routes. The local authorization,
-     * redirect and login-redirect URLs follow both ports through {@code application.yml}.
+     * Moves both listeners to ports drawn for this load attempt, Spring invoking this method again for each attempt,
+     * and every Box URL to WireMock, whose base URL the suppliers read once the extension has started. The HTTPS
+     * port is set through {@code ports.box-oauth} rather than {@code listeners.additional[0].port}: overriding one
+     * element of that list here would replace the whole list and drop the listener's TLS settings and routes. The
+     * local authorization, redirect and login-redirect URLs follow both ports through {@code application.yml}.
      */
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        String box = "http://localhost:" + WIREMOCK_PORT;
-        registry.add("server.port", () -> MAIN_PORT);
-        registry.add("ports.box-oauth", () -> HTTPS_PORT);
-        registry.add("box.authorization-url", () -> box + AUTHORIZE_PATH);
-        registry.add("box.token-url", () -> box + TOKEN_PATH);
-        registry.add("box.api-base-url", () -> box + "/2.0");
+        int[] ports = drawFreePorts(2);
+        registry.add("server.port", () -> ports[0]);
+        registry.add("ports.box-oauth", () -> ports[1]);
+        registry.add("box.authorization-url", () -> BOX.baseUrl() + AUTHORIZE_PATH);
+        registry.add("box.token-url", () -> BOX.baseUrl() + TOKEN_PATH);
+        registry.add("box.api-base-url", () -> BOX.baseUrl() + "/2.0");
     }
 
     @Test
     public void oauthTest() {
-        String redirectUrl = "https://localhost:" + HTTPS_PORT + "/redirectUrl";
-        String loginDoneUrl = "http://localhost:" + MAIN_PORT + "/web/loginDone";
+        String redirectUrl = "https://localhost:" + httpsPort + "/redirectUrl";
+        String loginDoneUrl = "http://localhost:" + mainPort + "/web/loginDone";
 
         // Box's consent step, granted at once: back to the redirect URL with a code and the state as received.
         BOX.stubFor(get(urlPathEqualTo(AUTHORIZE_PATH))
@@ -157,7 +159,7 @@ public class HttpAuthorizationCodeWebTest {
                 .withHeader("Authorization", equalTo("Bearer " + ACCESS_TOKEN))
                 .willReturn(okJson(SEARCH_RESPONSE)));
 
-        URI target = URI.create("http://localhost:" + MAIN_PORT + "/web");
+        URI target = URI.create("http://localhost:" + mainPort + "/web");
         List<String> paths = new ArrayList<>();
         List<String> hops = new ArrayList<>();
         HttpTestClient.Response response = null;
@@ -198,10 +200,10 @@ public class HttpAuthorizationCodeWebTest {
             fail("Redirect to a host other than localhost: " + target);
         }
         int port = target.getPort();
-        if ("http".equals(target.getScheme()) && (port == MAIN_PORT || port == WIREMOCK_PORT)) {
+        if ("http".equals(target.getScheme()) && (port == mainPort || port == BOX.getPort())) {
             return HttpTestClient.localhost(port);
         }
-        if ("https".equals(target.getScheme()) && port == HTTPS_PORT) {
+        if ("https".equals(target.getScheme()) && port == httpsPort) {
             return HttpTestClient.https("localhost", port, trustStorePath, "JKS", trustStorePassword,
                     keyStorePath, "JKS", keyStorePassword);
         }
@@ -219,12 +221,14 @@ public class HttpAuthorizationCodeWebTest {
     }
 
     /**
-     * Reserves {@code count} distinct free ports, none of them an original port, by holding every socket open until
-     * all are found, then releases them for the application and WireMock to bind.
+     * Draws {@code count} distinct free ports, none of them an original port, by holding every probe socket open
+     * until all are found, then closes the probes for the application to bind the ports. They are free when drawn,
+     * not reserved: a port another process binds in between fails the load with a port in use, which
+     * {@link PortInUseRetryingContextLoader} answers by loading the context again on newly drawn ports.
      *
-     * @throws UncheckedIOException if a port cannot be reserved or released
+     * @throws UncheckedIOException if a probe socket cannot be opened or closed
      */
-    private static int[] reserveFreePorts(int count) {
+    private static int[] drawFreePorts(int count) {
         List<ServerSocket> held = new ArrayList<>();
         int[] ports = new int[count];
         try {
@@ -239,7 +243,7 @@ public class HttpAuthorizationCodeWebTest {
             }
             return ports;
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve free ports", e);
+            throw new UncheckedIOException("Cannot draw free ports", e);
         } finally {
             held.forEach(HttpAuthorizationCodeWebTest::release);
         }
@@ -249,7 +253,7 @@ public class HttpAuthorizationCodeWebTest {
         try {
             socket.close();
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot release reserved port " + socket.getLocalPort(), e);
+            throw new UncheckedIOException("Cannot close the probe socket of port " + socket.getLocalPort(), e);
         }
     }
 }

@@ -39,6 +39,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -50,6 +51,7 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService.TokenSet;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.HttpTestClient;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link BoxAuthorizationController}: the {@code /authorization} and {@code /redirectUrl}
@@ -60,23 +62,22 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  *
  * <p>The whole application runs: the controller, {@code BoxOAuthService}, {@code BoxApiClient}, SC-10's HTTPS
  * listener with its {@code PortRoutingFilter}, and SC-1. The main listener takes a random port; the HTTPS listener
- * takes a free port chosen once per run, because SC-10 identifies it by its concrete local port. Box's authorization
- * and token endpoints are a WireMock stub, so nothing leaves the loopback interface. Requests go through ST-1
- * {@link HttpTestClient} in its TLS mode with the carried stores, presenting the client key the listener requires,
- * so status line, headers and body bytes are asserted as the listener writes them.
+ * takes a free port drawn for each load of the context, because SC-10 identifies it by its concrete local port, and
+ * {@link PortInUseRetryingContextLoader} loads the context again on a newly drawn port when another process binds
+ * the drawn one first. Box's authorization and token endpoints are a WireMock stub, so nothing leaves the loopback
+ * interface. Requests go through ST-1 {@link HttpTestClient} in its TLS mode with the carried stores, presenting the
+ * client key the listener requires, so status line, headers and body bytes are asserted as the listener writes them.
  *
  * <p>A successful callback stores tokens in the singleton service, so the methods that store tokens dirty the
  * context after they run; every other method therefore starts without tokens and asserts that none were stored.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 class BoxAuthorizationControllerTest {
 
     @RegisterExtension
     static WireMockExtension box = WireMockExtension.newInstance().options(wireMockConfig().dynamicPort()).build();
-
-    /** Local port of the HTTPS listener; SC-10 keys the listener's routes by it, so it cannot be 0. */
-    private static final int HTTPS_PORT = freePort();
 
     /** The carried {@code TLS_Context} stores as copied to {@code target/classes}, the files the listener reads. */
     private static final String TRUST_STORE_PATH = classpathFile("/trust-store");
@@ -114,6 +115,10 @@ class BoxAuthorizationControllerTest {
     @LocalServerPort
     int mainPort;
 
+    /** Local port of the HTTPS listener; SC-10 keys the listener's routes by it, so it cannot be 0. */
+    @Value("${ports.box-oauth}")
+    int httpsPort;
+
     @Value("${truststore.password}")
     String trustStorePassword;
 
@@ -122,9 +127,11 @@ class BoxAuthorizationControllerTest {
 
     @DynamicPropertySource
     static void props(DynamicPropertyRegistry r) {
+        // Drawn for each load attempt: Spring invokes this method again when the loader retries a lost port.
+        int drawnHttpsPort = freePort();
         // ports.box-oauth rather than listeners.additional[0].port: setting one element of that list in a
         // higher-priority source replaces the whole list and drops the listener's ssl and routes (application.yml).
-        r.add("ports.box-oauth", () -> HTTPS_PORT);
+        r.add("ports.box-oauth", () -> drawnHttpsPort);
         r.add("box.authorization-url", () -> box.baseUrl() + AUTHORIZE_PATH);
         r.add("box.token-url", () -> box.baseUrl() + TOKEN_PATH);
         // Not called by these endpoints; pointed at the stub so that no request can reach api.box.com.
@@ -154,7 +161,7 @@ class BoxAuthorizationControllerTest {
 
         assertRedirect(response, expectedAuthorizeLocation(false));
         // The redirect_uri sent to Box names the HTTPS listener that serves /redirectUrl, as redirectionUrl did.
-        assertThat(props.getRedirectUrl()).isEqualTo("https://localhost:" + HTTPS_PORT + "/redirectUrl");
+        assertThat(props.getRedirectUrl()).isEqualTo("https://localhost:" + httpsPort + "/redirectUrl");
         assertThat(box.getAllServeEvents()).isEmpty();
     }
 
@@ -334,7 +341,7 @@ class BoxAuthorizationControllerTest {
     @Test
     void httpsListenerRequiresClientCertificate() {
         HttpTestClient withoutClientKey =
-                HttpTestClient.https("localhost", HTTPS_PORT, TRUST_STORE_PATH, STORE_TYPE, trustStorePassword);
+                HttpTestClient.https("localhost", httpsPort, TRUST_STORE_PATH, STORE_TYPE, trustStorePassword);
 
         // Under TLS 1.3 the server's certificate_required alert may surface on the first read rather than in the
         // handshake, and a reset may arrive instead of the alert; ST-1 wraps each of them.
@@ -371,7 +378,7 @@ class BoxAuthorizationControllerTest {
 
     /** ST-1 client for the HTTPS listener, trusting only the carried trust store and presenting its client key. */
     private HttpTestClient tls() {
-        return HttpTestClient.https("localhost", HTTPS_PORT, TRUST_STORE_PATH, STORE_TYPE, trustStorePassword,
+        return HttpTestClient.https("localhost", httpsPort, TRUST_STORE_PATH, STORE_TYPE, trustStorePassword,
                 KEY_STORE_PATH, STORE_TYPE, keyStorePassword);
     }
 
@@ -443,7 +450,10 @@ class BoxAuthorizationControllerTest {
         assertThat(response.bodyAsString()).as(response::toString).isEqualTo("No listener for endpoint: " + path);
     }
 
-    /** A port free at class initialisation; the socket is closed again before the context binds it. */
+    /**
+     * A port free when drawn; the probe socket is closed again before the context binds it, so another process can
+     * take it in between, which {@link PortInUseRetryingContextLoader} answers by loading the context again.
+     */
     private static int freePort() {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();

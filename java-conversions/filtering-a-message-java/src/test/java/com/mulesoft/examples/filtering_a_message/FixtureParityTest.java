@@ -114,6 +114,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.beans.factory.support.BeanDefinitionRegistry;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.web.server.WebServerFactory;
+import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.ApplicationContext;
@@ -122,6 +124,7 @@ import org.springframework.context.ApplicationListener;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.core.Ordered;
 import org.springframework.core.convert.ConversionException;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.EnumerablePropertySource;
@@ -452,10 +455,12 @@ class FixtureParityTest {
      * replay the only trigger executions are the single-run invocations the fixtures name in {@code request.invoke};
      * production code keeps its schedules. It then fails the context, so no client or store bean is ever created,
      * when the effective configuration reaches a target the replay does not own ({@link #enforceReplayBoundary}).
-     * Last, it registers the {@link PortRegistry.Handover} of the replay's port reservations, which hands them to the
-     * application's listeners just before the embedded web server binds them, and the initializer adds the
-     * {@link PortRegistry.Securing} that holds every port nothing listens on exclusively again once the context has
-     * refreshed.
+     * Last, it registers the two singletons that hand the replay's port reservations over to the application's
+     * listeners, whichever acts first: the {@link PortRegistry.WebServerHandover}, which Spring Boot applies when the
+     * context creates its embedded web server, before any of the server's listeners is probed or bound, and the
+     * {@link PortRegistry.Handover}, which hands them over just before the web server start phase in a context without
+     * an embedded web server. The initializer adds the {@link PortRegistry.Securing} that holds every port nothing
+     * listens on exclusively again once the context has refreshed.
      */
     static final class ReplayContextInitializer
             implements ApplicationContextInitializer<ConfigurableApplicationContext> {
@@ -468,6 +473,8 @@ class FixtureParityTest {
                 enforceReplayBoundary(environment);
                 beanFactory.registerSingleton(PortRegistry.Handover.BEAN_NAME,
                         new PortRegistry.Handover(FixtureParityTest::portRegistry));
+                beanFactory.registerSingleton(PortRegistry.WebServerHandover.BEAN_NAME,
+                        new PortRegistry.WebServerHandover(FixtureParityTest::portRegistry));
             });
             applicationContext.addApplicationListener(
                     new PortRegistry.Securing(applicationContext, FixtureParityTest::portRegistry));
@@ -920,10 +927,11 @@ class FixtureParityTest {
     /**
      * The port of {@code name}: the same one for every use of the name and distinct from every other name's. It is
      * the port an embedded server bound and published under the name, or else one {@link PortRegistry} reserves for
-     * the replay until the class ends: held exclusively until the application context starts its listeners, so
-     * neither another process nor another name takes it and a connection to it is refused, shared with the
-     * application's listeners while they bind, then left to the listener that bound it or else held exclusively
-     * again.
+     * the replay until the class ends: held exclusively until the application context creates its embedded web
+     * server, or, without one, until just before the web server start phase, so neither another process nor another
+     * name takes it and a connection to it is refused; shared with the application's listeners from then until the
+     * context has refreshed, so they probe and bind it; then left to the listener that bound it or else held
+     * exclusively again.
      */
     static synchronized int freePort(String name) {
         return portRegistry().port(name);
@@ -947,13 +955,15 @@ class FixtureParityTest {
      * <p>A port the registry allocates is reserved by an unconnected socket bound to the wildcard address, and what
      * the registry holds for it follows the application context's start ({@link Phase}). On Linux:
      * <ul>
-     *   <li>from its allocation until the {@link Handover}, an exclusive reservation, bound without
-     *       {@code SO_REUSEADDR}: no other socket binds the port, with {@code SO_REUSEADDR} or without it, no
-     *       ephemeral bind receives it and a connection to it is refused, so neither another process nor another
-     *       name takes it;</li>
-     *   <li>from the handover, which runs just before the embedded web server binds its listeners, until the context
-     *       has refreshed, a shared reservation on the same port, bound with {@code SO_REUSEADDR}, so a listener that
-     *       sets it, as Undertow, GreenMail, Qpid and the JDK's server sockets do, binds beside it. Only in this
+     *   <li>from its allocation until the handover ({@link WebServerHandover} or {@link Handover}), an exclusive
+     *       reservation, bound without {@code SO_REUSEADDR}: no other socket binds the port, with
+     *       {@code SO_REUSEADDR} or without it, no ephemeral bind receives it and a connection to it is refused, so
+     *       neither another process nor another name takes it;</li>
+     *   <li>from the handover until the context has refreshed, a shared reservation on the same port, bound with
+     *       {@code SO_REUSEADDR}, so a listener that sets it, as Undertow, GreenMail, Qpid and the JDK's server
+     *       sockets do, binds beside it, and so does a probe that binds a listener's port to check that it is free.
+     *       The handover runs when the context creates its embedded web server, before any of the server's listeners
+     *       is probed or bound, or, in a context without one, just before the web server start phase. Only in this
      *       window can another socket bind the port as well: one that sets {@code SO_REUSEADDR} throughout, and any
      *       socket in the instant each swap from one reservation to the next takes;</li>
      *   <li>from the {@link Securing}, once the context has refreshed: an exclusive reservation again where nothing
@@ -1051,8 +1061,9 @@ class FixtureParityTest {
             IOException refusal = listenerRefusalBesideReservation();
             if (refusal != null) {
                 LOG.warn("Fixture replay: a listener cannot bind beside a shared port reservation on this host ({}),"
-                        + " so each ${freePort:<name>} reservation is released when the application context starts its"
-                        + " listeners, and another process can take the port until the application has bound it",
+                        + " so each ${freePort:<name>} reservation is released at the handover, when the application"
+                        + " context creates its embedded web server or, without one, just before the web server start"
+                        + " phase, and another process can take the port until the application has bound it",
                         refusal.toString());
             }
             return new PortRegistry(PortRegistry::openSocket, refusal == null);
@@ -1369,9 +1380,11 @@ class FixtureParityTest {
 
         /**
          * The Spring lifecycle that {@link #handOver hands the registry's reservations over} to the application's
-         * listeners just before the embedded web server binds them. The replay registers it as a singleton before any
-         * other singleton exists, so it starts within the context's refresh, in the phase order Spring starts every
-         * lifecycle in, and a later start, as after a stop, changes nothing.
+         * listeners just before the web server start phase, in a context without an embedded web server. Where the
+         * context has one, the {@link WebServerHandover} handed them over when the server was created, and this start
+         * changes nothing. The replay registers it as a singleton before any other singleton exists, so it starts
+         * within the context's refresh, in the phase order Spring starts every lifecycle in, and a later start, as
+         * after a stop, changes nothing.
          */
         static final class Handover implements SmartLifecycle {
 
@@ -1411,6 +1424,38 @@ class FixtureParityTest {
             @Override
             public int getPhase() {
                 return PHASE;
+            }
+        }
+
+        /**
+         * The embedded web server factory customizer that {@link #handOver hands the registry's reservations over} to
+         * the application's listeners when the context creates its embedded web server. Spring Boot applies it while
+         * it initializes the web server factory bean, which it does no later than when it asks the factory for the
+         * server, so the handover precedes the server's creation: before any builder customizer, such as one that
+         * probes the port of each additional listener, runs and before any listener binds. Ordered first, it also
+         * precedes every other factory customizer. It accepts every {@link WebServerFactory}, servlet or reactive and
+         * of any server, and a context without an embedded web server never applies it, so the {@link Handover} hands
+         * over there; whichever acts second changes nothing.
+         */
+        static final class WebServerHandover implements WebServerFactoryCustomizer<WebServerFactory>, Ordered {
+
+            /** The name of the singleton. */
+            static final String BEAN_NAME = "fixtureReplayWebServerPortHandover";
+
+            private final Supplier<PortRegistry> registry;
+
+            WebServerHandover(Supplier<PortRegistry> registry) {
+                this.registry = Objects.requireNonNull(registry, "registry");
+            }
+
+            @Override
+            public void customize(WebServerFactory factory) {
+                registry.get().handOver();
+            }
+
+            @Override
+            public int getOrder() {
+                return Ordered.HIGHEST_PRECEDENCE;
             }
         }
 

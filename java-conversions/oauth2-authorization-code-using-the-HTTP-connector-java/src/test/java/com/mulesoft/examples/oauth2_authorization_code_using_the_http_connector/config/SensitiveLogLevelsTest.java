@@ -52,10 +52,12 @@ import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.boot.logging.LogLevel;
 import org.springframework.boot.logging.LoggingSystem;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.env.PropertySource;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -71,6 +73,7 @@ import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.HttpTestClient;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.PortInUseRetryingContextLoader;
 
 /**
  * Tests the {@code logging.level} caps of {@code application.yml}, which keep the Box authorization code, the Box
@@ -104,8 +107,14 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * own appenders are detached, so that output stays out of the build log. After each test the appender is detached,
  * the root's appenders are attached again and every logger level the test changed is restored; the context, which
  * holds the stored tokens and the listener ports, is discarded after the class.
+ *
+ * <p>Both listeners run on free ports drawn for each load of the context, never on the original 8081 and 8082, and
+ * WireMock on a port of its own choosing. A drawn port is only free when it is drawn: when another process binds one
+ * first, {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports, so the test reads both
+ * ports from the loaded context.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class SensitiveLogLevelsTest {
@@ -185,26 +194,10 @@ class SensitiveLogLevelsTest {
     /** How long the captured log must stay as asserted, for lines written after the reply. */
     private static final Duration SETTLE = Duration.ofMillis(300);
 
-    /** Main listener ({@code /web}, {@code /web/loginDone}), plain HTTP. */
-    private static final int MAIN_PORT;
-
-    /** {@code box-oauth} listener ({@code /authorization}, {@code /redirectUrl}), HTTPS with client certificate. */
-    private static final int HTTPS_PORT;
-
-    /** The WireMock stand-in for Box. */
-    private static final int WIREMOCK_PORT;
-
-    // Must stay above BOX: static fields initialize in textual order and BOX reads WIREMOCK_PORT.
-    static {
-        int[] ports = reserveFreePorts(3);
-        MAIN_PORT = ports[0];
-        HTTPS_PORT = ports[1];
-        WIREMOCK_PORT = ports[2];
-    }
-
+    /** The WireMock stand-in for Box, started before the context on a port it binds itself. */
     @RegisterExtension
     static final WireMockExtension BOX = WireMockExtension.newInstance()
-            .options(wireMockConfig().port(WIREMOCK_PORT))
+            .options(wireMockConfig().dynamicPort())
             .build();
 
     private final LoggerContext loggerContext = (LoggerContext) LoggerFactory.getILoggerFactory();
@@ -219,6 +212,14 @@ class SensitiveLogLevelsTest {
     /** The root logger's own appenders, detached while the root is at TRACE. */
     private final List<Appender<ILoggingEvent>> detachedAppenders = new ArrayList<>();
 
+    /** Main listener ({@code /web}, {@code /web/loginDone}), plain HTTP. */
+    @LocalServerPort
+    private int mainPort;
+
+    /** {@code box-oauth} listener ({@code /authorization}, {@code /redirectUrl}), HTTPS with client certificate. */
+    @Value("${ports.box-oauth}")
+    private int httpsPort;
+
     @Value("${truststore.path}")
     private String trustStorePath;
 
@@ -232,19 +233,21 @@ class SensitiveLogLevelsTest {
     private String keyStorePassword;
 
     /**
-     * Moves both listeners to the reserved ports and every Box URL to WireMock, and supplies the sentinel client
-     * secret here, never inline: the test framework's TRACE lines print inlined {@code @SpringBootTest} properties.
-     * The HTTPS port is set through {@code ports.box-oauth}, which keeps the listener's TLS settings and routes.
+     * Moves both listeners to ports drawn for this load attempt, Spring invoking this method again for each attempt,
+     * and every Box URL to WireMock, whose base URL the suppliers read once the extension has started; and supplies
+     * the sentinel client secret here, never inline: the test framework's TRACE lines print inlined
+     * {@code @SpringBootTest} properties. The HTTPS port is set through {@code ports.box-oauth}, which keeps the
+     * listener's TLS settings and routes.
      */
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        String box = "http://localhost:" + WIREMOCK_PORT;
-        registry.add("server.port", () -> MAIN_PORT);
-        registry.add("ports.box-oauth", () -> HTTPS_PORT);
+        int[] ports = drawFreePorts(2);
+        registry.add("server.port", () -> ports[0]);
+        registry.add("ports.box-oauth", () -> ports[1]);
         registry.add("box.secret", () -> Sentinel.CLIENT_SECRET.value);
-        registry.add("box.authorization-url", () -> box + AUTHORIZE_PATH);
-        registry.add("box.token-url", () -> box + TOKEN_PATH);
-        registry.add("box.api-base-url", () -> box + "/2.0");
+        registry.add("box.authorization-url", () -> BOX.baseUrl() + AUTHORIZE_PATH);
+        registry.add("box.token-url", () -> BOX.baseUrl() + TOKEN_PATH);
+        registry.add("box.api-base-url", () -> BOX.baseUrl() + "/2.0");
     }
 
     @AfterEach
@@ -337,9 +340,9 @@ class SensitiveLogLevelsTest {
      * refresh token; and the search, which rejects the first access token and answers under the renewed one. Every
      * answer closes its connection.
      */
-    private static void stubBox() {
+    private void stubBox() {
         BOX.resetAll();
-        String redirectUrl = "https://localhost:" + HTTPS_PORT + "/redirectUrl";
+        String redirectUrl = "https://localhost:" + httpsPort + "/redirectUrl";
         BOX.stubFor(get(urlPathEqualTo(AUTHORIZE_PATH))
                 .willReturn(closing(aResponse().withStatus(302)
                         .withHeader("Location", redirectUrl + "?code=" + Sentinel.AUTHORIZATION_CODE.value
@@ -384,7 +387,7 @@ class SensitiveLogLevelsTest {
      * @return the response that ends the chain
      */
     private HttpTestClient.Response browseFromWeb() {
-        URI target = URI.create("http://localhost:" + MAIN_PORT + "/web");
+        URI target = URI.create("http://localhost:" + mainPort + "/web");
         List<String> paths = new ArrayList<>();
         for (int redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
             HttpTestClient.Response response = clientFor(target).get(requestTarget(target));
@@ -405,10 +408,10 @@ class SensitiveLogLevelsTest {
     private HttpTestClient clientFor(URI target) {
         assertThat(target.getHost()).as("host of %s", target).isEqualTo("localhost");
         int port = target.getPort();
-        if ("http".equals(target.getScheme()) && (port == MAIN_PORT || port == WIREMOCK_PORT)) {
+        if ("http".equals(target.getScheme()) && (port == mainPort || port == BOX.getPort())) {
             return HttpTestClient.localhost(port);
         }
-        if ("https".equals(target.getScheme()) && port == HTTPS_PORT) {
+        if ("https".equals(target.getScheme()) && port == httpsPort) {
             return HttpTestClient.https("localhost", port, trustStorePath, "JKS", trustStorePassword,
                     keyStorePath, "JKS", keyStorePassword);
         }
@@ -475,10 +478,12 @@ class SensitiveLogLevelsTest {
     }
 
     /**
-     * Reserves {@code count} distinct free ports, none of them an original port, by holding every socket open until
-     * all are found, then releases them for the application and WireMock to bind.
+     * Draws {@code count} distinct free ports, none of them an original port, by holding every probe socket open
+     * until all are found, then closes the probes for the application to bind the ports. They are free when drawn,
+     * not reserved: a port another process binds in between fails the load with a port in use, which
+     * {@link PortInUseRetryingContextLoader} answers by loading the context again on newly drawn ports.
      */
-    private static int[] reserveFreePorts(int count) {
+    private static int[] drawFreePorts(int count) {
         List<ServerSocket> held = new ArrayList<>();
         int[] ports = new int[count];
         try {
@@ -493,13 +498,14 @@ class SensitiveLogLevelsTest {
             }
             return ports;
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve free ports", e);
+            throw new UncheckedIOException("Cannot draw free ports", e);
         } finally {
             for (ServerSocket socket : held) {
                 try {
                     socket.close();
                 } catch (IOException e) {
-                    throw new UncheckedIOException("Cannot release reserved port " + socket.getLocalPort(), e);
+                    throw new UncheckedIOException("Cannot close the probe socket of port " + socket.getLocalPort(),
+                            e);
                 }
             }
         }

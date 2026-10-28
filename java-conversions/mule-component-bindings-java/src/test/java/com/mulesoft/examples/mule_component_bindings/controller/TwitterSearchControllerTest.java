@@ -32,6 +32,7 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -41,6 +42,7 @@ import com.mulesoft.examples.mule_component_bindings.exception.ErrorResponse;
 import com.mulesoft.examples.mule_component_bindings.model.Tweet;
 import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient;
 import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient.Response;
+import com.mulesoft.examples.mule_component_bindings.support.PortInUseRetryingContextLoader;
 
 import twitter4j.QueryResult;
 import twitter4j.Status;
@@ -54,20 +56,19 @@ import twitter4j.TwitterException;
  * (mule-component-bindings/src/main/app/mule-component-bindings.xml:31-36).
  *
  * <p>The whole application runs on Undertow under profile {@code test}: the main listener on a random port and the
- * stock-statistics listener on a free port reserved before the context starts, because SC-10's
- * {@code PortRoutingFilter} tells the listeners apart by local port. Only the outbound Twitter adapter
+ * stock-statistics listener on a free port drawn for each attempt to load the context, because SC-10's
+ * {@code PortRoutingFilter} tells the listeners apart by local port; {@link PortInUseRetryingContextLoader} loads
+ * the context again when another process takes that port first. Only the outbound Twitter adapter
  * {@link TwitterSearchClient} is mocked, so the real {@code TwitterSearchService}, {@code TwitterResponseMapper} and
  * SC-1 {@code GlobalExceptionHandler} produce every response and nothing leaves the JVM. Requests go through ST-1
  * {@link HttpTestClient}, which adds no {@code Accept} or {@code Content-Type} of its own, so the status line,
  * headers and body bytes are asserted as written.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class TwitterSearchControllerTest {
-
-    /** Port of the stock-statistics listener ({@code ports.stock-stats}), reserved once for the whole class. */
-    private static final int STOCK_STATS_PORT = TestSocketUtils.findAvailableTcpPort();
 
     /** The {@code query}, {@code since} and {@code until} the flow's {@code twitter:search} fixes. */
     private static final String QUERY = "AAPL";
@@ -83,9 +84,11 @@ class TwitterSearchControllerTest {
     @MockBean
     private TwitterSearchClient twitterSearchClient;
 
+    /** The stock-statistics listener ({@code ports.stock-stats}) on a free port drawn for each load attempt. */
     @DynamicPropertySource
     static void ports(DynamicPropertyRegistry registry) {
-        registry.add("ports.stock-stats", () -> STOCK_STATS_PORT);
+        int drawnPort = TestSocketUtils.findAvailableTcpPort();
+        registry.add("ports.stock-stats", () -> drawnPort);
     }
 
     /**

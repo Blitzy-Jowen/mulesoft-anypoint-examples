@@ -21,6 +21,9 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -46,15 +49,16 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.springframework.test.util.TestSocketUtils;
 
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.controller.BoxAuthorizationController;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.controller.WebController;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.exception.GlobalExceptionHandler;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.HttpTestClient;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link PreflightDispatchConfig} on both listeners of
@@ -72,19 +76,19 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * <p>The cases run the real controllers, SC-10 {@link ListenerPorts} with its {@link PortRoutingFilter} and the
  * HTTPS listener, and the SC-1 handler on Undertow ({@link WireConfig}), with {@link BoxOAuthService} mocked, so every
  * flow run is recorded with its arguments and no Box call is made. The main listener takes a random port; the HTTPS
- * listener takes a free port chosen once per run, because SC-10 identifies it by its concrete local port. Requests go
- * through ST-1 {@link HttpTestClient}, in its TLS mode on the HTTPS listener with the client key the listener
- * requires, so the status line, headers and body bytes are asserted as each listener writes them.
+ * listener takes a free port drawn for each load of the context, because SC-10 identifies it by its concrete local
+ * port, and {@link PortInUseRetryingContextLoader} loads the context again on a newly drawn port when another process
+ * binds the drawn one first. Requests go through ST-1 {@link HttpTestClient}, in its TLS mode on the HTTPS listener
+ * with the client key the listener requires, so the status line, headers and body bytes are asserted as each
+ * listener writes them.
  */
 @SpringBootTest(classes = PreflightDispatchListenerTest.WireConfig.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 class PreflightDispatchListenerTest {
 
     private static final String ORIGIN = "https://example.invalid";
-
-    /** Local port of the HTTPS listener, the {@code ports.box-oauth} the listener and its routes are keyed by. */
-    private static final int BOX_OAUTH_PORT = TestSocketUtils.findAvailableTcpPort();
 
     /** Store type of {@code keystore.jks} and {@code trust-store}, as {@code application.yml} declares it. */
     private static final String STORE_TYPE = "JKS";
@@ -113,6 +117,10 @@ class PreflightDispatchListenerTest {
     @LocalServerPort
     private int mainPort;
 
+    /** Local port of the HTTPS listener, the {@code ports.box-oauth} the listener and its routes are keyed by. */
+    @Value("${ports.box-oauth}")
+    private int boxOAuthPort;
+
     @Value("${truststore.path}")
     private String trustStorePath;
 
@@ -125,9 +133,25 @@ class PreflightDispatchListenerTest {
     @Value("${keystore.password}")
     private String keyStorePassword;
 
+    /** Draws the HTTPS port for this load attempt: Spring invokes this method again when the loader retries. */
     @DynamicPropertySource
     static void boxOAuthPort(DynamicPropertyRegistry registry) {
-        registry.add("ports.box-oauth", () -> BOX_OAUTH_PORT);
+        int drawnBoxOAuthPort = freePort();
+        registry.add("ports.box-oauth", () -> drawnBoxOAuthPort);
+    }
+
+    /**
+     * A port the system picks for a probe socket from its ephemeral range, as it picks the random main port, which
+     * lies above the original 8081 and 8082; the probe is closed before the context binds the port, so another
+     * process can take it in between, which {@link PortInUseRetryingContextLoader} answers by loading the context
+     * again.
+     */
+    private static int freePort() {
+        try (ServerSocket socket = new ServerSocket(0)) {
+            return socket.getLocalPort();
+        } catch (IOException e) {
+            throw new UncheckedIOException("No free port for the HTTPS listener", e);
+        }
     }
 
     /** The two listeners of the original application. */
@@ -324,7 +348,7 @@ class PreflightDispatchListenerTest {
         if (listener == Listener.MAIN) {
             return HttpTestClient.localhost(mainPort);
         }
-        return HttpTestClient.https("localhost", BOX_OAUTH_PORT, trustStorePath, STORE_TYPE, trustStorePassword,
+        return HttpTestClient.https("localhost", boxOAuthPort, trustStorePath, STORE_TYPE, trustStorePassword,
                 keyStorePath, STORE_TYPE, keyStorePassword);
     }
 

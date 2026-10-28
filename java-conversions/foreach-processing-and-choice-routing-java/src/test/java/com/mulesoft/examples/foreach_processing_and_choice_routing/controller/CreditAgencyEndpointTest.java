@@ -32,6 +32,7 @@ import com.mulesoft.examples.foreach_processing_and_choice_routing.model.Custome
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.soap.GetCreditProfile;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.soap.GetCreditProfileResponse;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.foreach_processing_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -39,7 +40,9 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -63,10 +66,13 @@ import org.xml.sax.InputSource;
  * requests.
  *
  * <p>The credit agency and the five banks listen on fixed ports, because the endpoints and the port routing tell
- * listeners apart by their local port; each is a free port chosen for this class, never an original port, so the
- * test runs beside the cached contexts of other classes and beside a running application.
+ * listeners apart by their local port; each is a free port drawn for each load of the context, never an original
+ * port, so the test runs beside the cached contexts of other classes and beside a running application. A port another
+ * process takes between its draw and its bind fails that load, which {@link PortInUseRetryingContextLoader} repeats
+ * on newly drawn ports, so the tests read the credit agency's port from the loaded context.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 class CreditAgencyEndpointTest {
 
     private static final String SOAP_11_NS = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -92,25 +98,6 @@ class CreditAgencyEndpointTest {
     /** The original listener ports, which a running application or another clone may hold. */
     private static final Set<Integer> ORIGINAL_PORTS = Set.of(11081, 18080, 10080, 20080, 30080, 40080, 50080);
 
-    private static final int CREDIT_AGENCY_PORT;
-
-    private static final int[] BANK_PORTS = new int[BANK_COUNT];
-
-    static {
-        Set<Integer> chosen = new LinkedHashSet<>();
-        while (chosen.size() < BANK_COUNT + 1) {
-            int candidate = TestSocketUtils.findAvailableTcpPort();
-            if (!ORIGINAL_PORTS.contains(candidate)) {
-                chosen.add(candidate);
-            }
-        }
-        Integer[] ports = chosen.toArray(new Integer[0]);
-        CREDIT_AGENCY_PORT = ports[0];
-        for (int bank = 0; bank < BANK_COUNT; bank++) {
-            BANK_PORTS[bank] = ports[bank + 1];
-        }
-    }
-
     /**
      * The whole CXF response a successful call must produce, with only the two random numbers left open:
      * {@code creditHistory} (group 1) before {@code creditScore} (group 2), JAXB's name order for the unannotated
@@ -131,11 +118,27 @@ class CreditAgencyEndpointTest {
     @Autowired
     private WebServiceTemplate webServiceTemplate;
 
+    /** The port the loaded context's credit agency listener is bound to. */
+    @Value("${ports.credit-agency}")
+    private int creditAgencyPort;
+
+    /**
+     * Draws the credit agency's and the five banks' ports for this load of the context, pairwise distinct and never
+     * an original port, so a repeated load runs on newly drawn ports.
+     */
     @DynamicPropertySource
     static void listenerPorts(DynamicPropertyRegistry registry) {
-        registry.add("ports.credit-agency", () -> CREDIT_AGENCY_PORT);
+        Set<Integer> chosen = new LinkedHashSet<>();
+        while (chosen.size() < BANK_COUNT + 1) {
+            int candidate = TestSocketUtils.findAvailableTcpPort();
+            if (!ORIGINAL_PORTS.contains(candidate)) {
+                chosen.add(candidate);
+            }
+        }
+        Integer[] ports = chosen.toArray(new Integer[0]);
+        registry.add("ports.credit-agency", () -> ports[0]);
         for (int bank = 0; bank < BANK_COUNT; bank++) {
-            int port = BANK_PORTS[bank];
+            int port = ports[bank + 1];
             registry.add("ports.bank" + (bank + 1), () -> port);
         }
         registry.add("loanbroker.outbound-host", () -> "localhost");
@@ -151,7 +154,7 @@ class CreditAgencyEndpointTest {
     @Test
     void productionTemplateReachesTheListenerBasePath() {
         Object reply = webServiceTemplate.marshalSendAndReceive(
-                "http://localhost:" + CREDIT_AGENCY_PORT + LISTENER_PATH,
+                "http://localhost:" + creditAgencyPort + LISTENER_PATH,
                 new GetCreditProfile(new Customer("Muley", 1234)));
 
         assertThat(reply).isInstanceOf(GetCreditProfileResponse.class);
@@ -207,7 +210,7 @@ class CreditAgencyEndpointTest {
         assertThat(addresses).hasSize(1);
         // ST-1 sends "Host: localhost:<port>", from which the request URL is built.
         assertThat(addresses.get(0).getLocationURI())
-                .isEqualTo("http://localhost:" + CREDIT_AGENCY_PORT + LISTENER_PATH);
+                .isEqualTo("http://localhost:" + creditAgencyPort + LISTENER_PATH);
     }
 
     @Test
@@ -282,12 +285,12 @@ class CreditAgencyEndpointTest {
         assertThat(profile.getCreditHistory()).isBetween(MIN_CREDIT_HISTORY, MAX_CREDIT_HISTORY);
     }
 
-    private static HttpTestClient client() {
-        return HttpTestClient.localhost(CREDIT_AGENCY_PORT);
+    private HttpTestClient client() {
+        return HttpTestClient.localhost(creditAgencyPort);
     }
 
     /** A SOAP 1.1 POST as the CXF client sent it; ST-1 adds {@code Content-Length} for every non-null body. */
-    private static HttpTestClient.Response post(String path, String body) {
+    private HttpTestClient.Response post(String path, String body) {
         return client().post(path, TEXT_XML_UTF8, body, Map.of("SOAPAction", "\"\""));
     }
 

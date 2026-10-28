@@ -25,6 +25,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -32,6 +33,7 @@ import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.HttpTestClient;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of the application with {@code box.id} and {@code box.secret} left empty, as the empty defaults of
@@ -41,18 +43,18 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * answers the token-call-failed marker 200 without a token request.
  *
  * <p>The store passwords come from the {@code test} profile, as in {@link BoxAuthorizationControllerTest}, and Box is
- * a WireMock stub that must receive nothing. The HTTPS listener takes a port of its own, so this context and the
- * other controller tests' contexts can be cached side by side.
+ * a WireMock stub that must receive nothing. The HTTPS listener takes a port of its own, drawn for each load of the
+ * context, so this context and the other controller tests' contexts can be cached side by side;
+ * {@link PortInUseRetryingContextLoader} loads the context again on a newly drawn port when another process binds
+ * the drawn one first.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"box.id=", "box.secret="})
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 class BoxAuthorizationWithoutClientCredentialsTest {
 
     @RegisterExtension
     static WireMockExtension box = WireMockExtension.newInstance().options(wireMockConfig().dynamicPort()).build();
-
-    /** Local port of the HTTPS listener; SC-10 keys the listener's routes by it, so it cannot be 0. */
-    private static final int HTTPS_PORT = freePort();
 
     /** The carried {@code TLS_Context} stores as copied to {@code target/classes}, the files the listener reads. */
     private static final String TRUST_STORE_PATH = classpathFile("/trust-store");
@@ -75,6 +77,10 @@ class BoxAuthorizationWithoutClientCredentialsTest {
     @LocalServerPort
     int mainPort;
 
+    /** Local port of the HTTPS listener; SC-10 keys the listener's routes by it, so it cannot be 0. */
+    @Value("${ports.box-oauth}")
+    int httpsPort;
+
     @Value("${truststore.password}")
     String trustStorePassword;
 
@@ -83,8 +89,10 @@ class BoxAuthorizationWithoutClientCredentialsTest {
 
     @DynamicPropertySource
     static void props(DynamicPropertyRegistry r) {
+        // Drawn for each load attempt: Spring invokes this method again when the loader retries a lost port.
+        int drawnHttpsPort = freePort();
         // ports.box-oauth rather than listeners.additional[0].port, for the reason application.yml gives.
-        r.add("ports.box-oauth", () -> HTTPS_PORT);
+        r.add("ports.box-oauth", () -> drawnHttpsPort);
         r.add("box.authorization-url", () -> box.baseUrl() + "/api/oauth2/authorize");
         r.add("box.token-url", () -> box.baseUrl() + "/api/oauth2/token");
         r.add("box.api-base-url", () -> box.baseUrl() + "/2.0");
@@ -135,11 +143,14 @@ class BoxAuthorizationWithoutClientCredentialsTest {
 
     /** ST-1 client for the HTTPS listener, trusting only the carried trust store and presenting its client key. */
     private HttpTestClient tls() {
-        return HttpTestClient.https("localhost", HTTPS_PORT, TRUST_STORE_PATH, STORE_TYPE, trustStorePassword,
+        return HttpTestClient.https("localhost", httpsPort, TRUST_STORE_PATH, STORE_TYPE, trustStorePassword,
                 KEY_STORE_PATH, STORE_TYPE, keyStorePassword);
     }
 
-    /** A port free at class initialisation; the socket is closed again before the context binds it. */
+    /**
+     * A port free when drawn; the probe socket is closed again before the context binds it, so another process can
+     * take it in between, which {@link PortInUseRetryingContextLoader} answers by loading the context again.
+     */
     private static int freePort() {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();

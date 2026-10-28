@@ -27,10 +27,13 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.w3c.dom.Document;
@@ -39,6 +42,7 @@ import org.w3c.dom.Node;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.support.HttpTestClient;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.support.HttpTestClient.Response;
+import com.mulesoft.examples.service_orchestration_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 /**
  * Endpoint test of {@link SamsungServiceEndpoint}, the mock Samsung SOAP listener of the original
@@ -55,12 +59,16 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.support.Ht
  * wire shape: {@code purchaseResponse} in {@value #SAMSUNG_NAMESPACE} with unqualified children, as the original
  * {@code package-info}'s {@code @XmlSchema} without {@code elementFormDefault} produced.
  *
- * <p>Port numbers come from the operating system ({@code ServerSocket(0)}), never a fixed original port. The embedded
- * Artemis server id and the in-memory Derby database are unique to this class, so its context can live beside the
- * contexts of other test classes in the same JVM.
+ * <p>Port numbers come from the operating system ({@code ServerSocket(0)}), never a fixed original port, and are
+ * drawn for each load attempt of the context: a drawn port is free when drawn, not when bound, so when another
+ * process takes one in between, {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports,
+ * and the tests read the ports of the loaded context from it. The embedded Artemis server id and the in-memory Derby
+ * database are unique to this class, so its context can live beside the contexts of other test classes in the same
+ * JVM.
  */
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @ExtendWith(OutputCaptureExtension.class)
 class SamsungServiceEndpointTest {
@@ -82,41 +90,45 @@ class SamsungServiceEndpointTest {
             "Message part {http://orders.se.mulesoft.com/}processOrder was not recognized.  (Does it exist in"
                     + " service WSDL?)";
 
-    private static final int MAIN_PORT;
-    private static final int AJAX_PORT;
-    private static final int POPULATE_PORT;
-    private static final int SAMSUNG_PORT;
-    private static final int PRICES_PORT;
     private static final int ARTEMIS_SERVER_ID;
     private static final String DERBY_DATABASE;
 
     static {
-        Iterator<Integer> ports = distinctFreePorts(5).iterator();
-        MAIN_PORT = ports.next();
-        AJAX_PORT = ports.next();
-        POPULATE_PORT = ports.next();
-        SAMSUNG_PORT = ports.next();
-        PRICES_PORT = ports.next();
         ThreadLocalRandom random = ThreadLocalRandom.current();
         ARTEMIS_SERVER_ID = random.nextInt(10_000, Integer.MAX_VALUE);
         DERBY_DATABASE = "memory:SamsungServiceEndpointTest_" + Long.toUnsignedString(random.nextLong());
     }
 
+    /** The main listener of the loaded context, which serves the SOAP {@code /orders} path alone. */
+    @LocalServerPort
+    private int mainPort;
+
+    /** The Samsung listener of the loaded context. */
+    @Value("${ports.samsung}")
+    private int samsungPort;
+
     /**
-     * Moves every listener off its original port. The {@code listeners.additional} entries read their ports from
-     * {@code ajax.port} and {@code ports.*}, so those keys are overridden rather than the list, which Spring Boot binds
-     * from a single property source. {@code orders.soap.url} names port 1080 literally and is therefore set too.
+     * Moves every listener off its original port, onto distinct free ports drawn for this load attempt. The
+     * {@code listeners.additional} entries read their ports from {@code ajax.port} and {@code ports.*}, so those keys
+     * are overridden rather than the list, which Spring Boot binds from a single property source.
+     * {@code orders.soap.url} names port 1080 literally and is therefore set too.
      */
     @DynamicPropertySource
     static void applicationProperties(DynamicPropertyRegistry registry) {
-        registry.add("server.port", () -> MAIN_PORT);
-        registry.add("ajax.port", () -> AJAX_PORT);
-        registry.add("ports.populate", () -> POPULATE_PORT);
-        registry.add("ports.samsung", () -> SAMSUNG_PORT);
-        registry.add("ports.prices", () -> PRICES_PORT);
-        registry.add("orders.samsung.url", () -> "http://localhost:" + SAMSUNG_PORT + SAMSUNG_PATH);
-        registry.add("orders.price.url", () -> "http://localhost:" + PRICES_PORT + "/api/prices/{productId}");
-        registry.add("orders.soap.url", () -> "http://localhost:" + MAIN_PORT + ORDERS_PATH);
+        Iterator<Integer> ports = distinctFreePorts(5).iterator();
+        int main = ports.next();
+        int ajax = ports.next();
+        int populate = ports.next();
+        int samsung = ports.next();
+        int prices = ports.next();
+        registry.add("server.port", () -> main);
+        registry.add("ajax.port", () -> ajax);
+        registry.add("ports.populate", () -> populate);
+        registry.add("ports.samsung", () -> samsung);
+        registry.add("ports.prices", () -> prices);
+        registry.add("orders.samsung.url", () -> "http://localhost:" + samsung + SAMSUNG_PATH);
+        registry.add("orders.price.url", () -> "http://localhost:" + prices + "/api/prices/{productId}");
+        registry.add("orders.soap.url", () -> "http://localhost:" + main + ORDERS_PATH);
         registry.add("spring.datasource.xa.properties.databaseName", () -> DERBY_DATABASE);
         registry.add("spring.datasource.xa.properties.createDatabase", () -> "create");
         registry.add("spring.artemis.mode", () -> "embedded");
@@ -128,7 +140,7 @@ class SamsungServiceEndpointTest {
     void purchaseReturnsAcceptedResponse(CapturedOutput output) {
         long loggedBefore = flowLoggerLines(output);
 
-        Response response = postSoap(SAMSUNG_PORT, SAMSUNG_PATH, purchaseEnvelope(1).getBytes(UTF_8));
+        Response response = postSoap(samsungPort, SAMSUNG_PATH, purchaseEnvelope(1).getBytes(UTF_8));
 
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.header("Content-Type")).as(response.toString()).startsWith("text/xml");
@@ -140,7 +152,7 @@ class SamsungServiceEndpointTest {
     @ParameterizedTest(name = "quantity {0} costs {1}")
     @CsvSource({"0, 0", "3, 7650"})
     void purchaseMultipliesPriceByQuantity(int quantity, String expectedPrice) {
-        Response response = postSoap(SAMSUNG_PORT, SAMSUNG_PATH, purchaseEnvelope(quantity).getBytes(UTF_8));
+        Response response = postSoap(samsungPort, SAMSUNG_PATH, purchaseEnvelope(quantity).getBytes(UTF_8));
 
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(orderResponse(response.bodyAsString()))
@@ -149,7 +161,7 @@ class SamsungServiceEndpointTest {
 
     @Test
     void getIsMethodNotAllowed() {
-        Response response = HttpTestClient.localhost(SAMSUNG_PORT).get(SAMSUNG_PATH);
+        Response response = HttpTestClient.localhost(samsungPort).get(SAMSUNG_PATH);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(405);
         assertThat(response.header("Content-Type")).as(response.toString()).isEqualTo("text/plain");
@@ -162,7 +174,7 @@ class SamsungServiceEndpointTest {
             "",
             "<foo/>"})
     void unreadableBodiesAreClientFaults(String body) {
-        Response response = postSoap(SAMSUNG_PORT, SAMSUNG_PATH, body.getBytes(UTF_8));
+        Response response = postSoap(samsungPort, SAMSUNG_PATH, body.getBytes(UTF_8));
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         Fault fault = fault(response.bodyAsString());
@@ -172,7 +184,7 @@ class SamsungServiceEndpointTest {
 
     @Test
     void processOrderOnSamsungListenerIsClientFault() {
-        Response response = postSoap(SAMSUNG_PORT, SAMSUNG_PATH, ORDER_MESSAGE);
+        Response response = postSoap(samsungPort, SAMSUNG_PATH, ORDER_MESSAGE);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(fault(response.bodyAsString())).isEqualTo(new Fault("soap:Client", EXPECTED_UNKNOWN_PART_FAULT));
@@ -180,7 +192,7 @@ class SamsungServiceEndpointTest {
 
     @Test
     void samsungPathOnMainPortIsNoListener() {
-        Response response = postSoap(MAIN_PORT, SAMSUNG_PATH, purchaseEnvelope(1).getBytes(UTF_8));
+        Response response = postSoap(mainPort, SAMSUNG_PATH, purchaseEnvelope(1).getBytes(UTF_8));
 
         assertThat(response.status()).as(response.toString()).isEqualTo(404);
         assertThat(response.header("Content-Type")).as(response.toString()).startsWith("text/plain");

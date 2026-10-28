@@ -36,13 +36,16 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.web.embedded.undertow.UndertowServletWebServerFactory;
+import org.springframework.boot.web.server.WebServerFactoryCustomizerBeanPostProcessor;
 import org.springframework.boot.web.servlet.context.AnnotationConfigServletWebServerApplicationContext;
 import org.springframework.context.SmartLifecycle;
+import org.springframework.context.support.GenericApplicationContext;
 
 /**
  * The fixture replay's port registry (ST-2): {@link PortRegistry} gives each name of {@code ${freePort:<name>}}, and
  * each embedded server's published port, one port that no other name shares. It holds each port it allocates
- * exclusively until the application context starts its listeners, shares it with those listeners from the handover
+ * exclusively until the handover, when the application context creates its embedded web server or, in a context
+ * without one, just before the web server start phase, shares it with the application's listeners from the handover
  * until the context has refreshed, then holds it exclusively again where nothing listens and leaves it to the
  * listener that bound it otherwise. Each test builds its own registry, so the registry {@link FixtureParityTest} keeps
  * for its own run is never touched.
@@ -434,25 +437,39 @@ class FixtureParityPortTest {
     }
 
     @Test
-    void anUndertowContextBindsItsListenersThroughTheHandoverAndThePortNothingListensOnIsSecured() throws IOException {
+    void anUndertowContextHandsOverWhenItCreatesItsServerSoAnAdditionalPortIsProbedAndBoundAndTheIdlePortIsSecured()
+            throws IOException {
         PortRegistry registry = PortRegistry.forThisHost();
         int main = registry.port("orders");
         int additional = registry.port("ajax");
         int closed = registry.port("closed");
+        List<Phase> atCreation = new ArrayList<>();
         UndertowServletWebServerFactory factory = new UndertowServletWebServerFactory(main);
-        factory.addBuilderCustomizers(builder -> builder.addHttpListener(additional, "0.0.0.0"));
+        factory.addBuilderCustomizers(builder -> {
+            // As a start-up check of an additional listener does when the server is created: bind its port, release
+            // it, then add the listener.
+            atCreation.add(registry.phase());
+            try {
+                listen(additional).close();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot probe the additional port " + additional, e);
+            }
+            builder.addHttpListener(additional, "0.0.0.0");
+        });
         try (AnnotationConfigServletWebServerApplicationContext context =
                      new AnnotationConfigServletWebServerApplicationContext()) {
             context.registerBean("webServerFactory", UndertowServletWebServerFactory.class, () -> factory);
-            context.addBeanFactoryPostProcessor(beanFactory -> beanFactory.registerSingleton(
-                    PortRegistry.Handover.BEAN_NAME, new PortRegistry.Handover(() -> registry)));
+            context.registerBean(WebServerFactoryCustomizerBeanPostProcessor.class);
+            registerHandovers(context, registry);
             context.addApplicationListener(new PortRegistry.Securing(context, () -> registry));
 
             context.refresh();
 
+            assertEquals(List.of(Phase.HANDED_OVER), atCreation,
+                    "the handover precedes the server's creation, so the probe binds beside the shared reservation");
             assertTrue(PortRegistry.Handover.PHASE
                             < context.getBean("webServerStartStop", SmartLifecycle.class).getPhase(),
-                    "the handover starts before the lifecycle that starts the web server");
+                    "the lifecycle handover starts before the lifecycle that starts the web server");
             assertEquals(Phase.SECURED, registry.phase(), "securing followed the context's refresh");
             assertEquals(Map.of("ajax", Hold.LISTENER_OWNED, "closed", Hold.EXCLUSIVE, "orders", Hold.LISTENER_OWNED),
                     registry.holds(),
@@ -463,6 +480,102 @@ class FixtureParityPortTest {
             assertThrows(BindException.class, () -> listen(closed).close(), "and it is held exclusively again");
         } finally {
             registry.releaseAll();
+        }
+    }
+
+    @Test
+    void aContextWithoutAWebServerHoldsItsPortsExclusivelyUntilJustBeforeTheWebServerStartPhase() throws IOException {
+        PortRegistry registry = PortRegistry.forThisHost();
+        int listened = registry.port("listener");
+        int closed = registry.port("closed");
+        List<Phase> atSingletonCreation = new ArrayList<>();
+        ListenerLifecycle lifecycle = new ListenerLifecycle(registry, listened);
+        try (GenericApplicationContext context = new GenericApplicationContext()) {
+            context.registerBean("singleton", Object.class, () -> {
+                atSingletonCreation.add(registry.phase());
+                return new Object();
+            });
+            context.registerBean("listenerLifecycle", ListenerLifecycle.class, () -> lifecycle);
+            registerHandovers(context, registry);
+            context.addApplicationListener(new PortRegistry.Securing(context, () -> registry));
+
+            context.refresh();
+
+            assertEquals(List.of(Phase.RESERVING), atSingletonCreation,
+                    "no web server is created, so the ports stay exclusive while the singletons are created");
+            assertEquals(Phase.HANDED_OVER, lifecycle.phaseAtStart(),
+                    "the lifecycle handover precedes a lifecycle of the web server start phase");
+            assertEquals(Phase.SECURED, registry.phase(), "securing followed the context's refresh");
+            assertEquals(Map.of("closed", Hold.EXCLUSIVE, "listener", Hold.LISTENER_OWNED), registry.holds(),
+                    "the lifecycle's listener bound its port, and the idle one is held exclusively again");
+            connect(listened).close();
+            assertThrows(ConnectException.class, () -> connect(closed).close(), "nothing listens on the idle port");
+        } finally {
+            registry.releaseAll();
+        }
+    }
+
+    /** Registers both handovers of {@code registry} before any other singleton exists, as the replay does. */
+    private static void registerHandovers(GenericApplicationContext context, PortRegistry registry) {
+        context.addBeanFactoryPostProcessor(beanFactory -> {
+            beanFactory.registerSingleton(PortRegistry.Handover.BEAN_NAME, new PortRegistry.Handover(() -> registry));
+            beanFactory.registerSingleton(PortRegistry.WebServerHandover.BEAN_NAME,
+                    new PortRegistry.WebServerHandover(() -> registry));
+        });
+    }
+
+    /**
+     * A lifecycle of the web server start phase that binds a listener with {@code SO_REUSEADDR} on its port when it
+     * starts, recording the registry's phase at that moment, and closes the listener when it stops.
+     */
+    private static final class ListenerLifecycle implements SmartLifecycle {
+
+        private final PortRegistry registry;
+        private final int port;
+        private Phase phaseAtStart;
+        private ServerSocket listener;
+
+        ListenerLifecycle(PortRegistry registry, int port) {
+            this.registry = registry;
+            this.port = port;
+        }
+
+        @Override
+        public void start() {
+            phaseAtStart = registry.phase();
+            try {
+                listener = listen(port);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot bind the lifecycle's listener on port " + port, e);
+            }
+        }
+
+        @Override
+        public void stop() {
+            if (listener == null) {
+                return;
+            }
+            try {
+                listener.close();
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot close the lifecycle's listener on port " + port, e);
+            } finally {
+                listener = null;
+            }
+        }
+
+        @Override
+        public boolean isRunning() {
+            return listener != null;
+        }
+
+        @Override
+        public int getPhase() {
+            return PortRegistry.Handover.PHASE + 1;
+        }
+
+        Phase phaseAtStart() {
+            return phaseAtStart;
         }
     }
 

@@ -29,11 +29,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -41,6 +43,7 @@ import org.springframework.test.util.TestSocketUtils;
 import com.mulesoft.examples.mule_component_bindings.service.StockStatsService;
 import com.mulesoft.examples.mule_component_bindings.service.TwitterSearchService;
 import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient;
+import com.mulesoft.examples.mule_component_bindings.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link PreflightDispatchConfig} on both listeners of the application: a CORS pre-flight gets
@@ -62,18 +65,18 @@ import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient;
  * </ul>
  *
  * <p>The whole application runs on Undertow under profile {@code test}, with SC-10's routing in force: the main
- * listener on a random port and the stock-statistics listener on a free port reserved before the context starts,
- * because {@code PortRoutingFilter} tells the listeners apart by their local port. {@link TwitterSearchService} and
- * {@link StockStatsService} are mocked, so every run of either flow is recorded and no upstream is called. Requests
- * go through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as written.
+ * listener on a random port and the stock-statistics listener on a free port drawn for each attempt to load the
+ * context, because {@code PortRoutingFilter} tells the listeners apart by their local port;
+ * {@link PortInUseRetryingContextLoader} loads the context again when another process takes that port first.
+ * {@link TwitterSearchService} and {@link StockStatsService} are mocked, so every run of either flow is recorded and
+ * no upstream is called. Requests go through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes
+ * are asserted as written.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class PreflightDispatchListenerTest {
-
-    /** Port of the stock-statistics listener ({@code ports.stock-stats}), reserved once for the whole class. */
-    private static final int STOCK_STATS_PORT = TestSocketUtils.findAvailableTcpPort();
 
     private static final String ROOT = "/";
 
@@ -101,15 +104,21 @@ class PreflightDispatchListenerTest {
     @LocalServerPort
     private int mainPort;
 
+    /** Port of this context's stock-statistics listener. */
+    @Value("${ports.stock-stats}")
+    private int stockStatsPort;
+
     /** The two listeners: the main (Twitter) one on {@link #mainPort} and the stock-statistics one. */
     enum Listener {
         MAIN,
         STOCK_STATS
     }
 
+    /** The stock-statistics listener ({@code ports.stock-stats}) on a free port drawn for each load attempt. */
     @DynamicPropertySource
     static void stockStatsPort(DynamicPropertyRegistry registry) {
-        registry.add("ports.stock-stats", () -> STOCK_STATS_PORT);
+        int drawnPort = TestSocketUtils.findAvailableTcpPort();
+        registry.add("ports.stock-stats", () -> drawnPort);
     }
 
     /** Requested method of the pre-flight, then its {@code Access-Control-Request-Headers}, or {@code null}. */
@@ -224,7 +233,7 @@ class PreflightDispatchListenerTest {
     }
 
     private HttpTestClient client(Listener listener) {
-        return HttpTestClient.localhost(listener == Listener.MAIN ? mainPort : STOCK_STATS_PORT);
+        return HttpTestClient.localhost(listener == Listener.MAIN ? mainPort : stockStatsPort);
     }
 
     private static Map<String, String> preflightHeaders(String requestedMethod, String requestedHeaders) {

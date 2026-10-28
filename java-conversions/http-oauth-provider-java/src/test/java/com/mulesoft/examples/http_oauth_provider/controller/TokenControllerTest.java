@@ -29,9 +29,11 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -39,6 +41,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
+import com.mulesoft.examples.http_oauth_provider.support.PortInUseRetryingContextLoader;
 
 /**
  * On-the-wire test of the provider's {@code /token} endpoint ({@link TokenController}), which replaces the token
@@ -51,10 +54,15 @@ import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
  * body bytes are asserted as a browser receives them. Codes are single-use, so each test that exchanges one
  * obtains its own.
  *
+ * <p>The two ports are drawn for every attempt to load the context, and an attempt that loses one to another process
+ * before Undertow binds it is repeated on newly drawn ports ({@link PortInUseRetryingContextLoader}); the tests
+ * therefore read both ports, and every URI built from them, from the loaded context.
+ *
  * <p>The client and resource-owner credentials are the original demo values of the {@code test} profile
  * ({@code src/test/resources/application-test.yml}), injected rather than repeated here.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class TokenControllerTest {
@@ -67,9 +75,13 @@ class TokenControllerTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private static int listenerPort;
+    /** The resource listener's port in the loaded context, the main {@code server.port}. */
+    @LocalServerPort
+    private int listenerPort;
 
-    private static int providerPort;
+    /** The SC-10 provider listener's port in the loaded context. */
+    @Value("${http.provider.port}")
+    private int providerPort;
 
     @Value("${oauth.provider.client-id}")
     private String clientId;
@@ -88,23 +100,26 @@ class TokenControllerTest {
     private HttpTestClient listener;
 
     /**
-     * Reserves two distinct free loopback ports, one per listener, and hands them to the application, which binds
-     * them once the sockets reserving them are closed.
+     * Draws two distinct free loopback ports, one per listener, both sockets open at once, and hands them to the
+     * application, which binds them once those sockets are closed. Spring calls this method again for every attempt
+     * to load the context, so each attempt runs on ports drawn for it.
      */
     @DynamicPropertySource
     static void ports(DynamicPropertyRegistry registry) {
+        int drawnListenerPort;
+        int drawnProviderPort;
         try (ServerSocket listenerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress());
              ServerSocket providerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            listenerPort = listenerSocket.getLocalPort();
-            providerPort = providerSocket.getLocalPort();
+            drawnListenerPort = listenerSocket.getLocalPort();
+            drawnProviderPort = providerSocket.getLocalPort();
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve free loopback ports for the two listeners", e);
+            throw new UncheckedIOException("Cannot draw free loopback ports for the two listeners", e);
         }
-        registry.add("http.listener.port", () -> listenerPort);
-        registry.add("http.provider.port", () -> providerPort);
+        registry.add("http.listener.port", () -> drawnListenerPort);
+        registry.add("http.provider.port", () -> drawnProviderPort);
     }
 
-    /** The ports are known only once the context has been created, after the test instance itself. */
+    /** The clients connect to the ports of the loaded context, injected into the test instance. */
     @BeforeEach
     void clients() {
         provider = HttpTestClient.localhost(providerPort);
@@ -264,7 +279,7 @@ class TokenControllerTest {
     }
 
     /** The redirect URI the codes are issued for: the resource listener's {@code /redirect}, as in the original. */
-    private static String redirectUri() {
+    private String redirectUri() {
         return "http://localhost:" + listenerPort + "/redirect";
     }
 

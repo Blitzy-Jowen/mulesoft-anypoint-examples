@@ -37,11 +37,13 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.Mockito;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -54,6 +56,7 @@ import com.mulesoft.examples.mule_component_bindings.service.SentimentService;
 import com.mulesoft.examples.mule_component_bindings.service.StockService;
 import com.mulesoft.examples.mule_component_bindings.service.TwitterSearchService;
 import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient;
+import com.mulesoft.examples.mule_component_bindings.support.PortInUseRetryingContextLoader;
 
 import twitter4j.QueryResult;
 
@@ -69,21 +72,18 @@ import twitter4j.QueryResult;
  * the raw-socket {@link HttpTestClient} returns once the complete response has arrived, so no wait is needed.
  *
  * <p>The scenarios need different mock sets or properties, so each sits in its own {@link Nested} class and
- * therefore its own application context. All bind the stock-statistics listener to {@link #STOCK_STATS_PORT},
- * reserved once for the class; each nested class discards its context after its tests, so one context releases
- * the port before the next binds it.
+ * therefore its own application context, which it discards after its tests. SC-10 reads the stock-statistics port
+ * from the configuration before Undertow binds it, so that port cannot be a random one: {@link #listenerAndUpstreams}
+ * draws a free port for every attempt to load a nested context, {@link PortInUseRetryingContextLoader} loads the
+ * context again when another process takes that port first, and each test reads the port of its own context.
  *
- * <p>{@code @SpringBootTest} and {@code @ActiveProfiles} sit on the nested classes, not on this class: JUnit
- * post-processes the enclosing instance of every nested test, so an annotated enclosing class makes the Spring
- * extension start a third, unmocked context for it, which keeps {@link #STOCK_STATS_PORT} bound for the whole run
- * and stops both nested contexts from starting. The nested classes still inherit this class's
- * {@link DynamicPropertySource} method, because Spring's default {@code @NestedTestConfiguration(INHERIT)} searches
- * enclosing classes for it.
+ * <p>{@code @SpringBootTest}, {@code @ContextConfiguration} and {@code @ActiveProfiles} sit on the nested classes,
+ * not on this class: JUnit post-processes the enclosing instance of every nested test, so an annotated enclosing
+ * class makes the Spring extension start a third, unmocked context for it beside the nested ones. The nested classes
+ * still inherit this class's {@link DynamicPropertySource} method, because Spring's default
+ * {@code @NestedTestConfiguration(INHERIT)} searches enclosing classes for it.
  */
 class MuleComponentBindingsTest {
-
-    /** Port of the stock-statistics listener ({@code ports.stock-stats}), reserved once for the whole class. */
-    private static final int STOCK_STATS_PORT = TestSocketUtils.findAvailableTcpPort();
 
     private static final String STOCK = "AAPL";
 
@@ -99,9 +99,14 @@ class MuleComponentBindingsTest {
             .options(wireMockConfig().dynamicPort())
             .build();
 
+    /**
+     * Configures every attempt to load a nested context: the stock-statistics listener ({@code ports.stock-stats})
+     * on a free port drawn for that attempt, and the upstreams on the WireMock stand-in.
+     */
     @DynamicPropertySource
     static void listenerAndUpstreams(DynamicPropertyRegistry registry) {
-        registry.add("ports.stock-stats", () -> STOCK_STATS_PORT);
+        int drawnPort = TestSocketUtils.findAvailableTcpPort();
+        registry.add("ports.stock-stats", () -> drawnPort);
         // The clients append their resource paths (historicalPrices/1.0, bulkClassifyJson) to these base URLs.
         registry.add("stockstats.stocklytics-base-url", () -> wm.baseUrl() + "/");
         registry.add("stockstats.sentiment140-base-url", () -> wm.baseUrl() + "/");
@@ -136,9 +141,14 @@ class MuleComponentBindingsTest {
      */
     @Nested
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @ActiveProfiles("test")
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class PortedBinding {
+
+        /** Port of this context's stock-statistics listener. */
+        @Value("${ports.stock-stats}")
+        private int stockStatsPort;
 
         @MockBean
         private StockService stockService;
@@ -165,7 +175,7 @@ class MuleComponentBindingsTest {
             Mockito.when(stockService.getHistoricalPrices(STOCK, new SimpleDateFormat("yyyy-MM-dd").parse(DATE)))
                     .thenReturn(stockStats);
 
-            HttpTestClient.Response result = HttpTestClient.localhost(STOCK_STATS_PORT).get(STOCK_STATS_PATH + MESSAGE);
+            HttpTestClient.Response result = HttpTestClient.localhost(stockStatsPort).get(STOCK_STATS_PATH + MESSAGE);
 
             assertOriginalReply(result);
         }
@@ -179,9 +189,14 @@ class MuleComponentBindingsTest {
      */
     @Nested
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @ActiveProfiles("test")
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class BindingThroughClients {
+
+        /** Port of this context's stock-statistics listener. */
+        @Value("${ports.stock-stats}")
+        private int stockStatsPort;
 
         @MockBean
         private TwitterSearchClient twitterSearchClient;
@@ -197,7 +212,7 @@ class MuleComponentBindingsTest {
             wm.stubFor(get(urlPathEqualTo("/historicalPrices/1.0")).willReturn(okJson(prices)));
             wm.stubFor(post(urlPathEqualTo("/bulkClassifyJson")).willReturn(okJson("{\"data\":[]}")));
 
-            HttpTestClient.Response result = HttpTestClient.localhost(STOCK_STATS_PORT).get(STOCK_STATS_PATH + MESSAGE);
+            HttpTestClient.Response result = HttpTestClient.localhost(stockStatsPort).get(STOCK_STATS_PATH + MESSAGE);
 
             // No tweet is loaded here, so tweetsLoaded is 0; the prefix ends at the key and tolerates any count.
             assertOriginalReply(result);
@@ -216,6 +231,7 @@ class MuleComponentBindingsTest {
     @Nested
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
             properties = {"stockstats.stocklyticsApiKey=", "stockstats.sentiment140ApiKey="})
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @ActiveProfiles("test")
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class WithoutStockStatsKeys {
@@ -227,6 +243,10 @@ class MuleComponentBindingsTest {
 
         @LocalServerPort
         private int mainPort;
+
+        /** Port of this context's stock-statistics listener. */
+        @Value("${ports.stock-stats}")
+        private int stockStatsPort;
 
         @BeforeEach
         void noStubsAndNoRequests() {
@@ -247,7 +267,7 @@ class MuleComponentBindingsTest {
 
         @Test
         void stockStatsFailsNamingTheMissingKeyBeforeAnyUpstreamCall() {
-            HttpTestClient.Response result = HttpTestClient.localhost(STOCK_STATS_PORT).get(STOCK_STATS_PATH + MESSAGE);
+            HttpTestClient.Response result = HttpTestClient.localhost(stockStatsPort).get(STOCK_STATS_PATH + MESSAGE);
 
             assertEquals("HTTP/1.1 500 Internal Server Error", result.statusLine(),
                     () -> "unexpected response: " + result);
@@ -265,6 +285,7 @@ class MuleComponentBindingsTest {
      */
     @Nested
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "twitter.apiKey=")
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @ActiveProfiles("test")
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class WithoutTwitterApiKey {
@@ -273,6 +294,10 @@ class MuleComponentBindingsTest {
 
         @LocalServerPort
         private int mainPort;
+
+        /** Port of this context's stock-statistics listener. */
+        @Value("${ports.stock-stats}")
+        private int stockStatsPort;
 
         @BeforeEach
         void noStubsAndNoRequests() {
@@ -297,7 +322,7 @@ class MuleComponentBindingsTest {
             wm.stubFor(get(urlPathEqualTo("/historicalPrices/1.0")).willReturn(okJson(prices)));
             wm.stubFor(post(urlPathEqualTo("/bulkClassifyJson")).willReturn(okJson("{\"data\":[]}")));
 
-            HttpTestClient.Response result = HttpTestClient.localhost(STOCK_STATS_PORT).get(STOCK_STATS_PATH + MESSAGE);
+            HttpTestClient.Response result = HttpTestClient.localhost(stockStatsPort).get(STOCK_STATS_PATH + MESSAGE);
 
             assertEquals("HTTP/1.1 500 Internal Server Error", result.statusLine(),
                     () -> "unexpected response: " + result);

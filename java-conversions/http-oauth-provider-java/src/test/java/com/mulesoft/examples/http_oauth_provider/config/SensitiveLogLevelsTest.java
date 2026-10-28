@@ -42,15 +42,18 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
+import com.mulesoft.examples.http_oauth_provider.support.PortInUseRetryingContextLoader;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -64,7 +67,10 @@ import ch.qos.logback.classic.LoggerContext;
  *
  * <p>The application runs on its two Undertow listeners, each on a free loopback port ({@code DEFINED_PORT}, as the
  * controller tests run it: the SC-10 provider listener needs a concrete port, and the {@code /redirect} location and
- * the payroll {@code uri} embed both ports). Every exchange goes over the socket through ST-1. The client secret and
+ * the payroll {@code uri} embed both ports). The ports are drawn for every attempt to load the context, and an
+ * attempt that loses one to another process before Undertow binds it is repeated on newly drawn ports
+ * ({@link PortInUseRetryingContextLoader}), so the tests read both ports, and every URI built from them, from the
+ * loaded context. Every exchange goes over the socket through ST-1. The client secret and
  * the owner password are sentinels overriding the demo values of profile {@code test}; the codes and tokens are the
  * ones the provider issues, collected as each test obtains them.
  *
@@ -80,6 +86,7 @@ import ch.qos.logback.classic.LoggerContext;
         "logging.level.root=TRACE",
         "logging.level.web=TRACE",
         "spring.mvc.log-request-details=true"})
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @ExtendWith(OutputCaptureExtension.class)
@@ -108,9 +115,13 @@ class SensitiveLogLevelsTest {
     /** The logger levels set before this class's context started, by logger name. */
     private static final Map<String, Level> LEVELS_BEFORE = new HashMap<>();
 
-    private static int listenerPort;
+    /** The resource listener's port in the loaded context, the main {@code server.port}. */
+    @LocalServerPort
+    private int listenerPort;
 
-    private static int providerPort;
+    /** The SC-10 provider listener's port in the loaded context. */
+    @Value("${http.provider.port}")
+    private int providerPort;
 
     /** The codes, tokens and encoded credentials this test obtained or sent; none may reach the log. */
     private final List<String> secrets = new ArrayList<>();
@@ -132,13 +143,13 @@ class SensitiveLogLevelsTest {
         QUERY {
             @Override
             HttpTestClient.Response exchange(HttpTestClient provider, String clientId, String secret, String code,
-                                             List<String> secrets) {
+                                             String redirectUri, List<String> secrets) {
                 return provider.get("/token" + query(
                         "grant_type", "authorization_code",
                         "client_id", clientId,
                         "client_secret", secret,
                         "code", code,
-                        "redirect_uri", redirectUri()));
+                        "redirect_uri", redirectUri));
             }
         },
 
@@ -146,13 +157,13 @@ class SensitiveLogLevelsTest {
         FORM_BODY {
             @Override
             HttpTestClient.Response exchange(HttpTestClient provider, String clientId, String secret, String code,
-                                             List<String> secrets) {
+                                             String redirectUri, List<String> secrets) {
                 return provider.post("/token", FORM, form(
                         "grant_type", "authorization_code",
                         "client_id", clientId,
                         "client_secret", secret,
                         "code", code,
-                        "redirect_uri", redirectUri()));
+                        "redirect_uri", redirectUri));
             }
         },
 
@@ -160,43 +171,46 @@ class SensitiveLogLevelsTest {
         BASIC_HEADER {
             @Override
             HttpTestClient.Response exchange(HttpTestClient provider, String clientId, String secret, String code,
-                                             List<String> secrets) {
+                                             String redirectUri, List<String> secrets) {
                 String credentials = Base64.getEncoder()
                         .encodeToString((clientId + ":" + secret).getBytes(StandardCharsets.UTF_8));
                 secrets.add(credentials);
                 return provider.post("/token", FORM, form(
                                 "grant_type", "authorization_code",
                                 "code", code,
-                                "redirect_uri", redirectUri()),
+                                "redirect_uri", redirectUri),
                         Map.of("Authorization", "Basic " + credentials));
             }
         };
 
         /**
-         * Exchanges {@code code} at {@code /token}, adding to {@code secrets} any encoded form of the credentials it
-         * sends.
+         * Exchanges {@code code}, issued for {@code redirectUri}, at {@code /token}, adding to {@code secrets} any
+         * encoded form of the credentials it sends.
          */
         abstract HttpTestClient.Response exchange(HttpTestClient provider, String clientId, String secret, String code,
-                                                  List<String> secrets);
+                                                  String redirectUri, List<String> secrets);
     }
 
     /**
-     * Reserves two distinct free loopback ports, both sockets open at once, for the resource and provider listeners;
-     * {@code application.yml} derives {@code server.port} from {@code http.listener.port}. Supplies the sentinel
+     * Draws two distinct free loopback ports, both sockets open at once, for the resource and provider listeners;
+     * {@code application.yml} derives {@code server.port} from {@code http.listener.port}. Spring calls this method
+     * again for every attempt to load the context, so each attempt runs on ports drawn for it. Supplies the sentinel
      * client secret and owner password here too: the test framework's own TRACE lines print the inlined
      * {@code @SpringBootTest} properties, but never the values of a dynamic property source.
      */
     @DynamicPropertySource
     static void portsAndSecrets(DynamicPropertyRegistry registry) {
+        int drawnListenerPort;
+        int drawnProviderPort;
         try (ServerSocket listenerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress());
              ServerSocket providerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            listenerPort = listenerSocket.getLocalPort();
-            providerPort = providerSocket.getLocalPort();
+            drawnListenerPort = listenerSocket.getLocalPort();
+            drawnProviderPort = providerSocket.getLocalPort();
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve the listener and provider ports", e);
+            throw new UncheckedIOException("Cannot draw the listener and provider ports", e);
         }
-        registry.add("http.listener.port", () -> listenerPort);
-        registry.add("http.provider.port", () -> providerPort);
+        registry.add("http.listener.port", () -> drawnListenerPort);
+        registry.add("http.provider.port", () -> drawnProviderPort);
         registry.add("oauth.provider.client-secret", () -> CLIENT_SECRET);
         registry.add("oauth.provider.owner.password", () -> OWNER_PASSWORD);
     }
@@ -222,7 +236,7 @@ class SensitiveLogLevelsTest {
         }
     }
 
-    /** The ports are known only once the context has been created, after the test instance itself. */
+    /** The clients connect to the ports of the loaded context, injected into the test instance. */
     @BeforeEach
     void clients() {
         provider = HttpTestClient.localhost(providerPort);
@@ -300,7 +314,8 @@ class SensitiveLogLevelsTest {
             throws IOException {
         String code = authorizeCode(OWNER_PASSWORD);
 
-        String token = assertIssuedToken(credentials.exchange(provider, clientId, CLIENT_SECRET, code, secrets));
+        String token = assertIssuedToken(
+                credentials.exchange(provider, clientId, CLIENT_SECRET, code, redirectUri(), secrets));
 
         assertPayroll(listener.get("/resources", Map.of("Authorization", "Bearer " + token)));
         assertLogHoldsNoSecret(output);
@@ -313,7 +328,7 @@ class SensitiveLogLevelsTest {
         String code = authorizeCode(OWNER_PASSWORD);
 
         HttpTestClient.Response response =
-                credentials.exchange(provider, clientId, WRONG_CLIENT_SECRET, code, secrets);
+                credentials.exchange(provider, clientId, WRONG_CLIENT_SECRET, code, redirectUri(), secrets);
 
         assertOAuthError(response, 401, "invalid_client");
         assertLogHoldsNoSecret(output);
@@ -322,10 +337,11 @@ class SensitiveLogLevelsTest {
     @Test
     void reusedCodeIsInvalidGrantWithoutLoggingIt(CapturedOutput output) throws IOException {
         String code = authorizeCode(OWNER_PASSWORD);
-        assertIssuedToken(ClientCredentials.FORM_BODY.exchange(provider, clientId, CLIENT_SECRET, code, secrets));
+        assertIssuedToken(
+                ClientCredentials.FORM_BODY.exchange(provider, clientId, CLIENT_SECRET, code, redirectUri(), secrets));
 
         HttpTestClient.Response reused =
-                ClientCredentials.FORM_BODY.exchange(provider, clientId, CLIENT_SECRET, code, secrets);
+                ClientCredentials.FORM_BODY.exchange(provider, clientId, CLIENT_SECRET, code, redirectUri(), secrets);
 
         assertOAuthError(reused, 400, "invalid_grant");
         assertLogHoldsNoSecret(output);
@@ -379,7 +395,7 @@ class SensitiveLogLevelsTest {
     }
 
     /** The redirect URI the codes are issued for: the resource listener's {@code /redirect}, as in the original. */
-    private static String redirectUri() {
+    private String redirectUri() {
         return "http://localhost:" + listenerPort + "/redirect";
     }
 
@@ -443,7 +459,7 @@ class SensitiveLogLevelsTest {
     }
 
     /** Asserts the payroll resource of {@code protectedAuthcodeFlow}, byte for byte. */
-    private static void assertPayroll(HttpTestClient.Response response) {
+    private void assertPayroll(HttpTestClient.Response response) {
         assertThat(response.status()).as("%s", response).isEqualTo(200);
         assertMediaType(response, MediaType.APPLICATION_JSON);
         assertThat(response.bodyAsString()).isEqualTo(

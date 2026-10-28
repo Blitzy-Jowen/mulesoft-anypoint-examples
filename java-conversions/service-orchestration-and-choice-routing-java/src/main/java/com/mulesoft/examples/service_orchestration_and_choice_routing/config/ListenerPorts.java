@@ -6,6 +6,10 @@ import io.undertow.util.HttpString;
 import jakarta.servlet.DispatcherType;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.ArrayList;
@@ -15,6 +19,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import javax.net.ssl.KeyManagerFactory;
@@ -23,15 +29,21 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.context.properties.source.ConfigurationProperty;
 import org.springframework.boot.context.properties.source.ConfigurationPropertyName;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySource;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
+import org.springframework.boot.web.context.WebServerApplicationContext;
 import org.springframework.boot.web.embedded.undertow.UndertowServletWebServerFactory;
+import org.springframework.boot.web.server.PortInUseException;
+import org.springframework.boot.web.server.WebServer;
 import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.ApplicationContextAware;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
@@ -44,6 +56,8 @@ import org.springframework.util.StringUtils;
 import org.xnio.OptionMap;
 import org.xnio.Options;
 import org.xnio.SslClientAuthMode;
+import org.xnio.Xnio;
+import org.xnio.XnioWorker;
 
 /**
  * Serves several HTTP listeners from one application, each answering only for its own routes, as a Mule application
@@ -77,6 +91,17 @@ import org.xnio.SslClientAuthMode;
  * <p>Additional ports must be concrete, between 1 and 65535 and unique: {@link PortRoutingFilter} identifies the
  * listener by {@code ServletRequest.getLocalPort()}, which a listener bound to port 0 would not reproduce.
  *
+ * <p>Start-up failure: an additional listener that cannot be bound ends the start-up and never hangs it. Before the
+ * listeners are added, a probe socket binds each one's host and port and releases it, so a port another socket holds
+ * stops the application with Spring Boot's {@link PortInUseException}, reported as "Web server failed to start. Port
+ * N was already in use.", and any other bind failure with an {@link IllegalStateException} naming the entry, host
+ * and port. A port taken between the probe and Undertow's own bind fails Undertow's start, and that failure reaches
+ * the caller too, because the server runs on an XNIO worker created here rather than by Undertow: when a bind fails
+ * on the worker Undertow created itself, Undertow shuts that worker down at once, and Spring Boot's clean-up then
+ * closes the listeners already bound on its dead I/O threads, which waits forever. Undertow never shuts down a worker
+ * it was given, so this one outlives a failed start, and it is stopped when the application context closes, after
+ * the web server. It has the threads and options of the worker Undertow would create.
+ *
  * <p>HTTPS: an entry with {@code ssl} opens a TLS listener over its key store. When the entry also names a trust
  * store, the listener requires a client certificate that the trust store accepts, because a Mule listener TLS
  * context requires one whenever it has a trust store ({@code needClientAuth = isTrustStoreConfigured()} in Mule
@@ -104,6 +129,17 @@ public class ListenerPorts {
 
     private static final int MIN_PORT = 1;
     private static final int MAX_PORT = 65535;
+
+    /** Settings Spring Boot reads for the I/O and worker threads of the embedded Undertow server. */
+    private static final String IO_THREADS_PROPERTY = "server.undertow.threads.io";
+    private static final String WORKER_THREADS_PROPERTY = "server.undertow.threads.worker";
+
+    /** Undertow's defaults: as many I/O threads as processors, at least two, and eight worker threads per I/O thread. */
+    private static final int MIN_IO_THREADS = 2;
+    private static final int WORKER_THREADS_PER_IO_THREAD = 8;
+
+    /** Connection high and low water of the worker Undertow creates for itself. */
+    private static final int CONNECTION_WATER_MARK = 1_000_000;
 
     /** {@code ssl} settings holding the key password and the store password it falls back to. */
     private static final String KEY_PASSWORD = "key-password";
@@ -233,6 +269,16 @@ public class ListenerPorts {
      * {@code environment} is a single {@code ${key}} or {@code ${key:default}} placeholder. A store or key that opens
      * with an empty password is used as before, and no password or configured value is put in the message.
      *
+     * <p>When the server is created, and unless its port is negative (Spring Boot then never starts it), each
+     * additional listener's host and port is probed with a socket bound and released before the listeners are added,
+     * and the server is given an XNIO worker created here, with the I/O and worker threads of
+     * {@code server.undertow.threads.io} and {@code server.undertow.threads.worker} or Undertow's defaults. A port
+     * that is in use then ends the start-up with {@link PortInUseException}, and any other failure to bind a
+     * listener, in the probe or in Undertow's own start, ends it instead of hanging it (see the class description).
+     * The returned customizer is a {@link DisposableBean}: when the context closes it stops the context's web server,
+     * if one is still running, and then every worker it created.
+     *
+     * @return the customizer that adds the additional listeners and the method restriction to the Undertow server
      * @throws IllegalStateException naming the entry when a port is invalid or repeated, or a TLS context cannot be
      *                               built
      */
@@ -241,15 +287,7 @@ public class ListenerPorts {
             Properties properties, ResourceLoader resourceLoader, Environment environment) {
         List<ListenerSpec> specs = listenerSpecs(properties, resourceLoader, environment);
         HttpString[] disallowed = disallowedMethods(properties);
-        return factory -> {
-            if (!specs.isEmpty()) {
-                factory.addBuilderCustomizers(builder -> specs.forEach(spec -> addListener(builder, spec)));
-            }
-            if (disallowed.length > 0) {
-                factory.addDeploymentInfoCustomizers(deploymentInfo -> deploymentInfo.addInitialHandlerChainWrapper(
-                        next -> new DisallowedMethodsHandler(next, disallowed)));
-            }
-        };
+        return new AdditionalListenersCustomizer(specs, disallowed, environment);
     }
 
     /**
@@ -271,6 +309,134 @@ public class ListenerPorts {
         registration.addUrlPatterns("/*");
         registration.setDispatcherTypes(DispatcherType.REQUEST);
         return registration;
+    }
+
+    /**
+     * Adds the additional listeners and the method restriction to every Undertow server it customizes, probes the
+     * listeners' ports and gives each server that will start an XNIO worker of its own, and stops those workers when
+     * destroyed.
+     */
+    private static final class AdditionalListenersCustomizer
+            implements WebServerFactoryCustomizer<UndertowServletWebServerFactory>, ApplicationContextAware,
+            DisposableBean {
+
+        private final List<ListenerSpec> specs;
+
+        private final HttpString[] disallowed;
+
+        private final int ioThreads;
+
+        private final int workerThreads;
+
+        private final List<XnioWorker> workers = new CopyOnWriteArrayList<>();
+
+        private ApplicationContext applicationContext;
+
+        AdditionalListenersCustomizer(List<ListenerSpec> specs, HttpString[] disallowed, Environment environment) {
+            this.specs = specs;
+            this.disallowed = disallowed;
+            int defaultIoThreads = Math.max(Runtime.getRuntime().availableProcessors(), MIN_IO_THREADS);
+            Integer io = environment.getProperty(IO_THREADS_PROPERTY, Integer.class);
+            Integer worker = environment.getProperty(WORKER_THREADS_PROPERTY, Integer.class);
+            this.ioThreads = io != null ? io : defaultIoThreads;
+            this.workerThreads = worker != null ? worker : defaultIoThreads * WORKER_THREADS_PER_IO_THREAD;
+        }
+
+        @Override
+        public void setApplicationContext(ApplicationContext applicationContext) {
+            this.applicationContext = applicationContext;
+        }
+
+        /**
+         * Registers the builder customizer for the additional listeners and the deployment customizer for the method
+         * restriction. The builder customizer runs when the server is created and reads the port it is created with:
+         * Spring Boot never starts a server whose port is negative, so such a server only gets the listeners, with no
+         * probe and no worker.
+         *
+         * @throws PortInUseException    when the server is created, if another socket holds an additional port
+         * @throws IllegalStateException when the server is created, if an additional listener cannot be bound for
+         *                               another reason, naming the entry, host and port
+         * @throws UncheckedIOException  when the server is created, if XNIO cannot create the worker
+         */
+        @Override
+        public void customize(UndertowServletWebServerFactory factory) {
+            if (!specs.isEmpty()) {
+                factory.addBuilderCustomizers(builder -> {
+                    boolean willStart = factory.getPort() >= 0;
+                    if (willStart) {
+                        specs.forEach(ListenerPorts::requireBindable);
+                    }
+                    specs.forEach(spec -> addListener(builder, spec));
+                    if (willStart) {
+                        builder.setWorker(newWorker());
+                    }
+                });
+            }
+            if (disallowed.length > 0) {
+                factory.addDeploymentInfoCustomizers(deploymentInfo -> deploymentInfo.addInitialHandlerChainWrapper(
+                        next -> new DisallowedMethodsHandler(next, disallowed)));
+            }
+        }
+
+        /**
+         * Stops the context's web server, then every worker created here, the way Undertow stops its own worker under
+         * the zero shutdown timeout Spring Boot sets: shut down, and shut down at once unless already terminated.
+         *
+         * <p>The web server has normally stopped by the time the context destroys its beans, and stopping it again does
+         * nothing. A refresh that fails after the server started destroys the beans first and stops the server only
+         * afterwards; stopping it here keeps a listener from being closed on a worker that is no longer running, which
+         * would wait forever. The workers are stopped even when stopping the server fails, whose failure then
+         * propagates, so no worker thread outlives the context.
+         */
+        @Override
+        public void destroy() {
+            try {
+                if (applicationContext instanceof WebServerApplicationContext webContext) {
+                    WebServer webServer = webContext.getWebServer();
+                    if (webServer != null) {
+                        webServer.stop();
+                    }
+                }
+            } finally {
+                for (XnioWorker worker : workers) {
+                    worker.shutdown();
+                    try {
+                        if (!worker.awaitTermination(0, TimeUnit.MILLISECONDS)) {
+                            worker.shutdownNow();
+                        }
+                    } catch (InterruptedException e) {
+                        worker.shutdownNow();
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                workers.clear();
+            }
+        }
+
+        /**
+         * A worker with the option map Undertow gives the worker it would otherwise create in {@code start()}.
+         *
+         * @throws UncheckedIOException if XNIO cannot create the worker
+         */
+        private XnioWorker newWorker() {
+            OptionMap options = OptionMap.builder()
+                    .set(Options.WORKER_IO_THREADS, ioThreads)
+                    .set(Options.CONNECTION_HIGH_WATER, CONNECTION_WATER_MARK)
+                    .set(Options.CONNECTION_LOW_WATER, CONNECTION_WATER_MARK)
+                    .set(Options.WORKER_TASK_CORE_THREADS, workerThreads)
+                    .set(Options.WORKER_TASK_MAX_THREADS, workerThreads)
+                    .set(Options.TCP_NODELAY, true)
+                    .set(Options.CORK, true)
+                    .getMap();
+            XnioWorker worker;
+            try {
+                worker = Xnio.getInstance(Undertow.class.getClassLoader()).createWorker(options);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot create the XNIO worker of the additional listeners", e);
+            }
+            workers.add(worker);
+            return worker;
+        }
     }
 
     private static List<ListenerSpec> listenerSpecs(Properties properties, ResourceLoader resourceLoader,
@@ -327,6 +493,25 @@ public class ListenerPorts {
                 .distinct()
                 .map(HttpString::tryFromString)
                 .toArray(HttpString[]::new);
+    }
+
+    /**
+     * Binds a probe socket to the listener's host and port, the address Undertow binds, with the address reuse
+     * Undertow's listeners use, and releases it again.
+     *
+     * @throws PortInUseException    if another socket holds the port
+     * @throws IllegalStateException if the address cannot be bound for another reason, such as a host that does not
+     *                               resolve or is not local, naming the entry, host and port
+     */
+    private static void requireBindable(ListenerSpec spec) {
+        try (ServerSocket probe = new ServerSocket()) {
+            probe.setReuseAddress(true);
+            probe.bind(new InetSocketAddress(InetAddress.getByName(spec.host()), spec.port()), 1);
+        } catch (IOException e) {
+            PortInUseException.throwIfPortBindingException(e, spec::port);
+            throw new IllegalStateException(spec.label() + ": cannot bind " + spec.host() + ":" + spec.port() + ": "
+                    + e.getMessage(), e);
+        }
     }
 
     private static void addListener(Undertow.Builder builder, ListenerSpec spec) {

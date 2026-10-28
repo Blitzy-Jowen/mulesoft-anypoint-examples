@@ -56,6 +56,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.jms.core.SessionCallback;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.AopTestUtils;
@@ -67,6 +68,7 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.model.orde
 import com.mulesoft.examples.service_orchestration_and_choice_routing.service.InHouseOrderService;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.service.OrderOrchestrationService;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.service.PriceCacheService;
+import com.mulesoft.examples.service_orchestration_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 /**
  * Trigger test of {@link InHouseOrderListener}, the {@code jms:inbound-endpoint queue="inhouseOrder"} with
@@ -90,12 +92,15 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.service.Pr
  * lookup replaced. The broker returns a rolled-back request after 1000 ms ({@code config/XaTransactionConfig}), so a
  * request that keeps failing is consumed on its fifth delivery, about four seconds after it was sent.
  *
- * <p>The five original ports are replaced by free ports. A fresh in-memory Derby database and a non-persistent
- * embedded broker with a server id of its own give the class its own state, so no other test class's context can
- * receive or redeliver these requests.
+ * <p>The five original ports are replaced by free ports, drawn for each load attempt of the context: a drawn port is
+ * free when drawn, not when bound, so when another process takes one in between,
+ * {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports. A fresh in-memory Derby
+ * database and a non-persistent embedded broker with a server id of its own give the class its own state, so no other
+ * test class's context can receive or redeliver these requests.
  */
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class InHouseOrderListenerTest {
 
@@ -161,7 +166,8 @@ class InHouseOrderListenerTest {
     private JmsTemplate nonXaJmsTemplate;
 
     /**
-     * Binds every listener to a free port and gives the class its own Derby database and Artemis broker.
+     * Binds every listener to a free port drawn for this load attempt and gives the class its own Derby database and
+     * Artemis broker.
      *
      * <p>{@code application.yml} sets each additional listener's port through a placeholder ({@code ajax.port},
      * {@code ports.populate}, {@code ports.samsung}, {@code ports.prices}), so only those keys are overridden:

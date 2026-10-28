@@ -7,7 +7,6 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -38,6 +37,7 @@ import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanBro
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanQuote;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.service.Bank;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.foreach_processing_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -46,6 +46,8 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.core.env.Environment;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -78,9 +80,13 @@ import org.xml.sax.SAXException;
  * </ul>
  *
  * <p>The six SOAP listener ports are chosen here instead of the original fixed ones: application contexts of other
- * test classes stay cached in the same JVM with their listeners bound, so a fixed port could already be taken.
+ * test classes stay cached in the same JVM with their listeners bound, so a fixed port could already be taken. They
+ * are drawn for each load of the context, and a port another process takes between its draw and its bind fails that
+ * load, which {@link PortInUseRetryingContextLoader} repeats on newly drawn ports; every test therefore reads the
+ * ports of the loaded context from its {@link Environment}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 class BankEndpointTest {
 
     private static final int BANK_COUNT = 5;
@@ -96,12 +102,8 @@ class BankEndpointTest {
 
     private static final int MAX_PORT_ATTEMPTS = 1000;
 
-    /** Credit agency port followed by the ports of Banks 1 to 5, all distinct. */
-    private static final int[] LISTENER_PORTS = distinctFreePorts(1 + BANK_COUNT);
-
-    private static final int CREDIT_AGENCY_PORT = LISTENER_PORTS[0];
-
-    private static final int[] BANK_PORTS = Arrays.copyOfRange(LISTENER_PORTS, 1, 1 + BANK_COUNT);
+    /** Property key of the credit agency listener's port. */
+    private static final String CREDIT_AGENCY_PORT_KEY = "ports.credit-agency";
 
     private static final String CREDIT_AGENCY_PATH = "/mule/TheCreditAgencyService";
 
@@ -138,17 +140,21 @@ class BankEndpointTest {
     @Autowired
     private BankEndpoint bankEndpoint;
 
+    @Autowired
+    private Environment environment;
+
     /**
-     * Binds the credit agency and the banks to the chosen ports. The additional listeners of {@code application.yml}
-     * take their ports from these keys ({@code port: ${ports.bank1}} and so on), so the listeners, the port routing
-     * and the bank chosen per port all follow them.
+     * Binds the credit agency and the banks to ports drawn for this load of the context. The additional listeners of
+     * {@code application.yml} take their ports from these keys ({@code port: ${ports.bank1}} and so on), so the
+     * listeners, the port routing and the bank chosen per port all follow them.
      */
     @DynamicPropertySource
     static void listenerPorts(DynamicPropertyRegistry registry) {
-        registry.add("ports.credit-agency", () -> CREDIT_AGENCY_PORT);
+        int[] ports = distinctFreePorts(1 + BANK_COUNT);
+        registry.add(CREDIT_AGENCY_PORT_KEY, () -> ports[0]);
         for (int bank = 1; bank <= BANK_COUNT; bank++) {
-            int port = bankPort(bank);
-            registry.add("ports.bank" + bank, () -> port);
+            int port = ports[bank];
+            registry.add(bankPortKey(bank), () -> port);
         }
         registry.add("loanbroker.outbound-host", () -> "localhost");
     }
@@ -214,8 +220,12 @@ class BankEndpointTest {
     void everyBankPortIsServedByItsOwnBankWithItsOwnRates() {
         Map<?, ?> banksByPort = (Map<?, ?>) ReflectionTestUtils.getField(bankEndpoint, "banksByPort");
         assertThat(banksByPort).as("banksByPort").isNotNull();
+        int[] bankPorts = new int[BANK_COUNT];
+        for (int bank = 1; bank <= BANK_COUNT; bank++) {
+            bankPorts[bank - 1] = bankPort(bank);
+        }
         assertThat(banksByPort.keySet().stream().mapToInt(port -> (Integer) port).toArray())
-                .as("bank ports, in the order of ports.bank1 to ports.bank5").containsExactly(BANK_PORTS);
+                .as("bank ports, in the order of ports.bank1 to ports.bank5").containsExactly(bankPorts);
 
         Bank[] banks = new Bank[BANK_COUNT];
         double[][] rates = new double[BANK_COUNT][];
@@ -325,24 +335,28 @@ class BankEndpointTest {
         assertThat(faultstring(response)).isNotBlank();
     }
 
+    /**
+     * Each case names its listener by the property key of its port: the arguments are built before the context
+     * loads, so the test reads the port of the loaded context through {@link #listenerPort(String)}.
+     */
     static Stream<Arguments> operationsTheListenersServiceDoesNotHave() {
         return Stream.of(
-                Arguments.of("credit agency operation on a bank port", bankPort(5), bankPath(5),
+                Arguments.of("credit agency operation on a bank port", bankPortKey(5), bankPath(5),
                         "<ca:getCreditProfile xmlns:ca=\"" + CREDIT_AGENCY_NS + "\"><arg0><name>Muley</name>"
                                 + "<ssn>1234</ssn></arg0></ca:getCreditProfile>",
                         CreditAgencyEndpoint.PAYLOAD_ROOT),
-                Arguments.of("unknown body root on a bank port", bankPort(1), bankPath(1),
+                Arguments.of("unknown body root on a bank port", bankPortKey(1), bankPath(1),
                         "<u:doSomething xmlns:u=\"urn:example:unknown\"/>",
                         new QName("urn:example:unknown", "doSomething")),
-                Arguments.of("bank operation on the credit agency port", CREDIT_AGENCY_PORT, CREDIT_AGENCY_PATH,
+                Arguments.of("bank operation on the credit agency port", CREDIT_AGENCY_PORT_KEY, CREDIT_AGENCY_PATH,
                         loanQuoteRequest(GOLD_SCORE), BankEndpoint.PAYLOAD_ROOT));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("operationsTheListenersServiceDoesNotHave")
-    void operationTheListenersServiceDoesNotHaveIsAnsweredWithCxfsUnknownPartFault(String description, int port,
-            String path, String payload, QName payloadRoot) {
-        HttpTestClient.Response response = post(port, path, envelope(payload));
+    void operationTheListenersServiceDoesNotHaveIsAnsweredWithCxfsUnknownPartFault(String description,
+            String portKey, String path, String payload, QName payloadRoot) {
+        HttpTestClient.Response response = post(listenerPort(portKey), path, envelope(payload));
 
         String faultString = "Message part " + payloadRoot + " was not recognized.  (Does it exist in service WSDL?)";
         assertThat(response.status()).isEqualTo(500);
@@ -373,8 +387,17 @@ class BankEndpointTest {
         assertThat(faultstring(response)).isEqualTo(SoapFaultConfig.DEFAULT_FAULT_STRING);
     }
 
-    private static int bankPort(int bank) {
-        return BANK_PORTS[bank - 1];
+    private int bankPort(int bank) {
+        return listenerPort(bankPortKey(bank));
+    }
+
+    /** The port the loaded context's listener of {@code portKey} is bound to. */
+    private int listenerPort(String portKey) {
+        return environment.getRequiredProperty(portKey, Integer.class);
+    }
+
+    private static String bankPortKey(int bank) {
+        return "ports.bank" + bank;
     }
 
     private static String bankPath(int bank) {
@@ -507,7 +530,8 @@ class BankEndpointTest {
 
     /**
      * {@code count} distinct free TCP ports, none of them an original listener port and all below
-     * {@link #EPHEMERAL_PORT_MIN}.
+     * {@link #EPHEMERAL_PORT_MIN}, drawn anew on every call. A port is free when drawn, not when bound, so a port
+     * lost in between fails the context load and {@link PortInUseRetryingContextLoader} draws again.
      *
      * @throws IllegalStateException when {@link #MAX_PORT_ATTEMPTS} draws do not yield enough such ports
      */

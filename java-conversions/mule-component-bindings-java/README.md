@@ -218,11 +218,15 @@ date is required
 | `mapper/TwitterResponseMapperTest` | every status of a result, in order, mapped to an `ArrayList` of tweets with id and text; an empty list serializes as an empty `java.util.ArrayList`; a non-empty list fails with `SerializationException`; `Tweet` is not `Serializable` |
 | `SecretLoggingTest` | the whole application at `logging.level.root=TRACE` with each secret set to a sentinel: each upstream receives its secret and the Twitter search is signed with both secrets, while the log holds none of the six, on success, on an upstream error status and on an upstream timeout |
 | `exception/GlobalExceptionHandlerTest` | SC-1, copied with only its `package` line changed: the `404`, `405` and `500` status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path |
-| `config/PortRoutingFilterTest` | SC-10's shared test, copied with its component: each port serves only its routes, other paths get the no-listener `404` written by the filter, named routes are forwarded, the registration and port validation, an additional listener serving the same deployment, an empty TLS password named in the start-up failure |
+| `config/PortRoutingFilterTest` | SC-10's shared test, copied with its component: each port serves only its routes, other paths get the no-listener `404` written by the filter, named routes are forwarded, the registration and port validation, an additional listener serving the same deployment, an empty TLS password named in the start-up failure; an additional port another socket holds failing server creation with `PortInUseException` before any XNIO worker exists; an unbindable host (`192.0.2.1`, a `.invalid` name) named with its port in an `IllegalStateException`; a server on port -1 neither probed nor given a worker; a port taken after the probe failing the start within 30 s instead of hanging it (`PortInUseException` with one additional listener, a `WebServerException` caused by a `BindException` with two); `destroy()` stopping the context's started server before the worker; the worker's I/O and worker threads from `server.undertow.threads.io` and `server.undertow.threads.worker` or Undertow's defaults |
+| `support/PortInUseRetryingContextLoaderTest` | SC-10 test support, copied with its component: a context whose additional port another socket holds on the first attempt loads on a newly drawn port, with one WARN line per lost attempt, and that listener serves on its port; only a port in use on the cause chain (`PortInUseException`, a `BindException` saying `Address already in use`) loads again; a port in use is attempted 5 times and any other failure once, then rethrown |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS` request with no CORS processing: on `/` it runs the flow, on `/api/stockStats` it gets the `OPTIONS` answer, and a cross-origin `GET /` still reaches the flow |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
+| `FixtureParityListenerPortTest` | ST-2 on the SC-10 listener `stock-stats`, in a JVM of its own: the application prepared by the replay's context initializer, with `ports.stock-stats` reserved through `${freePort:stock-stats}` as every fixture of this project sets it, starts although SC-10 probes that port when the web server is created, and the `stock-stats` listener serves `GET /api/stockStats?date=2012-11-28` on the reserved port (`400 Bad Request`, `stock is required`); an engine check, not parity evidence |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
+
+`support/PortInUseRetryingContextLoader` is SC-10's test support. `MuleComponentBindingsTest`, `SecretLoggingTest`, both controller tests and `config/PreflightDispatchListenerTest` run the main listener on a random port and draw a free port for `ports.stock-stats` in `@DynamicPropertySource` on every context load; when another process takes it first, the loader loads the context again on a newly drawn port, up to 5 attempts.
 
 ## Fixture parity (ST-2)
 
@@ -257,9 +261,9 @@ All fourteen scenarios are `deterministic`; none is `nondeterministic` or `unrea
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 502 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 502 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 104 of 104 lines (`service/StockStatsService` 76, `service/TwitterSearchService` 17, `mapper/TwitterResponseMapper` 11). Total project LINE coverage: 88.3% (1045 of 1183 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 523 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 523 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 104 of 104 lines (`service/StockStatsService` 76, `service/TwitterSearchService` 17, `mapper/TwitterResponseMapper` 11). Total project LINE coverage: 88.5% (1098 of 1241 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=14`, `failed=0`.
 
 Tier 1 evidence shows that the project builds and passes its own tests. It is not parity evidence.

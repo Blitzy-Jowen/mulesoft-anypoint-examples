@@ -29,11 +29,13 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import com.mulesoft.examples.service_orchestration_and_choice_routing.controller.SamsungServiceEndpoint;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.service_orchestration_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 /**
  * Port of the original {@code ServiceOrchestrationAndChoiceRoutingIT}: the whole application runs on Undertow, as the
@@ -41,12 +43,14 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.support.Ht
  * comparison semantics. The SOAP order reply must equal {@code reply.xml} exactly, and {@code /populate} must answer a
  * payload containing {@code db populated}. Requests go over the wire through ST-1 {@link HttpTestClient}.
  *
- * <p>The fixed original ports 1080, 8090, 8091, 9090 and 9999 are replaced by free ports. A fresh in-memory Derby
- * database and a non-persistent embedded Artemis broker with a server id of its own give the class its own state,
- * which replaces the original's deletion of {@code ./muleEmbeddedDB} and {@code ./ObjectStore} before the run.
+ * <p>The fixed original ports 1080, 8090, 8091, 9090 and 9999 are replaced by free ports, drawn for each load attempt
+ * of the context and read back from the loaded context. A fresh in-memory Derby database and a non-persistent
+ * embedded Artemis broker with a server id of its own give the class its own state, which replaces the original's
+ * deletion of {@code ./muleEmbeddedDB} and {@code ./ObjectStore} before the run.
  */
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @ExtendWith(OutputCaptureExtension.class)
 class ServiceOrchestrationAndChoiceRoutingTest {
@@ -72,7 +76,8 @@ class ServiceOrchestrationAndChoiceRoutingTest {
     }
 
     /**
-     * Binds every listener to a free port and gives the class its own Derby database and Artemis broker.
+     * Binds every listener to a free port drawn for this load attempt and gives the class its own Derby database and
+     * Artemis broker.
      *
      * <p>{@code application.yml} sets each additional listener's port through a placeholder ({@code ajax.port},
      * {@code ports.populate}, {@code ports.samsung}, {@code ports.prices}), so only those keys are overridden.
@@ -86,7 +91,9 @@ class ServiceOrchestrationAndChoiceRoutingTest {
         int populate;
         int samsung;
         int prices;
-        // All five sockets are open together so the ports are distinct; they close before the server binds them.
+        // All five sockets are open together so the ports are distinct; they close before the server binds them, and
+        // when another process takes one in between, PortInUseRetryingContextLoader loads the context again, which
+        // invokes this method again for newly drawn ports.
         try (ServerSocket mainSocket = new ServerSocket(0);
                 ServerSocket ajaxSocket = new ServerSocket(0);
                 ServerSocket populateSocket = new ServerSocket(0);

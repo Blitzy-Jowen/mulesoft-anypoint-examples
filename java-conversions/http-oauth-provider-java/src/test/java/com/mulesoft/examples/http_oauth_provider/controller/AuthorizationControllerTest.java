@@ -23,16 +23,20 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
+import com.mulesoft.examples.http_oauth_provider.support.PortInUseRetryingContextLoader;
 
 /**
  * On-the-wire test of {@code /authorize}, the authorization endpoint and login page the Mule OAuth2 provider
@@ -44,12 +48,17 @@ import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
  * {@link HttpTestClient}, so status code, reason phrase, headers and body bytes are asserted exactly as they reach the
  * wire; nothing is mocked.
  *
+ * <p>The two ports are drawn for every attempt to load the context, and an attempt that loses one to another process
+ * before Undertow binds it is repeated on newly drawn ports ({@link PortInUseRetryingContextLoader}); the tests
+ * therefore read both ports, and the redirect URI built from the resource port, from the loaded context.
+ *
  * <p>The {@code test} profile ({@code application-test.yml}) configures the original demo client {@code myclientid}
  * and resource owner {@code mule}/{@code mule}. The happy path follows the original {@code HttpOauthProviderIT}:
  * its authorization URL renders the login form whose {@code username} and {@code password} fields the IT fills, and
  * submitting them redirects to the client's {@code redirect_uri} with a code.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class AuthorizationControllerTest {
@@ -72,29 +81,36 @@ class AuthorizationControllerTest {
 
     private static final String SCRIPT_STATE = "<script>alert(1)</script>";
 
-    private static int listenerPort;
+    /** The resource listener's port in the loaded context, the main {@code server.port}. */
+    @LocalServerPort
+    private int listenerPort;
 
-    private static int providerPort;
+    /** The SC-10 provider listener's port in the loaded context. */
+    @Value("${http.provider.port}")
+    private int providerPort;
 
     private HttpTestClient provider;
 
     private HttpTestClient listener;
 
     /**
-     * Reserves two distinct free loopback ports, both sockets open at once, for the resource and provider
-     * listeners; {@code application.yml} derives {@code server.port} from {@code http.listener.port}.
+     * Draws two distinct free loopback ports, both sockets open at once, for the resource and provider listeners;
+     * {@code application.yml} derives {@code server.port} from {@code http.listener.port}. Spring calls this method
+     * again for every attempt to load the context, so each attempt runs on ports drawn for it.
      */
     @DynamicPropertySource
     static void ports(DynamicPropertyRegistry registry) {
+        int drawnListenerPort;
+        int drawnProviderPort;
         try (ServerSocket listenerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress());
              ServerSocket providerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            listenerPort = listenerSocket.getLocalPort();
-            providerPort = providerSocket.getLocalPort();
+            drawnListenerPort = listenerSocket.getLocalPort();
+            drawnProviderPort = providerSocket.getLocalPort();
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve the listener and provider ports", e);
+            throw new UncheckedIOException("Cannot draw the listener and provider ports", e);
         }
-        registry.add("http.listener.port", () -> listenerPort);
-        registry.add("http.provider.port", () -> providerPort);
+        registry.add("http.listener.port", () -> drawnListenerPort);
+        registry.add("http.provider.port", () -> drawnProviderPort);
     }
 
     @BeforeEach
@@ -263,12 +279,12 @@ class AuthorizationControllerTest {
     }
 
     /** The {@code redirect_uri} of the original IT: the resource listener's {@code /redirect}. */
-    private static String redirectUri() {
+    private String redirectUri() {
         return "http://localhost:" + listenerPort + "/redirect";
     }
 
     /** The login form as the page posts it: the five hidden fields of a valid request and the owner's login. */
-    private static String loginForm(String password) {
+    private String loginForm(String password) {
         return form(
                 "response_type", "code",
                 "client_id", CLIENT_ID,

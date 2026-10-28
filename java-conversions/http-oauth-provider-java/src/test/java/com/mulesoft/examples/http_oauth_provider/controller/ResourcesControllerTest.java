@@ -23,10 +23,13 @@ import java.util.regex.Pattern;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -34,6 +37,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient.Response;
+import com.mulesoft.examples.http_oauth_provider.support.PortInUseRetryingContextLoader;
 
 /**
  * On-the-wire test of {@link ResourcesController}: the two flows of the original resource listener
@@ -46,13 +50,17 @@ import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient.Response
  * {@code POST /authorize} with the demo owner and {@code GET /token} with the demo client of profile {@code test},
  * as the original test obtained its token through the browser login.
  *
- * <p>Both listeners run on concrete ports reserved on the loopback interface before the context starts
+ * <p>Both listeners run on concrete ports drawn on the loopback interface for every attempt to load the context
  * ({@code DEFINED_PORT}) rather than on {@code RANDOM_PORT}: the SC-10 {@code provider} listener requires a
  * concrete port, {@code PortRoutingFilter} tells the two listeners apart by local port, and the expected payroll
  * {@code uri} and {@code /redirect} {@code Location} embed {@code http.listener.port} and
- * {@code http.provider.port}, which must therefore be the ports actually served.
+ * {@code http.provider.port}, which must therefore be the ports actually served. An attempt that loses a drawn port
+ * to another process before Undertow binds it is repeated on newly drawn ports
+ * ({@link PortInUseRetryingContextLoader}), so the ports, and every expected value built from them, are read from
+ * the loaded context.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class ResourcesControllerTest {
@@ -67,9 +75,13 @@ class ResourcesControllerTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private static int listenerPort;
+    /** The resource listener's port in the loaded context, the main {@code server.port}. */
+    @LocalServerPort
+    private int listenerPort;
 
-    private static int providerPort;
+    /** The SC-10 provider listener's port in the loaded context. */
+    @Value("${http.provider.port}")
+    private int providerPort;
 
     private HttpTestClient listener;
 
@@ -77,16 +89,17 @@ class ResourcesControllerTest {
 
     @DynamicPropertySource
     static void listenerPorts(DynamicPropertyRegistry registry) {
+        // Called again for every attempt to load the context, so each attempt gets ports drawn for it.
         // Both sockets are open at once, so the two ports differ; closing them frees the ports for Undertow.
+        int resource;
+        int oauthProvider;
         try (ServerSocket resourceSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress());
              ServerSocket providerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            listenerPort = resourceSocket.getLocalPort();
-            providerPort = providerSocket.getLocalPort();
+            resource = resourceSocket.getLocalPort();
+            oauthProvider = providerSocket.getLocalPort();
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve the resource and provider listener ports", e);
+            throw new UncheckedIOException("Cannot draw the resource and provider listener ports", e);
         }
-        int resource = listenerPort;
-        int oauthProvider = providerPort;
         // http.listener.port is the main server.port; http.provider.port is the SC-10 "provider" listener.
         registry.add("http.listener.port", () -> resource);
         registry.add("http.provider.port", () -> oauthProvider);

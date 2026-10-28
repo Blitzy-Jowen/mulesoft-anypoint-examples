@@ -25,6 +25,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 
@@ -67,6 +68,7 @@ import org.springframework.boot.web.servlet.filter.OrderedRequestContextFilter;
 import org.springframework.oxm.jaxb.Jaxb2Marshaller;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.NestedTestConfiguration;
@@ -103,6 +105,7 @@ import com.mulesoft.examples.soap_webservice_security.config.WsSecurityConfig.La
 import com.mulesoft.examples.soap_webservice_security.model.soap.Greet;
 import com.mulesoft.examples.soap_webservice_security.model.soap.GreetResponse;
 import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient;
+import com.mulesoft.examples.soap_webservice_security.support.PortInUseRetryingContextLoader;
 
 /**
  * Endpoint test of the six Greeter paths the original {@code mule-config.xml} exposed as {@code cxf:jaxws-service}
@@ -133,9 +136,12 @@ import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient;
  */
 // The SOAP listener runs on a random port, as SoapWebserviceSecurityTest's does: the plan maps the originals' fixed
 // ports to RANDOM_PORT plus @DynamicPropertySource, and a random port leaves no gap between choosing and binding it.
-// Only the additional client listener, which ListenerPorts requires to have a concrete port, gets a free port.
+// Only the additional client listener, which ListenerPorts requires to have a concrete port, gets a free port, drawn
+// for each load attempt; PortInUseRetryingContextLoader loads the context again when another process takes that port
+// before the listener binds it.
 @SpringBootTest(classes = SoapWebserviceSecurityApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 class GreeterEndpointTest {
 
@@ -174,10 +180,10 @@ class GreeterEndpointTest {
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
     /**
-     * Port of the {@code /client} listener, allocated once for the class so a cached context and its bound listener
-     * keep agreeing on it.
+     * The {@code /client} listener port drawn for this class's latest context load attempt, which the
+     * {@link LoggedSecuredRequests} context keeps clear of while this class's context stays open; 0 before any.
      */
-    private static final int CLIENT_PORT = TestSocketUtils.findAvailableTcpPort();
+    private static final AtomicInteger DRAWN_CLIENT_PORT = new AtomicInteger();
 
     @LocalServerPort
     private int port;
@@ -205,11 +211,14 @@ class GreeterEndpointTest {
     @Qualifier("samlCallbackHandler")
     private SAMLCallbackHandler samlCallbackHandler;
 
+    /** Spring calls this for every load attempt of the context, so each attempt binds a newly drawn client port. */
     @DynamicPropertySource
     static void listeners(DynamicPropertyRegistry registry) {
+        int clientPort = TestSocketUtils.findAvailableTcpPort();
+        DRAWN_CLIENT_PORT.set(clientPort);
         // listeners.additional[0].port reads ${ports.client}; overriding the scalar keeps the list's name, host and
         // routes from application.yml, which a registered list element would replace as a whole.
-        registry.add("ports.client", () -> CLIENT_PORT);
+        registry.add("ports.client", () -> clientPort);
         // The client's own default host is 0.0.0.0; its named client methods must call this test's listener only.
         registry.add("soap-security.client.host", () -> "localhost");
     }
@@ -566,20 +575,21 @@ class GreeterEndpointTest {
      * receives, the configured secrets and the plaintext that decryption and signature validation process out of the
      * log under a root {@code TRACE} level: {@code mule-config.xml} declares no logger.
      *
-     * <p>The application runs in a context of its own, on a random SOAP port and a client listener port drawn for it
-     * alone, so it lives beside the enclosing class's context. The UsernameToken requests are sent as a user
-     * configured for this run alone, {@link #SENTINEL_USER} with the password {@link #SENTINEL_PASSWORD}; the signing
-     * requests keep {@code joe}, whose password is also his private-key password. Each request, the one the server
-     * rejects for a wrong password included, is asserted to be answered as its path answers it, then its own log
-     * events are asserted to hold the unpinned request-context filter's {@code TRACE} line, which proves the capture
-     * sees that level, the endpoint adapter's {@code TRACE} invocation line of an accepted request or the interceptor's
-     * {@code WARN} rejection line of a rejected one, and no {@code WARN} of Santuario's {@code DOMReference}, and the
-     * console output is asserted to hold no serialized security-header element, no sentinel and not the greeted name.
-     * The run restores the logger levels it found and closes its context, so later test classes do not run at
-     * {@code TRACE}.
+     * <p>The application runs in a context of its own, on a random SOAP port and a client listener port drawn for
+     * each of its load attempts apart from the enclosing class's, so it lives beside the enclosing class's context.
+     * The UsernameToken requests are sent as a user configured for this run alone, {@link #SENTINEL_USER} with the
+     * password {@link #SENTINEL_PASSWORD}; the signing requests keep {@code joe}, whose password is also his
+     * private-key password. Each request, the one the server rejects for a wrong password included, is asserted to be
+     * answered as its path answers it, then its own log events are asserted to hold the unpinned request-context
+     * filter's {@code TRACE} line, which proves the capture sees that level, the endpoint adapter's {@code TRACE}
+     * invocation line of an accepted request or the interceptor's {@code WARN} rejection line of a rejected one, and
+     * no {@code WARN} of Santuario's {@code DOMReference}, and the console output is asserted to hold no serialized
+     * security-header element, no sentinel and not the greeted name. The run restores the logger levels it found and
+     * closes its context, so later test classes do not run at {@code TRACE}.
      */
     @SpringBootTest(classes = SoapWebserviceSecurityApplication.class,
             webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @ActiveProfiles("test")
     @NestedTestConfiguration(NestedTestConfiguration.EnclosingConfiguration.OVERRIDE)
     @DirtiesContext
@@ -600,9 +610,6 @@ class GreeterEndpointTest {
         static final List<String> SECURITY_HEADER_ELEMENTS = List.of("<wsse:Security", "<wsse:UsernameToken",
                 "<wsse:Password", "<wsse:Nonce", "<wsse:BinarySecurityToken", "<saml2:Assertion",
                 "<ds:SignatureValue", "<xenc:CipherValue");
-
-        /** Port of this context's client listener, apart from the enclosing class's, whose context stays open. */
-        private static final int LOGGED_CLIENT_PORT = portOtherThan(CLIENT_PORT);
 
         /** Santuario's reference logger, whose null-digest-input WARN a signed assertion's STR-Transform raises. */
         private static final String DOM_REFERENCE_LOGGER = "org.apache.jcp.xml.dsig.internal.dom.DOMReference";
@@ -633,9 +640,14 @@ class GreeterEndpointTest {
         @Qualifier("samlCallbackHandler")
         SAMLCallbackHandler samlCallbackHandler;
 
+        /**
+         * Spring calls this for every load attempt of the context, so each attempt binds a newly drawn client port,
+         * apart from the enclosing class's, whose context stays open.
+         */
         @DynamicPropertySource
         static void listenersAndSentinelUser(DynamicPropertyRegistry registry) {
-            registry.add("ports.client", () -> LOGGED_CLIENT_PORT);
+            int loggedClientPort = portOtherThan(DRAWN_CLIENT_PORT.get());
+            registry.add("ports.client", () -> loggedClientPort);
             registry.add("soap-security.client.host", () -> "localhost");
             registry.add("soap-security.users." + SENTINEL_USER, () -> SENTINEL_PASSWORD);
         }

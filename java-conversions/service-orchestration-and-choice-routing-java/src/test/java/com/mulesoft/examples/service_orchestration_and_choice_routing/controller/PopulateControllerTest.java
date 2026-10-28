@@ -17,13 +17,17 @@ import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.service_orchestration_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link PopulateController}, the {@code databaseInitialisation} flow's
@@ -35,49 +39,33 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.support.Ht
  * Derby XA database. Every response is read through ST-1 {@link HttpTestClient}, so the raw status line, headers and
  * body bytes are asserted as sent on the wire.
  *
- * <p>Every listener port is a free port chosen here rather than an original port, so concurrent builds on one host
- * never collide. Each run gets its own in-memory Derby database, which starts without tables, and its own embedded
- * Artemis server ID, so the first {@code GET /populate} always creates the tables and no other context in the same
- * JVM shares either.
+ * <p>Every listener port is a free port drawn for each load attempt of the context rather than an original port, so
+ * concurrent builds on one host never collide: a drawn port is free when drawn, not when bound, so when another
+ * process takes one in between, {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports,
+ * and the tests read the ports of the loaded context from it. Each run gets its own in-memory Derby database, which
+ * starts without tables, and its own embedded Artemis server ID, so the first {@code GET /populate} always creates
+ * the tables and no other context in the same JVM shares either.
  */
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class PopulateControllerTest {
 
     private static final String POPULATE_PATH = "/populate";
-
-    private static final int MAIN_PORT;
-
-    private static final int AJAX_PORT;
-
-    private static final int POPULATE_PORT;
-
-    private static final int SAMSUNG_PORT;
-
-    private static final int PRICES_PORT;
 
     private static final int ARTEMIS_SERVER_ID = ThreadLocalRandom.current().nextInt(1_000_000, Integer.MAX_VALUE);
 
     private static final String DERBY_DATABASE_NAME =
             "memory:PopulateControllerTest_" + UUID.randomUUID().toString().replace("-", "");
 
-    static {
-        // All five sockets stay open together, so the ports are distinct from one another.
-        try (ServerSocket main = freeSocket();
-                ServerSocket ajax = freeSocket();
-                ServerSocket populate = freeSocket();
-                ServerSocket samsung = freeSocket();
-                ServerSocket prices = freeSocket()) {
-            MAIN_PORT = main.getLocalPort();
-            AJAX_PORT = ajax.getLocalPort();
-            POPULATE_PORT = populate.getLocalPort();
-            SAMSUNG_PORT = samsung.getLocalPort();
-            PRICES_PORT = prices.getLocalPort();
-        } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve free listener ports", e);
-        }
-    }
+    /** The main listener, which serves the SOAP {@code /orders} path alone. */
+    @LocalServerPort
+    private int mainPort;
+
+    /** The populate listener of the loaded context. */
+    @Value("${ports.populate}")
+    private int populatePort;
 
     private static ServerSocket freeSocket() throws IOException {
         ServerSocket socket = new ServerSocket(0);
@@ -86,7 +74,8 @@ class PopulateControllerTest {
     }
 
     /**
-     * Moves every listener of the application to the ports chosen above and isolates the embedded stores.
+     * Moves every listener of the application to free ports drawn for this load attempt and isolates the embedded
+     * stores.
      *
      * <p>The additional listener entries of {@code application.yml} read their ports from the placeholders
      * {@code ajax.port} and {@code ports.*}; those keys are overridden rather than {@code listeners.additional[i]}
@@ -95,14 +84,33 @@ class PopulateControllerTest {
      */
     @DynamicPropertySource
     static void listenerAndStoreProperties(DynamicPropertyRegistry registry) {
-        registry.add("server.port", () -> MAIN_PORT);
-        registry.add("ajax.port", () -> AJAX_PORT);
-        registry.add("ports.populate", () -> POPULATE_PORT);
-        registry.add("ports.samsung", () -> SAMSUNG_PORT);
-        registry.add("ports.prices", () -> PRICES_PORT);
-        registry.add("orders.samsung.url", () -> "http://localhost:" + SAMSUNG_PORT + "/samsung/orders");
-        registry.add("orders.price.url", () -> "http://localhost:" + PRICES_PORT + "/api/prices/{productId}");
-        registry.add("orders.soap.url", () -> "http://localhost:" + MAIN_PORT + "/orders");
+        int main;
+        int ajax;
+        int populate;
+        int samsung;
+        int prices;
+        // All five sockets stay open together, so the ports are distinct from one another.
+        try (ServerSocket mainSocket = freeSocket();
+                ServerSocket ajaxSocket = freeSocket();
+                ServerSocket populateSocket = freeSocket();
+                ServerSocket samsungSocket = freeSocket();
+                ServerSocket pricesSocket = freeSocket()) {
+            main = mainSocket.getLocalPort();
+            ajax = ajaxSocket.getLocalPort();
+            populate = populateSocket.getLocalPort();
+            samsung = samsungSocket.getLocalPort();
+            prices = pricesSocket.getLocalPort();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot draw free listener ports", e);
+        }
+        registry.add("server.port", () -> main);
+        registry.add("ajax.port", () -> ajax);
+        registry.add("ports.populate", () -> populate);
+        registry.add("ports.samsung", () -> samsung);
+        registry.add("ports.prices", () -> prices);
+        registry.add("orders.samsung.url", () -> "http://localhost:" + samsung + "/samsung/orders");
+        registry.add("orders.price.url", () -> "http://localhost:" + prices + "/api/prices/{productId}");
+        registry.add("orders.soap.url", () -> "http://localhost:" + main + "/orders");
         registry.add("spring.datasource.xa.properties.databaseName", () -> DERBY_DATABASE_NAME);
         registry.add("spring.datasource.xa.properties.createDatabase", () -> "create");
         registry.add("spring.artemis.mode", () -> "embedded");
@@ -122,7 +130,7 @@ class PopulateControllerTest {
      */
     @Test
     void populateCreatesTablesThenReportsAlreadyPopulated() {
-        HttpTestClient populateListener = HttpTestClient.localhost(POPULATE_PORT);
+        HttpTestClient populateListener = HttpTestClient.localhost(populatePort);
 
         HttpTestClient.Response created = populateListener.get(POPULATE_PATH);
 
@@ -144,7 +152,7 @@ class PopulateControllerTest {
      */
     @Test
     void postIsMethodNotAllowed() {
-        HttpTestClient.Response response = HttpTestClient.localhost(POPULATE_PORT).post(POPULATE_PATH, null, "");
+        HttpTestClient.Response response = HttpTestClient.localhost(populatePort).post(POPULATE_PATH, null, "");
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 405 Method Not Allowed");
         assertThat(response.header("Content-Type")).as(response::toString).startsWith("text/plain");
@@ -158,7 +166,7 @@ class PopulateControllerTest {
      */
     @Test
     void populatePathOnMainPortIsNoListener() {
-        HttpTestClient.Response response = HttpTestClient.localhost(MAIN_PORT).get(POPULATE_PATH);
+        HttpTestClient.Response response = HttpTestClient.localhost(mainPort).get(POPULATE_PATH);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 404 Not Found");
         assertThat(response.header("Content-Type")).as(response::toString).startsWith("text/plain");

@@ -34,8 +34,11 @@ import jakarta.mail.Multipart;
 import jakarta.mail.internet.InternetAddress;
 import jakarta.mail.internet.MimeBodyPart;
 import jakarta.mail.internet.MimeMessage;
+import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -186,18 +189,17 @@ class AggregationReportMailerTest {
 
     @Test
     void closedPortRaisesMailExceptionWithoutRetry() throws Exception {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
+        // A bound socket that never listens refuses connections and keeps the port from being taken meanwhile.
+        try (Socket reserved = reserveRefusingPort()) {
+            JavaMailSenderImpl sender = spy(senderOn(reserved.getLocalPort()));
+            AggregationReportMailer mailer = mailer(sender, FROM, TO);
+
+            assertThrows(MailException.class, () -> mailer.send(CSV));
+
+            // any(MimeMessage.class) binds the single-message overload the mailer calls; the varargs overload it
+            // delegates to is a separate method on the spy and is not counted here.
+            verify(sender, times(1)).send(any(MimeMessage.class));
         }
-        JavaMailSenderImpl sender = spy(senderOn(closedPort));
-        AggregationReportMailer mailer = mailer(sender, FROM, TO);
-
-        assertThrows(MailException.class, () -> mailer.send(CSV));
-
-        // any(MimeMessage.class) binds the single-message overload the mailer calls; the varargs overload it
-        // delegates to is a separate method on the spy and is not counted here.
-        verify(sender, times(1)).send(any(MimeMessage.class));
         assertEquals(0, greenMail.getReceivedMessages().length);
     }
 
@@ -310,6 +312,26 @@ class AggregationReportMailerTest {
         properties.setProperty("mail.smtp.writetimeout", "10000");
         sender.setJavaMailProperties(properties);
         return sender;
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
     }
 
     private static AggregationReportMailer mailer(JavaMailSender sender, String from, String to) {

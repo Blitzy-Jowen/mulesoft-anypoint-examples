@@ -45,6 +45,7 @@ import com.mulesoft.examples.foreach_processing_and_choice_routing.model.Custome
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanBrokerQuoteRequest;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanQuote;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.foreach_processing_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -60,12 +61,15 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatcher;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.core.env.Environment;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.NestedTestConfiguration;
@@ -81,8 +85,11 @@ import org.springframework.ws.client.core.WebServiceTemplate;
  * {@code http:listener} on 11081 with {@code path="/*"} and no {@code allowedMethods}.
  *
  * <p>The whole application runs on Undertow: the main listener on a random port stands in for 11081, and the six
- * SOAP listeners (credit agency, Banks 1 to 5) on ports drawn once per class, never the original 18080 or 10080 to
- * 50080, so this context can live in the test context cache beside any other without a bind collision. Both SOAP
+ * SOAP listeners (credit agency, Banks 1 to 5) on free ports drawn for each load of the context, never the original
+ * 18080 or 10080 to 50080, so this context can live in the test context cache beside any other without a bind
+ * collision. A port another process takes between its draw and its bind fails that load, and
+ * {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports, so every test reads the ports
+ * of the loaded context from its {@link Environment}. Both SOAP
  * clients are Spring mocks: the credit profile is fixed and each bank, recognised by the path of the bank URI the
  * service builds, answers a fixed quote, because the real credit agency and banks answer random values.
  *
@@ -102,6 +109,7 @@ import org.springframework.ws.client.core.WebServiceTemplate;
  * answered exactly as a plain {@code OPTIONS} request, with no {@code Access-Control-*} or {@code Vary} header.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 class LoanBrokerControllerTest {
 
     /** The original IT's request, parameters in its order. */
@@ -120,19 +128,16 @@ class LoanBrokerControllerTest {
     /** The original's fixed listener ports, which this class never binds. */
     private static final Set<Integer> ORIGINAL_PORTS = Set.of(11081, 18080, 10080, 20080, 30080, 40080, 50080);
 
-    private static final int CREDIT_AGENCY_PORT;
-    private static final int[] BANK_PORTS = new int[5];
+    private static final int BANK_COUNT = 5;
 
-    static {
-        Set<Integer> taken = new HashSet<>(ORIGINAL_PORTS);
-        CREDIT_AGENCY_PORT = drawPort(taken);
-        for (int i = 0; i < BANK_PORTS.length; i++) {
-            BANK_PORTS[i] = drawPort(taken);
-        }
-    }
+    /** Property key of the credit agency listener's port. */
+    private static final String CREDIT_AGENCY_PORT_KEY = "ports.credit-agency";
 
     @LocalServerPort
     private int port;
+
+    @Autowired
+    private Environment environment;
 
     @MockBean
     private CreditAgencyClient creditAgencyClient;
@@ -146,13 +151,7 @@ class LoanBrokerControllerTest {
 
     @DynamicPropertySource
     static void listenerPorts(DynamicPropertyRegistry registry) {
-        // listeners.additional[*].port reads these placeholders, so the SOAP listeners bind the drawn ports too.
-        registry.add("ports.credit-agency", () -> CREDIT_AGENCY_PORT);
-        for (int i = 0; i < BANK_PORTS.length; i++) {
-            int bankPort = BANK_PORTS[i];
-            registry.add("ports.bank" + (i + 1), () -> bankPort);
-        }
-        registry.add("loanbroker.outbound-host", () -> "localhost");
+        registerDrawnListenerPorts(registry);
     }
 
     @BeforeEach
@@ -398,9 +397,9 @@ class LoanBrokerControllerTest {
 
     /** The SOAP listeners serve only their {@code /mule/<service>} paths, so the loan broker is not reachable there. */
     @ParameterizedTest(name = "port of {0}")
-    @MethodSource("soapListenerPorts")
-    void loanBrokerIsNotServedOnASoapListener(String listener, int soapPort) {
-        HttpTestClient.Response response = HttpTestClient.localhost(soapPort).get("/?" + FULL_QUERY);
+    @MethodSource("soapListenerPortKeys")
+    void loanBrokerIsNotServedOnASoapListener(String listener, String portKey) {
+        HttpTestClient.Response response = HttpTestClient.localhost(listenerPort(portKey)).get("/?" + FULL_QUERY);
 
         assertEquals(404, response.status(), response::toString);
         assertEquals("No listener for endpoint: /", response.bodyAsString(), response::toString);
@@ -409,9 +408,10 @@ class LoanBrokerControllerTest {
 
     /** A CORS pre-flight to a path a SOAP listener does not serve gets that listener's 404, as plain OPTIONS does. */
     @ParameterizedTest(name = "port of {0}")
-    @MethodSource("soapListenerPorts")
-    void corsPreflightToAPathASoapListenerDoesNotServeAnswersLikeAPlainOptionsRequest(String listener, int soapPort) {
-        HttpTestClient soapListener = HttpTestClient.localhost(soapPort);
+    @MethodSource("soapListenerPortKeys")
+    void corsPreflightToAPathASoapListenerDoesNotServeAnswersLikeAPlainOptionsRequest(String listener,
+            String portKey) {
+        HttpTestClient soapListener = HttpTestClient.localhost(listenerPort(portKey));
         String target = "/?" + FULL_QUERY;
 
         HttpTestClient.Response plain = soapListener.send("OPTIONS", target, null, null);
@@ -424,10 +424,14 @@ class LoanBrokerControllerTest {
         verifyNoInteractions(creditAgencyClient, bankClient);
     }
 
-    static Stream<Arguments> soapListenerPorts() {
+    /**
+     * Each SOAP listener's name and the property key of its port: the arguments are built before the context loads,
+     * so each test reads the port of the loaded context through {@link #listenerPort(String)}.
+     */
+    static Stream<Arguments> soapListenerPortKeys() {
         return Stream.concat(
-                Stream.of(Arguments.of("credit agency", CREDIT_AGENCY_PORT)),
-                IntStream.range(0, BANK_PORTS.length).mapToObj(i -> Arguments.of("Bank " + (i + 1), BANK_PORTS[i])));
+                Stream.of(Arguments.of("credit agency", CREDIT_AGENCY_PORT_KEY)),
+                IntStream.rangeClosed(1, BANK_COUNT).mapToObj(bank -> Arguments.of("Bank " + bank, bankPortKey(bank))));
     }
 
     /** The loan requests of {@link LoggedLoanRequests} under {@code logging.level.root=TRACE}. */
@@ -458,13 +462,16 @@ class LoanBrokerControllerTest {
      * rate, never the applicant.
      *
      * <p>The whole application runs unmocked, the real credit agency and banks answering over SOAP, on a random main
-     * port and SOAP ports drawn for this context alone, so it lives beside the mocked context of the enclosing class.
+     * port and SOAP ports drawn for each load of this context, which never draws a port the mocked context of the
+     * enclosing class holds, so it lives beside that context; a port lost between draw and bind is drawn again by
+     * {@link PortInUseRetryingContextLoader}, declared here because this configuration overrides the enclosing one.
      * Each request is asserted on the wire, then its own log events are asserted to hold the original flow's logger
      * lines and a line of the root level from an unpinned logger, which proves the capture sees that level, and the
      * console output is asserted to hold neither the name nor the ssn. Each run restores the logger levels it found and
      * closes its context, so later test classes do not run at the low root level.
      */
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @NestedTestConfiguration(NestedTestConfiguration.EnclosingConfiguration.OVERRIDE)
     @DirtiesContext
     @ExtendWith(OutputCaptureExtension.class)
@@ -500,17 +507,9 @@ class LoanBrokerControllerTest {
 
         @DynamicPropertySource
         static void unmockedListenerPorts(DynamicPropertyRegistry registry) {
-            // Drawn apart from the enclosing class's ports, whose context stays open in the context cache.
-            Set<Integer> taken = new HashSet<>(ORIGINAL_PORTS);
-            taken.add(CREDIT_AGENCY_PORT);
-            Arrays.stream(BANK_PORTS).forEach(taken::add);
-            int creditAgencyPort = drawPort(taken);
-            registry.add("ports.credit-agency", () -> creditAgencyPort);
-            for (int i = 1; i <= BANK_PORTS.length; i++) {
-                int bankPort = drawPort(taken);
-                registry.add("ports.bank" + i, () -> bankPort);
-            }
-            registry.add("loanbroker.outbound-host", () -> "localhost");
+            // The enclosing class's context stays open in the context cache, and a port its listeners hold is never
+            // drawn, because only a port that can be bound is.
+            registerDrawnListenerPorts(registry);
         }
 
         @BeforeAll
@@ -673,13 +672,14 @@ class LoanBrokerControllerTest {
 
     /**
      * Asserts that exactly the given banks were asked, in this order, at the URIs the service builds from
-     * {@code loanbroker.outbound-host} and the drawn {@code ports.bankN}, and returns the requests they were sent.
+     * {@code loanbroker.outbound-host} and the loaded context's {@code ports.bankN}, and returns the requests they
+     * were sent.
      */
     private List<LoanBrokerQuoteRequest> assertBanksAsked(int... banks) {
         ArgumentCaptor<URI> uris = ArgumentCaptor.forClass(URI.class);
         ArgumentCaptor<LoanBrokerQuoteRequest> requests = ArgumentCaptor.forClass(LoanBrokerQuoteRequest.class);
         verify(bankClient, times(banks.length)).getLoanQuote(uris.capture(), requests.capture());
-        assertEquals(Arrays.stream(banks).mapToObj(LoanBrokerControllerTest::bankUri).toList(), uris.getAllValues());
+        assertEquals(Arrays.stream(banks).mapToObj(this::bankUri).toList(), uris.getAllValues());
         return requests.getAllValues();
     }
 
@@ -696,8 +696,17 @@ class LoanBrokerControllerTest {
         return uri -> uri != null && path.equals(uri.getPath());
     }
 
-    private static URI bankUri(int bank) {
-        return URI.create("http://localhost:" + BANK_PORTS[bank - 1] + "/mule/TheBank" + bank);
+    private URI bankUri(int bank) {
+        return URI.create("http://localhost:" + listenerPort(bankPortKey(bank)) + "/mule/TheBank" + bank);
+    }
+
+    /** The port the loaded context's listener of {@code portKey} is bound to. */
+    private int listenerPort(String portKey) {
+        return environment.getRequiredProperty(portKey, Integer.class);
+    }
+
+    private static String bankPortKey(int bank) {
+        return "ports.bank" + bank;
     }
 
     /** The original IT's parameters as an ordered, mutable map. */
@@ -721,6 +730,23 @@ class LoanBrokerControllerTest {
         StringJoiner query = new StringJoiner("&", "/?", "");
         params.forEach((name, value) -> query.add(value == null ? name : name + "=" + value));
         return query.toString();
+    }
+
+    /**
+     * Draws six pairwise distinct free ports, none of them an original port, and registers them as the credit
+     * agency's and Banks 1 to 5's, with the loopback name as the outbound host. Called from a
+     * {@code @DynamicPropertySource} method, so each load of the context, a repeated one included, draws afresh.
+     */
+    private static void registerDrawnListenerPorts(DynamicPropertyRegistry registry) {
+        Set<Integer> taken = new HashSet<>(ORIGINAL_PORTS);
+        // listeners.additional[*].port reads these placeholders, so the SOAP listeners bind the drawn ports too.
+        int creditAgencyPort = drawPort(taken);
+        registry.add(CREDIT_AGENCY_PORT_KEY, () -> creditAgencyPort);
+        for (int bank = 1; bank <= BANK_COUNT; bank++) {
+            int bankPort = drawPort(taken);
+            registry.add(bankPortKey(bank), () -> bankPort);
+        }
+        registry.add("loanbroker.outbound-host", () -> "localhost");
     }
 
     /** A free port not yet in {@code taken}, which it is then added to. */

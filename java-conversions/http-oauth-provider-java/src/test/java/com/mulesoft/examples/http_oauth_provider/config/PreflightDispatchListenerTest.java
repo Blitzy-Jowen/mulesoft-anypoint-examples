@@ -35,9 +35,11 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -45,6 +47,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient.Response;
+import com.mulesoft.examples.http_oauth_provider.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link PreflightDispatchConfig} on the application's two listeners: a CORS pre-flight is answered
@@ -61,15 +64,18 @@ import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient.Response
  *   <li>A path the receiving port does not serve gets the SC-10 no-listener 404.</li>
  * </ul>
  *
- * <p>The whole application runs, nothing mocked, on both Undertow listeners bound to loopback ports reserved before
- * the context starts ({@code DEFINED_PORT}): the SC-10 provider listener requires a concrete port,
+ * <p>The whole application runs, nothing mocked, on both Undertow listeners bound to loopback ports drawn for every
+ * attempt to load the context ({@code DEFINED_PORT}): the SC-10 provider listener requires a concrete port,
  * {@code PortRoutingFilter} tells the two listeners apart by local port, and the payroll {@code uri} and the
- * {@code /redirect} {@code Location} embed both configured ports. Tokens come from the real login at
+ * {@code /redirect} {@code Location} embed both configured ports. An attempt that loses a drawn port to another
+ * process before Undertow binds it is repeated on newly drawn ports ({@link PortInUseRetryingContextLoader}), so the
+ * ports, and the values expected from them, are read from the loaded context. Tokens come from the real login at
  * {@code POST /authorize} and exchange at {@code GET /token} with the demo client and owner of profile {@code test};
  * requests go through ST-1 {@link HttpTestClient}, so status line, headers and body bytes are asserted as the
  * listeners write them.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class PreflightDispatchListenerTest {
@@ -91,9 +97,13 @@ class PreflightDispatchListenerTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private static int listenerPort;
+    /** The resource listener's port in the loaded context, the main {@code server.port}. */
+    @LocalServerPort
+    private int listenerPort;
 
-    private static int providerPort;
+    /** The SC-10 provider listener's port in the loaded context. */
+    @Value("${http.provider.port}")
+    private int providerPort;
 
     @Value("${oauth.provider.provider-name}")
     private String providerName;
@@ -115,23 +125,26 @@ class PreflightDispatchListenerTest {
     private HttpTestClient provider;
 
     /**
-     * Reserves two distinct free loopback ports, both sockets open at once, for the resource and provider
-     * listeners; {@code application.yml} derives {@code server.port} from {@code http.listener.port}.
+     * Draws two distinct free loopback ports, both sockets open at once, for the resource and provider listeners;
+     * {@code application.yml} derives {@code server.port} from {@code http.listener.port}. Spring calls this method
+     * again for every attempt to load the context, so each attempt runs on ports drawn for it.
      */
     @DynamicPropertySource
     static void ports(DynamicPropertyRegistry registry) {
+        int drawnListenerPort;
+        int drawnProviderPort;
         try (ServerSocket listenerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress());
              ServerSocket providerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            listenerPort = listenerSocket.getLocalPort();
-            providerPort = providerSocket.getLocalPort();
+            drawnListenerPort = listenerSocket.getLocalPort();
+            drawnProviderPort = providerSocket.getLocalPort();
         } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve the resource and provider listener ports", e);
+            throw new UncheckedIOException("Cannot draw the resource and provider listener ports", e);
         }
-        registry.add("http.listener.port", () -> listenerPort);
-        registry.add("http.provider.port", () -> providerPort);
+        registry.add("http.listener.port", () -> drawnListenerPort);
+        registry.add("http.provider.port", () -> drawnProviderPort);
     }
 
-    /** The ports are known only once the context has been created, after the test instance itself. */
+    /** The clients connect to the ports of the loaded context, injected into the test instance. */
     @BeforeEach
     void clients() {
         listener = HttpTestClient.localhost(listenerPort);
@@ -297,7 +310,7 @@ class PreflightDispatchListenerTest {
     }
 
     /** The redirect URI the codes are issued for: the resource listener's {@code /redirect}, as in the original. */
-    private static String redirectUri() {
+    private String redirectUri() {
         return "http://localhost:" + listenerPort + "/redirect";
     }
 

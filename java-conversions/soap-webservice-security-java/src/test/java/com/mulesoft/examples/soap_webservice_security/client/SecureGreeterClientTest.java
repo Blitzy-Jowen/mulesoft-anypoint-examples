@@ -22,7 +22,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.io.IOException;
 import java.io.StringReader;
 import java.net.ConnectException;
-import java.net.ServerSocket;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
@@ -490,17 +491,17 @@ class SecureGreeterClientTest {
 
     @Test
     void unreachableServiceRaisesWebServiceIOException() throws IOException {
-        int closedPort;
-        try (ServerSocket socket = new ServerSocket(0)) {
-            closedPort = socket.getLocalPort();
+        // A port held by a socket that never listens, so no other process can serve it during the call.
+        try (Socket reserved = reserveRefusingPort()) {
+            URI unreachable = URI.create(
+                    "http://localhost:" + reserved.getLocalPort() + SERVICES + SecureGreeterClient.PATH_UNSECURE);
+
+            WebServiceIOException failure = assertThrows(WebServiceIOException.class,
+                    () -> client.greet(unreachable, OutboundSecurity.NONE, NAME));
+
+            assertThat(causes(failure)).anyMatch(ConnectException.class::isInstance);
+            WIREMOCK.verify(0, anyRequestedFor(anyUrl()));
         }
-        URI unreachable = URI.create("http://localhost:" + closedPort + SERVICES + SecureGreeterClient.PATH_UNSECURE);
-
-        WebServiceIOException failure = assertThrows(WebServiceIOException.class,
-                () -> client.greet(unreachable, OutboundSecurity.NONE, NAME));
-
-        assertThat(causes(failure)).anyMatch(ConnectException.class::isInstance);
-        WIREMOCK.verify(0, anyRequestedFor(anyUrl()));
     }
 
     /**
@@ -1113,6 +1114,26 @@ class SecureGreeterClientTest {
             chain.add(cause);
         }
         return chain;
+    }
+
+    /**
+     * A socket bound to a free port on every local address that never listens or connects: a connection to its port
+     * is refused while it is open, and with SO_REUSEADDR off no other socket can bind that port meanwhile.
+     */
+    private static Socket reserveRefusingPort() throws IOException {
+        Socket socket = new Socket();
+        try {
+            socket.setReuseAddress(false);
+            socket.bind(new InetSocketAddress(0));
+            return socket;
+        } catch (IOException | RuntimeException ex) {
+            try {
+                socket.close();
+            } catch (IOException closeFailure) {
+                ex.addSuppressed(closeFailure);
+            }
+            throw ex;
+        }
     }
 
     /** Registers {@link SoapSecurityProperties} for binding, as {@code @EnableConfigurationProperties} on the application. */

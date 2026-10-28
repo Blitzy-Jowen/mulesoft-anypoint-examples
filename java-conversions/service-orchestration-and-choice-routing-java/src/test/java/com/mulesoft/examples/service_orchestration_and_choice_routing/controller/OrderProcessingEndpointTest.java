@@ -55,8 +55,10 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.web.servlet.filter.OrderedRequestContextFilter;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.NestedTestConfiguration;
@@ -71,6 +73,7 @@ import org.w3c.dom.NodeList;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.service.OrderOrchestrationService;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.service_orchestration_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link OrderProcessingEndpoint}, the converted {@code orderService} flow of the original
@@ -84,14 +87,18 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.support.Ht
  * asserted as Undertow sent them. The only test double is a spy on {@link OrderOrchestrationService}; Mockito resets
  * it after every test, so only {@link #serviceFailureIsServerFault()} changes its behaviour.
  *
- * <p>The ports are allocated here rather than left random: each additional listener must be bound to a concrete port,
+ * <p>The ports are drawn here rather than left random: each additional listener must be bound to a concrete port,
  * because SC-10 identifies a listener by the local port that received the request, and the Samsung and SOAP client
- * URLs must name their listener's port before the context starts. The context gets its own in-memory Derby database
- * and its own embedded Artemis server id, so it never shares state with another context of the same test JVM. The
- * nested {@link UnderRootTrace} run covers the logger levels {@code application.yml} pins, in a context of its own.
+ * URLs must name their listener's port before the context starts. They are drawn for each load attempt of the
+ * context: a drawn port is free when drawn, not when bound, so when another process takes one in between,
+ * {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports, and the tests read the ports of
+ * the loaded context from it. The context gets its own in-memory Derby database and its own embedded Artemis server
+ * id, so it never shares state with another context of the same test JVM. The nested {@link UnderRootTrace} run
+ * covers the logger levels {@code application.yml} pins, in a context of its own.
  */
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class OrderProcessingEndpointTest {
 
@@ -119,12 +126,6 @@ class OrderProcessingEndpointTest {
     private static final String UNKNOWN_PURCHASE_FAULT = "Message part {http://samsung.se.mulesoft.com/}purchase"
             + " was not recognized.  (Does it exist in service WSDL?)";
 
-    private static final int MAIN_PORT;
-    private static final int AJAX_PORT;
-    private static final int POPULATE_PORT;
-    private static final int SAMSUNG_PORT;
-    private static final int PRICES_PORT;
-
     /** Embedded Artemis server id of this context: the in-VM acceptor is registered per id in the JVM. */
     private static final int ARTEMIS_SERVER_ID;
 
@@ -132,12 +133,6 @@ class OrderProcessingEndpointTest {
     private static final String DERBY_DATABASE;
 
     static {
-        int[] ports = distinctFreePorts(5);
-        MAIN_PORT = ports[0];
-        AJAX_PORT = ports[1];
-        POPULATE_PORT = ports[2];
-        SAMSUNG_PORT = ports[3];
-        PRICES_PORT = ports[4];
         ARTEMIS_SERVER_ID = ThreadLocalRandom.current().nextInt(10_000, Integer.MAX_VALUE);
         DERBY_DATABASE = "memory:OrderProcessingEndpointTest_" + UUID.randomUUID().toString().replace("-", "");
     }
@@ -145,21 +140,36 @@ class OrderProcessingEndpointTest {
     @SpyBean
     OrderOrchestrationService orchestration;
 
+    /** The main listener of the loaded context, which serves {@code /orders}. */
+    @LocalServerPort
+    int mainPort;
+
+    /** The populate listener of the loaded context. */
+    @Value("${ports.populate}")
+    int populatePort;
+
     /**
-     * Moves every original port onto an allocated one. The additional listeners' ports in {@code application.yml}
-     * are placeholders over {@code ajax.port} and {@code ports.*}, so those keys are overridden and the
-     * {@code listeners.additional} list, which Spring Boot binds from one property source only, stays as declared.
+     * Moves every original port onto a distinct free port drawn for this load attempt. The additional listeners'
+     * ports in {@code application.yml} are placeholders over {@code ajax.port} and {@code ports.*}, so those keys are
+     * overridden and the {@code listeners.additional} list, which Spring Boot binds from one property source only,
+     * stays as declared.
      */
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        registry.add("server.port", () -> MAIN_PORT);
-        registry.add("ajax.port", () -> AJAX_PORT);
-        registry.add("ports.populate", () -> POPULATE_PORT);
-        registry.add("ports.samsung", () -> SAMSUNG_PORT);
-        registry.add("ports.prices", () -> PRICES_PORT);
-        registry.add("orders.samsung.url", () -> "http://localhost:" + SAMSUNG_PORT + "/samsung/orders");
-        registry.add("orders.price.url", () -> "http://localhost:" + PRICES_PORT + "/api/prices/{productId}");
-        registry.add("orders.soap.url", () -> "http://localhost:" + MAIN_PORT + ORDERS_PATH);
+        int[] ports = distinctFreePorts(5);
+        int main = ports[0];
+        int ajax = ports[1];
+        int populate = ports[2];
+        int samsung = ports[3];
+        int prices = ports[4];
+        registry.add("server.port", () -> main);
+        registry.add("ajax.port", () -> ajax);
+        registry.add("ports.populate", () -> populate);
+        registry.add("ports.samsung", () -> samsung);
+        registry.add("ports.prices", () -> prices);
+        registry.add("orders.samsung.url", () -> "http://localhost:" + samsung + "/samsung/orders");
+        registry.add("orders.price.url", () -> "http://localhost:" + prices + "/api/prices/{productId}");
+        registry.add("orders.soap.url", () -> "http://localhost:" + main + ORDERS_PATH);
         registry.add("spring.datasource.xa.properties.databaseName", () -> DERBY_DATABASE);
         registry.add("spring.datasource.xa.properties.createDatabase", () -> "create");
         registry.add("spring.artemis.mode", () -> "embedded");
@@ -170,7 +180,7 @@ class OrderProcessingEndpointTest {
     /** The original {@code orderTest}: status 200 and the payload exactly equal to {@code reply.xml}. */
     @Test
     void postMessageReturnsExactReply() {
-        HttpTestClient.Response response = postOrders(MAIN_PORT, MESSAGE);
+        HttpTestClient.Response response = postOrders(mainPort, MESSAGE);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
@@ -180,7 +190,7 @@ class OrderProcessingEndpointTest {
 
     @Test
     void getIsMethodNotAllowed() {
-        HttpTestClient.Response response = HttpTestClient.localhost(MAIN_PORT).get(ORDERS_PATH);
+        HttpTestClient.Response response = HttpTestClient.localhost(mainPort).get(ORDERS_PATH);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(405);
         assertThat(response.header("Content-Type")).isEqualTo("text/plain");
@@ -199,7 +209,7 @@ class OrderProcessingEndpointTest {
     @ParameterizedTest(name = "{0} is a soap:Client fault")
     @MethodSource("unreadableEnvelopes")
     void unreadableEnvelopeIsClientFault(byte[] body) throws Exception {
-        HttpTestClient.Response response = postOrders(MAIN_PORT, body);
+        HttpTestClient.Response response = postOrders(mainPort, body);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
@@ -212,7 +222,7 @@ class OrderProcessingEndpointTest {
     /** One dispatcher servlet serves both SOAP listeners; the Samsung operation is still unknown on /orders. */
     @Test
     void samsungOperationOnOrdersListenerIsClientFault() throws Exception {
-        HttpTestClient.Response response = postOrders(MAIN_PORT, PURCHASE_ENVELOPE.getBytes(UTF_8));
+        HttpTestClient.Response response = postOrders(mainPort, PURCHASE_ENVELOPE.getBytes(UTF_8));
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
@@ -224,7 +234,7 @@ class OrderProcessingEndpointTest {
     /** The order listener exists on the main port only; another listener's port has no {@code /orders}. */
     @Test
     void ordersPathOnPopulatePortIsNoListener() {
-        HttpTestClient.Response response = postOrders(POPULATE_PORT, MESSAGE);
+        HttpTestClient.Response response = postOrders(populatePort, MESSAGE);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(404);
         assertThat(response.header("Content-Type")).startsWith("text/plain");
@@ -236,7 +246,7 @@ class OrderProcessingEndpointTest {
     void serviceFailureIsServerFault() throws Exception {
         doThrow(new IllegalStateException("boom")).when(orchestration).processOrder(any());
 
-        HttpTestClient.Response response = postOrders(MAIN_PORT, MESSAGE);
+        HttpTestClient.Response response = postOrders(mainPort, MESSAGE);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
@@ -257,9 +267,9 @@ class OrderProcessingEndpointTest {
      * root {@code TRACE} level: {@code fulfillment.xml} logs only {@code defaultErrorHandler}'s
      * {@code Error occurred: <payload>}.
      *
-     * <p>The whole application runs unmocked in a context of its own: listener ports drawn apart from the enclosing
-     * class's, which stays open in the context cache, its own Derby database and Artemis server id, and an in-house
-     * reply timeout of {@link #IN_HOUSE_REPLY_TIMEOUT_MS} ms. The tables are never populated, so every audit insert
+     * <p>The whole application runs unmocked in a context of its own: listener ports of its own, drawn for each load
+     * attempt as the enclosing class's are, its own Derby database and Artemis server id, and an in-house reply
+     * timeout of {@link #IN_HOUSE_REPLY_TIMEOUT_MS} ms. The tables are never populated, so every audit insert
      * fails into {@code defaultErrorHandler} and an in-house item is rolled back until its redelivery is exhausted, as
      * in the original before {@code /populate}; every total stays within the audit's rollback threshold. Three orders
      * are sent: the original test's Samsung order, an in-house order and an order published on the Ajax channel
@@ -272,6 +282,7 @@ class OrderProcessingEndpointTest {
      */
     @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
             webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @NestedTestConfiguration(NestedTestConfiguration.EnclosingConfiguration.OVERRIDE)
     @DirtiesContext
     @ExtendWith(OutputCaptureExtension.class)
@@ -322,15 +333,14 @@ class OrderProcessingEndpointTest {
         @Value("${orders.samsung.url}")
         String samsungUrl;
 
+        /**
+         * Moves every original port onto a distinct free port drawn for this load attempt. While the enclosing
+         * class's context is open in the context cache, its listeners hold their ports, so the system never draws one
+         * of them here.
+         */
         @DynamicPropertySource
         static void unmockedProperties(DynamicPropertyRegistry registry) {
-            Set<Integer> ports = new LinkedHashSet<>(Set.of(MAIN_PORT, AJAX_PORT, POPULATE_PORT, SAMSUNG_PORT,
-                    PRICES_PORT));
-            int enclosingPorts = ports.size();
-            while (ports.size() < enclosingPorts + 5) {
-                ports.add(freePort());
-            }
-            int[] own = ports.stream().skip(enclosingPorts).mapToInt(Integer::intValue).toArray();
+            int[] own = distinctFreePorts(5);
             int artemisServerId = ThreadLocalRandom.current().nextInt(10_000, Integer.MAX_VALUE);
             String derbyDatabase = "memory:OrderProcessingEndpointTest_logged_"
                     + UUID.randomUUID().toString().replace("-", "");

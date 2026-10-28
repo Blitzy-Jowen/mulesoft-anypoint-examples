@@ -187,6 +187,9 @@
                     <excludes>
                         <exclude>**/*IT.java</exclude>
                     </excludes>
+                    <!-- Turns a hung test JVM into a failed build instead of a build that never ends: the suite takes
+                         well under a minute, and 600 s leaves room on a loaded shared host. -->
+                    <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
                 </configuration>
             </plugin>
             <plugin>

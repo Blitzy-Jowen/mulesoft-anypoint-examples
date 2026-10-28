@@ -66,6 +66,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.junit.jupiter.SpringJUnitConfig;
@@ -75,6 +76,7 @@ import com.arjuna.ats.internal.jdbc.drivers.modifiers.ModifierFactory;
 import com.arjuna.ats.internal.jdbc.drivers.modifiers.SupportsMultipleConnectionsModifier;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.model.orders.Order;
+import com.mulesoft.examples.service_orchestration_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -442,12 +444,15 @@ class AuditServiceTest {
      *
      * <p>The application starts on free local ports with a fresh in-memory Derby database and an embedded,
      * non-persistent Artemis server of its own, and the context is closed after the class, so it shares no port,
-     * database or broker with another test class in the JVM. Derby's log and the Narayana object store stay under the
-     * {@code target/} directories surefire sets.
+     * database or broker with another test class in the JVM. The ports are drawn for each load attempt: a drawn port
+     * is free when drawn, not when bound, so when another process takes one in between,
+     * {@link PortInUseRetryingContextLoader} loads the context again on newly drawn ports. Derby's log and the
+     * Narayana object store stay under the {@code target/} directories surefire sets.
      */
     @Nested
     @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
             webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+    @ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
     @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
     class InApplicationContext {
 

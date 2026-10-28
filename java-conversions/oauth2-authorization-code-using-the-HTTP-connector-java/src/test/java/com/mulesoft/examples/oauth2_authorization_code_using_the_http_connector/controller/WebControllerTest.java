@@ -38,6 +38,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -48,6 +49,7 @@ import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.HttpTestClient;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level test of {@link WebController}, the main listener {@code HTTP_Listener_Configuration} of
@@ -62,15 +64,17 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * <p>The whole application runs on Undertow: the real controller, {@link BoxOAuthService}, the Box client, SC-1
  * {@code GlobalExceptionHandler} and SC-10 {@code ListenerPorts} with its {@code PortRoutingFilter}. Box is a
  * WireMock stub on a dynamic port, so no credential, external network or Mule runtime is needed. The main listener
- * takes a random port; the HTTPS listener takes a free port chosen once per run, because SC-10 identifies it by its
- * concrete local port. Requests go through ST-1 {@link HttpTestClient}, so status lines with their reason phrases,
- * headers and body bytes are asserted as Undertow writes them.
+ * takes a random port; the HTTPS listener takes a free port drawn for each load of the context, because SC-10
+ * identifies it by its concrete local port, and {@link PortInUseRetryingContextLoader} loads the context again on a
+ * newly drawn port when another process binds the drawn one first. Requests go through ST-1 {@link HttpTestClient},
+ * so status lines with their reason phrases, headers and body bytes are asserted as Undertow writes them.
  *
  * <p>The token store is a field of the singleton {@link BoxOAuthService}, which outlives a test method in Spring's
  * context cache; every method that stores tokens therefore dirties the context after it runs, and the method that
  * needs an empty store runs first and also passes alone.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class WebControllerTest {
@@ -100,9 +104,6 @@ class WebControllerTest {
     private static final String TEST_CLIENT_ID = "test-box-client-id";
     private static final String TEST_CLIENT_SECRET = "test-box-client-secret";
 
-    /** Port of the HTTPS {@code box-oauth} listener; never the original 8082. */
-    private static final int HTTPS_PORT = freePort();
-
     @RegisterExtension
     static WireMockExtension box = WireMockExtension.newInstance()
             .options(wireMockConfig().dynamicPort())
@@ -118,8 +119,9 @@ class WebControllerTest {
     BoxProperties props;
 
     /**
-     * Points the Box client at the WireMock stub and the HTTPS listener at {@link #HTTPS_PORT}. The suppliers run
-     * when the context resolves them, after the static WireMock extension has started.
+     * Points the Box client at the WireMock stub and the HTTPS {@code box-oauth} listener at a free port, never the
+     * original 8082, drawn for this load attempt: Spring invokes this method again when the loader retries a lost
+     * port. The suppliers run when the context resolves them, after the static WireMock extension has started.
      *
      * <p>The HTTPS port is set through {@code ports.box-oauth}, the scalar the {@code listeners.additional} entry
      * reads: overriding {@code listeners.additional[0].port} itself would replace the whole list from
@@ -131,7 +133,8 @@ class WebControllerTest {
      */
     @DynamicPropertySource
     static void boxProperties(DynamicPropertyRegistry r) {
-        r.add("ports.box-oauth", () -> HTTPS_PORT);
+        int drawnHttpsPort = freePort();
+        r.add("ports.box-oauth", () -> drawnHttpsPort);
         r.add("box.api-base-url", () -> box.baseUrl() + "/2.0");
         r.add("box.token-url", () -> box.baseUrl() + TOKEN_PATH);
         r.add("box.login-redirect-location", () -> ORIGINAL_LOGIN_LOCATION);
@@ -358,7 +361,10 @@ class WebControllerTest {
         return fields;
     }
 
-    /** A port free at class initialisation; the probe socket is closed before the context binds the port. */
+    /**
+     * A port free when drawn; the probe socket is closed before the context binds the port, so another process can
+     * take it in between, which {@link PortInUseRetryingContextLoader} answers by loading the context again.
+     */
     private static int freePort() {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();

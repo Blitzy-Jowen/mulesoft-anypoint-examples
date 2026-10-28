@@ -230,8 +230,8 @@ java -jar target/soap-webservice-security-java-1.0.0-SNAPSHOT.jar
   curl 'http://localhost:63081/services/unsecure?wsdl'
   ```
 
-- Running the application needs ports 63080 and 63081 free; override them with `--server.port=<port>` and `--ports.client=<port>`. The client front follows `server.port`, because it calls the SOAP listener's actual port.
-- `mvn test` opens no fixed port: the Spring tests run the SOAP listener on a random port and give the client listener a free port through `ports.client` (`@DynamicPropertySource`).
+- Running the application needs ports 63080 and 63081 free; override them with `--server.port=<port>` and `--ports.client=<port>`. A port in use stops start-up with `Web server failed to start. Port <n> was already in use.` The client front follows `server.port`, because it calls the SOAP listener's actual port.
+- `mvn test` opens no fixed port: the Spring tests run the SOAP listener on a random port and give the client listener a free port drawn as `ports.client` in `@DynamicPropertySource` on every context load. When another process takes the drawn port first, `support/PortInUseRetryingContextLoader` loads the context again on a newly drawn port, up to 5 attempts.
 - There is no `mvn verify` live tier: the project has no failsafe plugin and no `*IT` class, because it is not a connector project (Tier 2B `N/A`).
 - Reports land under `target/`: `surefire-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 
@@ -250,7 +250,8 @@ java -jar target/soap-webservice-security-java-1.0.0-SNAPSHOT.jar
 | `config/SAMLCustomValidatorTest` | `SAMLCustomValidator` accepting the `saml.properties` assertion and rejecting each failing check (issuer from `wrong-saml.properties`, SAML 1.1, bearer confirmation, another subject); `SAMLCallbackHandler`'s issuer-crypto diagnostics |
 | `exception/GreeterClientExceptionHandlerTest` | the catch branch's precedence over SC-1 and its scoping to `GreeterClientController`, the 200 `text/plain` reply, one ERROR line naming exception types without the message |
 | `service/GreeterServiceTest` | `greet` returns `Hello <name>`, `Hello null` and `Hello ` exactly as the original |
-| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, additional listener registration, an empty TLS password named in the start-up failure |
+| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, additional listener registration, an empty TLS password named in the start-up failure; an additional port another socket holds failing server creation with `PortInUseException` before any XNIO worker exists; an unbindable host (`192.0.2.1`, a `.invalid` name) named with its port in an `IllegalStateException`; a server on port -1 neither probed nor given a worker; a port taken after the probe failing the start within 30 s instead of hanging it (`PortInUseException` with one additional listener, a `WebServerException` caused by a `BindException` with two); `destroy()` stopping the context's started server before the worker; the worker's I/O and worker threads from `server.undertow.threads.io` and `server.undertow.threads.worker` or Undertow's defaults |
+| `support/PortInUseRetryingContextLoaderTest` | SC-10 test support: a context whose additional port another socket holds on the first attempt loads on a newly drawn port, with one WARN line per lost attempt, and that listener serves on its port; only a port in use on the cause chain (`PortInUseException`, a `BindException` saying `Address already in use`) loads again; a port in use is attempted 5 times and any other failure once, then rethrown |
 | `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server`, `soap:Client` and `soap:MustUnderstand` faults inside dispatch, the boundary faults, and `?wsdl`/`?xsd=` publication with rewritten addresses |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, body bytes and the bounded ERROR log line |
 | `FixtureParityTest` | ST-2 fixture replay (section below); skipped while no fixture is captured |
@@ -259,12 +260,12 @@ java -jar target/soap-webservice-security-java-1.0.0-SNAPSHOT.jar
 
 ## Shared components
 
-Each shared component is a copy of its reference implementation with only the `package` line changed (and, in `PortRoutingFilterTest`, its package-relative `support.HttpTestClient` import), registered in [`DECISIONS.md`](../../DECISIONS.md) section 4 (AAP 0.4.4). A change is made in the reference first and then copied here.
+Each shared component is a copy of its reference implementation with only the `package` line changed (and, in `PortRoutingFilterTest`, its package-relative `support.HttpTestClient` import; in `support/PortInUseRetryingContextLoaderTest`, its `config.ListenerPorts` import), registered in [`DECISIONS.md`](../../DECISIONS.md) section 4 (AAP 0.4.4). A change is made in the reference first and then copied here.
 
 | ID | Files in this project | Reference implementation |
 |---|---|---|
 | SC-1 | `exception/GlobalExceptionHandler`, `exception/ErrorResponse`; test `exception/GlobalExceptionHandlerTest` | `rest-api-with-apikit-java` |
-| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest` | `foreach-processing-and-choice-routing-java` |
+| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest`; test support `support/PortInUseRetryingContextLoader` with `support/PortInUseRetryingContextLoaderTest` | `foreach-processing-and-choice-routing-java` |
 | SC-11 | `config/SoapEnvelopeStyleInterceptor`, `config/WsdlQueryPublisher`, `config/SoapFaultConfig`, `config/SoapListenerBoundaryAdapter`; tests `config/SoapEnvelopeStyleInterceptorTest`, `config/WsdlQueryPublisherTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest` | `foreach-processing-and-choice-routing-java` |
 | ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` |
 | ST-2 | `FixtureParityTest` (test), `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` |
@@ -318,9 +319,9 @@ No scenario of this project is `unreachable`.
 
 This project's row in the root [`SUMMARY.md`](../../SUMMARY.md) carries the same values. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 547 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 547 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/GreeterService` (the project has no `mapper` package). Total project LINE coverage: 88.4% (1661 of 1879 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 567 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 567 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/GreeterService` (the project has no `mapper` package). Total project LINE coverage: 88.5% (1714 of 1937 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=29`, `failed=0`.
 - The run includes `controller/GreeterEndpointTest` and `controller/GreeterClientControllerTest` (AAP 0.5.6), 44 and 46 tests respectively.
 

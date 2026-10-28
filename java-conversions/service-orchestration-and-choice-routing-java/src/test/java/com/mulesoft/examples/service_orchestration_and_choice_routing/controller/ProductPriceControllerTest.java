@@ -30,15 +30,19 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
 import com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.service.ProductPriceService;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.support.HttpTestClient;
+import com.mulesoft.examples.service_orchestration_and_choice_routing.support.PortInUseRetryingContextLoader;
 
 /**
  * Wire-level controller test of {@link ProductPriceController}, the price service that replaces the
@@ -58,17 +62,19 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.support.Ht
  *
  * <p>The application context is isolated from the other Boot tests of this module: the listener ports, the embedded
  * Artemis server id and the in-memory Derby database are unique to this class, and the context is closed after it.
+ * The ports are drawn for each load attempt of the context: a drawn port is free when drawn, not when bound, so when
+ * another process takes one in between, {@link PortInUseRetryingContextLoader} loads the context again on newly drawn
+ * ports, and the tests read the ports of the loaded context from it.
  */
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class ProductPriceControllerTest {
 
-    private static final int MAIN_PORT;
-    private static final int AJAX_PORT;
-    private static final int POPULATE_PORT;
-    private static final int SAMSUNG_PORT;
-    private static final int PRICES_PORT;
+    /** The listeners {@link #pricesPathOnOtherPortIsNoListener} sends the price paths to, by name. */
+    private static final String MAIN_LISTENER = "main";
+    private static final String POPULATE_LISTENER = "populate";
 
     /** In-VM acceptor id of this context's embedded Artemis broker, distinct from any other context in the JVM. */
     private static final int ARTEMIS_SERVER_ID = ThreadLocalRandom.current().nextInt(10_000, Integer.MAX_VALUE);
@@ -88,30 +94,40 @@ class ProductPriceControllerTest {
     @SpyBean
     private ProductPriceService productPriceService;
 
-    static {
-        int[] ports = freePorts(5);
-        MAIN_PORT = ports[0];
-        AJAX_PORT = ports[1];
-        POPULATE_PORT = ports[2];
-        SAMSUNG_PORT = ports[3];
-        PRICES_PORT = ports[4];
-    }
+    /** The main listener of the loaded context. */
+    @LocalServerPort
+    private int mainPort;
+
+    /** The populate listener of the loaded context. */
+    @Value("${ports.populate}")
+    private int populatePort;
+
+    /** The prices listener of the loaded context. */
+    @Value("${ports.prices}")
+    private int pricesPort;
 
     /**
-     * The additional listeners' ports in {@code application.yml} are placeholders ({@code ajax.port},
-     * {@code ports.populate}, {@code ports.samsung}, {@code ports.prices}), so overriding those keys moves every
-     * {@code listeners.additional[]} entry without re-registering the list, which Boot binds from one property source.
+     * Moves every listener onto distinct free ports drawn for this load attempt. The additional listeners' ports in
+     * {@code application.yml} are placeholders ({@code ajax.port}, {@code ports.populate}, {@code ports.samsung},
+     * {@code ports.prices}), so overriding those keys moves every {@code listeners.additional[]} entry without
+     * re-registering the list, which Boot binds from one property source.
      */
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        registry.add("server.port", () -> MAIN_PORT);
-        registry.add("ajax.port", () -> AJAX_PORT);
-        registry.add("ports.populate", () -> POPULATE_PORT);
-        registry.add("ports.samsung", () -> SAMSUNG_PORT);
-        registry.add("ports.prices", () -> PRICES_PORT);
-        registry.add("orders.samsung.url", () -> "http://localhost:" + SAMSUNG_PORT + "/samsung/orders");
-        registry.add("orders.price.url", () -> "http://localhost:" + PRICES_PORT + "/api/prices/{productId}");
-        registry.add("orders.soap.url", () -> "http://localhost:" + MAIN_PORT + "/orders");
+        int[] ports = freePorts(5);
+        int main = ports[0];
+        int ajax = ports[1];
+        int populate = ports[2];
+        int samsung = ports[3];
+        int prices = ports[4];
+        registry.add("server.port", () -> main);
+        registry.add("ajax.port", () -> ajax);
+        registry.add("ports.populate", () -> populate);
+        registry.add("ports.samsung", () -> samsung);
+        registry.add("ports.prices", () -> prices);
+        registry.add("orders.samsung.url", () -> "http://localhost:" + samsung + "/samsung/orders");
+        registry.add("orders.price.url", () -> "http://localhost:" + prices + "/api/prices/{productId}");
+        registry.add("orders.soap.url", () -> "http://localhost:" + main + "/orders");
         registry.add("spring.datasource.xa.properties.databaseName", () -> DERBY_DATABASE);
         registry.add("spring.datasource.xa.properties.createDatabase", () -> "create");
         registry.add("spring.artemis.mode", () -> "embedded");
@@ -126,7 +142,7 @@ class ProductPriceControllerTest {
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {"POST", "post", "Post", "pOsT"})
     void postInAnyLetterCaseReturnsPrice(String method) {
-        HttpTestClient.Response response = HttpTestClient.localhost(PRICES_PORT)
+        HttpTestClient.Response response = HttpTestClient.localhost(pricesPort)
                 .send(method, PRICE_PATH, null, new byte[0]);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 200 OK");
@@ -136,7 +152,7 @@ class ProductPriceControllerTest {
 
     @Test
     void priceIsTheSameForEveryProduct() {
-        HttpTestClient.Response response = HttpTestClient.localhost(PRICES_PORT)
+        HttpTestClient.Response response = HttpTestClient.localhost(pricesPort)
                 .send("POST", "/api/prices/ZZ99", null, new byte[0]);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 200 OK");
@@ -153,7 +169,7 @@ class ProductPriceControllerTest {
     @ParameterizedTest(name = "{0} {1}")
     @MethodSource("methodsOutsideAllowedMethods")
     void methodOutsideAllowedMethodsIsMethodNotAllowed(String method, String path) {
-        HttpTestClient.Response response = HttpTestClient.localhost(PRICES_PORT).send(method, path, null, null);
+        HttpTestClient.Response response = HttpTestClient.localhost(pricesPort).send(method, path, null, null);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 405 Method Not Allowed");
         assertThat(response.header("Content-Type")).as(response::toString).isEqualTo("text/plain");
@@ -179,7 +195,7 @@ class ProductPriceControllerTest {
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {"POST", "post"})
     void postToListenerPathIsJerseyNotFound(String method) {
-        HttpTestClient.Response response = HttpTestClient.localhost(PRICES_PORT)
+        HttpTestClient.Response response = HttpTestClient.localhost(pricesPort)
                 .send(method, LISTENER_PATH, null, new byte[0]);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 404 Not Found");
@@ -196,7 +212,7 @@ class ProductPriceControllerTest {
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {"/api/", "/api/other", "/api/prices"})
     void unmappedPathUnderListenerPathIsNoListener(String path) {
-        HttpTestClient.Response response = HttpTestClient.localhost(PRICES_PORT)
+        HttpTestClient.Response response = HttpTestClient.localhost(pricesPort)
                 .send("POST", path, null, new byte[0]);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 404 Not Found");
@@ -214,7 +230,7 @@ class ProductPriceControllerTest {
     @ParameterizedTest(name = "{0}, Access-Control-Request-Method {1}")
     @MethodSource("preflights")
     void preflightIsAnsweredLikePlainOptions(String path, String requestedMethod) {
-        HttpTestClient client = HttpTestClient.localhost(PRICES_PORT);
+        HttpTestClient client = HttpTestClient.localhost(pricesPort);
         HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
 
         HttpTestClient.Response preflight = client.send("OPTIONS", path,
@@ -241,10 +257,11 @@ class ProductPriceControllerTest {
      * The price path and {@code /api} belong to the prices listener only: on the main and populate listeners each
      * is an unserved path, answered by SC-10's port routing with the no-listener 404 before any controller runs.
      */
-    @ParameterizedTest(name = "port {0} {1}")
+    @ParameterizedTest(name = "{0} listener {1}")
     @MethodSource("pricesPathsOnOtherPorts")
-    void pricesPathOnOtherPortIsNoListener(int port, String path) {
-        HttpTestClient.Response response = HttpTestClient.localhost(port).send("POST", path, null, new byte[0]);
+    void pricesPathOnOtherPortIsNoListener(String listener, String path) {
+        HttpTestClient.Response response = HttpTestClient.localhost(portOf(listener))
+                .send("POST", path, null, new byte[0]);
 
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 404 Not Found");
         assertThat(response.header("Content-Type")).as(response::toString).isEqualTo("text/plain");
@@ -253,9 +270,22 @@ class ProductPriceControllerTest {
         verifyNoInteractions(productPriceService);
     }
 
+    /**
+     * The listeners by name, never by port: the arguments are built before the context draws its ports, and a
+     * repeated load attempt draws them again.
+     */
     private static Stream<Arguments> pricesPathsOnOtherPorts() {
-        return Stream.of(MAIN_PORT, POPULATE_PORT)
-                .flatMap(port -> Stream.of(PRICE_PATH, LISTENER_PATH).map(path -> Arguments.of(port, path)));
+        return Stream.of(MAIN_LISTENER, POPULATE_LISTENER)
+                .flatMap(listener -> Stream.of(PRICE_PATH, LISTENER_PATH).map(path -> Arguments.of(listener, path)));
+    }
+
+    /** The port of the loaded context's listener named {@code listener}. */
+    private int portOf(String listener) {
+        return switch (listener) {
+            case MAIN_LISTENER -> mainPort;
+            case POPULATE_LISTENER -> populatePort;
+            default -> throw new IllegalArgumentException("No listener named " + listener);
+        };
     }
 
     /** Every header but {@code Date} as {@code name: value} with the name lower-cased, sorted, duplicates kept. */

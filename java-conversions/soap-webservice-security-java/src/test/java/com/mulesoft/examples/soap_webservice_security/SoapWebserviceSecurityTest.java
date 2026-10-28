@@ -19,6 +19,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
@@ -29,6 +30,7 @@ import com.mulesoft.examples.soap_webservice_security.client.SecureGreeterClient
 import com.mulesoft.examples.soap_webservice_security.config.WrongPasswordCallback;
 import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient;
 import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient.Response;
+import com.mulesoft.examples.soap_webservice_security.support.PortInUseRetryingContextLoader;
 
 /**
  * Port of the original example's {@code SoapWebserviceSecurityIT} functional test: the same nine requests against the
@@ -43,18 +45,15 @@ import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient.Res
  */
 // The SOAP listener runs on a random port (@LocalServerPort) rather than a pre-allocated DEFINED_PORT: the plan maps
 // the original fixed ports to RANDOM_PORT plus @DynamicPropertySource, and a random port leaves no window between
-// choosing and binding it. Only the additional client listener, which must have a concrete port, gets a free one.
+// choosing and binding it. Only the additional client listener, which must have a concrete port, gets a free one,
+// drawn for each load attempt; PortInUseRetryingContextLoader loads the context again when another process takes
+// that port before the listener binds it.
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 final class SoapWebserviceSecurityTest {
 
     private static final String SECURITY_EXCEPTION_EXPECTED = "Request should have thrown a security exception";
-
-    /**
-     * Port of the {@code /client} listener, allocated once for the class so a cached context and its bound listener
-     * keep agreeing on it.
-     */
-    private static final int CLIENT_PORT = TestSocketUtils.findAvailableTcpPort();
 
     @LocalServerPort
     private int port;
@@ -62,11 +61,13 @@ final class SoapWebserviceSecurityTest {
     @Autowired
     private SecureGreeterClient secureGreeterClient;
 
+    /** Spring calls this for every load attempt of the context, so each attempt binds a newly drawn port. */
     @DynamicPropertySource
     static void clientListenerPort(DynamicPropertyRegistry registry) {
+        int clientPort = TestSocketUtils.findAvailableTcpPort();
         // listeners.additional[0].port reads ${ports.client}, so the scalar is overridden and the list keeps its
         // name, host and routes from application.yml.
-        registry.add("ports.client", () -> CLIENT_PORT);
+        registry.add("ports.client", () -> clientPort);
     }
 
     @Test

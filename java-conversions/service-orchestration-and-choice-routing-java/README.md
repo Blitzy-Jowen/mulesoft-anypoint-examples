@@ -396,9 +396,9 @@ After start-up:
 
 Notes:
 
-- Running the application needs ports 1080, 8090, 8091, 9090 and 9999 free. Override them as shown under [Configuration keys](#configuration-keys).
+- Running the application needs ports 1080, 8090, 8091, 9090 and 9999 free. Override them as shown under [Configuration keys](#configuration-keys). A port in use stops start-up with `Web server failed to start. Port <n> was already in use.`
 - The Derby database `muleEmbeddedDB` is created under `target/derby` and the Narayana object store under `target/narayana`, relative to the working directory, so nothing lands in the project root.
-- `mvn test` needs no fixed port. Each Spring test binds the listeners to free ports through `@DynamicPropertySource` and uses its own in-memory Derby database and its own embedded Artemis server. Surefire points `derby.system.home` and `narayana.log-dir` at `target/derby-test` and `target/narayana-test`.
+- `mvn test` needs no fixed port. Each Spring test of the application binds the listeners to free ports drawn in `@DynamicPropertySource` on every context load and uses its own in-memory Derby database and its own embedded Artemis server. When another process takes a drawn port first, `support/PortInUseRetryingContextLoader` loads the context again on newly drawn ports, up to 5 attempts. Surefire points `derby.system.home` and `narayana.log-dir` at `target/derby-test` and `target/narayana-test`.
 - There is no `mvn verify` live tier: the project is not a connector project, so it has no failsafe plugin and no `*IT` class (Tier 2B `N/A`).
 - Reports land under `target/`: `surefire-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2).
@@ -424,7 +424,8 @@ Notes:
 | `client/SamsungServiceClientTest`, `client/ProductPriceClientTest`, `client/OrderProcessingSoapClientTest` | WireMock: request shape and bytes, status handling, timeouts and connection failures each sending exactly one request, empty bodies and charsets, the rejection of a timeout below 1 ms |
 | `mapper/OrderRequestMapperTest`, `mapper/PurchaseReceiptMapperTest`, `mapper/AjaxOrderXmlMapperTest`, `mapper/OrderSummaryJsonMapperTest`, `mapper/SoapEnvelopeTransformerTest` | the four DataWeave scripts and the two XSLT steps, including the Studio sample `json_1.json` and the summary of `reply.xml` |
 | `mapper/DwJsonWriterTest`, `mapper/DwXmlWriterTest`, `mapper/DwXmlToJsonTest` | SC-4 DataWeave 1.0 writer and reader bytes |
-| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, forwarding to the named servlet, an empty TLS password named in the start-up failure |
+| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, forwarding to the named servlet, an empty TLS password named in the start-up failure; an additional port another socket holds failing server creation with `PortInUseException` before any XNIO worker exists; an unbindable host (`192.0.2.1`, a `.invalid` name) named with its port in an `IllegalStateException`; a server on port -1 neither probed nor given a worker; a port taken after the probe failing the start within 30 s instead of hanging it (`PortInUseException` with one additional listener, a `WebServerException` caused by a `BindException` with two); `destroy()` stopping the context's started server before the worker; the worker's I/O and worker threads from `server.undertow.threads.io` and `server.undertow.threads.worker` or Undertow's defaults |
+| `support/PortInUseRetryingContextLoaderTest` | SC-10 test support: a context whose additional port another socket holds on the first attempt loads on a newly drawn port, with one WARN line per lost attempt, and that listener serves on its port; only a port in use on the cause chain (`PortInUseException`, a `BindException` saying `Address already in use`) loads again; a port in use is attempted 5 times and any other failure once, then rethrown |
 | `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server`, `soap:Client` and `soap:MustUnderstand` faults, the boundary 405 and faults; this project registers no WSDL, which the publisher test accepts |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight dispatched as a plain `OPTIONS` request |
 | `config/WebServiceConfigTest` | `saaj.use.default.transformer.factory` set to `true` when absent, at context refresh as well, and left unchanged when already `true` or `false`; the factory it selects is the one the JAXP service lookup finds |
@@ -442,7 +443,7 @@ Each shared component is a copy of its reference implementation with only the `p
 |---|---|---|---|
 | SC-1 | `exception/GlobalExceptionHandler`, `exception/ErrorResponse`; test `exception/GlobalExceptionHandlerTest` | `rest-api-with-apikit-java` | every project with a Spring MVC controller |
 | SC-4 | `mapper/DwJsonWriter`, `mapper/DwXmlWriter`, `mapper/DwXmlToJson`; their tests | `processing-orders-with-dataweave-and-APIkit-java` (`DwJsonWriter`), `web-service-consumer-java` (`DwXmlWriter`, `DwXmlToJson`) | the projects owning DataWeave mappers |
-| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest` | `foreach-processing-and-choice-routing-java` | `http-oauth-provider`, `oauth2-authorization-code-using-the-HTTP-connector`, `soap-webservice-security`, `mule-component-bindings` |
+| SC-10 | `config/ListenerPorts`, `config/PortRoutingFilter`; test `config/PortRoutingFilterTest`; test support `support/PortInUseRetryingContextLoader` with `support/PortInUseRetryingContextLoaderTest` | `foreach-processing-and-choice-routing-java` | `http-oauth-provider`, `oauth2-authorization-code-using-the-HTTP-connector`, `soap-webservice-security`, `mule-component-bindings` |
 | SC-11 | `config/SoapEnvelopeStyleInterceptor`, `config/WsdlQueryPublisher`, `config/SoapFaultConfig`, `config/SoapListenerBoundaryAdapter`; their four tests | `foreach-processing-and-choice-routing-java` | `soap-webservice-security`, `xml-only-soap-webservice`, `legacy-modernization`; `proxying-a-soap-api` (`WsdlQueryPublisher` only) |
 | SC-12 | `controller/BayeuxLongPollingController`, `service/AjaxChannelBroker`, `config/AjaxResourceConfig`, `src/main/resources/mule-resource/js/**`; tests `controller/BayeuxLongPollingControllerTest`, `service/AjaxChannelBrokerTest` | **this project** | `websphere-mq` (8086, server path `/services/wmqExample`, `ajax.disable-reply-to: true`) |
 | ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` | every project with an HTTP listener |
@@ -505,12 +506,12 @@ This is the project's row of the root [`SUMMARY.md`](../../SUMMARY.md) (AAP 0.8.
 
 The run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 977 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 977 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 997 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 997 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`, nested classes counted with their outer class: 99.3%, 1173 of 1181 lines.
   - `service`: `AjaxChannelBroker` 415 of 418, `AjaxOrderService` 35 of 35, `AuditService` 86 of 87, `InHouseOrderService` 26 of 26, `OrderOrchestrationService` 65 of 65, `PriceCacheService` 4 of 4, `ProductPriceService` 2 of 2, `SamsungOrderService` 35 of 35, `SamsungServiceImpl` 7 of 7.
   - `mapper`: `AjaxOrderXmlMapper` 73 of 73, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `DwXmlWriter` 170 of 170, `OrderRequestMapper` 6 of 6, `OrderSummaryJsonMapper` 12 of 12, `PurchaseReceiptMapper` 6 of 6, `SoapEnvelopeTransformer` 53 of 53.
-  - Total project LINE coverage: 92.8% (2895 of 3120 lines).
+  - Total project LINE coverage: 92.8% (2948 of 3178 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=19`, `failed=0`. `post-orders-samsung-rejected` is `UNREACHABLE` and counted in none.
 - Runtime check of the packaged jar, on free ports: `/populate`, the `reply.xml` exchange, the quantity-5 order, the Samsung `purchase`, the price `POST` and `GET`, the 405, 404 and fault answers, the in-house path and the Bayeux `/orders/manufacturers` and `/orders/request` replies answered as this README states.
 

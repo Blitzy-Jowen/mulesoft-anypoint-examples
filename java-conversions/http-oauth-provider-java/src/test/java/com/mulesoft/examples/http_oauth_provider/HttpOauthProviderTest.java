@@ -22,9 +22,12 @@ import java.util.Map;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -35,6 +38,7 @@ import com.gargoylesoftware.htmlunit.WebClient;
 import com.gargoylesoftware.htmlunit.html.HtmlElement;
 import com.gargoylesoftware.htmlunit.html.HtmlPage;
 import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
+import com.mulesoft.examples.http_oauth_provider.support.PortInUseRetryingContextLoader;
 
 /**
  * Port of the original {@code HttpOauthProviderIT}: a resource owner logs in through the provider's
@@ -46,11 +50,15 @@ import com.mulesoft.examples.http_oauth_provider.support.HttpTestClient;
  * its redirect chain. The login page needs no script, so JavaScript is off. The bearer request goes through the
  * project's ST-1 {@link HttpTestClient}, as the original sent it through a Mule client rather than the browser.
  *
- * <p>Both listeners are bound to two free loopback ports reserved here, never to the defaults 8081 and 8082. The
+ * <p>Both listeners are bound to two free loopback ports drawn here, never to the defaults 8081 and 8082. The
  * provider port is the SC-10 additional Undertow listener, so it must be a concrete port rather than port 0, and
- * {@code OAuthProviderService} writes both ports into the {@code /redirect} location and the resource URI.
+ * {@code OAuthProviderService} writes both ports into the {@code /redirect} location and the resource URI. The ports
+ * are drawn for every attempt to load the context, and an attempt that loses one to another process before Undertow
+ * binds it is repeated on newly drawn ports ({@link PortInUseRetryingContextLoader}), so the test reads both ports
+ * from the loaded context.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
 @ActiveProfiles("test")
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class HttpOauthProviderTest {
@@ -63,22 +71,36 @@ class HttpOauthProviderTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** Resource listener ({@code /resources}, {@code /redirect}), the main Undertow port. */
-    private static int LISTENER_PORT;
+    /** Resource listener ({@code /resources}, {@code /redirect}), the main Undertow port of the loaded context. */
+    @LocalServerPort
+    private int listenerPort;
 
-    /** Provider listener ({@code /authorize}, {@code /token}). */
-    private static int PROVIDER_PORT;
+    /** Provider listener ({@code /authorize}, {@code /token}) of the loaded context. */
+    @Value("${http.provider.port}")
+    private int providerPort;
 
     private WebClient webClient;
 
+    /**
+     * Draws two distinct free loopback ports, both sockets open at once, for the resource and provider listeners.
+     * Spring calls this method again for every attempt to load the context, so each attempt runs on ports drawn for
+     * it.
+     *
+     * @throws UncheckedIOException if no port can be drawn
+     */
     @DynamicPropertySource
     static void listenerPorts(DynamicPropertyRegistry registry) {
-        LISTENER_PORT = freeLoopbackPort();
-        do {
-            PROVIDER_PORT = freeLoopbackPort();
-        } while (PROVIDER_PORT == LISTENER_PORT);
-        registry.add("http.listener.port", () -> LISTENER_PORT);
-        registry.add("http.provider.port", () -> PROVIDER_PORT);
+        int drawnListenerPort;
+        int drawnProviderPort;
+        try (ServerSocket listenerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress());
+             ServerSocket providerSocket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
+            drawnListenerPort = listenerSocket.getLocalPort();
+            drawnProviderPort = providerSocket.getLocalPort();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot draw free loopback ports for the two listeners", e);
+        }
+        registry.add("http.listener.port", () -> drawnListenerPort);
+        registry.add("http.provider.port", () -> drawnProviderPort);
     }
 
     @BeforeEach
@@ -101,9 +123,9 @@ class HttpOauthProviderTest {
 
     @Test
     void oauthTest() throws Exception {
-        HtmlPage login = webClient.getPage("http://localhost:" + PROVIDER_PORT
+        HtmlPage login = webClient.getPage("http://localhost:" + providerPort
                 + "/authorize?response_type=code&client_id=myclientid&scope=READ_RESOURCE"
-                + "&redirect_uri=http://localhost:" + LISTENER_PORT + "/redirect");
+                + "&redirect_uri=http://localhost:" + listenerPort + "/redirect");
 
         HtmlElement username = login.getHtmlElementById("username");
         HtmlElement password = login.getHtmlElementById("password");
@@ -128,25 +150,12 @@ class HttpOauthProviderTest {
         String token = accessToken.asText();
         assertFalse(token.isBlank(), "access_token is blank");
 
-        HttpTestClient.Response response = HttpTestClient.localhost(LISTENER_PORT)
+        HttpTestClient.Response response = HttpTestClient.localhost(listenerPort)
                 .get("/resources", Map.of("Authorization", "Bearer " + token));
         assertEquals(200, response.status(), response::toString);
 
         JsonNode resource = MAPPER.readTree(response.bodyAsString());
         assertEquals(REPLY_NAME, resource.path("name").asText());
-        assertEquals("http://localhost:" + LISTENER_PORT + "/resources/payroll", resource.path("uri").asText());
-    }
-
-    /**
-     * Reserves a free port on the loopback address and releases it for the application to bind.
-     *
-     * @throws UncheckedIOException if no port can be reserved
-     */
-    private static int freeLoopbackPort() {
-        try (ServerSocket socket = new ServerSocket(0, 0, InetAddress.getLoopbackAddress())) {
-            return socket.getLocalPort();
-        } catch (IOException e) {
-            throw new UncheckedIOException("Cannot reserve a free loopback port", e);
-        }
+        assertEquals("http://localhost:" + listenerPort + "/resources/payroll", resource.path("uri").asText());
     }
 }
