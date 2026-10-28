@@ -17,19 +17,22 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import com.mulesoft.examples.service_orchestration_and_choice_routing.controller.SamsungServiceEndpoint;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.support.HttpTestClient;
 
 /**
@@ -45,9 +48,8 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.support.Ht
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+@ExtendWith(OutputCaptureExtension.class)
 class ServiceOrchestrationAndChoiceRoutingTest {
-
-    private static final Logger LOG = LoggerFactory.getLogger(ServiceOrchestrationAndChoiceRoutingTest.class);
 
     private static final String TEXT_XML_UTF8 = "text/xml; charset=UTF-8";
 
@@ -117,15 +119,21 @@ class ServiceOrchestrationAndChoiceRoutingTest {
     }
 
     @Test
-    void orderTest() {
+    void orderTest(CapturedOutput output) {
         // The order holds one Samsung item (s-1 / AX02, quantity 1): the flow purchases it from the in-process Samsung
         // endpoint on the samsung listener (receipt id 1, ACCEPTED, totalPrice 2550.0) and makes no in-house JMS or
         // price call. The @Async audit of totalValue "02550" runs after the reply is built and cannot change it.
+        // No log line may carry the reply's customer values; the Samsung flow's INFO "aaaa" proves the log is captured.
         HttpTestClient.Response response = HttpTestClient.localhost(mainPort).post("/orders", TEXT_XML_UTF8, MESSAGE);
-        LOG.info("res: {}", response.bodyAsString());
 
         assertEquals(200, response.status(), response::toString);
         assertEquals(REPLY, response.bodyAsString());
+        String logged = output.getAll();
+        assertTrue(logged.lines().anyMatch(line -> line.contains(SamsungServiceEndpoint.class.getSimpleName())
+                && line.endsWith(": aaaa")), "The Samsung flow logger's INFO line 'aaaa' was not captured");
+        for (String customerValue : List.of("Main Street 123", "John", "Doe")) {
+            assertFalse(logged.contains(customerValue), () -> "Customer value '" + customerValue + "' reached the log");
+        }
     }
 
     @Test

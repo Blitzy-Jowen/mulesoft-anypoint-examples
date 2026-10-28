@@ -300,6 +300,32 @@ class OrderOrchestrationServiceTest {
         verify(audit, times(point == FailurePoint.AUDIT ? 1 : 0)).audit(any(), any());
     }
 
+    /**
+     * A failing item ends the {@code foreach} where it fails: the item completed before it keeps its receipt, no later
+     * item is ordered, the same exception propagates and no audit is dispatched.
+     */
+    @Test
+    void laterItemFailureKeepsEarlierReceiptAndSkipsAudit() {
+        OrderItem first = samsungItem();
+        OrderItem failing = philipsItem();
+        OrderItem after = samsungItem();
+        Order order = order(first, failing, after);
+        PurchaseReceipt firstReceipt = receipt(Status.ACCEPTED, 2550);
+        RuntimeException failure = new IllegalStateException("boom");
+        when(samsung.order(same(first), any())).thenAnswer(appendingTotal(SAMSUNG_PRICE, firstReceipt));
+        when(inHouseTemplate.sendAndReceive(eq(QUEUE), any(MessageCreator.class))).thenThrow(failure);
+
+        assertThatThrownBy(() -> service.processOrder(order)).isSameAs(failure);
+
+        InOrder inOrder = inOrder(samsung, inHouseTemplate, audit);
+        inOrder.verify(samsung).order(same(first), any());
+        inOrder.verify(inHouseTemplate).sendAndReceive(eq(QUEUE), any(MessageCreator.class));
+        inOrder.verifyNoMoreInteractions();
+        verifyNoInteractions(audit);
+        assertThat(order.getOrderItems()).extracting(OrderItem::getPurchaseReceipt)
+                .containsExactly(firstReceipt, null, null);
+    }
+
     @ParameterizedTest
     @MethodSource("failureChains")
     void failureLogNamesOnlyTheExceptionTypes(RuntimeException failure, String expectedChain) {

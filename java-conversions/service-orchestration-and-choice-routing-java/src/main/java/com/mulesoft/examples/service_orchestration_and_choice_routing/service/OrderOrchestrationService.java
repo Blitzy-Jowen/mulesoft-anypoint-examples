@@ -156,6 +156,8 @@ public class OrderOrchestrationService implements IProcessOrder {
 			// logged, never the text: a JMS or JAXB message can quote the caller's order data.
 			LOG.error("Order processing failed: {}", describe(e));
 			logError(order);
+			// defaultErrorHandler only logs and shapes no reply, so the platform default answers: the exception leaves
+			// the endpoint and SoapFaultConfig returns a soap:Server fault.
 			throw e;
 		}
 	}
