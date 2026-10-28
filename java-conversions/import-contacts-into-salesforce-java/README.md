@@ -27,35 +27,7 @@ File disposition follows Mule 3.8's default file connector (SC-5), because the o
 - Relative directories resolve against the working directory: the project directory under `mvn spring-boot:run`.
 - The endpoint's `responseTimeout="10000"` is not carried: a one-way file endpoint sends no reply.
 
-## Mule-to-Java mapping
-
-| Mule construct (`import-contacts-into-salesforce`) | Java construct (`com.mulesoft.examples.import_contacts_into_salesforce`) |
-|---|---|
-| `sfdc:config` with `${sfdc.user}`, `${sfdc.password}`, `${sfdc.securityToken}` (xml:4) | SC-15 `client/SalesforcePartnerClient` in login mode, configured by `config/SalesforceProperties` (`sfdc.username`, `sfdc.password`, `sfdc.securityToken`) |
-| `sfdc:connection-pooling-profile exhaustedAction="WHEN_EXHAUSTED_GROW" initialisationPolicy="INITIALISE_ONE"` (xml:5) | one cached `PartnerConnection`, created lazily on the first call and re-created on re-authentication |
-| flow `Contacts_to_SFDC` (xml:8) | `trigger/ContactsFileTrigger` → `service/ContactImportService#importContacts(byte[])` |
-| `file:inbound-endpoint` (xml:9) | `trigger/ContactsFileTrigger` (`poll()`, `pollOnce()`) over SC-5 `trigger/FileInboundPoller` |
-| `dw:input-payload`: the polled CSV read by DataWeave 1.0 | SC-4 `mapper/DwCsvReader#read`: header row, comma separator, `"` quoting, string values |
-| `dw:set-payload` `%dw 1.0` / `%output application/java` / `payload map { FirstName: $.firstname, LastName : $.surname, Email : $.email, Phone : $.phone }` (header line 12) | `mapper/ContactMapper#map`: one `LinkedHashMap` per row, keys `FirstName` ← `firstname`, `LastName` ← `surname`, `Email` ← `email`, `Phone` ← `phone` |
-| `sfdc:create type="Contact"` with `#[payload]` (xml:24-26) | `SalesforcePartnerClient#create("Contact", records)`: one SOAP Partner API `create` call carrying every record of the file, as the connector made, through SC-9 `client/UpstreamCallExecutor` and `client/SalesforceFailureClassifier` |
-| Mule default exception strategy (none declared) | `FileInboundPoller`: ERROR log, then the move to `contacts.move-to-dir` |
-| `mule-deploy.properties` (`config.resources=contacts-to-SFDC.xml`) | `ImportContactsIntoSalesforceApplication` (`@SpringBootApplication`, `@EnableScheduling`) |
-| `mule-app.properties` (comments only) | `src/main/resources/application.yml` |
-| `ImportContactsToSfdcIT` (`FunctionalTestCase`, `MuleClient`, live org) | `ImportContactsToSfdcTest` (surefire, mocked client) and `ImportContactsToSfdcIT` (failsafe, live org) |
-| test flows `selectContactFromSalesforce` (`sfdc:query-single`) and `deleteContactFromSalesforce` (`sfdc:delete`) of `src/test/resources/testflows/test-flows.xml` | `SalesforcePartnerClient#query` and `SalesforcePartnerClient#delete` inside `ImportContactsToSfdcIT` |
-| `src/test/resources/mule.test.properties` (never committed) | `src/test/resources/application-it.yml` (git-ignored; template `application-it.yml.example`) |
-
-Shared components (register in the root [`DECISIONS.md`](../../DECISIONS.md)):
-
-- This project holds the reference implementation of **SC-4 `mapper/DwCsvReader`** and its test `mapper/DwCsvReaderTest`. The other CSV-reading projects copy both with only the `package` line changed: `import-leads-into-salesforce`, `dataweave-with-flowreflookup`, `import-contacts-into-ms-dynamics`, `importing-a-CSV-file-into-Mongo-DB`, `importing-an-email-attachment-using-the-IMAP-connector`, `importing-an-email-attachment-using-the-POP3-connector` and `sending-a-csv-file-through-email-using-smtp`.
-- It carries copies, each with only its `package` line changed and with its tests:
-  - SC-5 `trigger/FileInboundPoller` from `processing-orders-with-dataweave-and-APIkit-java`;
-  - SC-9 `client/UpstreamCallExecutor`, `client/UpstreamCall`, `client/UpstreamAction`, `client/UpstreamSystem`, `client/UpstreamFailureClassifier`, `client/UpstreamFailureKind`, `exception/UpstreamAuthenticationException`, `exception/UpstreamRateLimitException` and `exception/UpstreamUnavailableException` from `salesforce-data-retrieval-java`, without `UpstreamExceptionHandler`: there is no HTTP caller to answer;
-  - SC-15 `client/SalesforcePartnerClient`, `client/SalesforceFailureClassifier` and `config/SalesforceProperties` from `salesforce-data-retrieval-java`;
-  - ST-2 `FixtureParityTest` and the `SCENARIOS.md` format from `hello-world-java`.
-- It carries no SC-1 and no ST-1, because it has no HTTP listener.
-
-## Connector failure modes (AAP 0.4.8)
+### Connector failure modes (AAP 0.4.8)
 
 Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client/UpstreamCallExecutor` and is classified by `client/SalesforceFailureClassifier`. The project is file-triggered, so no caller receives a 502, 429 or 503: the classification is logged at ERROR with the upstream name `Salesforce`, and the file is then moved as after any handled failure.
 
@@ -74,8 +46,9 @@ Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client
 Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, and `sfdc.auth-endpoint` pointed at a closed local port (timestamps and thread prefixes removed):
 
 ```console
-$ java -jar target/import-contacts-into-salesforce-java-1.0.0-SNAPSHOT.jar --contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out --contacts.polling-frequency=2000 --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0 --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
-$ cp src/main/resources/contacts.csv target/run/in/
+$ CLOSED_PORT=1   # any loopback port nothing listens on
+$ java -jar target/import-contacts-into-salesforce-java-1.0.0-SNAPSHOT.jar --contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out --contacts.polling-frequency=2000 "--sfdc.auth-endpoint=http://127.0.0.1:${CLOSED_PORT}/services/Soap/u/65.0" --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
+$ cp src/main/resources/contacts.csv target/run/in/   # in a second terminal, while the application runs
 ERROR c.m.e.i.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
 ERROR c.m.e.i.trigger.FileInboundPoller        : Exception processing file contacts.csv: com.mulesoft.examples.import_contacts_into_salesforce.exception.UpstreamUnavailableException at com.mulesoft.examples.import_contacts_into_salesforce.client.UpstreamCallExecutor.translate(UpstreamCallExecutor.java:276)
 ```
@@ -113,9 +86,39 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
   SFDC_USERNAME='<user>' SFDC_PASSWORD='<password>' SFDC_SECURITYTOKEN='<token>' java -jar target/import-contacts-into-salesforce-java-1.0.0-SNAPSHOT.jar --sfdc.auth-endpoint=https://test.salesforce.com/services/Soap/u/65.0 --contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out
   ```
 
-  An external `application.yml` (for example `--spring.config.additional-location=<file>`) outside the repository works as well.
+  An external `application.yml` (for example `'--spring.config.additional-location=<file>'`) outside the repository works as well.
 
-## Behaviours stubbed, externalized or changed
+## Mule-to-Java mapping
+
+| Mule construct (`import-contacts-into-salesforce`) | Java construct (`com.mulesoft.examples.import_contacts_into_salesforce`) |
+|---|---|
+| `sfdc:config` with `${sfdc.user}`, `${sfdc.password}`, `${sfdc.securityToken}` (xml:4) | SC-15 `client/SalesforcePartnerClient` in login mode, configured by `config/SalesforceProperties` (`sfdc.username`, `sfdc.password`, `sfdc.securityToken`) |
+| `sfdc:connection-pooling-profile exhaustedAction="WHEN_EXHAUSTED_GROW" initialisationPolicy="INITIALISE_ONE"` (xml:5) | one cached `PartnerConnection`, created lazily on the first call and re-created on re-authentication |
+| flow `Contacts_to_SFDC` (xml:8) | `trigger/ContactsFileTrigger` → `service/ContactImportService#importContacts(byte[])` |
+| `file:inbound-endpoint` (xml:9) | `trigger/ContactsFileTrigger` (`poll()`, `pollOnce()`) over SC-5 `trigger/FileInboundPoller` |
+| `dw:input-payload`: the polled CSV read by DataWeave 1.0 | SC-4 `mapper/DwCsvReader#read`: header row, comma separator, `"` quoting, string values |
+| `dw:set-payload` `%dw 1.0` / `%output application/java` / `payload map { FirstName: $.firstname, LastName : $.surname, Email : $.email, Phone : $.phone }` (header line 12) | `mapper/ContactMapper#map`: one `LinkedHashMap` per row, keys `FirstName` ← `firstname`, `LastName` ← `surname`, `Email` ← `email`, `Phone` ← `phone` |
+| `sfdc:create type="Contact"` with `#[payload]` (xml:24-26) | `SalesforcePartnerClient#create("Contact", records)`: one SOAP Partner API `create` call carrying every record of the file, as the connector made, through SC-9 `client/UpstreamCallExecutor` and `client/SalesforceFailureClassifier` |
+| Mule default exception strategy (none declared) | `FileInboundPoller`: ERROR log, then the move to `contacts.move-to-dir` |
+| `mule-deploy.properties` (`config.resources=contacts-to-SFDC.xml`) | `ImportContactsIntoSalesforceApplication` (`@SpringBootApplication`, `@EnableScheduling`) |
+| `mule-app.properties` (comments only) | `src/main/resources/application.yml` |
+| `ImportContactsToSfdcIT` (`FunctionalTestCase`, `MuleClient`, live org) | `ImportContactsToSfdcTest` (surefire, mocked client) and `ImportContactsToSfdcIT` (failsafe, live org) |
+| test flows `selectContactFromSalesforce` (`sfdc:query-single`) and `deleteContactFromSalesforce` (`sfdc:delete`) of `src/test/resources/testflows/test-flows.xml` | `SalesforcePartnerClient#query` and `SalesforcePartnerClient#delete` inside `ImportContactsToSfdcIT` |
+| `src/test/resources/mule.test.properties` (never committed) | `src/test/resources/application-it.yml` (git-ignored; template `application-it.yml.example`) |
+
+Shared components (register in the root [`DECISIONS.md`](../../DECISIONS.md)):
+
+- This project holds the reference implementation of **SC-4 `mapper/DwCsvReader`** and its test `mapper/DwCsvReaderTest`. The other CSV-reading projects copy both with only the `package` line changed: `import-leads-into-salesforce`, `dataweave-with-flowreflookup`, `import-contacts-into-ms-dynamics`, `importing-a-CSV-file-into-Mongo-DB`, `importing-an-email-attachment-using-the-IMAP-connector`, `importing-an-email-attachment-using-the-POP3-connector` and `sending-a-csv-file-through-email-using-smtp`.
+- It carries copies, each with only its `package` line changed and with its tests:
+  - SC-5 `trigger/FileInboundPoller` from `processing-orders-with-dataweave-and-APIkit-java`;
+  - SC-9 `client/UpstreamCallExecutor`, `client/UpstreamCall`, `client/UpstreamAction`, `client/UpstreamSystem`, `client/UpstreamFailureClassifier`, `client/UpstreamFailureKind`, `exception/UpstreamAuthenticationException`, `exception/UpstreamRateLimitException` and `exception/UpstreamUnavailableException` from `salesforce-data-retrieval-java`, without `UpstreamExceptionHandler`: there is no HTTP caller to answer;
+  - SC-15 `client/SalesforcePartnerClient`, `client/SalesforceFailureClassifier` and `config/SalesforceProperties` from `salesforce-data-retrieval-java`;
+  - ST-2 `FixtureParityTest` and the `SCENARIOS.md` format from `hello-world-java`.
+- It carries no SC-1 and no ST-1, because it has no HTTP listener.
+
+## Behaviours stubbed or externalized
+
+This section also lists the behaviours the conversion changed.
 
 - Externalized: the Salesforce credentials, which the original also read from placeholders, are `TODO` keys with environment-variable fallbacks; `sfdc.user` is renamed `sfdc.username`. The file endpoint's path, move directory and polling frequency, hard-coded in the original, are configurable keys with the original values as defaults; the login URL and timeouts, defaults of the original connector, are configurable keys.
 - Changed: Mule's connection pooling (`WHEN_EXHAUSTED_GROW`, `INITIALISE_ONE`) is replaced by one cached `PartnerConnection`, re-created when Salesforce rejects the session.
@@ -159,7 +162,7 @@ Within one polling interval the file moves to `src/main/resources/output/contact
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
-## Live test (Tier 2B)
+### Live test (Tier 2B)
 
 `ImportContactsToSfdcIT` runs under failsafe (`mvn -B verify`) against a real org, reusing the existing Salesforce credentials; no new sandbox is needed.
 
@@ -190,7 +193,7 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 | `service/ContactImportServiceTest` | every record of `contacts.csv` sent in one `create` call; a header-only file still calls `create` once with no records; every client failure propagated unchanged |
 | `mapper/ContactMapperTest` | the four keys in script order; John Doe and Jane Doe in input order; a missing column gives `null`, an empty or `null` row four `null` values; values passed through without coercion or trimming; extra columns ignored; the input left unmodified |
 | `mapper/DwCsvReaderTest` | SC-4 reference test: header row, `,` separator, `"` quoting with the `""` and backslash escapes, LF, CRLF and lone-CR record ends, skipped empty lines, untrimmed string values |
-| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the `create`, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and 10 s default timeouts |
+| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the `create`, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and 10 s default timeouts; concurrent callers sharing the one login, re-login or session refresh in flight, its timeout included; paging that fails, with no further `queryMore`, on a repeated query locator, records beyond the reported size or pages beyond what that size allows |
 | `client/SalesforceFailureClassifierTest`, `client/UpstreamCallExecutorTest` | SC-9 and the Salesforce classification: re-login and one retry on `INVALID_SESSION_ID`, no retry on `REQUEST_LIMIT_EXCEEDED` (no `Retry-After`) or on any timeout or connectivity cause, the unchanged rethrow of every other failure, ERROR lines without vendor text |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
@@ -214,10 +217,10 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 The root `SUMMARY.md` carries the same row for this project (AAP 0.8.7). Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 692 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`ImportContactsToSfdcIT`: `src/test/resources/application-it.yml not supplied`).
-- `mvn -B clean package`: `BUILD SUCCESS`; 692 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
-- `mvn -B test`: `BUILD SUCCESS`; 692 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 92 of 92 lines (100.0%) of `service/ContactImportService`, `mapper/ContactMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 91.8% (659 of 718 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 701 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`ImportContactsToSfdcIT`: `src/test/resources/application-it.yml not supplied`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 701 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
+- `mvn -B test`: `BUILD SUCCESS`; 701 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 92 of 92 lines (100.0%) of `service/ContactImportService`, `mapper/ContactMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 91.7% (697 of 760 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=1`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `ImportContactsToSfdcIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

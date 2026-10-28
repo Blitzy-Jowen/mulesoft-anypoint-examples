@@ -161,7 +161,7 @@ Open the console at `http://localhost:8081/api/console/`.
 | `ApiTestSuiteTest` | the four ported MUnit tests above, against the running application |
 | `controller/MunitControllerTest` | on the wire through ST-1, so status code, reason phrase, `Content-Type` and body bytes are asserted: the four RAML 2xx with their JSON-string bodies, POST and PUT with `application/json` and `text/plain` bodies, the APIkit 405 for PATCH, OPTIONS and HEAD, the 406 for `Accept: text/xml`, the 404 under `/api` and the no-listener 404 outside it |
 | `service/MunitServiceTest` | the constants equal the original flow literals, each method returns its literal as a JSON string, and a serialization failure surfaces as `IllegalStateException` |
-| `controller/ApiKitConsoleControllerTest` | SC-17: the redirect and its `Host` handling, the console page and files, the RAML descriptor with its `baseUri`, and path-traversal probes answered with the 404 |
+| `controller/ApiKitConsoleControllerTest` | SC-17: the redirect and its `Host` handling, the console page and files, the RAML descriptor with its `baseUri`, and path-traversal probes answered with the 404; at `<api base>/<include>`, each RAML include served to GET with its bytes and to HEAD with an empty 200, and every other method (OPTIONS, POST, PUT, DELETE, PATCH, PROPFIND and TRACE are sent) and CORS pre-flights asking for GET or POST answered with the APIkit 404 and no `Allow`, `Access-Control-*` or `Vary` header (this RAML declares no `!include`, so these checks find no include and pass without a request) |
 | `exception/ApiKitExceptionHandlerTest`, `exception/GlobalExceptionHandlerTest` | SC-3's five mappings with exact bodies and their precedence; SC-1's defaults and log safety |
 | `config/JsonSchemaValidatorTest` | SC-3 draft-03 validation: body faults give 400, schema faults give 500 |
 | `config/ApiKitMethodCaseFilterTest`, `config/ApiKitMethodCaseListenerTest` | lower and mixed-case method tokens under `/api` answered as their upper-case form |
@@ -178,9 +178,9 @@ Open the console at `http://localhost:8081/api/console/`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 432 tests, 0 failures, 0 errors, 0 skipped; enforcer `BannedDependencies passed`; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 432 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 13 of 13 lines (`service/MunitService`; the project has no mapper package). Total project LINE coverage: 84.0% (686 of 817 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 443 tests, 0 failures, 0 errors, 0 skipped; enforcer `BannedDependencies passed`; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 443 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 13 of 13 lines (`service/MunitService`; the project has no mapper package). Total project LINE coverage: 83.3% (686 of 824 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project without `FixtureParityTest`. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported MUnit assertions of `ApiTestSuiteTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 

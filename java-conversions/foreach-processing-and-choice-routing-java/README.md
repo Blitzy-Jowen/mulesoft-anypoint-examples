@@ -82,29 +82,35 @@ No listener for endpoint: /mule/TheCreditAgencyService
 
 Every key of `src/main/resources/application.yml`. The original reads no placeholder and its `mule-app.properties` defines no key, so every value is a fixed default taken from the flow's literals (AAP 0.6.6). There are no secrets, credentials or TODO placeholders, so the project has no `application-test.yml` and no `application-it.yml`.
 
-| Key | Default | Source in the original | Purpose |
-|---|---|---|---|
-| `server.port` | `11081` | `http:listener-config` port, `loanbroker-simple.xml:4` | the loan broker's main listener |
-| `server.address` | `0.0.0.0` | `host="0.0.0.0"`, `:4` | bind host of the main listener |
-| `ports.credit-agency` | `18080` | listener and request config port, `:5,7` | the credit agency's listener and the port the loan broker calls |
-| `ports.bank1` … `ports.bank5` | `10080`, `20080`, `30080`, `40080`, `50080` | listener ports `:8-12` and bank URIs `:83-89` | each bank's listener and the port in the bank URI the loan broker calls |
-| `loanbroker.outbound-host` | `0.0.0.0` | host of the credit-agency request config and of every bank URI, `:5,83-89` | host of every outbound SOAP call, so log lines such as `Banks to contact: [http://0.0.0.0:10080/mule/TheBank1, http://0.0.0.0:20080/mule/TheBank2]` stay identical |
-| `loanbroker.response-timeout` | `10000` (milliseconds) | `responseTimeout="10000"`, `:73,108` | connect and read timeout of the shared outbound `WebServiceTemplate` |
-| `logging.level.org.springframework.ws.client.MessageTracing` | `INFO` | none: the flow's loggers never write the applicant | its `.sent`/`.received` `TRACE` write every SOAP envelope: `getCreditProfile` carries the name and ssn |
-| `logging.level.org.springframework.ws.server.MessageTracing` | `INFO` | none | the same envelopes as the credit agency and the banks receive and answer them |
-| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `WARN` | none | its `DEBUG` and `TRACE` write the request line with the query (`name`, `ssn`). `WARN`, not `INFO`: its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
-| `logging.level.org.springframework.web.method.HandlerMethod` | `INFO` | none | its `TRACE` writes handler arguments, the `NumberFormatException` quoting a malformed ssn or amount among them |
-| `logging.level.org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver` | `INFO` | none | its `DEBUG` writes the handled exception's message, which quotes a malformed ssn or amount |
-| `spring.webservices.path` | `/mule` | the `/mule/...` base paths, `:7-12` | maps Spring WS's `MessageDispatcherServlet` at `/mule/*`; `dispatcherServlet` stays at `/` |
-| `spring.webservices.servlet.init` | `"[dispatchOptionsRequest]": "true"`, `"[dispatchTraceRequest]": "true"` | listeners accept every method | `OPTIONS` and `TRACE` reach the SOAP listener boundary like any other method |
-| `spring.mvc.dispatch-trace-request` | `true` | listener accepts every method | `TRACE` on 11081 reaches `LoanBrokerController` |
-| `spring.web.resources.add-mappings` | `false` | none | no static-resource handler takes a path from the loan broker or from SC-1 |
-| `spring.autoconfigure.exclude` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | `path="/*"` covers `/error` | no Boot `/error` endpoint; `/error` on 11081 belongs to the loan broker |
-| `spring.application.name` | `foreach-processing-and-choice-routing-java` | none | application name in log lines |
-| `listeners.host` | `0.0.0.0` | `host="0.0.0.0"`, `:7-12` | bind host of the six additional listeners (SC-10) |
-| `listeners.disallowed-methods` | `[]` | no `allowedMethods` | no method is rejected on any listener |
-| `listeners.main.routes` | servlet `dispatcherServlet`, patterns `["/**"]` | `path="/*"` without `basePath`, `:4,21` | every path on 11081 belongs to the loan broker |
-| `listeners.additional` | six entries, `credit-agency` and `bank1` to `bank5`, each with `port: ${ports.<name>}` and one route to servlet `messageDispatcherServlet` with patterns `["/mule/<Service>", "/mule/<Service>/**"]` | `basePath` + `path="/*"`, `:7-12` and the mock flows' listeners | the extra Undertow listeners and the paths each one serves (SC-10) |
+The Type column gives the Java type each value binds to, taken from the code or the Spring Boot property that reads it.
+
+| Key | Type | Default | Source in the original | Purpose |
+|---|---|---|---|---|
+| `server.port` | `Integer` | `11081` | `http:listener-config` port, `loanbroker-simple.xml:4` | the loan broker's main listener |
+| `server.address` | `InetAddress` | `0.0.0.0` | `host="0.0.0.0"`, `:4` | bind host of the main listener |
+| `ports.credit-agency` | `int` | `18080` | listener and request config port, `:5,7` | the credit agency's listener and the port the loan broker calls |
+| `ports.bank1`, `ports.bank2`, `ports.bank3`, `ports.bank4`, `ports.bank5` | `int` | `10080`, `20080`, `30080`, `40080`, `50080`, in that order | listener ports `:8-12` and bank URIs `:83-89` | each bank's listener and the port in the bank URI the loan broker calls |
+| `loanbroker.outbound-host` | `String` | `0.0.0.0` | host of the credit-agency request config and of every bank URI, `:5,83-89` | host of every outbound SOAP call, so log lines such as `Banks to contact: [http://0.0.0.0:10080/mule/TheBank1, http://0.0.0.0:20080/mule/TheBank2]` stay identical |
+| `loanbroker.response-timeout` | `long` (milliseconds) | `10000` (milliseconds) | `responseTimeout="10000"`, `:73,108` | connect and read timeout of the shared outbound `WebServiceTemplate` |
+| `logging.level.org.springframework.ws.client.MessageTracing` | `LogLevel` | `INFO` | none: the flow's loggers never write the applicant | its `.sent`/`.received` `TRACE` write every SOAP envelope: `getCreditProfile` carries the name and ssn |
+| `logging.level.org.springframework.ws.server.MessageTracing` | `LogLevel` | `INFO` | none | the same envelopes as the credit agency and the banks receive and answer them |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `WARN` | none | its `DEBUG` and `TRACE` write the request line with the query (`name`, `ssn`). `WARN`, not `INFO`: its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
+| `logging.level.org.springframework.web.method.HandlerMethod` | `LogLevel` | `INFO` | none | its `TRACE` writes handler arguments, the `NumberFormatException` quoting a malformed ssn or amount among them |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver` | `LogLevel` | `INFO` | none | its `DEBUG` writes the handled exception's message, which quotes a malformed ssn or amount |
+| `spring.webservices.path` | `String` | `/mule` | the `/mule/...` base paths, `:7-12` | maps Spring WS's `MessageDispatcherServlet` at `/mule/*`; `dispatcherServlet` stays at `/` |
+| `spring.webservices.servlet.init` | `Map<String, String>` (servlet init-parameter name to value) | `"[dispatchOptionsRequest]": "true"`, `"[dispatchTraceRequest]": "true"` | listeners accept every method | `OPTIONS` and `TRACE` reach the SOAP listener boundary like any other method |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | listener accepts every method | `TRACE` on 11081 reaches `LoanBrokerController` |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | no static-resource handler takes a path from the loan broker or from SC-1 |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | `path="/*"` covers `/error` | no Boot `/error` endpoint; `/error` on 11081 belongs to the loan broker |
+| `spring.application.name` | `String` | `foreach-processing-and-choice-routing-java` | none | application name in log lines |
+| `listeners.host` | `String` | `0.0.0.0` | `host="0.0.0.0"`, `:7-12` | bind host of the six additional listeners (SC-10) |
+| `listeners.disallowed-methods` | `List<String>` (HTTP method names) | `[]` | no `allowedMethods` | no method is rejected on any listener |
+| `listeners.main.routes[0].servlet` | `String` | `dispatcherServlet` | `path="/*"` without `basePath`, `:4,21` | the servlet behind the one route of `listeners.main.routes`, a `List<ListenerPorts.Route>` |
+| `listeners.main.routes[0].patterns` | `List<String>` (`AntPathMatcher` patterns) | `["/**"]` | `path="/*"` without `basePath`, `:4,21` | every path on 11081 belongs to the loan broker |
+| `listeners.additional[i].name` | `String` | `[0]` `credit-agency`, `[1]` `bank1`, `[2]` `bank2`, `[3]` `bank3`, `[4]` `bank4`, `[5]` `bank5` | none: a label for `HTTP_Listener_Configuration_2` to `_7`, `:7-12` | label of each entry of `listeners.additional`, a `List<ListenerPorts.Additional>` of the extra Undertow listeners (SC-10), in log lines and start-up errors |
+| `listeners.additional[i].port` | `int` | `[0]` `${ports.credit-agency}`, `[1]` `${ports.bank1}`, `[2]` `${ports.bank2}`, `[3]` `${ports.bank3}`, `[4]` `${ports.bank4}`, `[5]` `${ports.bank5}` | listener ports, `:7-12` | the port each extra listener binds, read from its `ports.*` key |
+| `listeners.additional[i].routes[0].servlet` | `String` | `messageDispatcherServlet` in `[0]`, `[1]`, `[2]`, `[3]`, `[4]` and `[5]` | `basePath` + `path="/*"`, `:7-12` and the mock flows' listeners | the servlet behind each extra listener's one route |
+| `listeners.additional[i].routes[0].patterns` | `List<String>` (`AntPathMatcher` patterns) | `[0]` `["/mule/TheCreditAgencyService", "/mule/TheCreditAgencyService/**"]`, `[1]` `["/mule/TheBank1", "/mule/TheBank1/**"]`, `[2]` `["/mule/TheBank2", "/mule/TheBank2/**"]`, `[3]` `["/mule/TheBank3", "/mule/TheBank3/**"]`, `[4]` `["/mule/TheBank4", "/mule/TheBank4/**"]`, `[5]` `["/mule/TheBank5", "/mule/TheBank5/**"]` | `basePath` + `path="/*"`, `:7-12` and the mock flows' listeners | the paths each extra listener serves (SC-10) |
 
 - A port key moves both the listener and the URI the loan broker calls, because both read it. Additional listener ports must be concrete, unique and between 1 and 65535, and the five bank ports must differ from one another (`BankEndpoint` fails start-up otherwise).
 - The five `logging.level` keys keep the applicant's name and ssn out of the log at every root level, under `--debug` and `--trace` too, while the four sub-flow loggers and the banks' `Returning Rate is:` line still log at INFO. The original's loggers never wrote the applicant. The nested `UnderRootTrace` and `UnderRootDebug` runs of `controller/LoanBrokerControllerTest` assert this.
@@ -209,7 +215,7 @@ Each shared component is a copy of its reference implementation with only the `p
 | SC-11 | `config/SoapEnvelopeStyleInterceptor`, `config/WsdlQueryPublisher`, `config/SoapFaultConfig`, `config/SoapListenerBoundaryAdapter`; tests `config/SoapEnvelopeStyleInterceptorTest`, `config/WsdlQueryPublisherTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest` | **this project** | `soap-webservice-security`, `xml-only-soap-webservice`, `legacy-modernization`, `service-orchestration-and-choice-routing`; `proxying-a-soap-api` (`WsdlQueryPublisher` only) |
 | ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` | every project with an HTTP listener |
 | ST-2 | `FixtureParityTest` (test), `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` | the 51 non-RAML projects |
-| — | `config/PreflightDispatchConfig`; test `config/PreflightDispatchConfigTest` | `hello-world-java` | the other HTTP projects that carry it, 32 in all (`DECISIONS.md` section 9, verification points) |
+| — | `config/PreflightDispatchConfig`; test `config/PreflightDispatchConfigTest` | `hello-world-java` | the 36 other HTTP projects that carry it, this one included; 37 projects carry it in all (`DECISIONS.md` section 9, verification points) |
 
 This project passes no POST-only path to `SoapListenerBoundaryAdapter`, because every original listener accepts every method; `legacy-modernization` and `service-orchestration-and-choice-routing` pass theirs.
 

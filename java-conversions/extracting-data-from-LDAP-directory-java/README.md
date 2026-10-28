@@ -22,6 +22,54 @@ The example connects to an LDAP directory, retrieves the users stored under `ou=
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 - The absent `Content-Type` of the `200` reply, the empty-result reply and the bytes of the `404` and `500` defaults are Tier 2A verification points (see [Behaviours stubbed or externalized](#behaviours-stubbed-or-externalized)).
 
+## Configuration keys
+
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to. Status: `default` — a non-secret value the original fixed or documented, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original.
+
+| Key | Type | Default | Environment variable | Original name | Status | Description |
+|---|---|---|---|---|---|---|
+| `http.port` | `int` | `8081` | `HTTP_PORT` | `http.port` (unchanged) | default | bound to `server.port`. The original's `mule-app.properties` is empty, so `http.port` had no value there; its README sets port 8081 and browses to `http://localhost:8081/`. |
+| `ldap.port` | `int` | `389` | `LDAP_PORT` | `ldap.port` (unchanged) | default | directory port, embedded in `ldap.url`. `389` is the OpenLDAP port of the original README. |
+| `ldap.url` | `String` | `ldap://localhost:${ldap.port}/dc=my-domain,dc=com` | `LDAP_URL` | none: the literal `url` of `ldap:config` (`ldap.xml:3`) | default | connector URL carrying the host, port and base DN. Externalized because AAP 0.4.6 and 0.10.1 forbid hard-coded connection strings; only `ldap://` is accepted. |
+| `ldap.dn` | `String` | none (`${LDAP_DN:}`, `# TODO: supply the bind DN`) | `LDAP_DN` | `ldap.dn` (unchanged; the `authDn` of `ldap:config`) | TODO | bind DN of the service account. The original README suggests `cn=Manager,dc=my-domain,dc=com`. |
+| `ldap.password` | `String` | none (`${LDAP_PASSWORD:}`, `# TODO: supply the bind password`) | `LDAP_PASSWORD` | `ldap.password` (unchanged; the `authPassword` of `ldap:config`) | TODO (secret) | bind password of the service account |
+| `server.port` | `Integer` | `${http.port:8081}` | — | none | fixed | the `http:listener-config` port (`ldap.xml:6`); set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | — | none | fixed | `http:listener-config host="0.0.0.0"` (`ldap.xml:6`) |
+| `spring.application.name` | `String` | `extracting-data-from-LDAP-directory-java` | — | none | fixed | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | — | none | fixed | an unserved path reaches SC-1's no-listener 404, not the static resource handler |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | — | none | fixed | `TRACE` reaches `LdapController` like every other method, instead of the servlet's `message/http` echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | — | none | fixed | a form body on `PUT`, `PATCH` or `DELETE` reaches the controller unparsed, as on `POST` |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | — | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
+
+- The bind identity is a configured service account and comes only from configuration: no part of a request can supply or override it (AAP 0.4.1). An unset `ldap.dn` or `ldap.password` never falls back to an anonymous bind; the first request fails with the 500 above (`{ "message": "ldap.dn is not configured" }`), while the application still starts.
+- Relaxed binding maps each environment variable to its key, so `LDAP_PORT` also reaches `ldap.url` through its `${ldap.port}` placeholder.
+
+### Test configuration
+
+`src/test/resources/application-test.yml` (Spring profile `test`) supplies the original demo values, for tests only:
+
+| Key | Test value | Purpose |
+|---|---|---|
+| `ldap.admin` | `cn=Manager,dc=my-domain,dc=com` | bind DN accepted by the in-memory directory (original `mule.test.properties` key) |
+| `ldap.password` | the test bind password set in `src/test/resources/application-test.yml` | bind password (original `mule.test.properties` key) |
+| `ldap.root` | `dc=my-domain,dc=com` | base DN the in-memory directory is created with (original `mule.test.properties` key) |
+| `ldap.dn` | `${ldap.admin}` | the application's bind DN, as the original test set `ldap.dn` from `ldap.admin` (`ExtractingDataFromLdapDirectoryIT.java:73`) |
+
+- These are the keys the original test read from the uncommitted `src/test/resources/mule.test.properties` (`ExtractingDataFromLdapDirectoryIT.java:69-72`), which is no longer needed. `ldap.port` is absent on purpose.
+- The tests start an UnboundID in-memory directory server on a random port, loaded from `src/test/resources/ldap-add.ldif`, and register `ldap.port` through `@DynamicPropertySource`; `ldap.url` then resolves through it.
+- `src/test/resources/ldap-delete.ldif` is carried unchanged as the original's cleanup LDIF; no test reads it.
+- No test needs an external server, a credential or a licence, and the project has no `application-it.yml`.
+
+### Preparing a directory
+
+A real directory for running the application is prepared as the original README describes, condensed:
+
+1. Install and start an LDAP server such as OpenLDAP on port 389, with the root DN `cn=Manager,dc=my-domain,dc=com` and a root password of your choice (`<password>`); the tests use the original README's demo password, set in `src/test/resources/application-test.yml`.
+2. Import `src/main/resources/ldap.ldif`, byte-identical to the original's and to `ldap-add.ldif`: in Apache Directory Studio through **File > Import... > LDIF into LDAP**, or with `ldapadd -x -H ldap://localhost:389 -D cn=Manager,dc=my-domain,dc=com -W -f src/main/resources/ldap.ldif`.
+3. Supply `LDAP_DN` and `LDAP_PASSWORD` (and `LDAP_PORT` or `LDAP_URL` when the server differs from the defaults), then run the application as shown below.
+
+`ou=people` then holds `cn=admin`, `cn=testuser1` and `cn=mmc`. The LDIF also creates `cn=Manager` and `ou=groups` with three groups, which the search of `ou=people` does not reach.
+
 ## Mule-to-Java mapping
 
 | Mule construct (`extracting-data-from-LDAP-directory`) | Java construct (`com.mulesoft.examples.extracting_data_from_ldap_directory`) |
@@ -40,52 +88,6 @@ The example connects to an LDAP directory, retrieves the users stored under `ou=
 | `ExtractingDataFromLdapDirectoryIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`) | `ExtractingDataFromLdapDirectoryTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)` with ST-1 `support/HttpTestClient`) |
 
 Logging: each entry is logged at INFO as `LDAP user: <entry>`, then the whole list as `all users: <list>`, as the two loggers of `ldap.xml:12,14` did.
-
-## Configuration keys
-
-Every key of `src/main/resources/application.yml`. Status: `default` — a non-secret value the original fixed or documented, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original.
-
-| Key | Default | Environment variable | Original name | Status | Description |
-|---|---|---|---|---|---|
-| `http.port` | `8081` | `HTTP_PORT` | `http.port` (unchanged) | default | bound to `server.port`. The original's `mule-app.properties` is empty, so `http.port` had no value there; its README sets port 8081 and browses to `http://localhost:8081/`. |
-| `ldap.port` | `389` | `LDAP_PORT` | `ldap.port` (unchanged) | default | directory port, embedded in `ldap.url`. `389` is the OpenLDAP port of the original README. |
-| `ldap.url` | `ldap://localhost:${ldap.port}/dc=my-domain,dc=com` | `LDAP_URL` | none: the literal `url` of `ldap:config` (`ldap.xml:3`) | default | connector URL carrying the host, port and base DN. Externalized because AAP 0.4.6 and 0.10.1 forbid hard-coded connection strings; only `ldap://` is accepted. |
-| `ldap.dn` | none (`${LDAP_DN:}`, `# TODO: supply the bind DN`) | `LDAP_DN` | `ldap.dn` (unchanged; the `authDn` of `ldap:config`) | TODO | bind DN of the service account. The original README suggests `cn=Manager,dc=my-domain,dc=com`. |
-| `ldap.password` | none (`${LDAP_PASSWORD:}`, `# TODO: supply the bind password`) | `LDAP_PASSWORD` | `ldap.password` (unchanged; the `authPassword` of `ldap:config`) | TODO (secret) | bind password of the service account |
-| `server.port` | `${http.port:8081}` | — | none | fixed | the `http:listener-config` port (`ldap.xml:6`); set `http.port` rather than this key |
-| `server.address` | `0.0.0.0` | — | none | fixed | `http:listener-config host="0.0.0.0"` (`ldap.xml:6`) |
-| `spring.application.name` | `extracting-data-from-LDAP-directory-java` | — | none | fixed | application name in log lines |
-| `spring.web.resources.add-mappings` | `false` | — | none | fixed | an unserved path reaches SC-1's no-listener 404, not the static resource handler |
-| `spring.mvc.dispatch-trace-request` | `true` | — | none | fixed | `TRACE` reaches `LdapController` like every other method, instead of the servlet's `message/http` echo |
-| `spring.mvc.formcontent.filter.enabled` | `false` | — | none | fixed | a form body on `PUT`, `PATCH` or `DELETE` reaches the controller unparsed, as on `POST` |
-| `spring.autoconfigure.exclude` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | — | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
-
-- The bind identity is a configured service account and comes only from configuration: no part of a request can supply or override it (AAP 0.4.1). An unset `ldap.dn` or `ldap.password` never falls back to an anonymous bind; the first request fails with the 500 above (`{ "message": "ldap.dn is not configured" }`), while the application still starts.
-- Relaxed binding maps each environment variable to its key, so `LDAP_PORT` also reaches `ldap.url` through its `${ldap.port}` placeholder.
-
-## Test configuration
-
-`src/test/resources/application-test.yml` (Spring profile `test`) supplies the original demo values, for tests only:
-
-| Key | Test value | Purpose |
-|---|---|---|
-| `ldap.admin` | `cn=Manager,dc=my-domain,dc=com` | bind DN accepted by the in-memory directory (original `mule.test.properties` key) |
-| `ldap.password` | `root` | bind password (original `mule.test.properties` key) |
-| `ldap.root` | `dc=my-domain,dc=com` | base DN the in-memory directory is created with (original `mule.test.properties` key) |
-| `ldap.dn` | `${ldap.admin}` | the application's bind DN, as the original test set `ldap.dn` from `ldap.admin` (`ExtractingDataFromLdapDirectoryIT.java:73`) |
-
-- These are the keys the original test read from the uncommitted `src/test/resources/mule.test.properties` (`ExtractingDataFromLdapDirectoryIT.java:69-72`), which is no longer needed. `ldap.port` is absent on purpose.
-- The tests start an UnboundID in-memory directory server on a random port, loaded from `src/test/resources/ldap-add.ldif`, and register `ldap.port` through `@DynamicPropertySource`; `ldap.url` then resolves through it.
-- `src/test/resources/ldap-delete.ldif` is carried unchanged as the original's cleanup LDIF; no test reads it.
-- No test needs an external server, a credential or a licence, and the project has no `application-it.yml`.
-
-A real directory for running the application is prepared as the original README describes, condensed:
-
-1. Install and start an LDAP server such as OpenLDAP on port 389, with the root DN `cn=Manager,dc=my-domain,dc=com` and a root password (the original README's demo password is the test value above).
-2. Import `src/main/resources/ldap.ldif`, byte-identical to the original's and to `ldap-add.ldif`: in Apache Directory Studio through **File > Import... > LDIF into LDAP**, or with `ldapadd -x -H ldap://localhost:389 -D cn=Manager,dc=my-domain,dc=com -W -f src/main/resources/ldap.ldif`.
-3. Supply `LDAP_DN` and `LDAP_PASSWORD` (and `LDAP_PORT` or `LDAP_URL` when the server differs from the defaults), then run the application as shown below.
-
-`ou=people` then holds `cn=admin`, `cn=testuser1` and `cn=mmc`. The LDIF also creates `cn=Manager` and `ou=groups` with three groups, which the search of `ou=people` does not reach.
 
 ## Behaviours stubbed or externalized
 
@@ -172,10 +174,26 @@ No listener for endpoint: /unknown
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path, and carries no stack trace |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
 | `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/` gets exactly the plain `OPTIONS` reply with no `Access-Control-*` or `Vary` header; a pre-flight to an unserved path gets the no-listener 404 and one whose search fails the SC-1 500 |
-| `FixtureParityTest` | ST-2 fixture replay of the scenarios in `src/test/resources/fixtures/SCENARIOS.md`; skipped (`no Tier 2A fixtures captured`) while no fixture exists |
+| `FixtureParityTest` | ST-2 fixture replay of the scenarios in `src/test/resources/fixtures/SCENARIOS.md` ([Fixture parity (ST-2)](#fixture-parity-st-2)); skipped (`no Tier 2A fixtures captured`) while no fixture exists |
 
-- `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
-- `FixtureParityTest` is the shared replay engine, copied from `hello-world-java` with only its `package` line changed. The fixture format, the replay drivers and the comparison rules are described in [`java-conversions/hello-world-java/README.md`](../hello-world-java/README.md#fixture-parity-st-2-reference-implementation); this project's fixture contract, directory state and capture commands are in `src/test/resources/fixtures/SCENARIOS.md`. Every scenario seeds the directory through `state.ldap` and makes no outbound call (`"upstream": []`).
+`support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
+
+## Fixture parity (ST-2)
+
+`FixtureParityTest` is the shared replay engine, copied from `hello-world-java` with only its `package` line changed. The fixture format, the replay drivers and the comparison rules are described in [`java-conversions/hello-world-java/README.md`](../hello-world-java/README.md#fixture-parity-st-2-reference-implementation); this project's fixture contract, directory state and capture commands are in `src/test/resources/fixtures/SCENARIOS.md`. Every scenario seeds the directory through `state.ldap` and makes no outbound call (`"upstream": []`).
+
+Every scenario of `SCENARIOS.md` is unverified until Tier 2A capture:
+
+| Scenario | Trigger | State | Request | Status in the last run |
+|---|---|---|---|---|
+| `get-root-list-people` | `http` | `deterministic` | `GET /`, empty body, directory loaded from `ldap-add.ldif` | `UNVERIFIED-uncaptured` |
+| `post-root-list-people` | `http` | `deterministic` | `POST /`, empty body, directory as above | `UNVERIFIED-uncaptured` |
+| `get-root-no-people` | `http` | `deterministic` | `GET /`, empty body, directory holding only `dc=my-domain,dc=com` and `ou=people` | `UNVERIFIED-uncaptured` |
+| `get-root-ldap-unavailable` | `http` | `deterministic` | `GET /`, empty body, nothing listening on `ldap.port` | `UNVERIFIED-uncaptured` |
+| `get-unknown-path` | `http` | `deterministic` | `GET /unknown`, empty body | `UNVERIFIED-uncaptured` |
+
+- No scenario of this project is `unreachable` or `nondeterministic`.
+- `get-root-ldap-unavailable` stays unverified after capture as well: the replay runs one application context against one directory, so it cannot reproduce an absent directory. Once captured, its evidence is committed under `src/test/capture/get-root-ldap-unavailable/` without a fixture (`SCENARIOS.md`, Notes for this project).
 
 ## Tier status
 
@@ -198,19 +216,7 @@ Tier 2A is blocked: `DECISIONS.md` (section 9) records "Tier 2A blocked: Mule EE
 - `controller/LdapControllerTest`, `service/LdapSearchServiceTest`, `client/LdapDirectoryClientTest` and SC-1's `exception/GlobalExceptionHandlerTest` cover every reachable branch.
 - This evidence is weaker than captured fixtures. It shows that the conversion meets the original's own assertions and the AAP's reading of the platform defaults, but not that its bytes equal what the original runtime sent.
 - No original assertion covers `post-root-list-people`, `get-root-no-people`, `get-root-ldap-unavailable` or `get-unknown-path`; they are covered only by the new tests above.
-
-Every scenario of `SCENARIOS.md` is unverified until Tier 2A capture:
-
-| Scenario | Trigger | State | Request | Status in the last run |
-|---|---|---|---|---|
-| `get-root-list-people` | `http` | `deterministic` | `GET /`, empty body, directory loaded from `ldap-add.ldif` | `UNVERIFIED-uncaptured` |
-| `post-root-list-people` | `http` | `deterministic` | `POST /`, empty body, directory as above | `UNVERIFIED-uncaptured` |
-| `get-root-no-people` | `http` | `deterministic` | `GET /`, empty body, directory holding only `dc=my-domain,dc=com` and `ou=people` | `UNVERIFIED-uncaptured` |
-| `get-root-ldap-unavailable` | `http` | `deterministic` | `GET /`, empty body, nothing listening on `ldap.port` | `UNVERIFIED-uncaptured` |
-| `get-unknown-path` | `http` | `deterministic` | `GET /unknown`, empty body | `UNVERIFIED-uncaptured` |
-
-- No scenario of this project is `unreachable` or `nondeterministic`.
-- `get-root-ldap-unavailable` stays unverified after capture as well: the replay runs one application context against one directory, so it cannot reproduce an absent directory. Once captured, its evidence is committed under `src/test/capture/get-root-ldap-unavailable/` without a fixture (`SCENARIOS.md`, Notes for this project).
+- Unverified scenarios, until captured (see [Fixture parity (ST-2)](#fixture-parity-st-2)): `get-root-list-people`, `post-root-list-people`, `get-root-no-people`, `get-root-ldap-unavailable`, `get-unknown-path`; `get-root-ldap-unavailable` stays unverified after capture as well.
 
 The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed (AAP 0.8.7).
 

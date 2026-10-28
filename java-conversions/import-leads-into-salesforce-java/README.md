@@ -31,6 +31,87 @@ File disposition follows Mule 3.8's default file connector (SC-5), because the o
 - Relative directories resolve against the working directory: the project directory under `mvn spring-boot:run`.
 - The endpoint's `responseTimeout="10000"` is not carried: a one-way file endpoint sends no reply.
 
+### Behaviours kept from the original
+
+The batch semantics come from SC-7 `service/BatchJobRunner`; the job definition from `service/LeadImportBatchService`.
+
+- Steps run in declaration order, each step taking every record before the next step starts; records keep their file order.
+- A lead whose e-mail already exists in Salesforce (`exists` true) is not accepted by `LeadInsertStep`: it is neither logged `Got Record` nor created, and it counts as successful.
+- A record whose `Find Lead` query fails fails in `LeadExistsStep`. It is skipped by `LeadInsertStep` (default accept policy `NO_FAILURES`) and logged `Got Failure` by `LogFailuresStep`; the other records continue.
+- A `create` that throws fails every record of its commit group, and each of them reaches `LogFailuresStep`.
+- A Salesforce `SaveResult` that reports an error does not fail its record: the save results are not inspected, as the Mule connector returned them without raising.
+- The job stops processing once more than 1000 records have failed (`max-failed-records`), with status `FAILED_PROCESS_RECORDS`: no further step runs, so `LogFailuresStep` is not reached, and on-complete still logs the counts. After on-complete, `BatchJobRunner` logs the final result at WARN, as it does for every job that did not end `SUCCESSFUL` (stopped, or failed in on-complete), while a `SUCCESSFUL` one is logged at DEBUG: `Finished job instance '<id>' of job 'CreateLeadsBatch' with status FAILED_PROCESS_RECORDS: loaded <n>, processed <n>, successful <n>, failed <n>, unprocessed <n>`. A record counts as processed once it has failed or finished `LogFailuresStep`; a record the stop left before that step is neither processed nor successful.
+- Each record prints as its `LinkedHashMap`, for example `{Company=Eu Odio PC, Email=sem.egestas@mollis.org, FirstName=Cole, LastName=Burks}`, so the `Got Record` and `Got Failure` lines read as the original's `#[payload]`.
+- Values are the strings the CSV reader produced, untrimmed and uncoerced; a column missing from a row maps to `null`.
+
+### Connector failure modes (AAP 0.4.8)
+
+Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client/UpstreamCallExecutor` and is classified by `client/SalesforceFailureClassifier`. The project is file-triggered, so no caller receives a 502, 429 or 503: the classification is logged at ERROR with the upstream name `Salesforce`, and the batch job records the affected record (a failed lookup) or commit group (a failed `create`) as failed. The file is then moved as after any run.
+
+| Failure | Behaviour | Result |
+|---|---|---|
+| Authentication or session expiry: an `ApiFault`/`LoginFault`, or a SOAP fault without detail, with code `INVALID_SESSION_ID` | WARN `Upstream Salesforce rejected the session [AUTHENTICATION]; re-authenticating and retrying once`, a new `login`, then one retry; a second rejection ends the attempt | ERROR `Upstream Salesforce call failed [AUTHENTICATION]: …`, `UpstreamAuthenticationException`, record or group failed |
+| Throttling: code `REQUEST_LIMIT_EXCEEDED` | no retry | ERROR `Upstream Salesforce call failed [RATE_LIMIT]: …`, `UpstreamRateLimitException` without `Retry-After` (Salesforce sends none), record or group failed |
+| Timeout or connectivity failure anywhere in the cause chain (`SocketTimeoutException`, `ConnectException`, `UnknownHostException`, `NoRouteToHostException`, other `SocketException`) | never retried, even when the chain also holds `INVALID_SESSION_ID`; this protects the `Lead` create from being submitted twice | ERROR `Upstream Salesforce call failed [UNAVAILABLE]: …`, `UpstreamUnavailableException`, record or group failed |
+| Anything else (`INVALID_LOGIN`, `INVALID_FIELD`, `MALFORMED_QUERY`, …) | rethrown unchanged | the original branch: the record or commit group fails in the batch job and reaches `LogFailuresStep` |
+
+- The connect and read timeouts are 10 s each (`sfdc.connect-timeout`, `sfdc.read-timeout`), the Mule default response timeout.
+- The ERROR lines name the upstream, the category and exception classes only, never vendor messages, credentials or record data.
+- No failure is retried by the batch job or the poller; the only retry is the single one after a rejected session.
+
+Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, and `sfdc.auth-endpoint` pointed at a closed local port (timestamps, process ID, application name and thread removed; the job instance ID replaced by `<uuid>`):
+
+```console
+$ CLOSED_PORT=1   # any loopback port nothing listens on
+$ java -jar target/import-leads-into-salesforce-java-1.0.0-SNAPSHOT.jar --leads.input-dir=target/run/in --leads.move-to-dir=target/run/out --leads.polling-frequency=2000 "--sfdc.auth-endpoint=http://127.0.0.1:${CLOSED_PORT}/services/Soap/u/65.0" --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
+$ cp src/main/resources/leads.csv target/run/in/   # in a second terminal, while the application runs
+ERROR c.m.e.i.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
+ERROR c.m.e.i.service.BatchJobRunner           : Found exception processing record on step 'LeadExistsStep' for job instance '<uuid>' of job 'CreateLeadsBatch': com.mulesoft.examples.import_leads_into_salesforce.exception.UpstreamUnavailableException at com.mulesoft.examples.import_leads_into_salesforce.client.UpstreamCallExecutor.translate(UpstreamCallExecutor.java:276) <- com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException at sun.nio.ch.Net.pollConnect(Net.java)
+ERROR c.m.e.i.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
+ INFO c.m.e.i.service.LeadImportBatchService   : Got Failure {Company=Aliquam Tincidunt Nunc LLC, Email=faucibus@egetmetus.org, FirstName=Ishmael, LastName=Alexander}
+ INFO c.m.e.i.service.LeadImportBatchService   : Got Failure {Company=Eu Odio PC, Email=sem.egestas@mollis.org, FirstName=Cole, LastName=Burks}
+ INFO c.m.e.i.service.LeadImportBatchService   : 2 Loaded Records 2 Failed Records
+```
+
+Each record's lookup attempted the lazy `login` once, which failed without a retry; `BatchJobRunner` logged the first failure of the step and exception type. Afterwards `target/run/in/` was empty and `target/run/out/leads.csv` was byte-identical to the dropped file.
+
+### Query hardening (AAP 0.4.10)
+
+The original interpolated the e-mail address into the SOQL string literal unescaped (`import-leads-into-salesforce.xml:28`). `LeadImportBatchService` escapes it first: each `\` becomes `\\`, then each `'` becomes `\'`, so an inserted escape is never escaped again. The query of every legitimate address is unchanged and returns the same rows; a hostile address can no longer end the literal. This is the only intended difference for hostile input, recorded in the root `DECISIONS.md`, section [8. Query hardening](../../DECISIONS.md#8-query-hardening).
+
+## Configuration keys
+
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to. Salesforce authentication is the original's: the SOAP Partner API `login` with `sfdc.username` and `sfdc.password` immediately followed by `sfdc.securityToken` (SC-15, AAP 0.10.2), not an OAuth grant, so no connected app is needed. The client logs in lazily on the first Salesforce call, so the application starts with every secret empty.
+
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original, not a key of the original.
+
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `spring.application.name` | `String` | `import-leads-into-salesforce-java` | none | fixed | application name in log lines |
+| `spring.main.web-application-type` | `WebApplicationType` | `none` | none | fixed | the original has no HTTP listener, so no web server starts and no port is bound |
+| `leads.input-dir` | `String` (a path) | `src/main/resources/input` | none; the original hard-coded `path` on the file endpoint (xml:11) | default | directory polled for CSV files |
+| `leads.move-to-dir` | `String` (a path) | `src/main/resources/output` | none; the original hard-coded `moveToDirectory` (xml:11) | default | directory each polled file is moved to under its own name |
+| `leads.polling-frequency` | `long` (ms) | `10000` | none; the original hard-coded `pollingFrequency` (xml:11) | default | fixed delay between the end of one poll and the start of the next; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
+| `sfdc.username` | `String` | none, `${SFDC_USERNAME:}` | **`sfdc.user`** (xml:4) | TODO | the Salesforce user the `login` call authenticates; renamed because the request's key names govern (AAP 0.4.6) |
+| `sfdc.password` | `String` | none, `${SFDC_PASSWORD:}` | `sfdc.password` (unchanged, xml:4) | TODO (secret) | that user's password, without the security token |
+| `sfdc.securityToken` | `String` | none, `${SFDC_SECURITYTOKEN:}` | `sfdc.securityToken` (unchanged, xml:4) | TODO (secret) | appended to the password at login; `sfdc.security-token` binds as well |
+| `sfdc.auth-endpoint` | `String` | `https://login.salesforce.com/services/Soap/u/65.0` | none; the original `sfdc:config` sets no URL, so its connector logged in at its default login URL | default | Partner SOAP login endpoint of API 65.0 (`force-partner-api` 65.0.0); a sandbox org uses `https://test.salesforce.com/services/Soap/u/65.0` |
+| `sfdc.connect-timeout` | `Duration` | `10s` | none | default | connect timeout of every Salesforce call (AAP 0.4.8), the Mule default response timeout; a bare number binds as milliseconds |
+| `sfdc.read-timeout` | `Duration` | `10s` | none | default | read timeout of every Salesforce call (AAP 0.4.8), with the same rules |
+
+- Original-to-new key map: `sfdc.user` → `sfdc.username`; `sfdc.password` and `sfdc.securityToken` keep their names. The live test reads the same three keys from `src/test/resources/application-it.yml`, where the original test read `sfdc.user`, `sfdc.password` and `sfdc.securityToken` from `mule.test.properties`.
+- `config/SalesforceProperties` binds the `sfdc.*` keys; its `toString()` masks the password and the token.
+- The project has no `src/test/resources/application-test.yml`: the unit tests mock Salesforce or stub it with WireMock and need no credential. Surefire and failsafe set `leads.input-dir`, `leads.move-to-dir` (under `target/test-leads/` and `target/it-leads/`) and `leads.polling-frequency` (`3600000`) as system properties, so no test polls or moves files in `src/main/resources/input` or `src/main/resources/output`.
+- No credential appears in any committed file. Supply the credentials through the environment variables `SFDC_USERNAME`, `SFDC_PASSWORD` and `SFDC_SECURITYTOKEN`:
+
+  ```sh
+  SFDC_USERNAME='<user>' SFDC_PASSWORD='<password>' SFDC_SECURITYTOKEN='<token>' mvn spring-boot:run
+  # a sandbox org, with the directories under target/
+  SFDC_USERNAME='<user>' SFDC_PASSWORD='<password>' SFDC_SECURITYTOKEN='<token>' java -jar target/import-leads-into-salesforce-java-1.0.0-SNAPSHOT.jar --sfdc.auth-endpoint=https://test.salesforce.com/services/Soap/u/65.0 --leads.input-dir=target/run/in --leads.move-to-dir=target/run/out
+  ```
+
+  An external `application.yml` (for example `'--spring.config.additional-location=<file>'`) outside the repository works as well.
+
 ## Mule-to-Java mapping
 
 | Mule construct (`import-leads-into-salesforce`) | Java construct (`com.mulesoft.examples.import_leads_into_salesforce`) |
@@ -66,87 +147,9 @@ Shared components (register in the root [`DECISIONS.md`](../../DECISIONS.md)):
   - ST-2 `FixtureParityTest` and the `SCENARIOS.md` format from `hello-world-java`.
 - It carries no SC-1 and no ST-1, because it has no HTTP listener.
 
-## Behaviours kept from the original
+## Behaviours stubbed or externalized
 
-The batch semantics come from SC-7 `service/BatchJobRunner`; the job definition from `service/LeadImportBatchService`.
-
-- Steps run in declaration order, each step taking every record before the next step starts; records keep their file order.
-- A lead whose e-mail already exists in Salesforce (`exists` true) is not accepted by `LeadInsertStep`: it is neither logged `Got Record` nor created, and it counts as successful.
-- A record whose `Find Lead` query fails fails in `LeadExistsStep`. It is skipped by `LeadInsertStep` (default accept policy `NO_FAILURES`) and logged `Got Failure` by `LogFailuresStep`; the other records continue.
-- A `create` that throws fails every record of its commit group, and each of them reaches `LogFailuresStep`.
-- A Salesforce `SaveResult` that reports an error does not fail its record: the save results are not inspected, as the Mule connector returned them without raising.
-- The job stops processing once more than 1000 records have failed (`max-failed-records`), with status `FAILED_PROCESS_RECORDS`: no further step runs, so `LogFailuresStep` is not reached, and on-complete still logs the counts. After on-complete, `BatchJobRunner` logs the final result at WARN, as it does for every job that did not end `SUCCESSFUL` (stopped, or failed in on-complete), while a `SUCCESSFUL` one is logged at DEBUG: `Finished job instance '<id>' of job 'CreateLeadsBatch' with status FAILED_PROCESS_RECORDS: loaded <n>, processed <n>, successful <n>, failed <n>, unprocessed <n>`. A record counts as processed once it has failed or finished `LogFailuresStep`; a record the stop left before that step is neither processed nor successful.
-- Each record prints as its `LinkedHashMap`, for example `{Company=Eu Odio PC, Email=sem.egestas@mollis.org, FirstName=Cole, LastName=Burks}`, so the `Got Record` and `Got Failure` lines read as the original's `#[payload]`.
-- Values are the strings the CSV reader produced, untrimmed and uncoerced; a column missing from a row maps to `null`.
-
-## Connector failure modes (AAP 0.4.8)
-
-Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client/UpstreamCallExecutor` and is classified by `client/SalesforceFailureClassifier`. The project is file-triggered, so no caller receives a 502, 429 or 503: the classification is logged at ERROR with the upstream name `Salesforce`, and the batch job records the affected record (a failed lookup) or commit group (a failed `create`) as failed. The file is then moved as after any run.
-
-| Failure | Behaviour | Result |
-|---|---|---|
-| Authentication or session expiry: an `ApiFault`/`LoginFault`, or a SOAP fault without detail, with code `INVALID_SESSION_ID` | WARN `Upstream Salesforce rejected the session [AUTHENTICATION]; re-authenticating and retrying once`, a new `login`, then one retry; a second rejection ends the attempt | ERROR `Upstream Salesforce call failed [AUTHENTICATION]: …`, `UpstreamAuthenticationException`, record or group failed |
-| Throttling: code `REQUEST_LIMIT_EXCEEDED` | no retry | ERROR `Upstream Salesforce call failed [RATE_LIMIT]: …`, `UpstreamRateLimitException` without `Retry-After` (Salesforce sends none), record or group failed |
-| Timeout or connectivity failure anywhere in the cause chain (`SocketTimeoutException`, `ConnectException`, `UnknownHostException`, `NoRouteToHostException`, other `SocketException`) | never retried, even when the chain also holds `INVALID_SESSION_ID`; this protects the `Lead` create from being submitted twice | ERROR `Upstream Salesforce call failed [UNAVAILABLE]: …`, `UpstreamUnavailableException`, record or group failed |
-| Anything else (`INVALID_LOGIN`, `INVALID_FIELD`, `MALFORMED_QUERY`, …) | rethrown unchanged | the original branch: the record or commit group fails in the batch job and reaches `LogFailuresStep` |
-
-- The connect and read timeouts are 10 s each (`sfdc.connect-timeout`, `sfdc.read-timeout`), the Mule default response timeout.
-- The ERROR lines name the upstream, the category and exception classes only, never vendor messages, credentials or record data.
-- No failure is retried by the batch job or the poller; the only retry is the single one after a rejected session.
-
-Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, and `sfdc.auth-endpoint` pointed at a closed local port (timestamps, process ID, application name and thread removed; the job instance ID replaced by `<uuid>`):
-
-```console
-$ java -jar target/import-leads-into-salesforce-java-1.0.0-SNAPSHOT.jar --leads.input-dir=target/run/in --leads.move-to-dir=target/run/out --leads.polling-frequency=2000 --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0 --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
-$ cp src/main/resources/leads.csv target/run/in/
-ERROR c.m.e.i.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
-ERROR c.m.e.i.service.BatchJobRunner           : Found exception processing record on step 'LeadExistsStep' for job instance '<uuid>' of job 'CreateLeadsBatch': com.mulesoft.examples.import_leads_into_salesforce.exception.UpstreamUnavailableException at com.mulesoft.examples.import_leads_into_salesforce.client.UpstreamCallExecutor.translate(UpstreamCallExecutor.java:276) <- com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException at sun.nio.ch.Net.pollConnect(Net.java)
-ERROR c.m.e.i.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
- INFO c.m.e.i.service.LeadImportBatchService   : Got Failure {Company=Aliquam Tincidunt Nunc LLC, Email=faucibus@egetmetus.org, FirstName=Ishmael, LastName=Alexander}
- INFO c.m.e.i.service.LeadImportBatchService   : Got Failure {Company=Eu Odio PC, Email=sem.egestas@mollis.org, FirstName=Cole, LastName=Burks}
- INFO c.m.e.i.service.LeadImportBatchService   : 2 Loaded Records 2 Failed Records
-```
-
-Each record's lookup attempted the lazy `login` once, which failed without a retry; `BatchJobRunner` logged the first failure of the step and exception type. Afterwards `target/run/in/` was empty and `target/run/out/leads.csv` was byte-identical to the dropped file.
-
-## Query hardening (AAP 0.4.10)
-
-The original interpolated the e-mail address into the SOQL string literal unescaped (`import-leads-into-salesforce.xml:28`). `LeadImportBatchService` escapes it first: each `\` becomes `\\`, then each `'` becomes `\'`, so an inserted escape is never escaped again. The query of every legitimate address is unchanged and returns the same rows; a hostile address can no longer end the literal. This is the only intended difference for hostile input, recorded in the root `DECISIONS.md`, section [8. Query hardening](../../DECISIONS.md#8-query-hardening).
-
-## Configuration keys
-
-Every key of `src/main/resources/application.yml`, with the Java type its value binds to. Salesforce authentication is the original's: the SOAP Partner API `login` with `sfdc.username` and `sfdc.password` immediately followed by `sfdc.securityToken` (SC-15, AAP 0.10.2), not an OAuth grant, so no connected app is needed. The client logs in lazily on the first Salesforce call, so the application starts with every secret empty.
-
-Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original, not a key of the original.
-
-| Key | Type | Default | Original name | Status | Description |
-|---|---|---|---|---|---|
-| `spring.application.name` | `String` | `import-leads-into-salesforce-java` | none | fixed | application name in log lines |
-| `spring.main.web-application-type` | `WebApplicationType` | `none` | none | fixed | the original has no HTTP listener, so no web server starts and no port is bound |
-| `leads.input-dir` | `String` (a path) | `src/main/resources/input` | none; the original hard-coded `path` on the file endpoint (xml:11) | default | directory polled for CSV files |
-| `leads.move-to-dir` | `String` (a path) | `src/main/resources/output` | none; the original hard-coded `moveToDirectory` (xml:11) | default | directory each polled file is moved to under its own name |
-| `leads.polling-frequency` | `long` (ms) | `10000` | none; the original hard-coded `pollingFrequency` (xml:11) | default | fixed delay between the end of one poll and the start of the next; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
-| `sfdc.username` | `String` | none, `${SFDC_USERNAME:}` | **`sfdc.user`** (xml:4) | TODO | the Salesforce user the `login` call authenticates; renamed because the request's key names govern (AAP 0.4.6) |
-| `sfdc.password` | `String` | none, `${SFDC_PASSWORD:}` | `sfdc.password` (unchanged, xml:4) | TODO (secret) | that user's password, without the security token |
-| `sfdc.securityToken` | `String` | none, `${SFDC_SECURITYTOKEN:}` | `sfdc.securityToken` (unchanged, xml:4) | TODO (secret) | appended to the password at login; `sfdc.security-token` binds as well |
-| `sfdc.auth-endpoint` | `String` | `https://login.salesforce.com/services/Soap/u/65.0` | none; the original `sfdc:config` sets no URL, so its connector logged in at its default login URL | default | Partner SOAP login endpoint of API 65.0 (`force-partner-api` 65.0.0); a sandbox org uses `https://test.salesforce.com/services/Soap/u/65.0` |
-| `sfdc.connect-timeout` | `Duration` | `10s` | none | default | connect timeout of every Salesforce call (AAP 0.4.8), the Mule default response timeout; a bare number binds as milliseconds |
-| `sfdc.read-timeout` | `Duration` | `10s` | none | default | read timeout of every Salesforce call (AAP 0.4.8), with the same rules |
-
-- Original-to-new key map: `sfdc.user` → `sfdc.username`; `sfdc.password` and `sfdc.securityToken` keep their names. The live test reads the same three keys from `src/test/resources/application-it.yml`, where the original test read `sfdc.user`, `sfdc.password` and `sfdc.securityToken` from `mule.test.properties`.
-- `config/SalesforceProperties` binds the `sfdc.*` keys; its `toString()` masks the password and the token.
-- The project has no `src/test/resources/application-test.yml`: the unit tests mock Salesforce or stub it with WireMock and need no credential. Surefire and failsafe set `leads.input-dir`, `leads.move-to-dir` (under `target/test-leads/` and `target/it-leads/`) and `leads.polling-frequency` (`3600000`) as system properties, so no test polls or moves files in `src/main/resources/input` or `src/main/resources/output`.
-- No credential appears in any committed file. Supply the credentials through the environment variables `SFDC_USERNAME`, `SFDC_PASSWORD` and `SFDC_SECURITYTOKEN`:
-
-  ```sh
-  SFDC_USERNAME='<user>' SFDC_PASSWORD='<password>' SFDC_SECURITYTOKEN='<token>' mvn spring-boot:run
-  # a sandbox org, with the directories under target/
-  SFDC_USERNAME='<user>' SFDC_PASSWORD='<password>' SFDC_SECURITYTOKEN='<token>' java -jar target/import-leads-into-salesforce-java-1.0.0-SNAPSHOT.jar --sfdc.auth-endpoint=https://test.salesforce.com/services/Soap/u/65.0 --leads.input-dir=target/run/in --leads.move-to-dir=target/run/out
-  ```
-
-  An external `application.yml` (for example `--spring.config.additional-location=<file>`) outside the repository works as well.
-
-## Behaviours stubbed, externalized or changed
+This section also lists the behaviours the conversion changed.
 
 - Externalized: the Salesforce credentials, which the original also read from placeholders, are `TODO` keys with environment-variable fallbacks; `sfdc.user` is renamed `sfdc.username`. The file endpoint's path, move directory and polling frequency, hard-coded in the original, are configurable keys with the original values as defaults; the login URL and timeouts, defaults of the original connector, are configurable keys.
 - Changed:
@@ -194,7 +197,7 @@ Within one polling interval the file moves to `src/main/resources/output/leads.c
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
-## Live test (Tier 2B)
+### Live test (Tier 2B)
 
 `ImportLeadsToSfdcIT` runs under failsafe (`mvn -B verify`) against a real org, reusing the existing Salesforce credentials; no new sandbox is procured.
 
@@ -217,14 +220,14 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 |---|---|
 | `ImportLeadsToSfdcTest` | the ported `ImportLeadsToSfdcIT` (`import-leads-into-salesforce/src/test/java/org/mule/examples/ImportLeadsToSfdcIT.java:71-90`) with the whole application context against a mocked `SalesforcePartnerClient` that reports neither address as existing: `leads.csv` dropped into a temporary input directory and `pollOnce()` lead to exactly one `create` of type `Lead` with two records, `FirstName` `Ishmael` for `faucibus@egetmetus.org` and `LastName` `Burks` for `sem.egestas@mollis.org`; also every field of both records, one `Find Lead` query per address, the file moved unchanged to the output directory, and no other Salesforce call |
 | `ImportLeadsToSfdcIT` | the same two assertions against a live org (failsafe, previous section) |
-| `ImportLeadsToSfdcITCleanupTest` | the live test's `@AfterEach` without credentials or a Spring context, against a mocked `SalesforcePartnerClient`: a failed query or delete, and a failed delete result, whose messages, causes, suppressed exceptions and error details carry a token, a password and Lead fields, logged at WARN by class names (at most five, then `...`; `[circular]` on a repeated cause) or Salesforce status codes only, with no throwable attached; every Lead still deleted |
+| `ImportLeadsToSfdcITCleanupTest` | the live test's `@AfterEach` without credentials or a Spring context, against a mocked `SalesforcePartnerClient`: a failed query or delete, and a failed delete result, whose messages, causes, suppressed exceptions and error details carry a token, a password and Lead fields, logged at WARN by class names (at most five, then `...`; `[circular]` on a repeated cause) or Salesforce status codes only, with no throwable attached; every Lead still deleted; a Lead query answered only after the live wait's timeout answered on the thread running the wait, before the wait ends, and its Lead deleted by the cleanup |
 | `trigger/LeadsFileTriggerTest` | `leads.csv` handed byte for byte to the import once and moved to the output directory; an unavailable Salesforce and any other import failure logged at ERROR, not retried, file still moved; an empty input directory hands nothing over; `poll()` scheduled with the configured fixed delay and processing a dropped file like `pollOnce()` |
 | `service/LeadImportBatchServiceTest` | both leads of `leads.csv` new and created in one commit; a lead whose e-mail exists not created again; a failed lookup failing only its record, logged `Got Failure`, not retried; a failed `create` failing every record of its group; more than 200 new leads created in groups of 200 and a smaller last group; the e-mail escaped inside the SOQL literal; a header-only file loading no record and never calling Salesforce; 1000 failed records completing and 1001 stopping the job; the original job name, limits and step order |
 | `mapper/LeadMapperTest` | the four keys in script order; one lead per row in input order; extra columns such as `Birthday` dropped; a missing column gives `null`, an empty or `null` row four `null` values; values passed through untouched; the carried `leads.csv` mapped to Ishmael Alexander and Cole Burks |
 | `service/BatchJobRunnerTest` | SC-7 reference test: accept policies (`NO_FAILURES` default, `ONLY_FAILURES`) checked before the accept expression; record variables and replaced payloads reaching later steps; failures kept under their step's name; a failing commit failing its group; `max-failed-records` of 0 (default), -1 and above the failed count; on-complete run once, a failing on-complete giving `FAILED_ON_COMPLETE`; an input-phase exception propagated with nothing else run; empty input completing with zero counts; a stop in the last step counting as processed only the failed record and the records that completed that step, without a commit, with a commit group pending and after a committed group; the final result logged once after on-complete, at WARN with status and loaded, processed, successful, failed and unprocessed counts for a job that did not end `SUCCESSFUL` (stopped, or failed in on-complete), and at DEBUG, with no WARN, for a `SUCCESSFUL` one; one ERROR line per exception class and step |
 | `mapper/DwCsvReaderTest` | SC-4: header row, `,` separator, `"` quoting with its escapes, LF, CRLF and lone-CR record ends (the carried `leads.csv` uses CR), skipped empty lines, untrimmed string values |
 | `trigger/FileInboundPollerTest`, `trigger/FileInboundPollerLogSafetyTest` | SC-5: move after success and after a handled failure, delete without a move directory, the interrupt flag kept, the in-process mark against re-entrant and concurrent polls, an unopenable file left in place and retried, a file too large to read (over the read limit, or one whose allocation fails with `OutOfMemoryError`) left in place while the other files are consumed, missing directories created, subdirectories ignored, a same-named file replaced; every diagnostic one line, without exception messages or file content, an `OutOfMemoryError` read failure included |
-| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the `create`, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and 10 s default timeouts |
+| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the `create`, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and 10 s default timeouts; concurrent callers sharing the one login, re-login or session refresh in flight, its timeout included; paging that fails, with no further `queryMore`, on a repeated query locator, records beyond the reported size or pages beyond what that size allows |
 | `client/SalesforceFailureClassifierTest`, `client/UpstreamCallExecutorTest` | SC-9 and the Salesforce classification: re-login and one retry on `INVALID_SESSION_ID`, no retry on `REQUEST_LIMIT_EXCEEDED` (no `Retry-After`) or on any timeout or connectivity cause, the unchanged rethrow of every other failure, ERROR lines without vendor text |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
@@ -252,10 +255,10 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 The root `SUMMARY.md` carries the same row for this project (AAP 0.8.7). Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 790 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`ImportLeadsToSfdcIT`: `src/test/resources/application-it.yml not supplied (copy application-it.yml.example); live Salesforce test skipped`).
-- `mvn -B clean package`: `BUILD SUCCESS`; 790 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
-- `mvn -B test`: `BUILD SUCCESS`; 790 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 341 of 346 lines (98.6%) of `service/LeadImportBatchService`, `service/BatchJobRunner` with its nested classes, `mapper/LeadMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 96.7% (957 of 990 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 800 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`ImportLeadsToSfdcIT`: `src/test/resources/application-it.yml not supplied (copy application-it.yml.example); live Salesforce test skipped`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 800 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
+- `mvn -B test`: `BUILD SUCCESS`; 800 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 341 of 346 lines (98.6%) of `service/LeadImportBatchService`, `service/BatchJobRunner` with its nested classes, `mapper/LeadMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 96.4% (995 of 1032 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `ImportLeadsToSfdcIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

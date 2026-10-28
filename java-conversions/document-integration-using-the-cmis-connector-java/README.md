@@ -95,7 +95,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 - Override any key on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`):
 
   ```sh
-  export CMIS_USERNAME=<OpenKM user> CMIS_PASSWORD=<OpenKM password>
+  export CMIS_USERNAME='<OpenKM user>' CMIS_PASSWORD='<OpenKM password>'
   mvn spring-boot:run -Dspring-boot.run.arguments=--http.port=9090
   HTTP_PORT=9090 java -jar target/document-integration-using-the-cmis-connector-java-1.0.0-SNAPSHOT.jar
   ```
@@ -135,7 +135,7 @@ Run from `java-conversions/document-integration-using-the-cmis-connector-java/`:
 mvn -B clean install    # build, surefire tests, JaCoCo check, repackaged jar installed locally
 mvn -B clean package    # build, surefire tests, JaCoCo report and check (LINE >= 0.80 over service/** and mapper/**)
 mvn -B test             # surefire tests only
-export CMIS_USERNAME=<OpenKM user> CMIS_PASSWORD=<OpenKM password>
+export CMIS_USERNAME='<OpenKM user>' CMIS_PASSWORD='<OpenKM password>'
 mvn spring-boot:run     # listener on 0.0.0.0:8081
 java -jar target/document-integration-using-the-cmis-connector-java-1.0.0-SNAPSHOT.jar
 ```

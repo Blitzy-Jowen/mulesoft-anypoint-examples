@@ -12,10 +12,16 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
 
 import javax.xml.namespace.QName;
@@ -66,9 +72,16 @@ import com.sforce.ws.bind.XmlObject;
  * and any other failure ({@code INVALID_LOGIN}, {@code INVALID_TYPE}, {@code MALFORMED_QUERY}, ...) reaches the
  * caller as the original WSC exception. The credential check runs inside the same callbacks, so its
  * {@link IllegalStateException} is classified like any other failure and reaches the caller unchanged. This class
- * therefore neither catches, wraps, retries nor waits.
+ * therefore neither wraps nor retries a failure, and the only wait it adds is for a renewal already in flight.
  *
- * <p>Thread-safe: the cached connection is replaced under a lock, and {@link #toMap(XmlObject)} is stateless.
+ * <p>Thread-safe and single-flight: at most one login, re-login or session refresh is in flight at a time, and no
+ * lock is held while it runs. A call that needs a connection while one is in flight, like a concurrent
+ * {@link #reauthenticate()}, sends no request of its own: it waits for that one and receives its connection or,
+ * should it fail, the very exception instance it failed with, which the executor classifies exactly as for the
+ * caller that sent it (a timeout stays unavailable and is never retried). The wait is therefore bounded by the
+ * connect and read timeouts of the request in flight. A call made once a renewal has failed starts a new one. The
+ * lock guarding the cached connection, the renewal in flight and the session-mode rebuild (which sends nothing) is
+ * held for those local steps only, and {@link #toMap(XmlObject)} is stateless.
  *
  * <p>This project holds the reference copy. The other Salesforce projects carry an identical copy in which only the
  * {@code package} line differs, so the class depends on nothing but the JDK, SLF4J, Spring, the Salesforce WSC
@@ -123,7 +136,18 @@ public class SalesforcePartnerClient {
 
     private final AtomicReference<CachedConnection> connectionRef = new AtomicReference<>();
 
+    /**
+     * Guards the replacement of the cached connection and of {@link #renewalInFlight}, and the session-mode rebuild;
+     * held only for these local steps, never across a remote call.
+     */
     private final Object lock = new Object();
+
+    /**
+     * The login, re-login or session refresh in flight, or {@code null} when none is: concurrent callers join it
+     * instead of sending a request of their own. Guarded by {@link #lock}; only the caller performing the renewal
+     * installs and clears it.
+     */
+    private CompletableFuture<CachedConnection> renewalInFlight;
 
     /**
      * Creates the client; no connection is made, and no credential is checked, until the first call. The timeouts are
@@ -205,7 +229,10 @@ public class SalesforcePartnerClient {
      * @param soql the SOQL statement
      * @return the records in the order Salesforce returned them, each converted by {@link #toMap(XmlObject)}; a
      *         mutable list
-     * @throws Exception an SC-9 upstream exception, or the original WSC exception for any other failure
+     * @throws IllegalStateException if the pages Salesforce returns cannot form a valid result (a page that is not
+     *                               done brings more records than the reported size, repeats a query locator, or
+     *                               exceeds the pages that size allows); no further page is requested
+     * @throws Exception             an SC-9 upstream exception, or the original WSC exception for any other failure
      */
     public List<Map<String, Object>> query(String soql) throws Exception {
         QueryResult first = executor.call(UpstreamSystem.SALESFORCE, () -> connection().query(soql),
@@ -219,7 +246,10 @@ public class SalesforcePartnerClient {
      * @param soql the SOQL statement
      * @return the records in the order Salesforce returned them, each converted by {@link #toMap(XmlObject)}; a
      *         mutable list
-     * @throws Exception an SC-9 upstream exception, or the original WSC exception for any other failure
+     * @throws IllegalStateException if the pages Salesforce returns cannot form a valid result (a page that is not
+     *                               done brings more records than the reported size, repeats a query locator, or
+     *                               exceeds the pages that size allows); no further page is requested
+     * @throws Exception             an SC-9 upstream exception, or the original WSC exception for any other failure
      */
     public List<Map<String, Object>> queryAll(String soql) throws Exception {
         QueryResult first = executor.call(UpstreamSystem.SALESFORCE, () -> connection().queryAll(soql),
@@ -297,24 +327,32 @@ public class SalesforcePartnerClient {
      * {@link UpstreamAction} the executor runs once after Salesforce rejects the session; if it fails, no connection
      * stays cached and the next call connects afresh.
      *
+     * <p>Single-flight: when a login, re-login or refresh is already in flight, this waits for it instead of sending
+     * another, so re-authentications that overlap send one request between them. The wait is bounded by that
+     * request's connect and read timeouts, and its failure is thrown here as the same exception instance.
+     *
      * @throws IllegalStateException in login mode, if {@code sfdc.username}, {@code sfdc.password} or
      *                               {@code sfdc.securityToken} is missing or blank; in session mode, if the source
      *                               returns no session, or one without a session ID or service endpoint
+     * @throws InterruptedException  if the thread is interrupted while it waits for a renewal in flight; its
+     *                               interrupt flag is set again
      * @throws Exception             the vendor's or the session source's exception, unwrapped
      */
     public void reauthenticate() throws Exception {
-        synchronized (lock) {
-            connectionRef.set(null);
-            SessionSource source = sessionSource();
+        SessionSource source = sessionSource();
+        renew(true, () -> {
             Session session = source == null ? null : validated(source.refresh());
-            connectionRef.set(new CachedConnection(createConnection(session), session));
-        }
+            return new CachedConnection(createConnection(session), session);
+        });
     }
 
     /**
-     * Returns the connection for one call. Login mode returns the cached connection, creating it on first use.
-     * Session mode reads {@link SessionSource#current()} once and returns the cached connection only when it was
-     * built from that same session; otherwise it builds one from that session and caches it in its place. Called only
+     * Returns the connection for one call. Login mode returns the cached connection, creating it on first use; while
+     * a login or re-login is in flight it waits for that one instead of sending its own, so calls that overlap it
+     * send no login of their own and each receives its connection or the same exception instance it failed with.
+     * The wait is bounded by that login's connect and read timeouts. Session mode reads
+     * {@link SessionSource#current()} once and returns the cached connection only when it was built from that same
+     * session; otherwise it builds one from that session, which sends nothing, and caches it in its place. Called only
      * inside the lambdas handed to the executor, so a failed lazy login is classified like any other vendor failure.
      *
      * @return the connection
@@ -322,6 +360,8 @@ public class SalesforcePartnerClient {
      *                               {@code sfdc.password} or {@code sfdc.securityToken} is missing or blank; in
      *                               session mode, if the session source returns no session, or one without a session
      *                               ID or service endpoint
+     * @throws InterruptedException  in login mode, if the thread is interrupted while it waits for a login in flight;
+     *                               its interrupt flag is set again
      * @throws Exception             the vendor's or the session source's exception, unwrapped
      */
     PartnerConnection connection() throws Exception {
@@ -331,14 +371,7 @@ public class SalesforcePartnerClient {
             if (cached != null) {
                 return cached.connection();
             }
-            synchronized (lock) {
-                cached = connectionRef.get();
-                if (cached == null) {
-                    cached = new CachedConnection(createConnection(null), null);
-                    connectionRef.set(cached);
-                }
-                return cached.connection();
-            }
+            return renew(false, () -> new CachedConnection(createConnection(null), null)).connection();
         }
         Session session = validated(source.current());
         CachedConnection cached = connectionRef.get();
@@ -352,6 +385,89 @@ public class SalesforcePartnerClient {
                 connectionRef.set(cached);
             }
             return cached.connection();
+        }
+    }
+
+    /**
+     * Runs one connection renewal single-flight. Under {@link #lock}, which it holds for these local steps only, the
+     * caller either finds a renewal in flight, which it then waits for, or installs its own, which it then performs
+     * on its own thread with no lock held. The performer caches the connection and clears the slot before it
+     * completes the shared result; on any failure, the credential check and an {@link Error} included, it caches
+     * nothing, clears the slot, hands the failure to every waiter and throws it, so the next call starts afresh.
+     *
+     * @param reauthentication {@code true} to drop the cached connection first and never reuse it; {@code false}
+     *                         for the lazy login, which returns a connection cached since the caller last looked
+     * @param renewal          the login, re-login or refresh that builds the connection, run only by the performer
+     * @return the renewed connection, or for the lazy login the one already cached
+     * @throws InterruptedException if the thread is interrupted while it waits; its interrupt flag is set again
+     * @throws Exception            the renewal's own exception, the same instance for the performer and every waiter
+     */
+    private CachedConnection renew(boolean reauthentication, Callable<CachedConnection> renewal) throws Exception {
+        CompletableFuture<CachedConnection> own = new CompletableFuture<>();
+        CompletableFuture<CachedConnection> inFlight;
+        synchronized (lock) {
+            if (reauthentication) {
+                connectionRef.set(null);
+            } else {
+                CachedConnection cached = connectionRef.get();
+                if (cached != null) {
+                    return cached;
+                }
+            }
+            inFlight = renewalInFlight;
+            if (inFlight == null) {
+                renewalInFlight = own;
+            }
+        }
+        if (inFlight != null) {
+            return awaitRenewal(inFlight);
+        }
+        try {
+            CachedConnection renewed = renewal.call();
+            synchronized (lock) {
+                connectionRef.set(renewed);
+                renewalInFlight = null;
+            }
+            own.complete(renewed);
+            return renewed;
+        } catch (Throwable failure) {
+            synchronized (lock) {
+                if (renewalInFlight == own) {
+                    renewalInFlight = null;
+                }
+            }
+            // Wrapped once so that get() hands every waiter this very instance as the cause, even when the failure is
+            // itself a CompletionException, which get() would otherwise unwrap.
+            own.completeExceptionally(new CompletionException(failure));
+            throw failure;
+        }
+    }
+
+    /**
+     * Waits for a renewal another caller performs and returns its result.
+     *
+     * @param renewal the renewal in flight
+     * @return its connection
+     * @throws InterruptedException if the thread is interrupted while it waits; its interrupt flag is set again
+     * @throws Exception            the renewal's failure, the same instance its performer threw
+     */
+    private static CachedConnection awaitRenewal(CompletableFuture<CachedConnection> renewal) throws Exception {
+        try {
+            return renewal.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw e;
+        } catch (ExecutionException e) {
+            Throwable failure = e.getCause();
+            if (failure instanceof Exception exception) {
+                throw exception;
+            }
+            if (failure instanceof Error error) {
+                throw error;
+            }
+            // Only a Throwable that is neither an Exception nor an Error, which no Java code can throw from the
+            // renewal without bypassing the compiler, gets here; it stays the cause.
+            throw e;
         }
     }
 
@@ -476,11 +592,32 @@ public class SalesforcePartnerClient {
      * Collects the records of a query result and of every following page. Each {@code queryMore} runs through the
      * executor on its own. Paging stops when Salesforce reports the result done or sends no locator, so a result
      * without a locator can never loop.
+     *
+     * <p>Paging is also held to what a valid result allows, so an answer that never finishes fails instead of
+     * requesting pages forever. The first page's {@code size} is the total Salesforce reports for the whole result;
+     * every page before the last carries at least one record, so a valid result needs at most {@code size + 1}
+     * pages. The checks run only on a page that asks for another, before that {@code queryMore} is sent, so a
+     * result Salesforce reports done is returned as it came; they run outside the executor: the failure is not a
+     * vendor failure, so it is never classified or retried and reaches the caller unchanged.
+     *
+     * @param first the {@code query} or {@code queryAll} result; {@code null} gives no records
+     * @return the records of every page in the order Salesforce returned them; a mutable list
+     * @throws IllegalStateException if a page that is not done brings the records collected so far beyond the
+     *                               reported {@code size}, carries a query locator already requested, or is page
+     *                               {@code size + 1}; the message names the reported size and the pages read, never a
+     *                               locator or session ID
+     * @throws Exception             an SC-9 upstream exception, or the original WSC exception, from a
+     *                               {@code queryMore}
      */
     private List<Map<String, Object>> readAllPages(QueryResult first) throws Exception {
         List<Map<String, Object>> records = new ArrayList<>();
+        int reportedSize = first == null ? 0 : first.getSize();
+        long maxPages = (long) reportedSize + 1;
+        Set<String> requestedLocators = new HashSet<>();
+        long pagesRead = 0;
         QueryResult page = first;
         while (page != null) {
+            pagesRead++;
             SObject[] pageRecords = page.getRecords();
             if (pageRecords != null) {
                 for (SObject record : pageRecords) {
@@ -492,6 +629,18 @@ public class SalesforcePartnerClient {
             String locator = page.getQueryLocator();
             if (page.getDone() || isBlank(locator)) {
                 break;
+            }
+            if (records.size() > reportedSize) {
+                throw new IllegalStateException("Salesforce returned " + records.size() + " query records by page "
+                        + pagesRead + ", more than the reported size of " + reportedSize);
+            }
+            if (!requestedLocators.add(locator)) {
+                throw new IllegalStateException("Salesforce query paging did not advance: page " + pagesRead
+                        + " repeats a query locator already requested, for a reported size of " + reportedSize);
+            }
+            if (pagesRead >= maxPages) {
+                throw new IllegalStateException("Salesforce query is not done at page " + pagesRead
+                        + ", the last page a reported size of " + reportedSize + " allows");
             }
             page = executor.call(UpstreamSystem.SALESFORCE, () -> connection().queryMore(locator),
                     this::reauthenticate);

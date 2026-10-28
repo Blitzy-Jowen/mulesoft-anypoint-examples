@@ -2,26 +2,16 @@
 
 Spring Boot 3.2.12 / Java 17 conversion of the Mule EE 3.8.0 example [`service-orchestration-and-choice-routing`](../../service-orchestration-and-choice-routing/) (category SOAP/WSDL-based service). The original loads the flow files `fulfillment.xml` and `mule-config.xml` (`config.resources` of `service-orchestration-and-choice-routing/src/main/app/mule-deploy.properties`). It stays unchanged beside this project and is the Tier 2A capture source. The Java package is `com.mulesoft.examples.service_orchestration_and_choice_routing` and the main class is `ServiceOrchestrationAndChoiceRoutingApplication`.
 
+Every listener runs on Undertow in one process. The SOAP services and the Samsung client use Spring WS 4.1.4 over SAAJ and Jakarta JAXB. No JAX-WS or CXF artefact is on the classpath: the `maven-enforcer-plugin` `bannedDependencies` rule fails the build at `validate` if one arrives, even transitively (AAP 0.3.2).
+
+## Original example
+
 The example simulates the back end of an electronics store. An order arrives over SOAP, either from the store's Ajax web pages or as a raw envelope. Each item is routed by manufacturer:
 
 - A Samsung item goes to Samsung's SOAP web service, mocked inside the same application.
 - Every other item goes to an in-house processor behind a JMS queue. It prices the item from an in-house REST price service, caches the price by product ID and stores the item in the database under an XA transaction.
 
 The order is then audited asynchronously, and the caller receives one SOAP summary carrying a purchase receipt per item.
-
-Every listener runs on Undertow in one process. The SOAP services and the Samsung client use Spring WS 4.1.4 over SAAJ and Jakarta JAXB. No JAX-WS or CXF artefact is on the classpath: the `maven-enforcer-plugin` `bannedDependencies` rule fails the build at `validate` if one arrives, even transitively (AAP 0.3.2).
-
-## Status
-
-| Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
-|---|---|---|---|---|---|---|---|
-| service-orchestration-and-choice-routing-java | service-orchestration-and-choice-routing | SOAP/WSDL-based service | PASS | PASS | 99.3% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
-
-This is the project's row of the root [`SUMMARY.md`](../../SUMMARY.md) (AAP 0.8.7). The run behind it, the fallback evidence and the scenario statuses are under [Tier status evidence](#tier-status-evidence) and [Fallback evidence](#fallback-evidence-aap-084).
-
-- Tier 2A is blocked. [`DECISIONS.md`](../../DECISIONS.md) section 9 records `Tier 2A blocked: Mule EE licence and EE Maven repository credentials unconfirmed`, so no fixture has been captured from the original. Parity rests on the fallback, which is weaker than captured fixtures. The label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed.
-- Tier 2B is `N/A`: this is not a connector project, so it has no failsafe plugin and no `*IT` class.
-- This project holds the reference implementation of shared component SC-12, the Mule Ajax transport: `controller/BayeuxLongPollingController`, `service/AjaxChannelBroker`, `config/AjaxResourceConfig` and `src/main/resources/mule-resource/js/**`, with their tests `controller/BayeuxLongPollingControllerTest` and `service/AjaxChannelBrokerTest`. `websphere-mq-java` copies them with only the `package` line changed (the controller and its test also change the package root of their `AjaxChannelBroker` import). A change is made here first and then copied. The register is [`DECISIONS.md`](../../DECISIONS.md) section 4.
 
 ## Endpoints and triggers
 
@@ -58,11 +48,11 @@ The original declares five listener ports: four `http:listener-config` elements 
 - Every SOAP response and fault has CXF's envelope form: the `soap:` envelope prefix, no empty `Header`, the JAXB `ns2:` payload prefix, no XML declaration and no whitespace between elements (SC-11 `config/SoapEnvelopeStyleInterceptor`). The response headers carry neither `Accept` nor `SOAPAction`, request headers SAAJ keeps on every message, as CXF sent neither: SC-11 `config/SoapListenerBoundaryAdapter` drops both. Characters outside the Basic Multilingual Plane are written as raw UTF-8, as CXF wrote them, in the SOAP replies and in the Samsung `purchase` request (SC-11 `SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory`), where SAAJ alone writes numeric character references such as `&#128512;` (`DECISIONS.md` section 9).
 - A CORS pre-flight to a controller or SOAP path is answered exactly like a plain `OPTIONS` request to the same path, for example with the listener's 405 or the no-listener 404, and gets no `Access-Control-*` or `Vary` header (`config/PreflightDispatchConfig`). The original listeners applied no CORS policy. `PreflightDispatchConfig` covers the annotated request mappings only, so a pre-flight to the 8090 docroot (`/orders`, `/orders/`, `/orders/**`) still gets Spring's `403 Forbidden`, body `Invalid CORS request`, with three `Vary` headers, where a plain `OPTIONS` there gets `200`. What the original's Jetty docroot answered is a Tier 2A verification point.
 
-## How it works
+### How it works
 
 The branches below are those of AAP 0.7.2, described as this code implements them.
 
-### Order flow (`orderService`, `fulfillment.xml:28-48`)
+#### Order flow (`orderService`, `fulfillment.xml:28-48`)
 
 `OrderOrchestrationService.processOrder` runs the flow's processors in their original order:
 
@@ -72,7 +62,7 @@ The branches below are those of AAP 0.7.2, described as this code implements the
 4. The order is handed to the audit, one-way, and the caller receives the order as `summary`.
 5. Any exception: the flow's `catch-exception-strategy` runs `defaultErrorHandler`, which logs `Error occurred: <payload>` at INFO, then the exception is rethrown and answered with a `soap:Server` fault. No audit is dispatched for a failed order.
 
-#### Samsung branch (`samsungOrder`, `fulfillment.xml:49-97`)
+##### Samsung branch (`samsungOrder`, `fulfillment.xml:49-97`)
 
 `service/SamsungOrderService` runs these steps in order:
 
@@ -84,7 +74,7 @@ The branches below are those of AAP 0.7.2, described as this code implements the
 
 Any failure of these steps (a SOAP fault, a transport error, a timeout, a non-200 status, a reply without `orderResponse`, a mapping error) yields the receipt of the catch branch: status `REJECTED`, `totalPrice` 0 and no `id`. Nothing is retried. The Samsung service is this application's own mock, which accepts every request, so no order input reaches that branch: `SCENARIOS.md` lists it as `post-orders-samsung-rejected` (`unreachable`, with the proof), and `SamsungOrderServiceTest` covers it with a mocked client.
 
-#### In-house branch (`inhouseOrder`, `fulfillment.xml:98-129`)
+##### In-house branch (`inhouseOrder`, `fulfillment.xml:98-129`)
 
 The item travels as a JMS request-response over queue `inhouseOrder` (`OrderOrchestrationService.orderInHouse`). It is an `ObjectMessage` with the String property `totalValue`, on a non-transacted session with a temporary reply queue. The caller waits `orders.inhouse.reply-timeout-ms` (10000 ms) for the reply. `trigger/InHouseOrderListener` receives each delivery in a new Narayana JTA transaction, which the XA Artemis session and the XA Derby connection both join, and `service/InHouseOrderService` processes it:
 
@@ -99,14 +89,14 @@ The reply is sent on the same session, so the row, the consumed request and the 
 - Failure: the item is logged at INFO (`logger message="#[payload]"`, the item's `Object.toString()`), the transaction rolls back, and the broker redelivers the request after 1000 ms, ActiveMQ's default delay, which the original XA connector used. The broker itself never dead-letters the request. `rollback-exception-strategy maxRedeliveryAttempts="3"` is applied by the service: on the fifth delivery (`JMSXDeliveryCount - 1` > 3) `defaultErrorHandler` logs `Error occurred: <item>` and the request is consumed without a reply.
 - As implemented, every in-house item ends in that failure path. The price listener on 9999 accepts `POST` only, the original's `allowedMethods`, while the flow requests the price with `GET` (`fulfillment.xml:105`), so every lookup is answered with `405`. Four deliveries roll back one second apart, the fifth is consumed, and the caller's 10 s wait ends without a reply: the SOAP response arrives about 10 s after the request, the item carries no `purchaseReceipt`, `totalValue` is unchanged and no `orders` row is written. This mismatch is kept on purpose and is a Tier 2A verification point ([Price service](#price-service-and-the-method-mismatch)). The accepted path above is exercised by `InHouseOrderServiceTest` and `OrderOrchestrationServiceTest` with the price lookup mocked.
 
-#### Audit (`auditService`, `fulfillment.xml:130-143`)
+##### Audit (`auditService`, `fulfillment.xml:130-143`)
 
 `service/AuditService.audit` is `@Async` and `@Transactional(REQUIRES_NEW)`. It returns to the caller at once and runs on Boot's `applicationTaskExecutor` in its own JTA transaction, so the audit row commits independently of the order. It inserts `insert into order_audits values(default, <orderId>, <totalValue>)`. When the insert fails, the exception's type identifiers are logged at ERROR and the `choice-exception-strategy` branches are evaluated in declaration order:
 
 - `totalValue` is a number greater than `orders.audit.rollback-threshold` (5000): the failure is rethrown and the transaction rolls back. The original's VM redelivery after a rollback has no counterpart.
 - Otherwise, including a `totalValue` that is not a number: `defaultErrorHandler` logs `Error occurred: <order>` and the transaction commits.
 
-#### How `totalValue` is typed and combined
+##### How `totalValue` is typed and combined
 
 `totalValue` is a `String` throughout, as the original session variable was. The original set it to the string `"0"`, and MEL's `+` on a string concatenates. The conversion reproduces that:
 
@@ -116,7 +106,7 @@ The reply is sent on the same session, so the row, the consumed request and the 
 
 The stored audit value and the branch the `> 5000` condition selects are Tier 2A verification points: capture of the original settles both.
 
-### Price service and the method mismatch
+#### Price service and the method mismatch
 
 The original `priceService` flow is an `http:listener` with `path="api"` and `allowedMethods="POST"` in front of the Jersey resource `ProductPrice`, whose only method is `@GET @Path("/prices/{productId}")` producing `text/plain` `159`. The in-house flow calls it with `GET`. Two original declarations therefore conflict:
 
@@ -133,7 +123,7 @@ The conversion keeps the listener's restriction and the caller's `GET`:
 
 What the original answered to each request is a Tier 2A verification point (`post-api-prices`, `get-api-prices-method-not-allowed`). Switching the client to `POST` would change the behaviour being reproduced.
 
-### Ajax channels
+#### Ajax channels
 
 The copied pages call the flows with `mule.rpc(channel, data, callback)` from `/orders/mule-resource/js/_mule.js`. `AjaxOrderService` registers one handler per inbound channel on `AjaxChannelBroker`, which publishes each handler's result to the caller's `replyTo` channel `<channel>#<clientId>`.
 
@@ -159,7 +149,7 @@ The copied pages call the flows with `mule.rpc(channel, data, callback)` from `/
     - at most 16 handlers run at once, and at most 500 publications wait for one.
 - The Content-Type `text/json;charset=UTF-8` and the HTTP `400` framing are Tier 2A verification points, like the Jetty MIME table, redirect and method handling behind the docroot.
 
-### Example: a raw SOAP order
+#### Example: a raw SOAP order
 
 The original README's raw-SOAP example (order 12, John Doe, one Samsung item `s-1` / `AX02`, quantity 5), sent to the running application:
 
@@ -243,57 +233,63 @@ Method not allowed for endpoint: /orders
 
 Every key of `src/main/resources/application.yml`. The original reads only one placeholder, `${app.home}`, and its `mule-app.properties` holds comment lines only. Every value is therefore a fixed default taken from the flows' literals (AAP 0.6.6). The original holds no secret, host credential or tenant value, so the configuration has no TODO placeholder, and the project has no `application-test.yml` and no `application-it.yml` (AAP 0.4.6).
 
-| Key | Default | Source in the original | Purpose |
-|---|---|---|---|
-| `server.port` | `1080` | `HTTP_Listener_Configuration3`, `fulfillment.xml:27` | the main listener, which serves only SOAP `/orders` |
-| `server.address` | `0.0.0.0` | `host="0.0.0.0"`, `fulfillment.xml:24-27` | bind host of the main listener |
-| `ajax.port` | `8090` | `ajax:connector serverUrl="http://0.0.0.0:8090/orders"`, `mule-config.xml:3` | the Ajax listener: docroot, Mule Ajax JavaScript and `/ajax/cometd` |
-| `ports.populate` | `8091` | `HTTP_Listener_Configuration`, `fulfillment.xml:24` | the `/populate` listener |
-| `ports.samsung` | `9090` | `HTTP_Listener_Configuration1`, `fulfillment.xml:25` | the Samsung listener; also the port of `orders.samsung.url` |
-| `ports.prices` | `9999` | `HTTP_Listener_Configuration2`, `fulfillment.xml:26` | the price listener; also the port of `orders.price.url` |
-| `listeners.host` | `0.0.0.0` | `host="0.0.0.0"` | bind host of the four additional listeners (SC-10) |
-| `listeners.main.routes` | servlet `messageDispatcherServlet`, patterns `["/orders"]` | `http:listener path="orders"`, `fulfillment.xml:29` | the only path the 1080 listener serves |
-| `listeners.additional` | `ajax` (port `${ajax.port}`): `dispatcherServlet`, `["/orders", "/orders/**", "/ajax/**"]`; `populate` (`${ports.populate}`): `dispatcherServlet`, `["/populate"]`; `samsung` (`${ports.samsung}`): `messageDispatcherServlet`, `["/samsung/orders"]`; `prices` (`${ports.prices}`): `dispatcherServlet`, `["/api/**"]` | the listeners of `fulfillment.xml:145,151,160` and the Ajax connector | the extra Undertow listeners and the path-to-port routing (SC-10); a path outside a port's routes gets the no-listener 404 |
-| `ajax.server-path` | `/orders` | path of the connector's `serverUrl` | docroot at `/orders/`, JavaScript at `/orders/mule-resource/js/**`, channels `/orders/request`, `/orders/soap`, `/orders/manufacturers` |
-| `ajax.disable-reply-to` | `false` | the connector sets no `disableReplyTo` | handler results are published on the caller's `replyTo` channel |
-| `ajax.cache-messages-channels` | `[]` | no outbound channel sets `cacheMessages` | outbound channels whose messages are held for the first subscriber |
-| `ajax.response-timeout-ms` | `10000` | `responseTimeout="10000"`, `mule-config.xml:6,39,44` | a handler that has not returned by then is cancelled and no reply is published |
-| `ajax.connect-timeout-ms` | `250000` | Mule 3.8.0 `AjaxConnector` default server poll timeout | how long a `/meta/connect` is held; the `advice.timeout` of every handshake and connect |
-| `ajax.max-interval-ms` | `30000` | Mule 3.8.0 `AjaxConnector` default `maxInterval` | a client not heard from for this long is removed |
-| `orders.samsung.url` | `http://localhost:${ports.samsung}/samsung/orders` | `http:request method="POST" path="samsung/orders" port="9090"`, `fulfillment.xml:96` | target of `client/SamsungServiceClient` |
-| `orders.samsung.timeout-ms` | `10000` | Mule's default response timeout | connect and read timeout of the Samsung call; a value below 1 or above 2147483647 stops start-up |
-| `orders.price.url` | `http://localhost:${ports.prices}/api/prices/{productId}` | `http:request method="GET" path="api/prices/#[payload.productId]" port="9999"`, `fulfillment.xml:105` | target of `client/ProductPriceClient`; `{productId}` is a URI-template variable |
-| `orders.price.timeout-ms` | `10000` | Mule's default response timeout | connect and read timeout of the price lookup; a value below 1 stops start-up |
-| `orders.soap.url` | `http://localhost:1080/orders` | `http:request method="POST" path="orders" port="1080"`, `mule-config.xml:21,40` | target of `client/OrderProcessingSoapClient`; a literal port, so override it together with `server.port` |
-| `orders.soap.request-timeout-ms` | `10000000` | `responseTimeout="10000000"`, `mule-config.xml:21` | timeout of the `/orders/request` call; a value below 1 stops start-up |
-| `orders.soap.proxy-timeout-ms` | `10000` | no `responseTimeout` on `mule-config.xml:40`, so Mule's default | timeout of the `/orders/soap` call; a value below 1 stops start-up |
-| `orders.inhouse.queue` | `inhouseOrder` | `queue="inhouseOrder"`, `fulfillment.xml:39,99` | the in-house request queue |
-| `orders.inhouse.reply-timeout-ms` | `10000` | Mule's default response timeout of the request-response endpoint | how long the order flow waits for the in-house reply; a value below 1 stops start-up |
-| `orders.inhouse.max-redelivery-attempts` | `3` | `rollback-exception-strategy maxRedeliveryAttempts="3"`, `fulfillment.xml:123` | redeliveries before `defaultErrorHandler` consumes the request |
-| `orders.audit.rollback-threshold` | `5000` | `when="#[sessionVars.totalValue] > 5000"`, `fulfillment.xml:138` | above it a failed audit insert rolls back instead of being logged |
-| `spring.artemis.mode` | `embedded` | `jms:activemq-xa-connector brokerURL="vm://localhost"`, `fulfillment.xml:4` | the in-VM broker |
-| `spring.artemis.embedded.queues` | `inhouseOrder` | `fulfillment.xml:39,99` | queue created at start-up |
-| `spring.artemis.embedded.persistent` | `false` | the in-VM broker | no journal on disk |
-| `spring.datasource.xa.data-source-class-name` | `org.apache.derby.jdbc.EmbeddedXADataSource` | enhydra `StandardXADataSource` over `EmbeddedDriver`, `fulfillment.xml:7-10` | the XA data source that Narayana enlists |
-| `spring.datasource.xa.properties.databaseName` | `muleEmbeddedDB` | `jdbc:derby:muleEmbeddedDB;create=true`, `fulfillment.xml:9` | database name under the Derby system home |
-| `spring.datasource.xa.properties.createDatabase` | `create` | `;create=true` | the database is created on first use |
-| `spring.datasource.xa.properties.user` | `APP` | the original connected without a user | keeps the tables in Derby's default schema `APP`; Derby runs without authentication, so this is a schema name, not a credential |
-| `derby.system-home` | `target/derby` | the original created `muleEmbeddedDB` in the runtime's working directory | set as `derby.system.home` before Derby boots, unless that system property is already set |
-| `narayana.log-dir` | `target/narayana` | JBossTS object store | Narayana's object store |
-| `narayana.default-timeout` | `600` (seconds) | `com.arjuna.ats.arjuna.coordinator.defaultTimeout`, `fulfillment.xml:13` | JTA transaction timeout; `txReaperTimeout` 1000000 (`fulfillment.xml:14`) has no Narayana starter key |
-| `spring.cache.type` | `caffeine` | `ee:object-store-caching-strategy` over an `in-memory-store`, `fulfillment.xml:16-18` | the price cache |
-| `spring.cache.cache-names` | `prices` | `Caching_Strategy` | one cache, with no expiry or size bound, as the in-memory store configured none; entries live until the application stops |
-| `spring.webservices.servlet.init` | `"[dispatchOptionsRequest]": "true"`, `"[dispatchTraceRequest]": "true"` | the SOAP listeners' `allowedMethods="POST"` | `OPTIONS` and `TRACE` on `/orders` and `/samsung/orders` reach the listener boundary's 405 |
-| `spring.mvc.dispatch-trace-request` | `true` | every listener declares `allowedMethods` | `TRACE` reaches the MVC mappings and gets the 405 instead of the servlet's echo |
-| `spring.web.resources.add-mappings` | `false` | none | no default static mapping; unknown paths reach SC-1's 404, and `AjaxResourceConfig` registers the docroot itself |
-| `spring.application.name` | `service-orchestration-and-choice-routing-java` | none | application name in log lines |
-| `logging.level.org.springframework.ws.server.MessageTracing` | `INFO` | none: the flows' loggers never write the customer | its `.received`/`.sent` `TRACE` write every `processOrder` envelope and its `OrderSummary` reply, the customer included |
-| `logging.level.org.springframework.ws.client.MessageTracing` | `INFO` | none | the same for every envelope `client/SamsungServiceClient` sends and receives |
-| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `WARN` | none | its `DEBUG` and `TRACE` write the request line with its query: a `GET` to `/ajax/cometd` carries the published order in its `message` parameter. `WARN`, not `INFO`: its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
-| `logging.level.org.springframework.web.method.HandlerMethod` | `INFO` | none | its `TRACE` writes handler arguments: the Bayeux message holding the published order |
-| `logging.level.org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter` | `INFO` | none | its `TRACE` writes the async result a held `/meta/connect` resumes with: the order summary reply |
-| `logging.level.org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor` | `INFO` | none | its `TRACE` writes the response body: the same Bayeux reply |
-| `logging.level.org.apache.activemq.audit` | `WARN` | none: the embedded broker's own loggers, for which `fulfillment.xml` sets no level | its `.base`, `.resource` and `.message` `INFO` lines record every connection and session the in-house listener opens and closes, and each in-house message sent and consumed, its `totalValue` property included |
+The Type column gives the Java type each value binds to, taken from the code or the Spring Boot property that reads it.
+
+| Key | Type | Default | Source in the original | Purpose |
+|---|---|---|---|---|
+| `server.port` | `Integer` | `1080` | `HTTP_Listener_Configuration3`, `fulfillment.xml:27` | the main listener, which serves only SOAP `/orders` |
+| `server.address` | `InetAddress` | `0.0.0.0` | `host="0.0.0.0"`, `fulfillment.xml:24-27` | bind host of the main listener |
+| `ajax.port` | `int` | `8090` | `ajax:connector serverUrl="http://0.0.0.0:8090/orders"`, `mule-config.xml:3` | the Ajax listener: docroot, Mule Ajax JavaScript and `/ajax/cometd` |
+| `ports.populate` | `int` | `8091` | `HTTP_Listener_Configuration`, `fulfillment.xml:24` | the `/populate` listener |
+| `ports.samsung` | `int` | `9090` | `HTTP_Listener_Configuration1`, `fulfillment.xml:25` | the Samsung listener; also the port of `orders.samsung.url` |
+| `ports.prices` | `int` | `9999` | `HTTP_Listener_Configuration2`, `fulfillment.xml:26` | the price listener; also the port of `orders.price.url` |
+| `listeners.host` | `String` | `0.0.0.0` | `host="0.0.0.0"` | bind host of the four additional listeners (SC-10) |
+| `listeners.main.routes[0].servlet` | `String` | `messageDispatcherServlet` | `http:listener path="orders"`, `fulfillment.xml:29` | the servlet behind the one route of `listeners.main.routes`, a `List<ListenerPorts.Route>` |
+| `listeners.main.routes[0].patterns` | `List<String>` (`AntPathMatcher` patterns) | `["/orders"]` | `http:listener path="orders"`, `fulfillment.xml:29` | the only path the 1080 listener serves |
+| `listeners.additional[i].name` | `String` | `[0]` `ajax`, `[1]` `populate`, `[2]` `samsung`, `[3]` `prices` | none: labels for the Ajax connector (`mule-config.xml:3`) and the listener configurations of `fulfillment.xml:24-26` | label of each entry of `listeners.additional`, a `List<ListenerPorts.Additional>` of the extra Undertow listeners (SC-10), in log lines and start-up errors |
+| `listeners.additional[i].port` | `int` | `[0]` `${ajax.port}`, `[1]` `${ports.populate}`, `[2]` `${ports.samsung}`, `[3]` `${ports.prices}` | the Ajax connector's `serverUrl` port and the listener ports of `fulfillment.xml:24-26` | the port each extra listener binds, read from its port key |
+| `listeners.additional[i].routes[0].servlet` | `String` | `[0]` `dispatcherServlet`, `[1]` `dispatcherServlet`, `[2]` `messageDispatcherServlet`, `[3]` `dispatcherServlet` | the listeners of `fulfillment.xml:145,151,160` and the Ajax connector | the servlet behind each extra listener's one route |
+| `listeners.additional[i].routes[0].patterns` | `List<String>` (`AntPathMatcher` patterns) | `[0]` `["/orders", "/orders/**", "/ajax/**"]`, `[1]` `["/populate"]`, `[2]` `["/samsung/orders"]`, `[3]` `["/api/**"]` | the listeners of `fulfillment.xml:145,151,160` and the Ajax connector | the path-to-port routing (SC-10); a path outside a port's routes gets the no-listener 404 |
+| `ajax.server-path` | `String` | `/orders` | path of the connector's `serverUrl` | docroot at `/orders/`, JavaScript at `/orders/mule-resource/js/**`, channels `/orders/request`, `/orders/soap`, `/orders/manufacturers` |
+| `ajax.disable-reply-to` | `Boolean` | `false` | the connector sets no `disableReplyTo` | handler results are published on the caller's `replyTo` channel |
+| `ajax.cache-messages-channels` | `List<String>` (channel names) | `[]` | no outbound channel sets `cacheMessages` | outbound channels whose messages are held for the first subscriber |
+| `ajax.response-timeout-ms` | `Long` (milliseconds) | `10000` | `responseTimeout="10000"`, `mule-config.xml:6,39,44` | a handler that has not returned by then is cancelled and no reply is published |
+| `ajax.connect-timeout-ms` | `long` (milliseconds) | `250000` | Mule 3.8.0 `AjaxConnector` default server poll timeout | how long a `/meta/connect` is held; the `advice.timeout` of every handshake and connect |
+| `ajax.max-interval-ms` | `Long` (milliseconds) | `30000` | Mule 3.8.0 `AjaxConnector` default `maxInterval` | a client not heard from for this long is removed |
+| `orders.samsung.url` | `String` | `http://localhost:${ports.samsung}/samsung/orders` | `http:request method="POST" path="samsung/orders" port="9090"`, `fulfillment.xml:96` | target of `client/SamsungServiceClient` |
+| `orders.samsung.timeout-ms` | `long` (milliseconds) | `10000` | Mule's default response timeout | connect and read timeout of the Samsung call; a value below 1 or above 2147483647 stops start-up |
+| `orders.price.url` | `String` (a URI template) | `http://localhost:${ports.prices}/api/prices/{productId}` | `http:request method="GET" path="api/prices/#[payload.productId]" port="9999"`, `fulfillment.xml:105` | target of `client/ProductPriceClient`; `{productId}` is a URI-template variable |
+| `orders.price.timeout-ms` | `int` (milliseconds) | `10000` | Mule's default response timeout | connect and read timeout of the price lookup; a value below 1 stops start-up |
+| `orders.soap.url` | `String` | `http://localhost:1080/orders` | `http:request method="POST" path="orders" port="1080"`, `mule-config.xml:21,40` | target of `client/OrderProcessingSoapClient`; a literal port, so override it together with `server.port` |
+| `orders.soap.request-timeout-ms` | `int` (milliseconds) | `10000000` | `responseTimeout="10000000"`, `mule-config.xml:21` | timeout of the `/orders/request` call; a value below 1 stops start-up |
+| `orders.soap.proxy-timeout-ms` | `int` (milliseconds) | `10000` | no `responseTimeout` on `mule-config.xml:40`, so Mule's default | timeout of the `/orders/soap` call; a value below 1 stops start-up |
+| `orders.inhouse.queue` | `String` | `inhouseOrder` | `queue="inhouseOrder"`, `fulfillment.xml:39,99` | the in-house request queue |
+| `orders.inhouse.reply-timeout-ms` | `long` (milliseconds) | `10000` | Mule's default response timeout of the request-response endpoint | how long the order flow waits for the in-house reply; a value below 1 stops start-up |
+| `orders.inhouse.max-redelivery-attempts` | `int` | `3` | `rollback-exception-strategy maxRedeliveryAttempts="3"`, `fulfillment.xml:123` | redeliveries before `defaultErrorHandler` consumes the request |
+| `orders.audit.rollback-threshold` | `BigDecimal` | `5000` | `when="#[sessionVars.totalValue] > 5000"`, `fulfillment.xml:138` | above it a failed audit insert rolls back instead of being logged |
+| `spring.artemis.mode` | `ArtemisMode` | `embedded` | `jms:activemq-xa-connector brokerURL="vm://localhost"`, `fulfillment.xml:4` | the in-VM broker |
+| `spring.artemis.embedded.queues` | `String[]` (queue names) | `inhouseOrder` | `fulfillment.xml:39,99` | queue created at start-up |
+| `spring.artemis.embedded.persistent` | `boolean` | `false` | the in-VM broker | no journal on disk |
+| `spring.datasource.xa.data-source-class-name` | `String` (a fully qualified class name) | `org.apache.derby.jdbc.EmbeddedXADataSource` | enhydra `StandardXADataSource` over `EmbeddedDriver`, `fulfillment.xml:7-10` | the XA data source that Narayana enlists |
+| `spring.datasource.xa.properties.databaseName` | `String` (an entry of the `Map<String, String>` `spring.datasource.xa.properties`) | `muleEmbeddedDB` | `jdbc:derby:muleEmbeddedDB;create=true`, `fulfillment.xml:9` | database name under the Derby system home |
+| `spring.datasource.xa.properties.createDatabase` | `String` (an entry of the same map) | `create` | `;create=true` | the database is created on first use |
+| `spring.datasource.xa.properties.user` | `String` (an entry of the same map) | `APP` | the original connected without a user | keeps the tables in Derby's default schema `APP`; Derby runs without authentication, so this is a schema name, not a credential |
+| `derby.system-home` | `String` (a directory path) | `target/derby` | the original created `muleEmbeddedDB` in the runtime's working directory | set as `derby.system.home` before Derby boots, unless that system property is already set |
+| `narayana.log-dir` | `String` (a directory path) | `target/narayana` | JBossTS object store | Narayana's object store |
+| `narayana.default-timeout` | `int` (seconds) | `600` (seconds) | `com.arjuna.ats.arjuna.coordinator.defaultTimeout`, `fulfillment.xml:13` | JTA transaction timeout; `txReaperTimeout` 1000000 (`fulfillment.xml:14`) has no Narayana starter key |
+| `spring.cache.type` | `CacheType` | `caffeine` | `ee:object-store-caching-strategy` over an `in-memory-store`, `fulfillment.xml:16-18` | the price cache |
+| `spring.cache.cache-names` | `List<String>` (cache names) | `prices` | `Caching_Strategy` | one cache, with no expiry or size bound, as the in-memory store configured none; entries live until the application stops |
+| `spring.webservices.servlet.init` | `Map<String, String>` (servlet init-parameter name to value) | `"[dispatchOptionsRequest]": "true"`, `"[dispatchTraceRequest]": "true"` | the SOAP listeners' `allowedMethods="POST"` | `OPTIONS` and `TRACE` on `/orders` and `/samsung/orders` reach the listener boundary's 405 |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | every listener declares `allowedMethods` | `TRACE` reaches the MVC mappings and gets the 405 instead of the servlet's echo |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | no default static mapping; unknown paths reach SC-1's 404, and `AjaxResourceConfig` registers the docroot itself |
+| `spring.application.name` | `String` | `service-orchestration-and-choice-routing-java` | none | application name in log lines |
+| `logging.level.org.springframework.ws.server.MessageTracing` | `LogLevel` | `INFO` | none: the flows' loggers never write the customer | its `.received`/`.sent` `TRACE` write every `processOrder` envelope and its `OrderSummary` reply, the customer included |
+| `logging.level.org.springframework.ws.client.MessageTracing` | `LogLevel` | `INFO` | none | the same for every envelope `client/SamsungServiceClient` sends and receives |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `WARN` | none | its `DEBUG` and `TRACE` write the request line with its query: a `GET` to `/ajax/cometd` carries the published order in its `message` parameter. `WARN`, not `INFO`: its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
+| `logging.level.org.springframework.web.method.HandlerMethod` | `LogLevel` | `INFO` | none | its `TRACE` writes handler arguments: the Bayeux message holding the published order |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter` | `LogLevel` | `INFO` | none | its `TRACE` writes the async result a held `/meta/connect` resumes with: the order summary reply |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor` | `LogLevel` | `INFO` | none | its `TRACE` writes the response body: the same Bayeux reply |
+| `logging.level.org.apache.activemq.audit` | `LogLevel` | `WARN` | none: the embedded broker's own loggers, for which `fulfillment.xml` sets no level | its `.base`, `.resource` and `.message` `INFO` lines record every connection and session the in-house listener opens and closes, and each in-house message sent and consumed, its `totalValue` property included |
 
 - The seven `logging.level` keys keep the order's customer (names and address) out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`, and silence the embedded broker's `INFO` audit stream. The original flows' loggers still log at INFO, `Error occurred: <payload>` among them. The nested `UnderRootTrace` run of `controller/OrderProcessingEndpointTest` asserts this.
 - `spring.webservices.path` keeps Boot's default `/services`. `messageDispatcherServlet` is reached only through the SC-10 named-servlet forwards of `/orders` and `/samsung/orders`, so a request to `/services/**` matches no route and gets the no-listener 404.
@@ -353,7 +349,7 @@ The original has no other placeholder: every port, path, queue, URL and timeout 
 
 No JAX-WS or CXF type is used anywhere. `spring-boot-starter-web-services` declares `jakarta.xml.ws:jakarta.xml.ws-api`, which the pom excludes. `<spring-ws.version>4.1.4</spring-ws.version>` overrides the Boot 3.2.12 BOM's 4.0.11 while Spring Framework stays at 6.1.15 (AAP 0.6.2, `DECISIONS.md` section 2). The endpoint and client tests are the gate for that combination.
 
-## Behaviours kept, not ported and externalized
+## Behaviours stubbed or externalized
 
 - Not ported, under the reachability rule of AAP 0.4.5 (`DECISIONS.md` section 5):
   - `com.mulesoft.se.samsung.SamsungServiceService`, a JAX-WS client stub, replaced by `client/SamsungServiceClient`;
@@ -451,6 +447,7 @@ Each shared component is a copy of its reference implementation with only the `p
 
 - SC-11: `config/WebServiceConfig` passes the POST-only paths `/orders` and `/samsung/orders` to `SoapListenerBoundaryAdapter`. It registers no `WsdlQueryPublisher`, because both listeners accept `POST` only and the original therefore published no `?wsdl` (AAP 0.4.5).
 - SC-12: the JavaScript under `mule-resource/js/` is the Mule 3.8.0 `transports/ajax/src/main/resources/js/` tree, copied unchanged with its licence headers: `mule.js`, `_mule.js`, `dojo/dojo.js`, `dojo/dojo.js.uncompressed.js`, `dojox/cometd.js`, `dojox/cometd.js.uncompressed.js`, `dojox/cometd/timestamp.js`, `dojox/cometd/timesync.js` and `dojox/uuid/generateRandomUuid.js`.
+- This project holds the reference implementation of shared component SC-12, the Mule Ajax transport: `controller/BayeuxLongPollingController`, `service/AjaxChannelBroker`, `config/AjaxResourceConfig` and `src/main/resources/mule-resource/js/**`, with their tests `controller/BayeuxLongPollingControllerTest` and `service/AjaxChannelBrokerTest`. `websphere-mq-java` copies them with only the `package` line changed (the controller and its test also change the package root of their `AjaxChannelBroker` import). A change is made here first and then copied. The register is [`DECISIONS.md`](../../DECISIONS.md) section 4.
 
 ## Fixture parity (ST-2)
 
@@ -492,9 +489,18 @@ Fourteen scenarios are `deterministic`, five `nondeterministic` and one `unreach
 - `ajax-orders-manufacturers` gets no fixture while the replay cannot carry the server-issued Bayeux `clientId` into later requests, so it stays `UNVERIFIED-uncaptured`.
 - After capture, the label can therefore reach at most `PARITY: PARTIAL — Tier 2A fixtures: 9 verified, 10 unverified`. It becomes `PARITY: FAIL — Tier 2A fixtures` when a captured deterministic scenario differs. The nine scenarios that can become `VERIFIED` are `get-orders-method-not-allowed`, `post-orders-malformed-envelope`, `post-samsung-orders-purchase`, `get-samsung-orders-method-not-allowed`, `post-api-prices`, `get-api-prices-method-not-allowed`, `get-populate-created`, `get-populate-already-populated` and `wrong-port-no-listener`.
 
-## Tier status evidence
+## Tier status
 
-The run behind the [Status](#status) row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+| Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
+|---|---|---|---|---|---|---|---|
+| service-orchestration-and-choice-routing-java | service-orchestration-and-choice-routing | SOAP/WSDL-based service | PASS | PASS | 99.3% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+
+This is the project's row of the root [`SUMMARY.md`](../../SUMMARY.md) (AAP 0.8.7). The fallback evidence and the scenario statuses are under [Fallback evidence](#fallback-evidence-aap-084).
+
+- Tier 2A is blocked. [`DECISIONS.md`](../../DECISIONS.md) section 9 records `Tier 2A blocked: Mule EE licence and EE Maven repository credentials unconfirmed`, so no fixture has been captured from the original. Parity rests on the fallback, which is weaker than captured fixtures. The label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed.
+- Tier 2B is `N/A`: this is not a connector project, so it has no failsafe plugin and no `*IT` class.
+
+The run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
 - `mvn -B clean package`: `BUILD SUCCESS`; 941 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
 - `mvn -B test`: `BUILD SUCCESS`; 941 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
@@ -525,4 +531,3 @@ The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never 
 ## Licence
 
 Apache License 2.0. `LICENSE` is copied unchanged from `service-orchestration-and-choice-routing/`. `NOTICE` is the original's notice followed by the credits for the Mule Ajax JavaScript under `src/main/resources/mule-resource/js/`: `mule.js` and `_mule.js` under the Common Public Attribution License 1.0 (CPAL 1.0), and the Dojo files under the Academic Free License 2.1 or the modified BSD licence. The docroot under `src/main/resources/static/orders/` carries its own `MIT-LICENSE` and `LGPL-LICENSE`, copied with it.
-

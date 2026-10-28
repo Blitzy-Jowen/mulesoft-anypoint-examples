@@ -52,10 +52,12 @@ import com.mulesoft.examples.get_customer_list_from_netsuite.support.HttpTestCli
  * <p>The original relied on whatever customers the account held. This test brings its own: it creates a customer
  * with a unique last name through the NetSuite REST record API, waits until {@code GET /customers} lists it as a row,
  * runs the original assertion, and deletes the customer in {@code finally}, so no test customer stays in the account.
- * The create is never retried: {@link NetsuiteRestClient} retries a request only after a 401, which NetSuite answers
- * before processing it. The profile {@code it} makes Spring Boot load {@code application-it.yml} over the empty
- * {@code netsuite.*} placeholders of {@code application.yml}; the original read its SuiteTalk login from
- * {@code mule.test.properties}.
+ * The create goes through {@link NetsuiteRestClient#createRecord} and its SC-9 executor, so it is retried exactly once
+ * after an HTTP 401: the cached token is evicted and the create is sent again, which is safe because NetSuite rejected
+ * the first request before processing it. A timeout or connectivity failure is never retried, nor is a 429 rate
+ * limit, and the test adds no retry of its own. The profile {@code it} makes Spring Boot load
+ * {@code application-it.yml} over the empty {@code netsuite.*} placeholders of {@code application.yml}; the original
+ * read its SuiteTalk login from {@code mule.test.properties}.
  *
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of its five keys is missing, blank,
  * still {@code TODO} or an unresolvable placeholder ({@link #missingCredential()}); then the Spring context never

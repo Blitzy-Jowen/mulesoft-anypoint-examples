@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.StringJoiner;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
@@ -73,7 +74,8 @@ import org.springframework.web.util.UriUtils;
  *       otherwise, and whose port is the listener socket's local port on the console paths and the
  *       {@code Host} header's port, none when the header names none, on {@code <base>/};</li>
  *   <li>{@code GET <base>/<include>} and {@code GET <base>/console/<include>}: each file the RAML
- *       {@code !include}s, so the console resolves includes relative to the RAML it loaded.</li>
+ *       {@code !include}s, so the console resolves includes relative to the RAML it loaded; HEAD is the GET
+ *       without its body, and every other method on these paths, OPTIONS included, gets APIkit's 404.</li>
  * </ul>
  * The console paths answer every method alike, a non-standard one such as {@code PROPFIND} included, because
  * the original listener declares no {@code allowedMethods} and {@code ConsoleHandler} never read the method;
@@ -441,8 +443,9 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     }
 
     /**
-     * A file the RAML includes, requested relative to the console or to the API base path. Registered per
-     * include target by {@link #afterSingletonsInstantiated()}, so it carries no mapping annotation.
+     * A file the RAML includes, requested with GET (or HEAD) relative to the console or to the API base path.
+     * Registered per include target by {@link #afterSingletonsInstantiated()}, so it carries no mapping
+     * annotation.
      */
     public ResponseEntity<byte[]> serveInclude(HttpServletRequest request) {
         String path = pathWithinApplication(request);
@@ -457,9 +460,28 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
     }
 
     /**
+     * Every method but GET and HEAD on a file the RAML includes, requested relative to the API base path: the
+     * unknown resource it was for APIkit, whose router answered a path no RAML resource declares with its
+     * not-found mapping, so only the GET {@link #serveInclude} answers is served there. Registered per include
+     * target by {@link #afterSingletonsInstantiated()} beside the GET mapping, so it carries no mapping
+     * annotation: once without a method, which Spring matches for every method but a plain OPTIONS request, a
+     * non-standard one such as {@code PROPFIND} included, and ranks below the GET mapping for GET and HEAD, and
+     * once for OPTIONS, which Spring would otherwise answer itself with 200 and an {@code Allow} header. Below the
+     * console path no such mapping is needed, because {@link #consoleFile} and {@link #consoleFileOptions}
+     * already answer every other method there with the 404.
+     *
+     * @return never
+     * @throws ApiKitNotFoundException always, which SC-3 answers with APIkit's 404 body
+     */
+    public ResponseEntity<byte[]> includeNotFound() {
+        throw new ApiKitNotFoundException(NOT_FOUND_MESSAGE);
+    }
+
+    /**
      * Maps {@code GET <console>/<target>} and {@code GET <base>/<target>} to {@link #serveInclude} for every
-     * include target. Runs once, after every singleton exists, because the handler mapping cannot be injected
-     * into one of its own controllers without an initialisation cycle.
+     * include target, and every other method on {@code <base>/<target>} to {@link #includeNotFound}, once
+     * without a method and once for OPTIONS. Runs once, after every singleton exists, because the handler
+     * mapping cannot be injected into one of its own controllers without an initialisation cycle.
      */
     @Override
     public void afterSingletonsInstantiated() {
@@ -474,30 +496,42 @@ public class ApiKitConsoleController implements SmartInitializingSingleton {
         }
         RequestMappingHandlerMapping mapping =
                 applicationContext.getBean(mappingBean, RequestMappingHandlerMapping.class);
-        Method handler = serveIncludeMethod();
+        Method handler = handlerMethod("serveInclude", HttpServletRequest.class);
+        Method notFound = handlerMethod("includeNotFound");
         for (String target : includes.keySet()) {
-            register(mapping, handler, consolePrefix + "/" + target);
-            register(mapping, handler, basePath + "/" + target);
+            register(mapping, handler, consolePrefix + "/" + target, RequestMethod.GET);
+            register(mapping, handler, basePath + "/" + target, RequestMethod.GET);
+            register(mapping, notFound, basePath + "/" + target);
+            register(mapping, notFound, basePath + "/" + target, RequestMethod.OPTIONS);
         }
     }
 
-    private void register(RequestMappingHandlerMapping mapping, Method handler, String path) {
+    /**
+     * Maps {@code path} to {@code handler} for {@code methods}, or without a method condition when none is given,
+     * which Spring matches for every method but a plain OPTIONS request.
+     */
+    private void register(RequestMappingHandlerMapping mapping, Method handler, String path,
+                          RequestMethod... methods) {
         RequestMappingInfo info = RequestMappingInfo.paths(path)
-                .methods(RequestMethod.GET)
+                .methods(methods)
                 .options(mapping.getBuilderConfiguration())
                 .build();
         try {
             mapping.registerMapping(info, this, handler);
         } catch (IllegalStateException ex) {
-            LOGGER.warn("RAML include not served at {}: {}", path, ex.getMessage());
+            LOGGER.warn("RAML include mapping {} not registered: {}", info, ex.getMessage());
         }
     }
 
-    private static Method serveIncludeMethod() {
+    private static Method handlerMethod(String name, Class<?>... parameterTypes) {
         try {
-            return ApiKitConsoleController.class.getMethod("serveInclude", HttpServletRequest.class);
+            return ApiKitConsoleController.class.getMethod(name, parameterTypes);
         } catch (NoSuchMethodException ex) {
-            throw new IllegalStateException("ApiKitConsoleController.serveInclude(HttpServletRequest) is missing", ex);
+            StringJoiner signature = new StringJoiner(", ", name + "(", ")");
+            for (Class<?> parameterType : parameterTypes) {
+                signature.add(parameterType.getSimpleName());
+            }
+            throw new IllegalStateException("ApiKitConsoleController." + signature + " is missing", ex);
         }
     }
 

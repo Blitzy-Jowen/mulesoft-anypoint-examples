@@ -28,7 +28,7 @@ The listener binds to `0.0.0.0` on port `http.port`, default `8081` (`add_a_new_
 | `POST`, in any letter case (`post`, `Post`, …) | `/` | an XML body per `src/main/resources/root.xsd`: `root/Account` with `CustomerName`, `BusinessEntityName`, `Customer_Category_Reference_Type`, `Customer_Category_Reference_Value`, `Customer_Status_Reference_Type`, `Customer_Status_Reference_Value` | `200 OK`, no `Content-Type`, `Content-Length` of the body, body `Added customer: <Customer_Reference@Descriptor returned by Workday>` in UTF-8 | `add-customer-flow`, `add_a_new_customer.xml:8-52` |
 | `POST` | `/` | a body that is not well-formed XML: empty, malformed, or declaring a DOCTYPE | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<parser message>" }`, for example `{ "message": "Content is not allowed in prolog." }`; Workday is never called | `xml-to-dom-transformer` (xml:9) and no exception strategy → platform default (SC-1, AAP 0.4.7) |
 | `POST` | `/` | a request Workday answers with a SOAP fault that is not a WS-Security rejection (`Validation_Fault`, `Processing_Fault`), with any other HTTP error, or that fails otherwise | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }`, for a fault its `faultstring` | `wd-connector:invoke` (xml:42) and no exception strategy → platform default (SC-1, AAP 0.4.7) |
-| `POST` | `/` | a request whose Workday call fails through an approved connector failure mode | `502`, `429` or `503`, `Content-Type: application/json` (next section) | AAP 0.4.8 addition |
+| `POST` | `/` | a request whose Workday call fails through an approved connector failure mode | `502`, `429` or `503`, `Content-Type: application/json` (Connector failure modes below) | AAP 0.4.8 addition |
 | `GET`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `TRACE`, in any letter case, and any other token | `/` | any | `405 Method Not Allowed`, `Content-Type: text/plain`, body `Method not allowed for endpoint: /` (SC-1) | `allowedMethods="POST"` (xml:8) |
 | any | any other path (`/other`, `/services/x`, `/error` included) | any | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1) | the one listener serves only `/` |
 
@@ -101,7 +101,7 @@ Date: <current date>
 { "message": "I/O error: Connection refused", "upstream": "Workday" }
 ```
 
-## Connector failure modes (AAP 0.4.8)
+### Connector failure modes (AAP 0.4.8)
 
 Every Workday call runs through SC-9 `client/UpstreamCallExecutor` and is classified by `client/WorkdayFailureClassifier`. These three responses are the only behaviour the original did not have. `exception/UpstreamExceptionHandler` answers them at the highest `@Order`, ahead of SC-1.
 
@@ -110,13 +110,13 @@ Every Workday call runs through SC-9 `client/UpstreamCallExecutor` and is classi
 | Authentication: HTTP 401, or a SOAP fault whose code is `wsse:FailedAuthentication` or `wsse:InvalidSecurity` | re-authenticate once, then retry the call once; a second authentication failure ends the attempt | `502 Bad Gateway`, `{ "message": "<upstream message>", "upstream": "Workday" }` |
 | Throttling: HTTP 429 | no retry | `429 Too Many Requests`, same body; `Retry-After` copied when Workday sends it |
 | Timeout or connectivity failure anywhere in the cause chain (`SocketTimeoutException`, `HttpTimeoutException`, `ConnectException`, `UnknownHostException`, `NoRouteToHostException`, other `SocketException`) | never retried | `503 Service Unavailable`, same body |
-| Anything else (`Validation_Fault`, `Processing_Fault`, any other HTTP status, an unexpected response) | rethrown unchanged | the SC-1 500 of the previous section |
+| Anything else (`Validation_Fault`, `Processing_Fault`, any other HTTP status, an unexpected response) | rethrown unchanged | the SC-1 500 of the endpoint table above |
 
 - Every body has `Content-Type: application/json`, with APIkit's spacing. The upstream message is the fault string, or the HTTP reason phrase with its status.
 - Re-authentication rebuilds the WS-Security UsernameToken from the current `wday.user`, `wday.tenant` and `wday.password`. Workday's UsernameToken is stateless, so this makes no network call.
 - The retry after an authentication rejection is safe because Workday refused the request before processing it. A timeout or connectivity failure is never retried, so a `Put_Customer` that Workday may already have processed is never submitted twice. The client also streams each request with a fixed length, so the JDK never re-sends the POST on its own after a connection reset.
 - The connect and read timeouts are 10 s each (`wday.connect-timeout`, `wday.read-timeout`), the Mule default response timeout.
-- With `wday.endpoint` pointed at a closed port and `wday.tenant`, `wday.user` and `wday.password` set, `POST /` answers `503` with `{ "message": "I/O error: Connection refused", "upstream": "Workday" }` (measured on this build, previous section).
+- With `wday.endpoint` pointed at a closed port and `wday.tenant`, `wday.user` and `wday.password` set, `POST /` answers `503` with `{ "message": "I/O error: Connection refused", "upstream": "Workday" }` (measured on this build, the fourth exchange above).
 
 ## Configuration keys
 
@@ -191,7 +191,7 @@ Shared components (AAP 0.4.4), each copied with its tests and with only the pack
 - **ST-1** `support/HttpTestClient`, from `rest-api-with-apikit-java`.
 - **ST-2** `FixtureParityTest` and the `SCENARIOS.md` format, from `hello-world-java`.
 
-## Workday WSDL and generated classes
+### Workday WSDL and generated classes
 
 - `src/main/resources/wsdl/Revenue_Management_v25.0.wsdl` is Workday's public Revenue_Management v25.0 WSDL, downloaded unchanged from `https://community.workday.com/sites/default/files/file-hosting/productionapi/Revenue_Management/v25.0/Revenue_Management.wsdl` (1,524,923 bytes).
 - Version v25.0 is kept because the original targets it (`catalog/Workday__md__io__.xml`). `Put_Customer` is replaced by `Submit_Customer` from v31.1, so a later WSDL would change the operation (AAP 0.3.3, 0.10.2). The v25.0 WSDL has no operation named `Submit_Customer`; its `Submit_Customer_*` text matches are sibling operations such as `Submit_Customer_Invoice`.
@@ -231,10 +231,10 @@ java -jar target/adding-a-new-customer-to-workday-revenue-management-java-1.0.0-
 - `mvn test` needs no licence, credential or network access to Workday: Workday is a WireMock SOAP stub on `localhost`, or a Mockito mock.
 - The build needs the Shibboleth releases repository `https://build.shibboleth.net/maven/releases/`, declared in `pom.xml` as `shibboleth-releases`. `spring-ws-security` 4.1.4 brings WSS4J 4.0.1, which depends on OpenSAML 5, and OpenSAML 5 is not published to Maven Central. Every other artefact comes from Maven Central.
 - `<spring-ws.version>4.1.4</spring-ws.version>` overrides the Boot 3.2.12 BOM's Spring WS 4.0.11; Spring Framework stays at the BOM's 6.1.15 (root `DECISIONS.md`).
-- The build runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` and the WSDL presence check and XJC at `generate-sources` (previous section).
+- The build runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` and the WSDL presence check and XJC at `generate-sources` (Workday WSDL and generated classes above).
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 
-## Live tests (Tier 2B)
+### Live tests (Tier 2B)
 
 `AddingANewCustomerToWorkdayIT` runs under failsafe (`mvn -B verify`) against a real Workday tenant. It reuses the existing Workday tenant and integration user; no new tenant is procured (AAP 0.2.4).
 
@@ -255,7 +255,7 @@ While `application-it.yml` or one of the six keys is missing, blank, still `TODO
 | Test class | What it asserts |
 |---|---|
 | `AddingANewCustomerToWorkdayTest` | the ported MUnit suite (`integration-test.xml:32-122`), run offline against a WireMock Workday: `POST /` with the `John<millis>` customer answers `Added customer: <descriptor>`, the descriptor taken from Workday's response rather than echoed from the input; `Get_Customers` by `Customer_Reference_ID` returns `Total_Results` `1`; the inactivating `Put_Customer` carries both WIDs and the `Customer_Category_ID` chosen by its `type`, not the first `ID`; each of the three Workday calls is sent once |
-| `AddingANewCustomerToWorkdayIT` | the same steps against a live tenant (failsafe, previous section) |
+| `AddingANewCustomerToWorkdayIT` | the same steps against a live tenant (failsafe, Live tests above) |
 | `controller/WorkdayCustomerControllerTest` | on the wire through ST-1, the whole application against WireMock: `customer.xml` sent as `POST`, `post`, `Post` or `pOsT` to `/`, or as `post` to `/?source=test` → 200 `Added customer: NAME` with its `Content-Length` and no `Content-Type`, with one `Put_Customer` carrying the mapped values and the `PasswordText` UsernameToken `testuser@test_pt1`; `GET`, `OPTIONS`, `get`, `Get`, `options` (also with pre-flight headers), `put`, `postx` and `pos` on `/` → 405 without `Access-Control-*` headers; `POST /other` and `post /other` → 404; malformed XML → 500 with no Workday call; a Workday validation fault → 500 `{ "message": "<faultstring>" }`; HTTP 401 → two attempts, then 502; HTTP 429 → 429 with `Retry-After: 30`; a read timeout → 503 after one attempt |
 | `controller/WorkdayCustomerControllerUnconfiguredTest` | the application started on a random port with every `wday.*` value empty: the derived endpoint `https:///ccx/service//Revenue_Management/v25.0`, and `POST /` with `customer.xml` → 500 `application/json` `{ "message": "wday.hostname is not configured" }` through ST-1 |
 | `service/WorkdayCustomerServiceTest` | the flow's order (parse, request mapping, `Put_Customer`, descriptor, `Added customer: `); `customer.xml` reaching Workday as the mapper builds it; the encoding of the XML declaration honoured; malformed XML and a DOCTYPE failing before Workday is called; every upstream and vendor failure passed through unchanged with no retry; a `null` descriptor concatenated verbatim |

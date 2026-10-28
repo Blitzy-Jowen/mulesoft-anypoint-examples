@@ -43,7 +43,7 @@ Neither listener declares `allowedMethods`, so every path below accepts every HT
 | HTTP `localhost:8081` | `/web/loginDone` | any | Box search below 400: `200 OK`, **no `Content-Type` header**, body `The user successfully authorized access to the resource. Searching for files containing "mule": <Box response body>`; otherwise `500` from SC-1 (below) | `http-authorization-code-web.xml:37-48` |
 | HTTPS `localhost:8082` (`ports.box-oauth`), client certificate required | `/authorization` | any | `302 Found` to Box's authorization URL (below), no body, no `Content-Type`; without a `box.id` value, SC-1's `500` `{ "message": "Box client ID (box.id) is not configured" }` and no redirect | platform OAuth handler of `oauth2:authorization-code-grant-type` (`http-authorization-code-web.xml:5-19`) |
 | HTTPS `localhost:8082`, client certificate required | `/redirectUrl` | any | `302 Found` to `onCompleteRedirectTo` with `authorizationStatus`, or `200`/`400`/`500` with a platform text (below); without a `box.id` or `box.secret` value, marker `200` and no token request | platform OAuth handler of `oauth2:authorization-code-grant-type` |
-| either | any other path, and a path of one listener requested on the other's port | any | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1 for an unserved path; SC-10 `PortRoutingFilter` for the wrong port) | listener platform default (AAP 0.4.7) |
+| either | any other path, and a path of one listener requested on the other's port | any | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-10 `PortRoutingFilter` in both cases, before the dispatcher runs: each port's routes admit only its paths above) | listener platform default (AAP 0.4.7) |
 | either | a served path, when processing throws | any | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }` (SC-1) | platform default for an unhandled exception (AAP 0.4.7) |
 
 SC-1's 405 (`Method not allowed for endpoint: <path>`) cannot occur, because no listener restricts methods.
@@ -99,7 +99,7 @@ Every text is UTF-8 with no `Content-Type`. A failure marker is logged at ERROR 
 
 - **Inbound.** The 8082 listener presents the `keystore.jks` key `replserver` and **requires a client certificate** that `trust-store` accepts. A handshake without one is refused. This matches Mule 3.8, whose HTTPS listener demanded client authentication whenever its TLS context had a trust store (`needClientAuth = isTrustStoreConfigured()`). SC-10 `config/ListenerPorts` sets it for every listener whose `ssl` entry names a trust store. A browser completing the flow therefore needs the client certificate installed and must accept the self-signed server certificate, as with the original. For the demo stores, export the certificate and key of `replserver` from `keystore.jks` to a PKCS12 file with `keytool -importkeystore` and import that into the browser. The file holds a private key, so keep it out of the repository.
 - **Outbound.** `client/BoxApiClient` makes every HTTPS call (token, refresh, search) with the same `TLS_Context`, as the original's `tlsContext-ref="TLS_Context"` did on the request configuration and the grant. It trusts `trust-store` only, never the JDK `cacerts`, checks the server's host name, and offers the `keystore.jks` key when Box asks for a client certificate. For live use, `trust-store` must therefore trust Box's CA chain for `www.box.com` and `api.box.com`. The committed `trust-store` holds only the demo certificate, so live Box calls fail the TLS handshake until the CA certificate is imported, for example with `keytool -importcert -alias box-ca -file <Box CA certificate> -keystore trust-store`.
-- The stores are loaded when the HTTPS listener opens at start-up, so the application does not start without the store passwords, as the original did not deploy without them. The failure names the first empty password and its key, for example `box-oauth (listeners.additional[0]): cannot build the TLS context: the key store password is empty; supply keystore.password (listeners.additional[0].ssl.key-store-password)`, and `truststore.password` the same way. An empty `keystore.keyPassword` falls back to `keystore.password`. A password that is set but wrong keeps the JDK's reason (`cannot build the TLS context: Keystore was tampered with, or password was incorrect`).
+- The stores are loaded when the HTTPS listener opens at start-up, so the application does not start without the store passwords, as the original did not deploy without them. The failure names the first empty password and its key, for example `box-oauth (listeners.additional[0]): cannot build the TLS context: the key store password is empty; supply keystore.password (listeners.additional[0].ssl.key-store-password)`, and `truststore.password` the same way. For the listener, an empty `keystore.keyPassword` falls back to `keystore.password`; the outbound calls do not fall back (see [Configuration keys](#configuration-keys)). A password that is set but wrong keeps the JDK's reason (`cannot build the TLS context: Keystore was tampered with, or password was incorrect`).
 
 ### Tier 2A verification points
 
@@ -115,42 +115,46 @@ These details were generated by the Mule platform rather than declared by the fl
 
 ## Configuration keys
 
-Every key of `src/main/resources/application.yml` (AAP 0.4.6). Line numbers refer to `http-authorization-code-web.xml`.
+Every key of `src/main/resources/application.yml` (AAP 0.4.6), with the Java type its value binds to. Line numbers refer to `http-authorization-code-web.xml`.
 
 Status: `default` is a non-secret value the original fixed, overridable. `TODO` has no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until it is supplied through the named environment variable or a `--key=value` argument; `(secret)` marks a secret. `fixed` is a framework or SC-10 setting that reproduces the original listeners; changing it changes behaviour.
 
-| Key | Default | Status | Original name | Notes |
-|---|---|---|---|---|
-| `box.id` | `${BOX_ID:}` | TODO (secret) | `box.id` (unchanged) | Box OAuth client ID (`clientId`, line 6): `client_id` of the authorization URL and of both token forms. Without a value, `/authorization` answers SC-1's 500 `Box client ID (box.id) is not configured`, `/redirectUrl` marker `200`, and a refresh SC-1's 500 with the same message; Box is not called |
-| `box.secret` | `${BOX_SECRET:}` | TODO (secret) | `box.secret` (unchanged) | Box OAuth client secret (`clientSecret`, line 6): `client_secret` of both token forms. Without a value, `/redirectUrl` answers marker `200` and a refresh SC-1's 500 `Box client secret (box.secret) is not configured`; Box is not called |
-| `keystore.password` | `${KEYSTORE_PASSWORD:}` | TODO (secret) | `keystore.password` (unchanged) | store password of `keystore.jks` (line 23) |
-| `keystore.keyPassword` | `${KEYSTORE_KEYPASSWORD:}` | TODO (secret) | `keystore.keyPassword` (unchanged) | password of the private key in `keystore.jks` (line 23) |
-| `truststore.password` | `${TRUSTSTORE_PASSWORD:}` | TODO (secret) | `truststore.password` (unchanged) | store password of `trust-store` (line 22) |
-| `keystore.path` | `keystore.jks` | default | none (literal, line 23) | file system first, then classpath |
-| `truststore.path` | `trust-store` | default | none (literal, line 22) | file system first, then classpath |
-| `box.authorization-url` | `https://www.box.com/api/oauth2/authorize` | default | none (`authorizationUrl`, line 7) | Box authorization page, the base of the `/authorization` redirect |
-| `box.token-url` | `https://www.box.com/api/oauth2/token` | default | none (`tokenUrl`, line 13) | code exchange and refresh |
-| `box.api-base-url` | `https://api.box.com:443/2.0` | default | none (`http:request-config` protocol, host, port and `basePath`, line 5) | base of the `/search?query=mule` call |
-| `box.redirect-url` | `https://localhost:${ports.box-oauth}/redirectUrl` | default | none (`redirectionUrl`, line 6) | `redirect_uri` of the authorization URL and of both token forms; must equal the redirect URL registered with Box |
-| `box.local-authorization-url` | `https://localhost:${ports.box-oauth}/authorization` | default | none (`localAuthorizationUrl`, line 7) | bound by `config/BoxProperties` as the record of `localAuthorizationUrl`; no request reads it, because the listener is opened by `listeners.additional[0]` |
-| `box.login-redirect-location` | `https://localhost:${ports.box-oauth}/authorization?onCompleteRedirectTo=http://localhost:${server.port}/web/loginDone` | default | none (response-builder `Location`, line 30) | `Location` of the `/web` 302 |
-| `server.address` | `localhost` | fixed | none (`host="localhost"`, line 26) | bind address of the main listener |
-| `server.port` | `8081` | default | none (`port="8081"`, line 26) | main listener; `box.login-redirect-location` follows it |
-| `ports.box-oauth` | `8082` | default | none (the port of `localAuthorizationUrl` and `redirectionUrl`, lines 6-7) | HTTPS listener; the three local URLs above follow it. Override this key, not `listeners.additional[0].port`: overriding one list element replaces the whole `listeners.additional` list and drops its `ssl` and routes. Changing it also changes the redirect URL Box must have registered. |
-| `listeners.host` | `localhost` | fixed | none | SC-10 default bind host of the additional listeners |
-| `listeners.main.routes` | patterns `/web`, `/web/loginDone` | fixed | none (listener paths, lines 28 and 39) | SC-10: the paths the main listener serves |
-| `listeners.additional[0]` | name `box-oauth`, port `${ports.box-oauth}`, host `localhost`; `ssl`: `key-store: ${keystore.path}`, `key-store-password: ${keystore.password}`, `key-password: ${keystore.keyPassword}`, `key-store-type: JKS`, `trust-store: ${truststore.path}`, `trust-store-password: ${truststore.password}`; routes `/authorization`, `/redirectUrl` | fixed | none (`TLS_Context`, lines 21-24) | SC-10 HTTPS listener; its trust store makes it require a client certificate. No `disallowed-methods`, so every method is accepted. |
-| `spring.application.name` | `oauth2-authorization-code-using-the-HTTP-connector-java` | fixed | none | application name in log lines |
-| `spring.web.resources.add-mappings` | `false` | fixed | none | an unserved path reaches SC-1's no-listener 404, not the static resource handler |
-| `spring.mvc.dispatch-trace-request` | `true` | fixed | none | `TRACE` reaches the controllers like every other method |
-| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `WARN` | fixed | none | below `INFO` it logs the `/redirectUrl` request line with its query, the authorization code included; `WARN`, not `INFO`, because its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
-| `logging.level.org.apache.hc` | `INFO` | fixed | none | below `INFO` the httpclient5 transport under `BoxApiClient` logs the `Authorization: Bearer` header of each search and the wire bytes of every exchange: both token forms (the code or the refresh token, with the client secret) and the token responses with their access and refresh tokens. None of these values was logged by the original; a named level wins over `logging.level.root`, `--debug` and `--trace`, so a root `DEBUG` or `TRACE` does not reach these two loggers, and the application's own loggers are not pinned |
+| Key | Type | Default | Status | Original name | Notes |
+|---|---|---|---|---|---|
+| `box.id` | `String` | `${BOX_ID:}` | TODO (secret) | `box.id` (unchanged) | Box OAuth client ID (`clientId`, line 6): `client_id` of the authorization URL and of both token forms. Without a value, `/authorization` answers SC-1's 500 `Box client ID (box.id) is not configured`, `/redirectUrl` marker `200`, and a refresh SC-1's 500 with the same message; Box is not called |
+| `box.secret` | `String` | `${BOX_SECRET:}` | TODO (secret) | `box.secret` (unchanged) | Box OAuth client secret (`clientSecret`, line 6): `client_secret` of both token forms. Without a value, `/redirectUrl` answers marker `200` and a refresh SC-1's 500 `Box client secret (box.secret) is not configured`; Box is not called |
+| `keystore.password` | `String` | `${KEYSTORE_PASSWORD:}` | TODO (secret) | `keystore.password` (unchanged) | store password of `keystore.jks` (line 23) |
+| `keystore.keyPassword` | `String` | `${KEYSTORE_KEYPASSWORD:}` | TODO (secret) | `keystore.keyPassword` (unchanged) | password of the private key in `keystore.jks` (line 23); not needed to start, because the listener falls back to `keystore.password`, but needed by the outbound Box calls, which do not fall back |
+| `truststore.password` | `String` | `${TRUSTSTORE_PASSWORD:}` | TODO (secret) | `truststore.password` (unchanged) | store password of `trust-store` (line 22) |
+| `keystore.path` | `String` | `keystore.jks` | default | none (literal, line 23) | file system first, then classpath |
+| `truststore.path` | `String` | `trust-store` | default | none (literal, line 22) | file system first, then classpath |
+| `box.authorization-url` | `String` | `https://www.box.com/api/oauth2/authorize` | default | none (`authorizationUrl`, line 7) | Box authorization page, the base of the `/authorization` redirect |
+| `box.token-url` | `String` | `https://www.box.com/api/oauth2/token` | default | none (`tokenUrl`, line 13) | code exchange and refresh |
+| `box.api-base-url` | `String` | `https://api.box.com:443/2.0` | default | none (`http:request-config` protocol, host, port and `basePath`, line 5) | base of the `/search?query=mule` call |
+| `box.redirect-url` | `String` | `https://localhost:${ports.box-oauth}/redirectUrl` | default | none (`redirectionUrl`, line 6) | `redirect_uri` of the authorization URL and of both token forms; must equal the redirect URL registered with Box |
+| `box.local-authorization-url` | `String` | `https://localhost:${ports.box-oauth}/authorization` | default | none (`localAuthorizationUrl`, line 7) | bound by `config/BoxProperties` as the record of `localAuthorizationUrl`; no request reads it, because the listener is opened by `listeners.additional[0]` |
+| `box.login-redirect-location` | `String` | `https://localhost:${ports.box-oauth}/authorization?onCompleteRedirectTo=http://localhost:${server.port}/web/loginDone` | default | none (response-builder `Location`, line 30) | `Location` of the `/web` 302 |
+| `server.address` | `InetAddress` | `localhost` | fixed | none (`host="localhost"`, line 26) | bind address of the main listener |
+| `server.port` | `Integer` | `8081` | default | none (`port="8081"`, line 26) | main listener; `box.login-redirect-location` follows it |
+| `ports.box-oauth` | `int` (no class binds it; it is read through `listeners.additional[0].port`) | `8082` | default | none (the port of `localAuthorizationUrl` and `redirectionUrl`, lines 6-7) | HTTPS listener; the three local URLs above follow it. Override this key, not `listeners.additional[0].port`: overriding one list element replaces the whole `listeners.additional` list and drops its `ssl` and routes. Changing it also changes the redirect URL Box must have registered. |
+| `listeners.host` | `String` | `localhost` | fixed | none | SC-10 default bind host of the additional listeners |
+| `listeners.main.routes` | `List<Route>`; `Route`: `servlet` `String`, `patterns` `List<String>` | patterns `/web`, `/web/loginDone` | fixed | none (listener paths, lines 28 and 39) | SC-10: the paths the main listener serves |
+| `listeners.additional[0]` | `Additional`: `name` `String`, `port` `int`, `host` `String`, `ssl` `Ssl` (six `String` settings), `routes` `List<Route>` | name `box-oauth`, port `${ports.box-oauth}`, host `localhost`; `ssl`: `key-store: ${keystore.path}`, `key-store-password: ${keystore.password}`, `key-password: ${keystore.keyPassword}`, `key-store-type: JKS`, `trust-store: ${truststore.path}`, `trust-store-password: ${truststore.password}`; routes `/authorization`, `/redirectUrl` | fixed | none (`TLS_Context`, lines 21-24) | SC-10 HTTPS listener; its trust store makes it require a client certificate. No `disallowed-methods`, so every method is accepted. |
+| `spring.application.name` | `String` | `oauth2-authorization-code-using-the-HTTP-connector-java` | fixed | none | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | fixed | none | no static resource handler is registered, so a path the routes admit but no controller maps would get SC-1's no-listener 404, never a static-resource lookup; with the routes above every admitted path has a controller, and SC-10 answers every other path first |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | fixed | none | `TRACE` reaches the controllers like every other method |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `WARN` | fixed | none | below `INFO` it logs the `/redirectUrl` request line with its query, the authorization code included; `WARN`, not `INFO`, because its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
+| `logging.level.org.apache.hc` | `LogLevel` | `INFO` | fixed | none | below `INFO` the httpclient5 transport under `BoxApiClient` logs the `Authorization: Bearer` header of each search and the wire bytes of every exchange: both token forms (the code or the refresh token, with the client secret) and the token responses with their access and refresh tokens. None of these values was logged by the original; a named level wins over `logging.level.root`, `--debug` and `--trace`, so a root `DEBUG` or `TRACE` does not reach these two loggers, and the application's own loggers are not pinned |
 
-The HTTPS listener cannot start without the three store passwords, so the application does not start until they are supplied. It starts without `box.id` and `box.secret`, and `/web` still answers its 302; each operation that sends a Box client credential checks it first and fails locally, naming the key and never a value, as described above. Supply the secrets through the environment, or as arguments:
+The HTTPS listener opens both stores at start-up, so the application does not start until `keystore.password` and `truststore.password` are supplied. `keystore.keyPassword` is not needed to start: when it is empty, the listener recovers its key with `keystore.password`. The outbound Box calls (code exchange, refresh and search) have no such fallback. They build `TLS_Context` on their first HTTPS connection with `keystore.keyPassword` as given, so an empty value fails each of them with `Cannot load key store '<keystore.path>': its private key cannot be recovered with keystore.keyPassword`, even when the key's password equals `keystore.password`; the code exchange then answers marker `200`. The application also starts without `box.id` and `box.secret`, and `/web` still answers its 302. `/authorization` needs `box.id`, and the code exchange of `/redirectUrl` and the refresh need both. Each operation that sends a Box client credential checks it first and fails locally, naming the key and never a value, as described above. Supply the secrets through the environment, or as arguments:
 
 ```sh
-export BOX_ID=<Box client_id> BOX_SECRET=<Box client_secret>
-export KEYSTORE_PASSWORD=<key store password> KEYSTORE_KEYPASSWORD=<key password> TRUSTSTORE_PASSWORD=<trust store password>
+# needed to start: the HTTPS listener opens both stores
+export KEYSTORE_PASSWORD='<key store password>' TRUSTSTORE_PASSWORD='<trust store password>'
+# optional to start (the listener falls back to KEYSTORE_PASSWORD); needed by the outbound Box calls
+export KEYSTORE_KEYPASSWORD='<key password>'
+# needed only when used: BOX_ID by /authorization, both by the code exchange and the refresh
+export BOX_ID='<Box client_id>' BOX_SECRET='<Box client_secret>'
 mvn spring-boot:run
 # other ports; the Box application must then register https://localhost:9082/redirectUrl
 java -jar target/oauth2-authorization-code-using-the-HTTP-connector-java-1.0.0-SNAPSHOT.jar --server.port=9081 --ports.box-oauth=9082
@@ -187,7 +191,7 @@ Classes are relative to `src/main/java/com/mulesoft/examples/oauth2_authorizatio
 | `tls:context TLS_Context` (lines 21-24) | `config/BoxProperties` (store paths and passwords, `sslContext()` for outbound calls) plus the `ssl` block of the SC-10 listener |
 | `http:request-config HTTP_Request_Configuration_HTTPS` (line 5) | `client/BoxApiClient`: `RestClient` over Apache httpclient5, 10 s connect and read timeouts (the Mule default response timeout), redirects followed (at most 4, never from `https` to `http`, the bearer token dropped once a redirect leaves the origin), no automatic retries |
 | `logger level="INFO"` (line 34) | SLF4J INFO in `service/BoxOAuthService` |
-| listener and runtime defaults (no listener, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse`; SC-10 `config/PortRoutingFilter` for the wrong port |
+| listener and runtime defaults (no listener, unhandled exception) | SC-10 `config/PortRoutingFilter` for the no-listener 404, both for an unserved path and for a path requested on the other listener's port; SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` for the unhandled-exception 500 |
 | Grizzly listener without a CORS policy | `config/PreflightDispatchConfig` |
 | `mule-deploy.properties` (loads `http-authorization-code-web.xml`) | `Oauth2AuthorizationCodeUsingTheHTTPConnectorApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` (empty) and the flow's `${...}` placeholders | `src/main/resources/application.yml` |
@@ -195,8 +199,8 @@ Classes are relative to `src/main/java/com/mulesoft/examples/oauth2_authorizatio
 
 Shared components, each copied from its first consumer with only the `package` line changed and registered in `DECISIONS.md` (section 4):
 
-- SC-1 `exception/GlobalExceptionHandler`, `exception/ErrorResponse`: the 404 and 500 platform defaults.
-- SC-10 `config/ListenerPorts`, `config/PortRoutingFilter`: the second listener, HTTPS with required client certificate, and the per-port path scoping.
+- SC-1 `exception/GlobalExceptionHandler`, `exception/ErrorResponse`: the 500 platform default. Its no-listener 404 and its 405 are carried unchanged but not reached here: SC-10 answers every path outside the routes, and no listener restricts methods.
+- SC-10 `config/ListenerPorts`, `config/PortRoutingFilter`: the second listener, HTTPS with required client certificate, and the per-port path scoping, which writes the no-listener 404 for every path a port does not serve.
 - ST-1 `src/test/java/.../support/HttpTestClient`: raw HTTP/1.1 client that returns the status line with its reason phrase. Its HTTPS mode `HttpTestClient.https(host, port, trustStorePath, trustStoreType, trustStorePassword, keyStorePath, keyStoreType, keyStorePassword)` presents the carried client certificate.
 - ST-2 `src/test/java/.../FixtureParityTest`, `src/test/resources/fixtures/SCENARIOS.md`: fixture replay.
 
@@ -216,7 +220,7 @@ Run from `java-conversions/oauth2-authorization-code-using-the-HTTP-connector-ja
 mvn -B clean install    # enforcer JAX-WS/CXF ban, build, surefire tests, JaCoCo check, jar installed locally
 mvn -B clean package    # build, surefire tests, JaCoCo report and check (LINE >= 0.80 over service/** and mapper/**)
 mvn -B test             # surefire tests only
-mvn spring-boot:run     # needs the five TODO keys (see Configuration keys); HTTP localhost:8081, HTTPS localhost:8082
+mvn spring-boot:run     # starts once keystore.password and truststore.password are set; the Box flow also needs keystore.keyPassword, box.id and box.secret (see Configuration keys); HTTP localhost:8081, HTTPS localhost:8082
 ```
 
 Expected exchange (the `Date` value varies):

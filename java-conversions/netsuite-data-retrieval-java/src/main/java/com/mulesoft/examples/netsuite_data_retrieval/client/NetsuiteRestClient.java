@@ -57,7 +57,8 @@ import reactor.netty.http.client.HttpClient;
  *   <li>goes through {@link UpstreamCallExecutor} for {@link UpstreamSystem#NETSUITE}, one executor call per HTTP
  *       request (each page of a paged read included), with {@link NetsuiteTokenProvider#evict()} as the
  *       re-authentication step: a 401 evicts the cached token and the request is retried once, a 429 or a timeout or
- *       connectivity failure is never retried, so no write is ever submitted twice;</li>
+ *       connectivity failure is never retried, so NetSuite never processes a write twice: the one re-send follows a
+ *       401, which NetSuite answers before processing the request;</li>
  *   <li>fetches its bearer token inside the attempt, so the retry after a 401 carries a fresh token;</li>
  *   <li>lets {@code WebClientResponseException} (non-2xx answer) and {@code WebClientRequestException} (timeout,
  *       connection failure) reach the executor unwrapped, so {@link NetsuiteFailureClassifier} can classify them;</li>

@@ -56,24 +56,24 @@ Sample message, the original README's and the original test's `src/test/resource
 
 ## Configuration keys
 
-Every key of `src/main/resources/application.yml`, plus the unset Spring keys a deployment may need.
+Every key of `src/main/resources/application.yml`, plus the unset Spring keys a deployment may need, with the Java type each value binds to.
 
 Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it holds a credential; `fixed` — a framework setting that reproduces the original, changing it changes behaviour; `unset` — not set in `application.yml`, Spring's default applies.
 
-| Key | Default | Original name | Status | Description |
-|---|---|---|---|---|
-| `jdbc.url` | `${JDBC_URL:}`, empty | `jdbc.url` (unchanged), `db:generic-config url="${jdbc.url}"` (`transactions.xml:4`) | TODO (secret) | MySQL JDBC URL, with the user and password as URL parameters, bound to `spring.datasource.url`. The comment in `application.yml` reads `# TODO: supply the MySQL JDBC URL, e.g. jdbc:mysql://<host>:3306/<database>?user=<user>&password=<password>`. Boot infers the driver `com.mysql.cj.jdbc.Driver` (Connector/J 8.3.0) from the URL, replacing the original's `com.mysql.jdbc.Driver` (Connector/J 5.1.31) |
-| `spring.datasource.url` | `${jdbc.url}` | none | fixed | set `jdbc.url` rather than this key |
-| `jms.max-redelivery` | `2` | `maxRedelivery="2"` of connector `Active_MQ` (`transactions.xml:3`) | default | redeliveries processed before a delivery is logged and consumed |
-| `jms.inbound-queue` | `in` | `jms:inbound-endpoint queue="in"` (`transactions.xml:7`) | default | queue the listener consumes |
-| `jms.outbound-queue` | `out` | `jms:outbound-endpoint queue="out"` (`transactions.xml:18`) | default | queue of the send that follows the component |
-| `spring.artemis.mode` | `native` | none | fixed | connect to an external broker; the test profile switches to `embedded` |
-| `spring.artemis.broker-url` | `tcp://localhost:61616` | none (the connector declared no `brokerURL`) | default | the broker address the original README has the user start, on Artemis's default acceptor |
-| `spring.artemis.user`, `spring.artemis.password` | none | none (the connector declared no credentials) | unset | Spring's standard broker credentials, for a broker that requires them; supply them through `SPRING_ARTEMIS_USER` and `SPRING_ARTEMIS_PASSWORD` |
-| `spring.jms.cache.enabled` | `false` | none | fixed | the listener container and the `JmsTemplate` must share the unwrapped connection factory, so the send to `out` joins the listener's session |
-| `spring.sql.init.mode` | `never` | none | fixed | the application creates no schema; the table comes from `order.sql` (Setup) |
-| `spring.main.web-application-type` | `none` | none | fixed | the original has no HTTP listener |
-| `spring.application.name` | `using-transactional-scope-in-jms-to-database-java` | none | fixed | application name in log lines |
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `jdbc.url` | `String` | `${JDBC_URL:}`, empty | `jdbc.url` (unchanged), `db:generic-config url="${jdbc.url}"` (`transactions.xml:4`) | TODO (secret) | MySQL JDBC URL, with the user and password as URL parameters, bound to `spring.datasource.url`. The comment in `application.yml` reads `# TODO: supply the MySQL JDBC URL, e.g. jdbc:mysql://<host>:3306/<database>?user=<user>&password=<password>`. Boot infers the driver `com.mysql.cj.jdbc.Driver` (Connector/J 8.3.0) from the URL, replacing the original's `com.mysql.jdbc.Driver` (Connector/J 5.1.31) |
+| `spring.datasource.url` | `String` | `${jdbc.url}` | none | fixed | set `jdbc.url` rather than this key |
+| `jms.max-redelivery` | `int` | `2` | `maxRedelivery="2"` of connector `Active_MQ` (`transactions.xml:3`) | default | redeliveries processed before a delivery is logged and consumed |
+| `jms.inbound-queue` | `String` | `in` | `jms:inbound-endpoint queue="in"` (`transactions.xml:7`) | default | queue the listener consumes |
+| `jms.outbound-queue` | `String` | `out` | `jms:outbound-endpoint queue="out"` (`transactions.xml:18`) | default | queue of the send that follows the component |
+| `spring.artemis.mode` | `ArtemisMode` | `native` | none | fixed | connect to an external broker; the test profile switches to `embedded` |
+| `spring.artemis.broker-url` | `String` | `tcp://localhost:61616` | none (the connector declared no `brokerURL`) | default | the broker address the original README has the user start, on Artemis's default acceptor |
+| `spring.artemis.user`, `spring.artemis.password` | `String` | none | none (the connector declared no credentials) | unset | Spring's standard broker credentials, for a broker that requires them; supply them through `SPRING_ARTEMIS_USER` and `SPRING_ARTEMIS_PASSWORD` |
+| `spring.jms.cache.enabled` | `boolean` | `false` | none | fixed | the listener container and the `JmsTemplate` must share the unwrapped connection factory, so the send to `out` joins the listener's session |
+| `spring.sql.init.mode` | `DatabaseInitializationMode` | `never` | none | fixed | the application creates no schema; the table comes from `order.sql` (Setup) |
+| `spring.main.web-application-type` | `WebApplicationType` | `none` | none | fixed | the original has no HTTP listener |
+| `spring.application.name` | `String` | `using-transactional-scope-in-jms-to-database-java` | none | fixed | application name in log lines |
 
 - While `jdbc.url` is blank the application still starts: `config/DataSourceConfig` logs one WARN, `jdbc.url (environment variable JDBC_URL) is not configured: the application starts without a database connection, and every database call fails until it is supplied`, and supplies `config/UnconfiguredDataSource`. Every delivery is then converted and logged, fails when the transactional scope opens its database transaction (before the insert), is logged as `JMS listener failed: SQLNonTransientConnectionException: MySQL JDBC URL (jdbc.url, environment variable JDBC_URL) is not configured at …`, and is consumed on delivery 4 like any other failure.
 - The original test properties `database.url`, `database.user` and `database.password`, which `MySQLDbCreator` read from the never-committed `mule.test.properties`, are dropped. The tests use the in-memory H2 database and the embedded Artemis broker of `src/test/resources/application-test.yml` (profile `test`), which holds no credential or host.
@@ -107,14 +107,18 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 
 Nothing is stubbed at run time: the application talks to the real broker and database it is configured for.
 
-## Setup
+## Build, run and test
+
+### Setup
 
 Run from `java-conversions/using-transactional-scope-in-jms-to-database-java/`:
 
 1. Create table `orders` in a MySQL database with `src/main/resources/order.sql`, copied unchanged (the original README calls it `import.sql`):
 
    ```sh
-   mysql -u <user> -p <database> < src/main/resources/order.sql
+   DB_USER='<user>'
+   DB_NAME='<database>'
+   mysql -u "$DB_USER" -p "$DB_NAME" < src/main/resources/order.sql
    ```
 
 2. Start an ActiveMQ Artemis broker reachable at `spring.artemis.broker-url` (default `tcp://localhost:61616`), with `max-delivery-attempts` for `in` at least 4 (see above).
@@ -124,17 +128,18 @@ Run from `java-conversions/using-transactional-scope-in-jms-to-database-java/`:
    export JDBC_URL='jdbc:mysql://<host>:3306/<database>?user=<user>&password=<password>'
    ```
 
-4. Start the application (next section).
+4. Start the application with `mvn spring-boot:run` or `java -jar` ([Build and run commands](#build-and-run-commands)).
 5. Send the sample message to queue `in`, with the Artemis CLI of the broker instance or any JMS client:
 
    ```sh
-   <artemis-instance>/bin/artemis producer --url tcp://localhost:61616 --destination queue://in --message-count 1 \
+   ARTEMIS_INSTANCE='<artemis instance directory>'
+   "$ARTEMIS_INSTANCE/bin/artemis" producer --url tcp://localhost:61616 --destination queue://in --message-count 1 \
        --message '<order><itemId>1</itemId><itemUnits>2</itemUnits><customerId>1</customerId></order>'
    ```
 
 6. The log shows three `XXXXXXX order: Order [item_id=1, item_units=2, customer_id=1]` lines, three `JMS listener failed: MyException: exception customized at …` lines and then the redelivery-exceeded ERROR. `select count(*) from orders` returns `0`.
 
-## Build, run and test
+### Build and run commands
 
 Run from `java-conversions/using-transactional-scope-in-jms-to-database-java/`:
 
@@ -142,8 +147,11 @@ Run from `java-conversions/using-transactional-scope-in-jms-to-database-java/`:
 mvn -B clean install    # build, surefire tests, JaCoCo check, repackaged jar installed locally
 mvn -B clean package    # build, surefire tests, JaCoCo report and check (LINE >= 0.80 over service/** and mapper/**)
 mvn -B test             # surefire tests only
-mvn spring-boot:run     # reads JDBC_URL; add -Dspring-boot.run.arguments=--spring.artemis.broker-url=tcp://<host>:<port> for another broker
-java -jar target/using-transactional-scope-in-jms-to-database-java-1.0.0-SNAPSHOT.jar --spring.artemis.broker-url=tcp://<host>:<port>
+mvn spring-boot:run     # reads JDBC_URL; connects to spring.artemis.broker-url, default tcp://localhost:61616
+# for another broker, pass its URL through spring-boot.run.arguments, or to the packaged jar:
+BROKER_URL='tcp://<host>:<port>'
+mvn spring-boot:run "-Dspring-boot.run.arguments=--spring.artemis.broker-url=$BROKER_URL"
+java -jar target/using-transactional-scope-in-jms-to-database-java-1.0.0-SNAPSHOT.jar "--spring.artemis.broker-url=$BROKER_URL"
 ```
 
 - The tests need no external server, credential or licence: surefire sets `spring.profiles.active=test`, whose `application-test.yml` uses an in-memory H2 database in MySQL mode created from `order.sql` (one database per Spring test context) and an embedded, non-persistent Artemis broker with queues `in` and `out`.

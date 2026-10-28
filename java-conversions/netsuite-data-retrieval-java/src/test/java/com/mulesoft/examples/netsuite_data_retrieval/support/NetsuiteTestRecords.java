@@ -37,7 +37,9 @@ import org.springframework.core.env.Environment;
  * {@code externalId} body field of the create; {@code companyName} and the subsidiary stay the configured values the
  * MUnit assertion reads. When the create's outcome is unknown, because NetSuite may have committed the customer while
  * its answer was lost or carried no record ID, the cleanup finds the customer by that external ID with SuiteQL and
- * deletes it, so it removes this run's customer and no other. The create is never sent a second time.
+ * deletes it, so it removes this run's customer and no other. This class sends the create once and never again; only
+ * {@link NetsuiteRestClient#createRecord} re-sends it, exactly once after an HTTP 401 with the cached token evicted
+ * first, and never after a timeout, connectivity failure or 429.
  *
  * <p>The client's exceptions, the SC-9 upstream exceptions and NetSuite's {@code WebClient*Exception}s among them,
  * pass through unchanged. Only record IDs and the generated external ID are logged; no property value, credential,
@@ -194,7 +196,9 @@ public final class NetsuiteTestRecords {
      *       #externalIdQuery(String)}, at most one, because NetSuite keeps external IDs unique per record type) is
      *       deleted, and none is when the lookup finds nothing.</li>
      * </ul>
-     * The create is sent once and never again, the cleanup included.
+     * The bracket sends the create once and never again, the cleanup included; only
+     * {@link NetsuiteRestClient#createRecord} re-sends it, exactly once after an HTTP 401 with the cached token evicted
+     * first, and never after a timeout, connectivity failure or 429.
      *
      * <p>A cleanup failure is thrown when the create and the assertion succeeded, because the customer may be left in
      * the account; when either already failed, the cleanup failure is added to that failure as suppressed and the

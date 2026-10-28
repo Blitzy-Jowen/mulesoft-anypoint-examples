@@ -15,7 +15,7 @@ There is no HTTP endpoint. The only trigger is a file poller:
 
 | Trigger | Component | Input directory | Polling | Disposition | Source |
 |---|---|---|---|---|---|
-| file inbound endpoint | `trigger/CsvFileTrigger`, `@Scheduled(fixedDelayString = "${csv-import.polling-frequency:1000}")` on `poll()`, over SC-5 `trigger/FileInboundPoller` | `csv-import.input-dir`, default `src/main/resources/input`, resolved against the working directory as the original's relative `path` was | every `csv-import.polling-frequency` ms, default `1000` (the Mule file connector default, because the endpoint declares no `pollingFrequency`), as a fixed delay between the end of one poll and the start of the next | deleted once the import returns or fails, because the endpoint declares no `moveToDirectory` | `csv-to-mongodb.xml:9` (`path="src/main/resources/input" responseTimeout="10000"`) |
+| file inbound endpoint | `trigger/CsvFileTrigger`, `@Scheduled(fixedDelayString = "${csv-import.polling-frequency:1000}")` on `poll()`, over SC-5 `trigger/FileInboundPoller` | `csv-import.input-dir`, default `src/main/resources/input`, resolved against the working directory as the original's relative `path` was | every `csv-import.polling-frequency` (milliseconds or an ISO-8601 duration, see Configuration keys), default `1000` ms (the Mule file connector default, because the endpoint declares no `pollingFrequency`), as a fixed delay between the end of one poll and the start of the next | deleted once the import returns or fails, because the endpoint declares no `moveToDirectory` | `csv-to-mongodb.xml:9` (`path="src/main/resources/input" responseTimeout="10000"`) |
 
 `CsvFileTrigger.pollOnce()` runs one poll on demand and returns the number of files handed to the import, counting a file whose import failed. Tests and the fixture replay call it. It shares the scheduled poll's poller, so neither run picks up a file the other is processing.
 
@@ -48,13 +48,14 @@ Data notes:
 
 ## Configuration keys
 
-Every key of `src/main/resources/application.yml`, with the Java type its value binds to. The original's `mule-app.properties` holds no keys; its `mongo:config` (l.4) reads the three `database.*` placeholders.
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to, followed by the two optional Spring Boot keys `config/MongoDatabaseSettings` reads although `application.yml` sets neither. The original's `mule-app.properties` holds no keys; its `mongo:config` (l.4) reads the three `database.*` placeholders.
 
 Status values:
 
 - `default`: a non-secret value the original fixed or defaulted, overridable.
 - `TODO`: no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until it is supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6). A secret is marked `(secret)`.
 - `fixed`: a framework setting that wires the original's configuration, not a key of the original.
+- `optional`: a Spring Boot key absent from `application.yml` and unset by default; when supplied, it changes how the `database.*` keys apply.
 
 | Key | Type | Default | Original name | Status | Description |
 |---|---|---|---|---|---|
@@ -65,8 +66,10 @@ Status values:
 | `spring.data.mongodb.port` | `Integer` | `27017` | none: Mule MongoDB connector default | default | `mongo:config` names no port, so the connector's default applied |
 | `spring.data.mongodb.database` | `String` | `${database.name}` | none | fixed | the `mongo:config database` attribute |
 | `csv-import.input-dir` | `String` (a `Path`) | `src/main/resources/input` | none: `file:inbound-endpoint path` (l.9) | default | directory polled for CSV files |
-| `csv-import.polling-frequency` | `long` (ms) | `1000` | none: the file connector's default `pollingFrequency` | default | delay between polls; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
+| `csv-import.polling-frequency` | `String` | `1000` (ms) | none: the file connector's default `pollingFrequency` | default | delay between polls: milliseconds as a positive whole number, or a positive ISO-8601 duration (for example `PT1S`). As Spring's `@Scheduled(fixedDelayString)` reads it, a value whose first or second character is `P` or `p` is a duration and any other a number of milliseconds, untrimmed. A zero, negative or unreadable value stops start-up with an error naming the key and the value |
 | `spring.main.web-application-type` | `WebApplicationType` | `none` | none | fixed | no HTTP listener, as in the original |
+| `spring.data.mongodb.uri` | `String` | unset (not in `application.yml`) | none | optional | MongoDB connection string. When set, it alone gives the server and credentials, as in Spring Boot: Boot ignores `spring.data.mongodb.host` and `port`, and `config/MongoConfig` applies no credential from `database.user`, `database.password` or `spring.data.mongodb.authentication-database`. `database.name`, when it has text, still selects the database; otherwise the URI's database applies, and when neither names one, `database.name` is reported missing. A URI the driver cannot parse is not reported as a missing key: Boot stops start-up with the driver's own `The connection string is invalid.` message |
+| `spring.data.mongodb.authentication-database` | `String` | unset (not in `application.yml`) | none | optional | database the credential of `database.user` and `database.password` authenticates against when it has text, for example `admin` for a user created there; otherwise the credential authenticates against `database.name`. Used only while `spring.data.mongodb.uri` is not set |
 
 Supply `database.name`, and `database.user` with `database.password`, before `mvn spring-boot:run` or `java -jar`; leave the user and password both empty only for a server without access control. The application starts while a key is missing: `config/MongoConfig` logs one WARN at startup naming the key and its environment variable, for example `database.name (environment variable DATABASE_NAME) is not configured: the application starts without a MongoDB connection, and every import fails until it is supplied`, and never a value. It then creates no MongoDB client, so no connection is attempted, and its `config/UnconfiguredMongoDatabaseFactory` fails every import at the first database call with `IllegalStateException` `database.name is not configured` (or `database.user is not configured` when only the password is set, `database.password is not configured` when only the user is set). `FileInboundPoller` logs that failure at ERROR and deletes the file, as for any failed import. The original could not deploy with an unresolved `${…}` placeholder; this conversion starts and names the missing key instead. Supply the keys through the environment variables above, `--key=value` arguments or a local, uncommitted override file, and never commit a real value.
 
@@ -77,7 +80,7 @@ Original-to-new key map:
 - Unchanged: `database.name`, `database.user` and `database.password` keep the names of the original's `mongo:config` placeholders. The original IT set the same three keys as system properties. No key is renamed.
 - Added: `csv-import.input-dir` and `csv-import.polling-frequency` carry the values the original hard-coded (`path`) or left to the file connector's default (`pollingFrequency`). `spring.data.mongodb.host` and `spring.data.mongodb.port` state the connector default the original relied on.
 
-`src/test/resources/application-test.yml` (profile `test`, which surefire activates through `spring.profiles.active=test`) supplies `database.name: customers`, `database.user: test_user` and `database.password: test_password`, the values of the original IT, so the placeholders resolve in tests. Tests that start the application and connect to MongoDB point `spring.data.mongodb.uri` at an in-memory `mongo-java-server` through `@DynamicPropertySource`. Once the URI is set, it alone gives the server and credentials: Boot ignores `spring.data.mongodb.host` and `port`, and `config/MongoConfig` applies no credential from `database.user` and `database.password`, while `database.name` still selects the database. Surefire also points `csv-import.input-dir` at `target/test-csv-import/input`, so a test context's scheduled poll never touches `src/main/resources/input`. The project is not a connector project, so it has no credential file, no `application-it.yml` and no live tier.
+`src/test/resources/application-test.yml` (profile `test`, which surefire activates through `spring.profiles.active=test`) supplies `database.name: customers`, and for `database.user` and `database.password` the values of the original IT, which this README does not repeat, so the placeholders resolve in tests. Tests that start the application and connect to MongoDB point `spring.data.mongodb.uri` at an in-memory `mongo-java-server` through `@DynamicPropertySource`. Once the URI is set, it alone gives the server and credentials: Boot ignores `spring.data.mongodb.host` and `port`, and `config/MongoConfig` applies no credential from `database.user` and `database.password`, while `database.name` still selects the database. Surefire also points `csv-import.input-dir` at `target/test-csv-import/input`, so a test context's scheduled poll never touches `src/main/resources/input`. The project is not a connector project, so it has no credential file, no `application-it.yml` and no live tier.
 
 ## Mule-to-Java mapping
 
@@ -98,7 +101,7 @@ Original-to-new key map:
 
 ## Behaviours stubbed, externalized or changed
 
-- Credentials are externalized. The original tutorial's demo user `mule`/`mule` (original README step 3) and the IT's `test_user`/`test_password` are no longer in code or main configuration. The three `database.*` keys are TODO placeholders under their original names, and the IT's values survive only in `src/test/resources/application-test.yml`, for tests.
+- Credentials are externalized. The original tutorial's demo login (original README step 3) and the user and password of the original IT are no longer in code or main configuration. The three `database.*` keys are TODO placeholders under their original names, and the IT's values survive only in `src/test/resources/application-test.yml`, for tests.
 - `mongo:connection-pooling-profile exhaustedAction="WHEN_EXHAUSTED_GROW" initialisationPolicy="INITIALISE_ONE"` becomes the MongoDB Java driver's own connection pool. No equivalent setting is needed: one sequential flow uses one connection at a time.
 - `responseTimeout="10000"` on the one-way file endpoint has no Java counterpart, because nothing waits for a response.
 - Original README steps 5 and 7 (set the connector's user, password and database in Studio; edit the File connector's path) become the `database.*` keys and `csv-import.input-dir`.

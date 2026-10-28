@@ -28,16 +28,16 @@ The project has no HTTP listener: no port is bound and no web server starts, so 
 - Polls never overlap: Spring's default scheduler is single-threaded, and `synchronize()` is `synchronized`, so a `pollOnce()` never runs beside a scheduled poll. The flow's `processingStrategy="synchronous"` (line 60) gave the same guarantee.
 - The batch job runs to the end inside the poll. In Mule, `batch:execute` queued the job and the flow ended once the records were loaded.
 
-## Watermark, query and batch job
+### Watermark, query and batch job
 
-### Watermark (`salesforce-to-database.xml:63`)
+#### Watermark (`salesforce-to-database.xml:63`)
 
 - The watermark is the variable `timestamp` (`ContactToDatabaseBatchService.WATERMARK_KEY`). While no value is stored it resolves to the original Groovy `default-expression`, `new Date(System.currentTimeMillis() - 10000)` formatted `yyyy-MM-dd'T'HH:mm:ss.SSS'Z'` in time zone UTC (`WATERMARK_PATTERN`): now minus 10 s. The default is computed afresh on every poll that finds no stored value and is never written to the store.
 - The selector is `MAX` over `#[payload.LastModifiedDate]` (`SELECTOR_FIELD`). After a successful batch job run, with no failed record, the stored value becomes the latest `LastModifiedDate` among the polled records, compared as instants among that poll's values only. A job that failed a record, and so stopped, leaves the stored watermark unchanged: the next scheduled poll queries from the same value and selects the failed and unprocessed Contacts again. Nothing is retried within a poll. A `LastModifiedDate` that arrives as a date-time object rather than text is stored in Salesforce's UTC form `yyyy-MM-dd'T'HH:mm:ss.SSS'Z'`; a record without one selects nothing.
 - An empty poll leaves the watermark unchanged (the store file is neither created nor rewritten), and so does a failed query, which ends the poll before the update.
 - The value is kept by SC-8 `service/WatermarkStore` in the UTF-8 `java.util.Properties` file at `watermark.store-path`, default `.mule/objectstore/watermark.properties` relative to the working directory. The root `.gitignore` entry `**/.mule/` keeps that file out of git. Like Mule's persistent object store, the file survives a restart; it is read afresh on every access and replaced atomically through a temporary file. Delete it to start again from the default.
 
-### Query (`salesforce-to-database.xml:64`)
+#### Query (`salesforce-to-database.xml:64`)
 
 ```sql
 SELECT Email,FirstName,LastModifiedDate,LastName FROM Contact WHERE LastModifiedDate > <timestamp>
@@ -47,7 +47,7 @@ SELECT Email,FirstName,LastModifiedDate,LastName FROM Contact WHERE LastModified
 - The watermark is appended unquoted, as a SOQL date-time literal, as in the original. Its value comes only from the default expression or from a `LastModifiedDate` Salesforce returned, never from a caller, so no escaping applies.
 - Right after the query, and before the batch job, the flow's logger `#[flowVars.timestamp]` (line 66) becomes the INFO line `<timestamp>` under `service.ContactToDatabaseBatchService`: the watermark the query used.
 
-### Batch job `salesforce-to-database-Batch` (`salesforce-to-database.xml:8-59`, `:67`)
+#### Batch job `salesforce-to-database-Batch` (`salesforce-to-database.xml:8-59`, `:67`)
 
 `batch:execute name="salesforce-to-database-Batch"` runs the job (`JOB_NAME`) on SC-7 `service/BatchJobRunner`, with the query's records as its input phase. The job declares no `max-failed-records`, accept expression or accept policy, so the Mule defaults apply: `max-failed-records` 0, so the job stops at the first failed record with status `FAILED_PROCESS_RECORDS`, and step accept policy `NO_FAILURES`, so a record that failed in one step is not offered to the next.
 
@@ -65,6 +65,86 @@ SELECT Email,FirstName,LastModifiedDate,LastName FROM Contact WHERE LastModified
 **Unreachable branch.** The `otherwise` branch of `upsertContactInDbStep` (lines 50-52) cannot be selected by any input. Step 1 always sets `exists` to a Boolean (`payload.size() > 0`) and `dbRecord` to the select's result list, which is never null, even when empty. A record that fails step 1 never reaches step 2 under `NO_FAILURES`. Every record step 2 receives therefore matches one of the two `when` conditions. The branch is kept exactly as declared, in the package-visible `ContactToDatabaseBatchService#upsert`. It is listed as `unreachable` in [`src/test/resources/fixtures/SCENARIOS.md`](src/test/resources/fixtures/SCENARIOS.md) (`scheduler-poll-otherwise-branch`) and covered by a direct unit invocation in `service/ContactToDatabaseBatchServiceTest`. Following the AAP 0.8.2 rule, it is excluded from fixture capture and from the branch-coverage claim.
 
 **Record order.** Records are processed sequentially on the polling thread, in the order the query returned them; each step takes every record before the next step starts. The original ran them in blocks on its batch thread pool (`batch:threading-profile poolExhaustedAction="WAIT"`, line 9). The only observable difference is for duplicate emails inside one poll, which is a Tier 2A verification point. Two Contacts whose emails are equal under the case-insensitive collation both find no row in step 1. Step 2 inserts the first; the second fails on the duplicate primary key, and the job stops.
+
+### Connector failure modes (AAP 0.4.8)
+
+The only vendor call is the poll's Salesforce query, with its lazy SOAP `login` and its `queryMore` pages. Each runs through SC-9 `client/UpstreamCallExecutor` with the upstream `Salesforce` and is classified by `client/SalesforceFailureClassifier`. The project is poll-triggered, so no caller receives an HTTP status: each classified failure is logged at ERROR with the upstream name.
+
+| Failure | Behaviour | Result |
+|---|---|---|
+| Authentication or session expiry: `ApiFault`/`LoginFault` code `INVALID_SESSION_ID` | WARN `Upstream Salesforce rejected the session [AUTHENTICATION]; re-authenticating and retrying once`, one fresh SOAP `login`, then one retry; a second rejection ends the attempt | ERROR `Upstream Salesforce call failed [AUTHENTICATION]: …`, `UpstreamAuthenticationException`, the poll fails |
+| Throttling: code `REQUEST_LIMIT_EXCEEDED` | no retry | ERROR `Upstream Salesforce call failed [RATE_LIMIT]: …`, `UpstreamRateLimitException` without `Retry-After` (Salesforce sends none), the poll fails |
+| Timeout or connectivity failure anywhere in the cause chain (`SocketTimeoutException`, `ConnectException`, `UnknownHostException`, `NoRouteToHostException`, other `SocketException`) | **never retried**, even when the chain also holds `INVALID_SESSION_ID` | ERROR `Upstream Salesforce call failed [UNAVAILABLE]: …`, `UpstreamUnavailableException`, the poll fails |
+| Anything else (`INVALID_LOGIN`, `MALFORMED_QUERY`, `INVALID_FIELD`, …) | rethrown unchanged | the original WSC exception, the poll fails |
+
+- A failed query ends the poll before `batch:execute`: no job instance runs, the watermark stays unchanged, and the next scheduled poll runs normally. `poll()` logs ERROR `Poll of triggerFlow failed: <failure>` with the failure's type identifiers, Salesforce fault code and upstream, never its message or stack trace; `pollOnce()` rethrows the failure unchanged instead.
+- The connect and read timeouts are 10 s each (`sfdc.connect-timeout`, `sfdc.read-timeout`), the Mule default response timeout.
+- The executor's ERROR lines name the upstream, the category and exception classes only, never vendor messages, credentials or record data.
+- The poll only reads Salesforce, so no retry can repeat a vendor write; the only retry is the single one after a rejected session.
+- Database failures inside a step are record failures, captured by SC-7 with one ERROR line per step and exception type: `Found exception processing record on step '<step>' for job instance '<id>' of job 'salesforce-to-database-Batch': <exception classes>`. An example is a Contact without `Email`, whose insert violates `email NOT NULL`. Because `max-failed-records` is 0, the job then stops with status `FAILED_PROCESS_RECORDS`; on-complete still logs `Batch sf->db has finished`, after which `BatchJobRunner` logs the final result of a job that did not end `SUCCESSFUL` (stopped, or failed in on-complete) at WARN, here `Finished job instance '<id>' of job 'salesforce-to-database-Batch' with status FAILED_PROCESS_RECORDS: loaded <n>, processed <n>, successful <n>, failed <n>, unprocessed <n>`, and the watermark stays unchanged, so the next poll selects the failed and unprocessed Contacts again.
+- No other behaviour is added.
+
+Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, `sfdc.auth-endpoint` pointed at a closed local port and polls every 2 s (timestamps, process ID, application name and thread removed):
+
+```console
+$ CLOSED_PORT=1   # any loopback port nothing listens on
+$ java -jar target/salesforce-to-MySQL-DB-using-Batch-Processing-java-1.0.0-SNAPSHOT.jar "--sfdc.auth-endpoint=http://127.0.0.1:${CLOSED_PORT}/services/Soap/u/65.0" --poll.frequency=2000 --watermark.store-path=target/run/watermark.properties --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
+ERROR c.m.e.s.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
+ERROR c.m.e.s.trigger.ContactPollScheduler     : Poll of triggerFlow failed: com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.exception.UpstreamUnavailableException [upstream Salesforce] at com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.client.UpstreamCallExecutor.translate(UpstreamCallExecutor.java:276) <- com.sforce.ws.ConnectionException <- java.net.ConnectException
+```
+
+The first poll ran at start-up, and the same pair of lines followed every 2 s. Each lazy `login` attempt failed once, without a retry, and no watermark file was created.
+
+A second run used a WireMock Partner SOAP stub (one `login`, one `query` answering one Contact) and a MySQL 8 server holding the `contact` table of `contact.sql`. The first poll logged the default watermark, 10 s before the poll, then `Batch sf->db has finished`, and inserted the row. The stored watermark became the Contact's `LastModifiedDate`. Later polls queried from that stored value and updated the row's `first_name` after the stub changed it. A Contact without `Email` logged the `DataIntegrityViolationException` record failure above for `upsertContactInDbStep`, then the on-complete line.
+
+## Configuration keys
+
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to; a `mysql.*` key, read only through a `spring.datasource.*` placeholder, has the type of the property it feeds. A `TODO` key has no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until it is supplied through the named environment variable or a `--key=value` argument. Salesforce authentication is the original's: the SOAP Partner API `login` with `sfdc.username` and `sfdc.password` immediately followed by `sfdc.securityToken` (SC-15, AAP 0.10.2; root `DECISIONS.md`, section 6.2), not an OAuth flow, so no connected app is needed. Nothing connects at start-up: the Salesforce client logs in lazily on the first poll, and Hikari opens its first MySQL connection on the first lookup.
+
+| Key | Type | Default | Purpose | Original name |
+|---|---|---|---|---|
+| `sfdc.username` | `String` | none — TODO, `${SFDC_USERNAME:}` | the Salesforce user the `login` call authenticates | **`sfdc.user`** (xml:4); renamed because the request's key names govern |
+| `sfdc.password` | `String` | none — TODO (secret), `${SFDC_PASSWORD:}` | that user's password, without the security token | `sfdc.password` (unchanged, xml:4) |
+| `sfdc.securityToken` | `String` | none — TODO (secret), `${SFDC_SECURITYTOKEN:}` | appended to the password at login; `sfdc.security-token` binds as well | `sfdc.securityToken` (unchanged, xml:4) |
+| `sfdc.auth-endpoint` | `String` | `https://login.salesforce.com/services/Soap/u/65.0` | Partner SOAP login endpoint of API 65.0 (`force-partner-api` 65.0.0); a sandbox org uses `https://test.salesforce.com/services/Soap/u/65.0` | none; the original `sfdc:config` sets no URL, so its connector logged in at its default login URL |
+| `sfdc.connect-timeout` | `Duration` | `10s` | connect timeout of every Salesforce call (AAP 0.4.8), the Mule default response timeout; a bare number binds as milliseconds | none |
+| `sfdc.read-timeout` | `Duration` | `10s` | read timeout of every Salesforce call (AAP 0.4.8), with the same rules | none |
+| `mysql.host` | `String` | none — TODO, `${MYSQL_HOST:}` | MySQL server host, feeding `spring.datasource.url` | `mysql.host` (unchanged, xml:7) |
+| `mysql.port` | `String` | `3306` | MySQL server port, feeding `spring.datasource.url` | none; the original hard-coded `port="3306"` (xml:7) |
+| `mysql.database` | `String` | `company` | database (schema) holding the `contact` table, feeding `spring.datasource.url` | none; the original hard-coded `database="company"` (xml:7) |
+| `mysql.user` | `String` | none — TODO, `${MYSQL_USER:}` | MySQL user with read and write access to `company.contact`, bound to `spring.datasource.username` | `mysql.user` (unchanged, xml:7) |
+| `mysql.password` | `String` | none — TODO (secret), `${MYSQL_PASSWORD:}` | that user's password, bound to `spring.datasource.password` | `mysql.password` (unchanged, xml:7) |
+| `poll.frequency` | `String` (whole milliseconds or an ISO-8601 duration) | `60000` (ms) | fixed rate between poll starts; a zero, negative or unreadable value stops start-up with an error naming the key and the value | none; the original hard-coded `frequency="60" timeUnit="SECONDS"` (xml:62) |
+| `poll.initial-delay` | `String` (whole milliseconds or an ISO-8601 duration) | `0` (ms) | delay before the first poll | none; the original scheduler declares no start delay |
+| `watermark.store-path` | `Path` | `.mule/objectstore/watermark.properties` | SC-8 store file, relative to the working directory; git-ignored through the root `**/.mule/` entry | none; Mule kept the watermark in the application's persistent object store |
+| `spring.datasource.url` | `String` | `jdbc:mysql://${mysql.host}:${mysql.port}/${mysql.database}` | JDBC URL of the original `db:mysql-config`. A blank URL, or a `jdbc:mysql:` URL (any case) without a host, such as `jdbc:mysql://:3306/company`, counts as `mysql.host` missing | none |
+| `spring.datasource.username` / `spring.datasource.password` | `String` / `String` | `${mysql.user}` / `${mysql.password}` | the database account. With a blank or `jdbc:mysql:` URL, a blank value counts as `mysql.user` or `mysql.password` missing; with any other URL, such as the tests' H2 database, none is required | none |
+| `spring.sql.init.mode` | `DatabaseInitializationMode` | `never` | the application never creates the schema, as the original did not | none |
+| `spring.main.web-application-type` | `WebApplicationType` | `none` | the original has no HTTP listener, so no web server starts and no port is bound | none |
+| `spring.application.name` | `String` | `salesforce-to-MySQL-DB-using-Batch-Processing-java` | application name in log lines | none |
+| `logging.level.org.springframework.jdbc.core.StatementCreatorUtils` | `LogLevel` | `INFO` | fixed: its `TRACE` writes every bound parameter value, each lookup's e-mail address and the first name, last name and e-mail address of each `INSERT` and `UPDATE` | none |
+
+- The `logging.level` key keeps the contacts out of the log under a root `DEBUG` or `TRACE` level (`logging.level.root`, `LogLevel`) and under `--debug` or `--trace` (`debug`, `trace`, both `boolean`): a logger's own level outranks them. The original logs a contact's e-mail address only on the error branch of `upsertContactInDbStep` (`Error with <email> contact`), which stays, as do the watermark and on-complete lines. `service/SensitiveLogLevelsTest` asserts this.
+- Original-to-new key map: `sfdc.user` → `sfdc.username`. Every other placeholder keeps its original name (`sfdc.password`, `sfdc.securityToken`, `mysql.host`, `mysql.user`, `mysql.password`).
+- The original test read `sfdc.user`, `sfdc.password` and `sfdc.securityToken` from `src/test/resources/mule.test.properties`, together with `database.host`, `database.user`, `database.password` and `database.url` for its `MySQLDbCreator`. The live test reads the three Salesforce keys, under their new names, from `application-it.yml`. The `database.*` keys have no equivalent: H2 in MySQL mode replaces the live MySQL server in every test.
+- `config/SalesforceProperties` binds the `sfdc.*` keys; its `toString()` masks the password and the token.
+- `src/test/resources/application-test.yml` (Spring profile `test`) holds no credential. It points the datasource at an in-memory H2 database in MySQL mode, one per Spring test context, initialised from `classpath:contact.sql` (`spring.sql.init.mode: always`), and it holds the scheduled poll back for an hour (`poll.initial-delay: 3600000`). Surefire and failsafe also set `watermark.store-path` (under `target/test-watermark/` and `target/it-watermark/`) and `poll.initial-delay` (`3600000`) as system properties, so no test writes the default store file or polls on its own schedule.
+- No credential appears in any committed file. Supply the values at run time through the environment variables `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`, `SFDC_USERNAME`, `SFDC_PASSWORD` and `SFDC_SECURITYTOKEN`, `--key=value` arguments, or an external `application.yml` outside the repository (`'--spring.config.additional-location=<file>'`; `spring.config.additional-location` binds to `ConfigDataLocation[]`, comma-separated locations).
+
+### Database setup
+
+The project expects the MySQL schema `company` with the table `contact`, created from `src/main/resources/contact.sql`, which is copied unchanged from the original (`first_name`, `last_name`, and `email` NOT NULL as primary key, all `varchar(45)`, collation `utf8_slovak_ci`). The application never creates the schema itself (`spring.sql.init.mode: never`), as the original did not. Run from this project directory, with an account that may create the schema:
+
+```sh
+mysql -u '<admin user>' -p -e 'CREATE DATABASE company'
+mysql -u '<admin user>' -p company < src/main/resources/contact.sql
+```
+
+Then grant the account configured as `mysql.user` read and write access to `company.contact`. The original README's inline SQL (`salesforce-to-MySQL-DB-using-Batch-Processing/README.md`, lines 57-65) differs from `contact.sql`. It adds an `ID INT(11) NOT NULL AUTO_INCREMENT` column and uses `varchar(255)` columns. It also opens with `USE comapany;`, a typo, and inserts its sample row into `contacts`, not `contact`. The carried `contact.sql` governs, because it is the script the original's own test ran (`MySQLDbCreator` over `src/main/resources/contact.sql`). It inserts no row; a starting row such as the README's sample may be inserted by hand.
+
+### Credentials file for the live test
+
+Copy `src/test/resources/application-it.yml.example` to `src/test/resources/application-it.yml` and fill in `sfdc.username`, `sfdc.password` and `sfdc.securityToken` (and `sfdc.auth-endpoint` for a sandbox org). The copy is git-ignored by this project's `.gitignore` (`src/test/resources/application-it.yml`) and by the root `.gitignore` (`**/src/test/resources/application-it.yml`). Never commit it. No MySQL key is needed there: the live test uses the H2 database of profile `test`.
 
 ## Mule-to-Java mapping
 
@@ -102,86 +182,7 @@ Each component below is copied from its reference project with only the `package
 
 The project carries no SC-1 and no ST-1 `HttpTestClient`, because it has no HTTP listener.
 
-## Connector failure modes (AAP 0.4.8)
-
-The only vendor call is the poll's Salesforce query, with its lazy SOAP `login` and its `queryMore` pages. Each runs through SC-9 `client/UpstreamCallExecutor` with the upstream `Salesforce` and is classified by `client/SalesforceFailureClassifier`. The project is poll-triggered, so no caller receives an HTTP status: each classified failure is logged at ERROR with the upstream name.
-
-| Failure | Behaviour | Result |
-|---|---|---|
-| Authentication or session expiry: `ApiFault`/`LoginFault` code `INVALID_SESSION_ID` | WARN `Upstream Salesforce rejected the session [AUTHENTICATION]; re-authenticating and retrying once`, one fresh SOAP `login`, then one retry; a second rejection ends the attempt | ERROR `Upstream Salesforce call failed [AUTHENTICATION]: …`, `UpstreamAuthenticationException`, the poll fails |
-| Throttling: code `REQUEST_LIMIT_EXCEEDED` | no retry | ERROR `Upstream Salesforce call failed [RATE_LIMIT]: …`, `UpstreamRateLimitException` without `Retry-After` (Salesforce sends none), the poll fails |
-| Timeout or connectivity failure anywhere in the cause chain (`SocketTimeoutException`, `ConnectException`, `UnknownHostException`, `NoRouteToHostException`, other `SocketException`) | **never retried**, even when the chain also holds `INVALID_SESSION_ID` | ERROR `Upstream Salesforce call failed [UNAVAILABLE]: …`, `UpstreamUnavailableException`, the poll fails |
-| Anything else (`INVALID_LOGIN`, `MALFORMED_QUERY`, `INVALID_FIELD`, …) | rethrown unchanged | the original WSC exception, the poll fails |
-
-- A failed query ends the poll before `batch:execute`: no job instance runs, the watermark stays unchanged, and the next scheduled poll runs normally. `poll()` logs ERROR `Poll of triggerFlow failed: <failure>` with the failure's type identifiers, Salesforce fault code and upstream, never its message or stack trace; `pollOnce()` rethrows the failure unchanged instead.
-- The connect and read timeouts are 10 s each (`sfdc.connect-timeout`, `sfdc.read-timeout`), the Mule default response timeout.
-- The executor's ERROR lines name the upstream, the category and exception classes only, never vendor messages, credentials or record data.
-- The poll only reads Salesforce, so no retry can repeat a vendor write; the only retry is the single one after a rejected session.
-- Database failures inside a step are record failures, captured by SC-7 with one ERROR line per step and exception type: `Found exception processing record on step '<step>' for job instance '<id>' of job 'salesforce-to-database-Batch': <exception classes>`. An example is a Contact without `Email`, whose insert violates `email NOT NULL`. Because `max-failed-records` is 0, the job then stops with status `FAILED_PROCESS_RECORDS`; on-complete still logs `Batch sf->db has finished`, after which `BatchJobRunner` logs the final result of a job that did not end `SUCCESSFUL` (stopped, or failed in on-complete) at WARN, here `Finished job instance '<id>' of job 'salesforce-to-database-Batch' with status FAILED_PROCESS_RECORDS: loaded <n>, processed <n>, successful <n>, failed <n>, unprocessed <n>`, and the watermark stays unchanged, so the next poll selects the failed and unprocessed Contacts again.
-- No other behaviour is added.
-
-Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, `sfdc.auth-endpoint` pointed at a closed local port and polls every 2 s (timestamps, process ID, application name and thread removed):
-
-```console
-$ java -jar target/salesforce-to-MySQL-DB-using-Batch-Processing-java-1.0.0-SNAPSHOT.jar --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0 --poll.frequency=2000 --watermark.store-path=target/run/watermark.properties --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
-ERROR c.m.e.s.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
-ERROR c.m.e.s.trigger.ContactPollScheduler     : Poll of triggerFlow failed: com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.exception.UpstreamUnavailableException [upstream Salesforce] at com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.client.UpstreamCallExecutor.translate(UpstreamCallExecutor.java:276) <- com.sforce.ws.ConnectionException <- java.net.ConnectException
-```
-
-The first poll ran at start-up, and the same pair of lines followed every 2 s. Each lazy `login` attempt failed once, without a retry, and no watermark file was created.
-
-A second run used a WireMock Partner SOAP stub (one `login`, one `query` answering one Contact) and a MySQL 8 server holding the `contact` table of `contact.sql`. The first poll logged the default watermark, 10 s before the poll, then `Batch sf->db has finished`, and inserted the row. The stored watermark became the Contact's `LastModifiedDate`. Later polls queried from that stored value and updated the row's `first_name` after the stub changed it. A Contact without `Email` logged the `DataIntegrityViolationException` record failure above for `upsertContactInDbStep`, then the on-complete line.
-
-## Configuration keys (AAP 0.4.6, 0.6.6)
-
-Every key of `src/main/resources/application.yml`. A `TODO` key has no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until it is supplied through the named environment variable or a `--key=value` argument. Salesforce authentication is the original's: the SOAP Partner API `login` with `sfdc.username` and `sfdc.password` immediately followed by `sfdc.securityToken` (SC-15, AAP 0.10.2; root `DECISIONS.md`, section 6.2), not an OAuth flow, so no connected app is needed. Nothing connects at start-up: the Salesforce client logs in lazily on the first poll, and Hikari opens its first MySQL connection on the first lookup.
-
-| Key | Default | Purpose | Original name |
-|---|---|---|---|
-| `sfdc.username` | none — TODO, `${SFDC_USERNAME:}` | the Salesforce user the `login` call authenticates | **`sfdc.user`** (xml:4); renamed because the request's key names govern |
-| `sfdc.password` | none — TODO (secret), `${SFDC_PASSWORD:}` | that user's password, without the security token | `sfdc.password` (unchanged, xml:4) |
-| `sfdc.securityToken` | none — TODO (secret), `${SFDC_SECURITYTOKEN:}` | appended to the password at login; `sfdc.security-token` binds as well | `sfdc.securityToken` (unchanged, xml:4) |
-| `sfdc.auth-endpoint` | `https://login.salesforce.com/services/Soap/u/65.0` | Partner SOAP login endpoint of API 65.0 (`force-partner-api` 65.0.0); a sandbox org uses `https://test.salesforce.com/services/Soap/u/65.0` | none; the original `sfdc:config` sets no URL, so its connector logged in at its default login URL |
-| `sfdc.connect-timeout` | `10s` | connect timeout of every Salesforce call (AAP 0.4.8), the Mule default response timeout; a bare number binds as milliseconds | none |
-| `sfdc.read-timeout` | `10s` | read timeout of every Salesforce call (AAP 0.4.8), with the same rules | none |
-| `mysql.host` | none — TODO, `${MYSQL_HOST:}` | MySQL server host, feeding `spring.datasource.url` | `mysql.host` (unchanged, xml:7) |
-| `mysql.port` | `3306` | MySQL server port, feeding `spring.datasource.url` | none; the original hard-coded `port="3306"` (xml:7) |
-| `mysql.database` | `company` | database (schema) holding the `contact` table, feeding `spring.datasource.url` | none; the original hard-coded `database="company"` (xml:7) |
-| `mysql.user` | none — TODO, `${MYSQL_USER:}` | MySQL user with read and write access to `company.contact`, bound to `spring.datasource.username` | `mysql.user` (unchanged, xml:7) |
-| `mysql.password` | none — TODO (secret), `${MYSQL_PASSWORD:}` | that user's password, bound to `spring.datasource.password` | `mysql.password` (unchanged, xml:7) |
-| `poll.frequency` | `60000` (ms) | fixed rate between poll starts; a zero, negative or unreadable value stops start-up with an error naming the key and the value | none; the original hard-coded `frequency="60" timeUnit="SECONDS"` (xml:62) |
-| `poll.initial-delay` | `0` (ms) | delay before the first poll | none; the original scheduler declares no start delay |
-| `watermark.store-path` | `.mule/objectstore/watermark.properties` | SC-8 store file, relative to the working directory; git-ignored through the root `**/.mule/` entry | none; Mule kept the watermark in the application's persistent object store |
-| `spring.datasource.url` | `jdbc:mysql://${mysql.host}:${mysql.port}/${mysql.database}` | JDBC URL of the original `db:mysql-config`. A blank URL, or a `jdbc:mysql:` URL (any case) without a host, such as `jdbc:mysql://:3306/company`, counts as `mysql.host` missing | none |
-| `spring.datasource.username` / `spring.datasource.password` | `${mysql.user}` / `${mysql.password}` | the database account. With a blank or `jdbc:mysql:` URL, a blank value counts as `mysql.user` or `mysql.password` missing; with any other URL, such as the tests' H2 database, none is required | none |
-| `spring.sql.init.mode` | `never` | the application never creates the schema, as the original did not | none |
-| `spring.main.web-application-type` | `none` | the original has no HTTP listener, so no web server starts and no port is bound | none |
-| `spring.application.name` | `salesforce-to-MySQL-DB-using-Batch-Processing-java` | application name in log lines | none |
-| `logging.level.org.springframework.jdbc.core.StatementCreatorUtils` | `INFO` | fixed: its `TRACE` writes every bound parameter value, each lookup's e-mail address and the first name, last name and e-mail address of each `INSERT` and `UPDATE` | none |
-
-- The `logging.level` key keeps the contacts out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`: a logger's own level outranks them. The original logs a contact's e-mail address only on the error branch of `upsertContactInDbStep` (`Error with <email> contact`), which stays, as do the watermark and on-complete lines. `service/SensitiveLogLevelsTest` asserts this.
-- Original-to-new key map: `sfdc.user` → `sfdc.username`. Every other placeholder keeps its original name (`sfdc.password`, `sfdc.securityToken`, `mysql.host`, `mysql.user`, `mysql.password`).
-- The original test read `sfdc.user`, `sfdc.password` and `sfdc.securityToken` from `src/test/resources/mule.test.properties`, together with `database.host`, `database.user`, `database.password` and `database.url` for its `MySQLDbCreator`. The live test reads the three Salesforce keys, under their new names, from `application-it.yml`. The `database.*` keys have no equivalent: H2 in MySQL mode replaces the live MySQL server in every test.
-- `config/SalesforceProperties` binds the `sfdc.*` keys; its `toString()` masks the password and the token.
-- `src/test/resources/application-test.yml` (Spring profile `test`) holds no credential. It points the datasource at an in-memory H2 database in MySQL mode, one per Spring test context, initialised from `classpath:contact.sql` (`spring.sql.init.mode: always`), and it holds the scheduled poll back for an hour (`poll.initial-delay: 3600000`). Surefire and failsafe also set `watermark.store-path` (under `target/test-watermark/` and `target/it-watermark/`) and `poll.initial-delay` (`3600000`) as system properties, so no test writes the default store file or polls on its own schedule.
-- No credential appears in any committed file. Supply the values at run time through the environment variables `MYSQL_HOST`, `MYSQL_USER`, `MYSQL_PASSWORD`, `SFDC_USERNAME`, `SFDC_PASSWORD` and `SFDC_SECURITYTOKEN`, `--key=value` arguments, or an external `application.yml` outside the repository (`--spring.config.additional-location=<file>`).
-
-### Database setup
-
-The project expects the MySQL schema `company` with the table `contact`, created from `src/main/resources/contact.sql`, which is copied unchanged from the original (`first_name`, `last_name`, and `email` NOT NULL as primary key, all `varchar(45)`, collation `utf8_slovak_ci`). The application never creates the schema itself (`spring.sql.init.mode: never`), as the original did not. Run from this project directory, with an account that may create the schema:
-
-```sh
-mysql -u '<admin user>' -p -e 'CREATE DATABASE company'
-mysql -u '<admin user>' -p company < src/main/resources/contact.sql
-```
-
-Then grant the account configured as `mysql.user` read and write access to `company.contact`. The original README's inline SQL (`salesforce-to-MySQL-DB-using-Batch-Processing/README.md`, lines 57-65) differs from `contact.sql`. It adds an `ID INT(11) NOT NULL AUTO_INCREMENT` column and uses `varchar(255)` columns. It also opens with `USE comapany;`, a typo, and inserts its sample row into `contacts`, not `contact`. The carried `contact.sql` governs, because it is the script the original's own test ran (`MySQLDbCreator` over `src/main/resources/contact.sql`). It inserts no row; a starting row such as the README's sample may be inserted by hand.
-
-### Credentials file for the live test
-
-Copy `src/test/resources/application-it.yml.example` to `src/test/resources/application-it.yml` and fill in `sfdc.username`, `sfdc.password` and `sfdc.securityToken` (and `sfdc.auth-endpoint` for a sandbox org). The copy is git-ignored by this project's `.gitignore` (`src/test/resources/application-it.yml`) and by the root `.gitignore` (`**/src/test/resources/application-it.yml`). Never commit it. No MySQL key is needed there: the live test uses the H2 database of profile `test`.
-
-## Behaviours stubbed, externalized or changed
+## Behaviours stubbed or externalized
 
 - Externalized: the Salesforce and MySQL credentials and the MySQL host, which the original also read from placeholders, are `TODO` keys with environment-variable fallbacks; `sfdc.user` is renamed `sfdc.username`. The MySQL port and database name, the polling frequency and the default watermark lag were hard-coded in the original. The first three are configurable keys with the original values as defaults; the 10 s lag stays in code. The store location, the login URL and the timeouts, defaults of the original runtime and connector, are configurable keys.
 - Changed:
@@ -224,7 +225,7 @@ java -jar target/salesforce-to-MySQL-DB-using-Batch-Processing-java-1.0.0-SNAPSH
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
-## Live test (Tier 2B)
+### Live test (Tier 2B)
 
 `SalesforceToMySQLDBUsingBatchProcessingIT` runs under failsafe (`mvn -B verify`) against a real org, reusing the existing Salesforce credentials of the original example; no new sandbox is procured. MySQL is replaced by the in-memory H2 database of profile `test`.
 
@@ -255,7 +256,7 @@ Every surefire test is credential-free and contacts no external system.
 | `client/ContactRepositoryTest` | `@JdbcTest` on H2 in MySQL mode: `contact` created from `contact.sql`; the select returns the original columns and nothing for an unknown email, and matches the email case-insensitively; insert and update affect only the given email, an update of an unknown email inserts nothing; a null email propagates as a `DataIntegrityViolationException` and a duplicate key as a `DuplicateKeyException`, with nothing written; quotes and hostile values are bound literally; every statement uses bind parameters for every value |
 | `service/BatchJobRunnerTest` | SC-7: accept policies (`NO_FAILURES` default, `ONLY_FAILURES`) before the accept expression; record variables and replaced payloads reaching later steps; failures kept under their step's name; commit grouping; `max-failed-records` of 0 (default), -1 and above the failed count; on-complete run once; an input-phase exception propagated with nothing else run; empty input completing with zero counts; a stop in the last step counting as processed only the failed record and the records that completed that step, without a commit, with a commit group pending and after a committed group; the final result logged once after on-complete, at WARN with status and loaded, processed, successful, failed and unprocessed counts for a job that did not end `SUCCESSFUL` (stopped, or failed in on-complete), and at DEBUG, with no WARN, for a `SUCCESSFUL` one |
 | `service/WatermarkStoreTest` | SC-8: default while nothing is stored, never persisted and evaluated on every call; `MAX` by instant over the current poll's candidates only; no candidate stores nothing and creates no file; values survive a restart and are read afresh; atomic UTF-8 writes; unusable paths fail visibly |
-| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query` and `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the call, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and the 10 s default timeouts |
+| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query` and `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the call, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and the 10 s default timeouts; concurrent callers sharing the one login, re-login or session refresh in flight, its timeout included; paging that fails, with no further `queryMore`, on a repeated query locator, records beyond the reported size or pages beyond what that size allows |
 | `client/SalesforceFailureClassifierTest`, `client/UpstreamCallExecutorTest` | SC-9 and the Salesforce classification: re-login and one retry on `INVALID_SESSION_ID`, no retry on `REQUEST_LIMIT_EXCEEDED` (no `Retry-After`) or on any timeout or connectivity cause, the unchanged rethrow of every other failure, ERROR lines without vendor text |
 | `config/DataSourceConfigTest` | with the datasource keys as `application.yml` writes them or overridden directly: an empty or whitespace `mysql.host`, `mysql.user` or `mysql.password`, every combination of them, a blank URL, and `jdbc:mysql:` URLs without a host (upper case, no authority, load-balanced, user information only) start the context with `UnconfiguredDataSource`, log one WARN listing exactly the missing keys and environment variables and no value, and fail the first query with `CannotGetJdbcConnectionException` around the `08001` failure carrying that list; complete MySQL settings keep Boot's Hikari pool unstarted, so nothing connects, and log nothing; an H2 URL with an empty password or no account keeps Hikari and logs nothing |
 | `config/UnconfiguredDataSourceTest` | both `getConnection` overloads fail with `SQLNonTransientConnectionException`, SQL state `08001`, carrying the message the data source was created with; a `null` message is rejected |
@@ -298,11 +299,11 @@ Coverage: the JaCoCo `check` goal at `prepare-package` fails `mvn clean package`
 
 This row is the project's row of the root `SUMMARY.md` (AAP 0.8.7). Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 809 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`SalesforceToMySQLDBUsingBatchProcessingIT`: `src/test/resources/application-it.yml not supplied (copy application-it.yml.example); Tier 2B live Salesforce test skipped`).
-- `mvn -B clean package`: `BUILD SUCCESS`; 809 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
-- `mvn -B test`: `BUILD SUCCESS`; 809 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- `mvn -B verify`: `BUILD SUCCESS`; the same 809 surefire tests, then the failsafe IT skipped as above.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 363 of 374 lines (97.1%) of `service/ContactToDatabaseBatchService`, `service/WatermarkStore`, `service/BatchJobRunner` with its nested classes, and `mapper/ContactRowMapper`. Total project LINE coverage: 97.0% (969 of 999 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 818 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`SalesforceToMySQLDBUsingBatchProcessingIT`: `src/test/resources/application-it.yml not supplied (copy application-it.yml.example); Tier 2B live Salesforce test skipped`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 818 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
+- `mvn -B test`: `BUILD SUCCESS`; 818 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B verify`: `BUILD SUCCESS`; the same 818 surefire tests, then the failsafe IT skipped as above.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 363 of 374 lines (97.1%) of `service/ContactToDatabaseBatchService`, `service/WatermarkStore`, `service/BatchJobRunner` with its nested classes, and `mapper/ContactRowMapper`. Total project LINE coverage: 96.7% (1007 of 1041 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`; the six reachable scenarios `UNVERIFIED-uncaptured`, `scheduler-poll-otherwise-branch` `UNREACHABLE`.
 - Tier 2B: no sandbox credentials were supplied, so `SalesforceToMySQLDBUsingBatchProcessingIT` was skipped. The cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 
@@ -323,4 +324,3 @@ The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never 
 ## Licence
 
 Apache License 2.0. `LICENSE` and `NOTICE` are copied unchanged from `salesforce-to-MySQL-DB-using-Batch-Processing/`.
-

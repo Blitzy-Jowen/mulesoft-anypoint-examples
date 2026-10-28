@@ -14,8 +14,10 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
 import static org.awaitility.Awaitility.await;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
@@ -35,6 +37,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -50,6 +53,10 @@ import jakarta.jms.Connection;
 import jakarta.jms.ConnectionFactory;
 import jakarta.jms.JMSException;
 import jakarta.jms.JMSSecurityException;
+import jakarta.jms.Session;
+import org.apache.activemq.artemis.api.core.SimpleString;
+import org.apache.activemq.artemis.core.server.Queue;
+import org.apache.activemq.artemis.core.server.embedded.EmbeddedActiveMQ;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
@@ -60,21 +67,31 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.stubbing.Answer;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.assertj.AssertableApplicationContext;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.jms.config.DefaultJmsListenerContainerFactory;
+import org.springframework.jms.config.JmsListenerEndpointRegistry;
+import org.springframework.jms.config.SimpleJmsListenerEndpoint;
 import org.springframework.jms.connection.UserCredentialsConnectionFactoryAdapter;
 import org.springframework.jms.core.JmsTemplate;
+import org.springframework.jms.listener.AbstractMessageListenerContainer;
+import org.springframework.jms.listener.DefaultMessageListenerContainer;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
+import org.springframework.test.util.ReflectionTestUtils;
 
+import com.mulesoft.examples.websphere_mq.client.MqQueueSender;
 import com.mulesoft.examples.websphere_mq.config.IbmMqConfig;
 import com.mulesoft.examples.websphere_mq.support.HttpTestClient;
 
@@ -97,6 +114,19 @@ import com.mulesoft.examples.websphere_mq.support.HttpTestClient;
  *       {@code replyTo} channel: the connector's {@code disableReplyTo="true"} (websphere-mq.xml:7), carried as
  *       {@code ajax.disable-reply-to: true}, and flow {@code Input}'s deletion of {@code MULE_REPLYTO}
  *       (websphere-mq.xml:10-12) leave the rpc unanswered.</li>
+ *   <li>{@link #failureAfterTheOutSendRollsBackTheSendAndRedeliversTheInMessage()} plays the same page exchange
+ *       with a failure injected after the first real send to queue {@code out}, and proves on the embedded broker's
+ *       queue counters that flow {@code MessageProcessor} is one transaction: queue {@code in} ({@code ALWAYS_BEGIN})
+ *       and the send to queue {@code out} ({@code JOIN_IF_POSSIBLE}, websphere-mq.xml:16-22). The first output is
+ *       rolled back together with the receive, so the input is redelivered rather than sent again, exactly one
+ *       consume from {@code in} and one message on {@code out} commit, and the processed text reaches the dequeue
+ *       channel once, with nothing on {@code replyTo}.</li>
+ *   <li>{@link #inQueueListenerRunsOnTheSessionTransactedContainerTheTemplateJoins()} checks the wiring that
+ *       transaction rests on in the running application: the {@code in} listener container is session-transacted
+ *       with four consumers, exposes its session to the listener, has no transaction manager and shares its
+ *       {@code ConnectionFactory} instance with the session-transacted {@code jmsTemplate}; the {@code out}
+ *       container acknowledges on receipt without a transaction; and the
+ *       {@link IbmMqConfig#TRANSACTED_LISTENER_FACTORY} bean builds every container that way.</li>
  *   <li>The docroot page, the Mule Ajax JavaScript and the listener's no-listener 404 are fetched from the same
  *       running application.</li>
  *   <li>The IBM MQ factory configuration, which the embedded broker replaces at run time, is verified without a
@@ -153,6 +183,18 @@ class WebsphereMqBrokerTest {
     /** The original component's {@code appendString}, leading space included. */
     private static final String PROCESSED_SUFFIX = " - processed";
 
+    /** WMQ queue of flows {@code Input} and {@code MessageProcessor}, an embedded Artemis queue in profile test. */
+    private static final String IN_QUEUE = "in";
+
+    /** WMQ queue of flows {@code MessageProcessor} and {@code Output}, an embedded Artemis queue in profile test. */
+    private static final String OUT_QUEUE = "out";
+
+    /** Consumers per queue that the listener container factories configure: Mule 3.8's four receivers. */
+    private static final int ORIGINAL_CONSUMERS = 4;
+
+    /** Bound of each wait for the flows or the broker, as in the round-trip test. */
+    private static final Duration FLOW_TIMEOUT = Duration.ofSeconds(20);
+
     /**
      * Prefixes of the JVM-wide IBM client properties {@link IbmMqConfig#mqConnectionFactory} sets (transport budgets,
      * then log and trace locations) and of the configuration-file location the diagnostics tests set; they are
@@ -193,6 +235,30 @@ class WebsphereMqBrokerTest {
 
     @LocalServerPort
     int port;
+
+    /**
+     * The sender {@code InQueueListener} calls, as a spy that runs every real send; only the rollback test stubs it,
+     * for its own processed text, and the stubbing is reset after each test.
+     */
+    @SpyBean
+    MqQueueSender mqQueueSender;
+
+    /** Boot's embedded Artemis server, whose queue counters show what the broker committed. */
+    @Autowired
+    EmbeddedActiveMQ embeddedActiveMq;
+
+    /** Holds the containers of the two {@code @JmsListener} methods, as the running application started them. */
+    @Autowired
+    JmsListenerEndpointRegistry listenerEndpointRegistry;
+
+    /** The application's template, which the send to {@code out} uses on the {@code in} listener thread. */
+    @Autowired
+    JmsTemplate jmsTemplate;
+
+    /** The factory of the {@code in} listener container. */
+    @Autowired
+    @Qualifier(IbmMqConfig.TRANSACTED_LISTENER_FACTORY)
+    DefaultJmsListenerContainerFactory transactedListenerContainerFactory;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -253,6 +319,123 @@ class WebsphereMqBrokerTest {
                 .extracting(WebsphereMqBrokerTest::channel)
                 .as("channels of %s", deliveries)
                 .doesNotContain(replyTo);
+    }
+
+    /**
+     * Flow {@code MessageProcessor} is one transaction on the broker: a failure after the send to {@code out} has
+     * really been made rolls back that send together with the receive from {@code in}, and the broker redelivers the
+     * input. The page exchange is the round-trip test's; the spied sender fails once, after the real send of the
+     * first attempt, and only for this test's unique text. The embedded broker's queue counters are cumulative over
+     * the cached context and count a message only once its transaction has committed, so their changes from the
+     * idle queues before the publication to the end show what committed: one message added to {@code in} although
+     * it was processed twice, hence redelivered rather than sent again; one committed consume from {@code in}; and
+     * one message added to {@code out}, consumed by flow {@code Output}, so the first attempt's output was rolled
+     * back. The processed text arrives once on the dequeue channel, and nothing on {@code replyTo}.
+     */
+    @Test
+    void failureAfterTheOutSendRollsBackTheSendAndRedeliversTheInMessage() throws IOException {
+        String sent = "rollback-" + UUID.randomUUID();
+        String processed = sent + PROCESSED_SUFFIX;
+        AtomicInteger realSends = new AtomicInteger();
+        doAnswer(invocation -> {
+            Object result = invocation.callRealMethod();
+            if (realSends.incrementAndGet() == 1) {
+                throw new IllegalStateException("injected failure after the send to out");
+            }
+            return result;
+        }).when(mqQueueSender).sendToOut(processed);
+        QueueCounters inBefore = idleCounters(IN_QUEUE);
+        QueueCounters outBefore = idleCounters(OUT_QUEUE);
+        String clientId = handshakeClient();
+        String replyTo = ENQUEUE + "#" + clientId;
+        List<JsonNode> deliveries = new ArrayList<>(connect(clientId));
+        // Subscribed before the publication, so the dequeue channel delivers rather than caches the processed text.
+        subscribe(clientId, DEQUEUE);
+        subscribe(clientId, replyTo);
+
+        ObjectNode rpc = message(ENQUEUE).put("clientId", clientId);
+        rpc.putObject("data").put("data", sent).put("replyTo", replyTo);
+        assertSuccessful(reply(bayeux(batch(rpc)), ENQUEUE));
+
+        await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).pollInSameThread()
+                .untilAsserted(() -> {
+                    deliveries.addAll(connect(clientId));
+                    QueueCounters in = counters(IN_QUEUE);
+                    QueueCounters out = counters(OUT_QUEUE);
+                    assertThat(realSends).as("real sends of %s to %s", processed, OUT_QUEUE)
+                            .hasValueGreaterThanOrEqualTo(2);
+                    assertThat(in.acknowledged() - inBefore.acknowledged())
+                            .as("committed consumes from %s: %s", IN_QUEUE, in).isPositive();
+                    assertThat(out.acknowledged() - outBefore.acknowledged())
+                            .as("consumes from %s: %s", OUT_QUEUE, out).isPositive();
+                    assertThat(List.of(in, out)).as("queues %s and %s", IN_QUEUE, OUT_QUEUE)
+                            .allMatch(QueueCounters::isIdle);
+                    assertThat(deliveries).as("deliveries")
+                            .anyMatch(delivery -> isDequeueDelivery(delivery, processed));
+                });
+        // One more connect collects whatever was published after the processed text, a second output included.
+        deliveries.addAll(connect(clientId));
+        QueueCounters inAfter = counters(IN_QUEUE);
+        QueueCounters outAfter = counters(OUT_QUEUE);
+
+        verify(mqQueueSender, times(2)).sendToOut(processed);
+        assertThat(realSends).as("real sends of %s to %s, the first followed by the failure", processed, OUT_QUEUE)
+                .hasValue(2);
+        assertThat(inAfter.added() - inBefore.added())
+                .as("messages added to %s (before %s, after %s): the enqueue, redelivered once rolled back",
+                        IN_QUEUE, inBefore, inAfter)
+                .isEqualTo(1);
+        assertThat(inAfter.acknowledged() - inBefore.acknowledged())
+                .as("committed consumes from %s (before %s, after %s)", IN_QUEUE, inBefore, inAfter)
+                .isEqualTo(1);
+        assertThat(outAfter.added() - outBefore.added())
+                .as("messages committed to %s (before %s, after %s): the first send rolled back with the receive",
+                        OUT_QUEUE, outBefore, outAfter)
+                .isEqualTo(1);
+        assertThat(outAfter.acknowledged() - outBefore.acknowledged())
+                .as("consumes from %s (before %s, after %s)", OUT_QUEUE, outBefore, outAfter)
+                .isEqualTo(1);
+        assertThat(deliveries)
+                .filteredOn(delivery -> DEQUEUE.equals(channel(delivery)))
+                .extracting(delivery -> delivery.get("data"))
+                .as("data delivered on %s among %s", DEQUEUE, deliveries)
+                .containsExactly(TextNode.valueOf(processed));
+        assertThat(deliveries)
+                .extracting(WebsphereMqBrokerTest::channel)
+                .as("channels of %s", deliveries)
+                .doesNotContain(replyTo);
+    }
+
+    /**
+     * The wiring the transaction of flow {@code MessageProcessor} rests on, as the running application holds it. The
+     * container of the {@code in} listener is a {@link DefaultMessageListenerContainer} that is session-transacted
+     * ({@code ALWAYS_BEGIN}), runs four consumers, exposes its session to the listener thread and has no transaction
+     * manager, and its {@code ConnectionFactory} is the very instance of the session-transacted {@code jmsTemplate}:
+     * together these make the send to {@code out} reuse the listener's session ({@code JOIN_IF_POSSIBLE},
+     * websphere-mq.xml:16-22). The {@code out} container acknowledges on receipt without a transaction
+     * (websphere-mq.xml:25). Every container the {@link IbmMqConfig#TRANSACTED_LISTENER_FACTORY} bean builds is
+     * configured like the {@code in} one.
+     */
+    @Test
+    void inQueueListenerRunsOnTheSessionTransactedContainerTheTemplateJoins() {
+        DefaultMessageListenerContainer in = runningListenerContainer(IN_QUEUE);
+        DefaultMessageListenerContainer out = runningListenerContainer(OUT_QUEUE);
+
+        assertThat(jmsTemplate.isSessionTransacted()).as("jmsTemplate sessionTransacted").isTrue();
+        assertJoinedByTheTemplate(IN_QUEUE + " container", in);
+        assertThat(out.isSessionTransacted()).as("%s container sessionTransacted", OUT_QUEUE).isFalse();
+        assertThat(out.getSessionAcknowledgeMode()).as("%s container acknowledge mode", OUT_QUEUE)
+                .isEqualTo(Session.AUTO_ACKNOWLEDGE);
+        assertThat(out.getConnectionFactory()).as("%s container connectionFactory", OUT_QUEUE)
+                .isSameAs(jmsTemplate.getConnectionFactory());
+
+        SimpleJmsListenerEndpoint endpoint = new SimpleJmsListenerEndpoint();
+        endpoint.setId("transactedListenerContainerFactoryProbe");
+        endpoint.setDestination(IN_QUEUE);
+        endpoint.setMessageListener(message -> fail("A container built for inspection received %s", message));
+        DefaultMessageListenerContainer built = transactedListenerContainerFactory.createListenerContainer(endpoint);
+        assertThat(built.isRunning()).as("container built for inspection running").isFalse();
+        assertJoinedByTheTemplate("container built by " + IbmMqConfig.TRANSACTED_LISTENER_FACTORY, built);
     }
 
     @Test
@@ -728,6 +911,91 @@ class WebsphereMqBrokerTest {
         JsonNode reply = reply(bayeux(batch(subscribe)), SUBSCRIBE);
         assertSuccessful(reply);
         assertThat(reply.path("subscription").asText()).as(reply.toString()).isEqualTo(channel);
+    }
+
+    /** Performs the page's Bayeux handshake and returns the {@code clientId} the server assigned. */
+    private String handshakeClient() throws IOException {
+        ObjectNode handshake = message(HANDSHAKE).put("version", "1.0").put("minimumVersion", "0.9");
+        handshake.putArray("supportedConnectionTypes").add("long-polling");
+        JsonNode handshakeReply = reply(bayeux(batch(handshake)), HANDSHAKE);
+        assertSuccessful(handshakeReply);
+        String clientId = handshakeReply.path("clientId").asText();
+        assertThat(clientId).as(handshakeReply.toString()).isNotBlank();
+        return clientId;
+    }
+
+    /**
+     * The one running {@code @JmsListener} container of the registry that consumes {@code destination}, which must be
+     * a {@link DefaultMessageListenerContainer}.
+     */
+    private DefaultMessageListenerContainer runningListenerContainer(String destination) {
+        List<AbstractMessageListenerContainer> containers = listenerEndpointRegistry.getListenerContainers().stream()
+                .filter(AbstractMessageListenerContainer.class::isInstance)
+                .map(AbstractMessageListenerContainer.class::cast)
+                .filter(container -> destination.equals(container.getDestinationName()))
+                .toList();
+        assertThat(containers).as("listener containers of %s", destination).hasSize(1);
+        AbstractMessageListenerContainer container = containers.get(0);
+        assertThat(container.isRunning()).as("%s container running", destination).isTrue();
+        assertThat(container).as("%s container", destination).isInstanceOf(DefaultMessageListenerContainer.class);
+        return (DefaultMessageListenerContainer) container;
+    }
+
+    /**
+     * Asserts that a send of {@link #jmsTemplate} on the thread of a listener of {@code container} joins the
+     * listener's local transaction: the container's sessions are transacted and exposed to the listener, no
+     * transaction manager gives the template a session of its own, and the template looks the session up under the
+     * same {@code ConnectionFactory} instance. Also asserts the four consumers of the original.
+     *
+     * @param which     names the container in the assertion messages
+     * @param container the container to check
+     */
+    private void assertJoinedByTheTemplate(String which, DefaultMessageListenerContainer container) {
+        assertThat(container.isSessionTransacted()).as("%s sessionTransacted", which).isTrue();
+        assertThat(container.isExposeListenerSession()).as("%s exposeListenerSession", which).isTrue();
+        assertThat(ReflectionTestUtils.getField(container, "transactionManager"))
+                .as("%s transactionManager", which).isNull();
+        assertThat(container.getConnectionFactory()).as("%s connectionFactory", which)
+                .isSameAs(jmsTemplate.getConnectionFactory());
+        assertThat(container.getConcurrentConsumers()).as("%s concurrentConsumers", which)
+                .isEqualTo(ORIGINAL_CONSUMERS);
+        assertThat(container.getMaxConcurrentConsumers()).as("%s maxConcurrentConsumers", which)
+                .isEqualTo(ORIGINAL_CONSUMERS);
+    }
+
+    /** The current counters of the embedded broker's queue {@code name}. */
+    private QueueCounters counters(String name) {
+        Queue queue = embeddedActiveMq.getActiveMQServer().locateQueue(SimpleString.toSimpleString(name));
+        assertThat(queue).as("embedded Artemis queue %s", name).isNotNull();
+        return new QueueCounters(queue.getMessagesAdded(), queue.getMessagesAcknowledged(), queue.getMessageCount(),
+                queue.getDeliveringCount());
+    }
+
+    /**
+     * Waits until queue {@code name} holds no message, neither waiting nor in delivery, so that no earlier test's
+     * message is still on its way, and returns its counters then.
+     */
+    private QueueCounters idleCounters(String name) {
+        return await().atMost(FLOW_TIMEOUT).pollInterval(Duration.ofMillis(100)).pollInSameThread()
+                .until(() -> counters(name), QueueCounters::isIdle);
+    }
+
+    /**
+     * Counters of one embedded Artemis queue. {@code added} and {@code acknowledged} are cumulative and count a
+     * message only once the transaction that sent or consumed it has committed; {@code messageCount} includes the
+     * messages in delivery, which {@code delivering} counts.
+     *
+     * @param added        messages added to the queue
+     * @param acknowledged messages consumed from the queue
+     * @param messageCount messages on the queue
+     * @param delivering   messages delivered to a consumer and not yet acknowledged
+     */
+    private record QueueCounters(long added, long acknowledged, long messageCount, int delivering) {
+
+        /** Whether the queue holds no message, neither waiting nor in delivery. */
+        boolean isIdle() {
+            return messageCount == 0 && delivering == 0;
+        }
     }
 
     /** A Bayeux message on {@code channel} with the next message {@code id}. */

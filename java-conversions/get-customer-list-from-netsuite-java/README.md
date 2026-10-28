@@ -26,7 +26,7 @@ The listener binds to `0.0.0.0` on port `http.port`, default `8081` (`get-custom
 | any | `/customers` | URL query `lastName=<prefix>`; an empty value (`lastName=`) is accepted and matches every customer, as the original's `like '%'` did | `200 OK`, `Content-Type: text/html;charset=UTF-8`: `customer/index.html` (heading `Netsuite Customer List`, columns Last Name / First Name / Email) with one row per customer whose last name starts with the prefix, compared case-insensitively, ordered by last name | xml:8-35 |
 | any | `/customers` | `lastName=<prefix>` that no customer matches | `200 OK`, `Content-Type: text/html;charset=UTF-8`, the same page with the single row `No customers found` | xml:26-31 |
 | any | `/customers` | no `lastName` in the URL query, or `lastName` without `=` (`?lastName`) | `200 OK`, empty body, `Content-Length: 0`, no `Content-Type`; NetSuite is not called | expression filter, xml:9; filter-rejection platform default (AAP 0.4.7) |
-| any | `/customers` | a request whose NetSuite call fails through an approved connector failure mode | `502`, `429` or `503`, `Content-Type: application/json` (next section) | AAP 0.4.8 addition |
+| any | `/customers` | a request whose NetSuite call fails through an approved connector failure mode | `502`, `429` or `503`, `Content-Type: application/json` (Connector failure modes below) | AAP 0.4.8 addition |
 | any | `/customers` | any other failure: a missing or invalid `netsuite.*` setting, a query NetSuite rejects | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }` (SC-1) | platform default; the flow has no exception strategy |
 | any | any other path (`/customers/`, `/error` included) | any | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1) | the listener serves `/customers` only |
 | any | any path | a URL query with a malformed percent escape (`?lastName=%ZZ`) | `400 Bad Request`, empty body, `Connection: close`; Undertow rejects the request before the application runs | Undertow default |
@@ -87,7 +87,7 @@ No listener for endpoint: /customers/
 
 With dummy OAuth values, a throwaway key and `--netsuite.base-url=http://127.0.0.1:1` (a closed port), the same `lastName=a` request is answered `503 Service Unavailable` with `{ "message": "NetSuite is unreachable", "upstream": "NetSuite" }`.
 
-## Connector failure modes (AAP 0.4.8)
+### Connector failure modes (AAP 0.4.8)
 
 Every NetSuite call, the token request included, runs through SC-9 `client/UpstreamCallExecutor` and is classified by SC-16 `client/NetsuiteFailureClassifier`. These three responses are the only behaviour the original did not have.
 
@@ -102,7 +102,7 @@ Every NetSuite call, the token request included, runs through SC-9 `client/Upstr
 - `exception/UpstreamExceptionHandler` runs at the highest `@Order`, ahead of SC-1.
 - The connect and read timeouts are 10 s each (`netsuite.connect-timeout`, `netsuite.read-timeout`), the Mule default response timeout.
 
-## Query hardening (AAP 0.4.10)
+### Query hardening (AAP 0.4.10)
 
 The original concatenated `lastName` into its DSQL (xml:10). `service/NetsuiteCustomerService#customerQuery` builds the SuiteQL equivalent:
 
@@ -229,7 +229,7 @@ java -jar target/get-customer-list-from-netsuite-java-1.0.0-SNAPSHOT.jar
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2).
 
-## Live tests (Tier 2B)
+### Live tests (Tier 2B)
 
 `GetCustomersListFromNetsuiteIT` runs under failsafe (`mvn -B verify`) against a real NetSuite account.
 
@@ -242,7 +242,7 @@ java -jar target/get-customer-list-from-netsuite-java-1.0.0-SNAPSHOT.jar
 - It creates a customer with a unique last name (`Amuleit<millis>`) through the NetSuite REST record API.
 - It waits up to 60 s until `GET /customers?lastName=<that name>` answers 200 with the heading `<h1>Netsuite Customer List</h1>` and the customer's row.
 - It re-runs the original assertion: `GET /customers?lastName=a` contains `<h1>Netsuite Customer List</h1>`.
-- It deletes the customer in `finally`. The create is never retried.
+- It deletes the customer in `finally`. The create goes through `NetsuiteRestClient#createRecord` and SC-9, so it is retried exactly once after an HTTP 401: the cached token is evicted and the create is sent again, which is safe because NetSuite rejected the first request before processing it. A timeout or connectivity failure is never retried, nor is a 429 rate limit, and the test adds no retry of its own.
 
 While `application-it.yml` or one of the five keys is missing, blank or still `TODO`, the class is skipped by its `LiveCredentialsGate` condition, never failed, and NetSuite is not called. A skipped run is not Tier 2B evidence.
 
@@ -251,7 +251,7 @@ While `application-it.yml` or one of the five keys is missing, blank or still `T
 | Test class | What it asserts |
 |---|---|
 | `GetCustomersListFromNetsuiteTest` | the ported `GetCustomersListFromNetsuiteIT` (`get-customer-list-from-netsuite/src/test/java/org/mule/examples/GetCustomersListFromNetsuiteIT.java:33-34,64-66`) over HTTP against WireMock NetSuite: `GET /customers?lastName=a` returns 200 and contains `<h1>Netsuite Customer List</h1>`, with one token request and one SuiteQL request shaped as the clients send them |
-| `GetCustomersListFromNetsuiteIT` | the live-account test of the previous section (failsafe) |
+| `GetCustomersListFromNetsuiteIT` | the live-account test of Live tests above (failsafe) |
 | `controller/NetsuiteCustomerControllerTest` | on the wire through ST-1: the exact page bytes and `text/html;charset=UTF-8`; the same answer for `POST`, `PUT`, `PATCH`, `DELETE` and `OPTIONS`; the empty 200 without `Content-Type` for no `lastName`, a bare `?lastName` and a form-body `lastName`, with no NetSuite call; an empty `lastName` querying every customer; the `No customers found` row; a quote escaped inside the SuiteQL literal; `/unknown` → 404; 502 after one re-authentication, 429 with `Retry-After`, 503 on a timeout; another NetSuite failure → SC-1's 500 without retry |
 | `service/NetsuiteCustomerServiceTest` | the filter guard; the SuiteQL text and its escaping; rows rendered into the template in query order; the no-match row; `tableBody` with Groovy `tokenize` semantics, and its failure when no line follows the first; upstream failures propagated unchanged |
 | `mapper/CustomerHtmlMapperTest` | the exact DataWeave document for four customers, structurally equal to the original's `example.xml`; the single `No customers found` cell under `div`; `<td/>` for null or absent values; escaping; cell and row order |

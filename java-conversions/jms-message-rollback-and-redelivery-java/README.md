@@ -8,7 +8,7 @@ The original has one flow file, `src/main/app/jms-redelivery.xml`, the only `con
 
 Use case, restated from the original README (`README.md:9-10`, `README.md:39`): a JMS message received in a transaction fails with `MyException` on its first four deliveries. The rollback exception strategy rolls it back each time and the broker redelivers it; on the fifth delivery the message is published to topic `topic1` and the transaction commits.
 
-## Trigger and outputs
+## Endpoints and triggers
 
 There is no HTTP endpoint: `spring.main.web-application-type: none`.
 
@@ -53,22 +53,22 @@ The `broker.properties` form is `addressSettings.in.redeliveryDelay=0` and `addr
 
 ## Configuration keys
 
-`src/main/resources/application.yml`:
+`src/main/resources/application.yml` keys, read by `config/RedeliveryProperties`, `config/JmsConfig`, `trigger/InQueueListener`, `client/TopicPublisher` and Spring Boot, with the Java type each value binds to:
 
-| Key | Default | Original source | Notes |
-|---|---|---|---|
-| `spring.application.name` | `jms-message-rollback-and-redelivery-java` | none | application name in log lines |
-| `spring.main.web-application-type` | `none` | the original has no HTTP listener | the application opens no port |
-| `spring.artemis.broker-url` | `tcp://localhost:61616` | `failover:(tcp://localhost:61616)` on the `ActiveMQConnectionFactory` bean (`jms-redelivery.xml:13-16`) | Reconnection after a broker loss is handled by the listener container's recovery: the application starts without a broker and retries every 5000 ms, logging ERROR `Could not refresh JMS Connection for destination 'in' - retrying …`. Appending `?reconnectAttempts=-1` gives Artemis-client failover semantics closer to ActiveMQ's `failover:` |
-| `jms.inbound-queue` | `in` | `queue="in"` (`jms-redelivery.xml:22`) | queue `trigger/InQueueListener` consumes |
-| `jms.outbound-topic` | `topic1` | `topic="topic1"` (`jms-redelivery.xml:35`) | topic `client/TopicPublisher` publishes to |
-| `jms.concurrent-consumers` | `4` | Mule 3.8 JMS connector default; `jms-redelivery.xml:19` sets none | fixed consumer count of the listener container |
-| `redelivery.initial-redelivery-delay` | `5000` | `initialRedeliveryDelay` (`jms-redelivery.xml:8`) | milliseconds; pause before the rollback of delivery 1 |
-| `redelivery.redelivery-delay` | `2000` | `redeliveryDelay` (`jms-redelivery.xml:9`) | milliseconds; pause before the rollback of every later delivery |
-| `redelivery.maximum-redeliveries` | `5` | `maximumRedeliveries` (`jms-redelivery.xml:7`) | no pause above this count; the broker enforces the limit through `max-delivery-attempts` |
+| Key | Type | Default | Original source | Notes |
+|---|---|---|---|---|
+| `spring.application.name` | `String` | `jms-message-rollback-and-redelivery-java` | none | application name in log lines |
+| `spring.main.web-application-type` | `WebApplicationType` | `none` | the original has no HTTP listener | the application opens no port |
+| `spring.artemis.broker-url` | `String` | `tcp://localhost:61616` | `failover:(tcp://localhost:61616)` on the `ActiveMQConnectionFactory` bean (`jms-redelivery.xml:13-16`) | Reconnection after a broker loss is handled by the listener container's recovery: the application starts without a broker and retries every 5000 ms, logging ERROR `Could not refresh JMS Connection for destination 'in' - retrying …`. Appending `?reconnectAttempts=-1` gives Artemis-client failover semantics closer to ActiveMQ's `failover:` |
+| `jms.inbound-queue` | `String` | `in` | `queue="in"` (`jms-redelivery.xml:22`) | queue `trigger/InQueueListener` consumes |
+| `jms.outbound-topic` | `String` | `topic1` | `topic="topic1"` (`jms-redelivery.xml:35`) | topic `client/TopicPublisher` publishes to |
+| `jms.concurrent-consumers` | `int` | `4` | Mule 3.8 JMS connector default; `jms-redelivery.xml:19` sets none | fixed consumer count of the listener container |
+| `redelivery.initial-redelivery-delay` | `long` (milliseconds) | `5000` | `initialRedeliveryDelay` (`jms-redelivery.xml:8`) | milliseconds; pause before the rollback of delivery 1 |
+| `redelivery.redelivery-delay` | `long` (milliseconds) | `2000` | `redeliveryDelay` (`jms-redelivery.xml:9`) | milliseconds; pause before the rollback of every later delivery |
+| `redelivery.maximum-redeliveries` | `int` | `5` | `maximumRedeliveries` (`jms-redelivery.xml:7`) | no pause above this count; the broker enforces the limit through `max-delivery-attempts` |
 
-- There are no secrets and no TODO placeholders, because the original connects to the broker anonymously and reads no placeholder. Every key above is a default taken from a literal of the flow, so there is no original-to-new key map. If a broker needs credentials, supply Boot's `spring.artemis.user` and `spring.artemis.password` through the environment variables `SPRING_ARTEMIS_USER` and `SPRING_ARTEMIS_PASSWORD`, and never commit them.
-- `spring.artemis.mode` is intentionally unset. In production `artemis-jakarta-server` is absent, because the `pom.xml` scopes it to tests, so Boot selects `NATIVE` and connects to `spring.artemis.broker-url`. In tests, where it is on the classpath, Boot selects the embedded in-VM broker.
+- There are no secrets and no TODO placeholders, because the original connects to the broker anonymously and reads no placeholder. Every key above is a default taken from a literal of the flow, so there is no original-to-new key map. If a broker needs credentials, supply Boot's `spring.artemis.user` and `spring.artemis.password` (both `String`) through the environment variables `SPRING_ARTEMIS_USER` and `SPRING_ARTEMIS_PASSWORD`, and never commit them.
+- `spring.artemis.mode` (`ArtemisMode`) is intentionally unset. In production `artemis-jakarta-server` is absent, because the `pom.xml` scopes it to tests, so Boot selects `NATIVE` and connects to `spring.artemis.broker-url`. In tests, where it is on the classpath, Boot selects the embedded in-VM broker.
 
 Override on the command line, for example `java -jar target/jms-message-rollback-and-redelivery-java-1.0.0-SNAPSHOT.jar --spring.artemis.broker-url=tcp://broker.example.com:61616`.
 
@@ -87,18 +87,27 @@ Override on the command line, for example `java -jar target/jms-message-rollback
 | `mule-deploy.properties` (loads `jms-redelivery.xml`) | `com.mulesoft.examples.jms_message_rollback_and_redelivery.JmsMessageRollbackAndRedeliveryApplication` |
 | `JmsMessageRollbackAndRedeliveryIT` (`FunctionalTestCase`, embedded ActiveMQ `BrokerService`) | `JmsMessageRollbackAndRedeliveryTest` (`@SpringBootTest`, embedded Artemis) |
 
-## Behaviours externalized or not reproduced
+## Behaviours stubbed or externalized
+
+Externalized behaviour, and behaviour of the original that is not reproduced:
 
 - The ActiveMQ 5 client (`activemq-all` 5.10.0) is replaced by the Artemis Jakarta client. Both the original IT's embedded `BrokerService` and an external ActiveMQ are replaced by Artemis: embedded in tests, external at runtime.
 - The Mule `jms:activemq-connector maxRedelivery="5"` check is not reproduced. Mule raises its redelivery-exceeded error only when the redelivery count exceeds 5, which never happens here because delivery 5 succeeds. The original README's step 8 (removing `maxRedelivery`, `README.md:43`) describes a Mule-connector-only variation with no counterpart; the broker-side limit is `max-delivery-attempts`. A message reaches that limit only when deliveries are lost to an application crash during a pause; the broker then moves it to the dead-letter address unpublished.
-- The ActiveMQ admin console steps of the original README (`README.md:37,41`) are replaced by sending a text message to `in` with any JMS client. With the Artemis CLI, subscribe to `topic1` first, because the topic is non-durable, then send:
+- The ActiveMQ admin console steps of the original README (`README.md:37,41`) are replaced by sending a text message to `in` with any JMS client. With the Artemis CLI, use two terminals, because the consumer blocks until its message arrives.
+
+  Terminal 1 — subscribe to `topic1` first (non-durable topic: only a subscription made before the publish receives the message) and leave it waiting; it prints `Consumer ActiveMQTopic[topic1], thread=0 wait until 1 messages are consumed`:
 
   ```sh
-  artemis consumer --destination topic://topic1 --message-count 1 --url tcp://localhost:61616
+  artemis consumer --verbose --destination topic://topic1 --message-count 1 --url tcp://localhost:61616
+  ```
+
+  Terminal 2 — once terminal 1 shows it is waiting for messages, send:
+
+  ```sh
   artemis producer --destination queue://in --message-count 1 --message Message123 --url tcp://localhost:61616
   ```
 
-  The application logs the rollback line four times, 5000 ms and then 2000 ms apart, then `Transaction without errors`, and the consumer receives `Message123`.
+  The application logs the rollback line four times, 5000 ms and then 2000 ms apart, then `Transaction without errors`, and the consumer receives `Message123`. Terminal 1 then prints `Consumer ActiveMQTopic[topic1], thread=0 Received Message123` (`--verbose` makes it print the received text) and exits.
 
 Studio metadata (`mule-project.xml`, `catalog/`) and `log4j2.xml` are not carried (AAP 0.2.2).
 

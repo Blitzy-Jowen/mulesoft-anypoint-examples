@@ -32,9 +32,11 @@ import java.util.Base64;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -64,6 +66,7 @@ import com.mulesoft.examples.get_customer_list_from_netsuite.support.HttpTestCli
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class GetCustomersListFromNetsuiteTest {
 
     private static final String LAST_NAME_VALUE = "a";
@@ -88,8 +91,16 @@ class GetCustomersListFromNetsuiteTest {
      */
     private static final WireMockServer NETSUITE = startNetsuiteStub();
 
-    /** PKCS#8 PEM file of an RSA key generated for this run; it signs the token request's client assertion. */
-    private static final Path PRIVATE_KEY_PEM = writeGeneratedPrivateKey();
+    /*
+     * Holds the generated key file. JUnit injects it before the Spring context starts and deletes it when the class's
+     * extension context closes, which follows SpringExtension.afterAll, where @DirtiesContext closes the context that
+     * reads the key.
+     */
+    @TempDir
+    static Path keyDirectory;
+
+    /** PKCS#8 PEM file of an RSA key generated for this class; written by {@link #privateKeyPem()} on first use. */
+    private static Path privateKey;
 
     @LocalServerPort
     private int port;
@@ -100,7 +111,7 @@ class GetCustomersListFromNetsuiteTest {
     @DynamicPropertySource
     static void netsuiteProperties(DynamicPropertyRegistry registry) {
         registry.add("netsuite.base-url", NETSUITE::baseUrl);
-        registry.add("netsuite.oauth.private-key-path", () -> PRIVATE_KEY_PEM.toString());
+        registry.add("netsuite.oauth.private-key-path", () -> privateKeyPem().toString());
     }
 
     @AfterAll
@@ -155,22 +166,32 @@ class GetCustomersListFromNetsuiteTest {
     }
 
     /**
-     * Generates an RSA-2048 key pair and writes its private key as the unencrypted PKCS#8 PEM file the token
-     * provider reads, in a temporary directory removed when the JVM exits.
+     * The key file the {@code netsuite.oauth.private-key-path} supplier names, written into {@link #keyDirectory} on
+     * the first call; every later resolution of the property reuses that file.
      */
-    private static Path writeGeneratedPrivateKey() {
+    private static synchronized Path privateKeyPem() {
+        if (privateKey == null) {
+            if (keyDirectory == null) {
+                throw new IllegalStateException("JUnit has not injected the @TempDir key directory");
+            }
+            privateKey = writeGeneratedPrivateKey(keyDirectory);
+        }
+        return privateKey;
+    }
+
+    /**
+     * Generates an RSA-2048 key pair and writes its private key as the unencrypted PKCS#8 PEM file the token
+     * provider reads, in {@code directory}.
+     */
+    private static Path writeGeneratedPrivateKey(Path directory) {
         try {
             KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
             generator.initialize(2048);
             byte[] pkcs8 = generator.generateKeyPair().getPrivate().getEncoded();
             String base64 = Base64.getMimeEncoder(64, "\n".getBytes(StandardCharsets.US_ASCII)).encodeToString(pkcs8);
-            Path directory = Files.createTempDirectory("netsuite-test-key");
-            // Registered before the file, so the JVM deletes the file first and then the emptied directory.
-            directory.toFile().deleteOnExit();
             Path pem = directory.resolve("netsuite-test-key.pem");
             Files.writeString(pem, "-----BEGIN PRIVATE KEY-----\n" + base64 + "\n-----END PRIVATE KEY-----\n",
                     StandardCharsets.US_ASCII);
-            pem.toFile().deleteOnExit();
             return pem;
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot write the generated NetSuite test key", e);

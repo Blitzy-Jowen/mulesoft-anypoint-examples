@@ -156,8 +156,9 @@ Status: `default` — a non-secret value, overridable; `TODO` — no value (`${E
 - Override on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`):
 
   ```sh
-  TSHIRT_API_KEY=<key> mvn spring-boot:run -Dspring-boot.run.arguments=--http.port=9090
-  TSHIRT_API_KEY=<key> java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT.jar --tshirt.service-address=http://localhost:8089
+  # replace <key> with the T-shirt service API key, keeping the quotes
+  TSHIRT_API_KEY='<key>' mvn spring-boot:run -Dspring-boot.run.arguments=--http.port=9090
+  TSHIRT_API_KEY='<key>' java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT.jar --tshirt.service-address=http://localhost:8089
   ```
 
 ## Mule-to-Java mapping
@@ -203,8 +204,9 @@ Run from `java-conversions/web-service-consumer-java/`:
 mvn -B clean install    # build, surefire tests, JaCoCo check, repackaged jar installed locally
 mvn -B clean package    # build, surefire tests, JaCoCo report and check (LINE >= 0.80 over service/** and mapper/**)
 mvn -B test             # surefire tests only; credential-free, WireMock stands in for the T-shirt service
-TSHIRT_API_KEY=<key> mvn spring-boot:run    # listener on 0.0.0.0:8081
-TSHIRT_API_KEY=<key> java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT.jar
+# replace <key> with the T-shirt service API key, keeping the quotes
+TSHIRT_API_KEY='<key>' mvn spring-boot:run    # listener on 0.0.0.0:8081
+TSHIRT_API_KEY='<key>' java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT.jar
 ```
 
 - There is no `mvn verify` live tier: the project has no failsafe plugin and no `*IT` class, because it calls no vendor system with sandbox credentials (Tier 2B `N/A`).
@@ -244,7 +246,7 @@ Each shared component is a copy of its reference implementation with only the `p
 | ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` |
 | ST-2 | `FixtureParityTest` (test), `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` |
 
-A change to `DwXmlWriter` or `DwXmlToJson` is made here first and then copied to every consumer. `config/PreflightDispatchConfig` is the CORS pre-flight class that 32 HTTP projects carry (`DECISIONS.md` section 9, verification points).
+A change to `DwXmlWriter` or `DwXmlToJson` is made here first and then copied to every consumer. `config/PreflightDispatchConfig` is the CORS pre-flight class that 37 HTTP projects carry, this one included (`DECISIONS.md` section 9, verification points).
 
 ## Fixture parity (ST-2)
 

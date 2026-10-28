@@ -101,20 +101,22 @@ The carried `src/main/resources/Hospital-Admission-Example-soapui-project.xml`, 
 
 Every key of `src/main/resources/application.yml`. The original reads one placeholder, `http.port`, and its `mule-app.properties` defines no key.
 
-| Key | Default | Source in the original | Purpose |
-|---|---|---|---|
-| `http.port` | `8081` | `http.port=8081` in `xml-only-soap-webservice/src/main/resources/config.dev.properties:1`, read by both `HTTP_Listener_Configuration` and `HTTP_Request_Configuration` (`Hospital_Admissions_SOA.xml:16-17`) | the listener port; `server.port` and, until the server is bound, `http.request.port` resolve from it |
-| `http.request.host` | `localhost` | `HTTP_Request_Configuration host="0.0.0.0"` (`Hospital_Admissions_SOA.xml:17`) | host of the two internal SOAP calls. As a destination, `0.0.0.0` means "this host", but not every OS accepts it as one; `localhost` reaches the same local listener everywhere. |
-| `http.request.port` | `${local.server.port:${http.port}}` | `HTTP_Request_Configuration port="${http.port}"` (`Hospital_Admissions_SOA.xml:17`) | port of the two internal calls, read at call time: the port Undertow bound once it has started, so a `RANDOM_PORT` test calls its own listener, and `http.port` before that. The client tests point `http.request.host` and `http.request.port` at WireMock. |
-| `http.request.response-timeout` | `10000` (milliseconds) | none declared, so Mule's default `http:request` response timeout | connect and read timeout of the shared `WebServiceTemplate`; it must be positive, because zero would wait forever |
-| `server.port` | `${http.port:8081}` | `HTTP_Listener_Configuration port="${http.port}"` (`Hospital_Admissions_SOA.xml:16`) | set `http.port` rather than this key |
-| `server.address` | `0.0.0.0` | `HTTP_Listener_Configuration host="0.0.0.0"` (`Hospital_Admissions_SOA.xml:16`) | bind host of the listener |
-| `spring.application.name` | `xml-only-soap-webservice-java` | none | application name in log lines |
-| `spring.web.resources.add-mappings` | `false` | none | no static-resource handler answers any path |
-| `spring.webservices.servlet.init` | `dispatchOptionsRequest: "true"`, `dispatchTraceRequest: "true"` (servlet init-params, so strings) | no listener declares `allowedMethods` (`Hospital_Admissions_SOA.xml:20`, `mocks.xml:5,46`) | `OPTIONS` and `TRACE` reach `SoapListenerBoundaryAdapter` like every other method |
-| `spring.autoconfigure.exclude` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | no Boot `/error` endpoint; `WebServiceConfig.ListenerPathFilter` alone owns the no-listener 404, `/error` included |
-| `logging.level.org.springframework.ws.client.MessageTracing` | `INFO` | none: `Hospital_Admissions_SOA.xml` and `mocks.xml` declare no logger | its `.sent`/`.received` `TRACE` write every SOAP envelope the `PatientService` and `EHRService` clients exchange: `upsertPatient` carries the `Subject` |
-| `logging.level.org.springframework.ws.server.MessageTracing` | `INFO` | none | the same envelopes as `AdmissionService` and the two mocks receive and answer them |
+The Type column gives the Java type each value binds to, taken from the code or the Spring Boot property that reads it.
+
+| Key | Type | Default | Source in the original | Purpose |
+|---|---|---|---|---|
+| `http.port` | `int` | `8081` | `http.port=8081` in `xml-only-soap-webservice/src/main/resources/config.dev.properties:1`, read by both `HTTP_Listener_Configuration` and `HTTP_Request_Configuration` (`Hospital_Admissions_SOA.xml:16-17`) | the listener port; `server.port` and, until the server is bound, `http.request.port` resolve from it |
+| `http.request.host` | `String` | `localhost` | `HTTP_Request_Configuration host="0.0.0.0"` (`Hospital_Admissions_SOA.xml:17`) | host of the two internal SOAP calls. As a destination, `0.0.0.0` means "this host", but not every OS accepts it as one; `localhost` reaches the same local listener everywhere. |
+| `http.request.port` | `String` (a port number, read with `Environment.getRequiredProperty` on every call) | `${local.server.port:${http.port}}` | `HTTP_Request_Configuration port="${http.port}"` (`Hospital_Admissions_SOA.xml:17`) | port of the two internal calls, read at call time: the port Undertow bound once it has started, so a `RANDOM_PORT` test calls its own listener, and `http.port` before that. The client tests point `http.request.host` and `http.request.port` at WireMock. |
+| `http.request.response-timeout` | `long` (milliseconds) | `10000` (milliseconds) | none declared, so Mule's default `http:request` response timeout | connect and read timeout of the shared `WebServiceTemplate`; it must be positive, because zero would wait forever |
+| `server.port` | `Integer` | `${http.port:8081}` | `HTTP_Listener_Configuration port="${http.port}"` (`Hospital_Admissions_SOA.xml:16`) | set `http.port` rather than this key |
+| `server.address` | `InetAddress` | `0.0.0.0` | `HTTP_Listener_Configuration host="0.0.0.0"` (`Hospital_Admissions_SOA.xml:16`) | bind host of the listener |
+| `spring.application.name` | `String` | `xml-only-soap-webservice-java` | none | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | no static-resource handler answers any path |
+| `spring.webservices.servlet.init` | `Map<String, String>` (servlet init-parameter name to value) | `dispatchOptionsRequest: "true"`, `dispatchTraceRequest: "true"` (servlet init-params, so strings) | no listener declares `allowedMethods` (`Hospital_Admissions_SOA.xml:20`, `mocks.xml:5,46`) | `OPTIONS` and `TRACE` reach `SoapListenerBoundaryAdapter` like every other method |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | no Boot `/error` endpoint; `WebServiceConfig.ListenerPathFilter` alone owns the no-listener 404, `/error` included |
+| `logging.level.org.springframework.ws.client.MessageTracing` | `LogLevel` | `INFO` | none: `Hospital_Admissions_SOA.xml` and `mocks.xml` declare no logger | its `.sent`/`.received` `TRACE` write every SOAP envelope the `PatientService` and `EHRService` clients exchange: `upsertPatient` carries the `Subject` |
+| `logging.level.org.springframework.ws.server.MessageTracing` | `LogLevel` | `INFO` | none | the same envelopes as `AdmissionService` and the two mocks receive and answer them |
 
 - `spring.webservices.path` is not set and stays at Boot's default: `WebServicesProperties` rejects `/` ("Path must have length greater than 1"), so the application would not start. `WebServiceConfig` maps `messageDispatcherServlet` to exactly `/AdmissionService`, `/PatientService` and `/EHRService`, whatever its initial mapping.
 - The two `logging.level` keys keep the patient's `Subject` (`nationalId`, names, address, `dateOfBirth`) out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`. The original had no logger, so it logged none of it. The nested `UnderRootTrace` run of `controller/AdmissionServiceEndpointTest` asserts this.

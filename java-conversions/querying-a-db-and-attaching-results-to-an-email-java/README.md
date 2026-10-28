@@ -151,7 +151,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 
 - Test profile: `src/test/resources/application-test.yml` (Spring profile `test`, activated with `@ActiveProfiles("test")`) points `jdbc.url` at H2 in MySQL mode (`jdbc:h2:mem:company-${random.uuid};MODE=MySQL;DATABASE_TO_LOWER=TRUE;IGNORECASE=TRUE;DB_CLOSE_DELAY=-1`, one in-memory database per test context), `smtp.host` at `localhost` with `smtp.port` `3025` (each test replaces it with its GreenMail server's dynamic port), `smtp.user` and `smtp.password` at the demo GreenMail user the tests register, `mail.from` and `mail.to` at that user's address, as the original test sent to and from its own account (`QueryingDbAndAttachingResultsToAnEmailIT.java:118-119`), and `mail.subject` at the original test's `Mule flow completed!`. It turns STARTTLS off, because GreenMail's SMTP is plain text. It holds no real host, account or credential, and the project has no `application-it.yml`, because it calls no vendor system.
 
-## Database setup
+### Database setup
 
 `src/main/resources/import_orders.sql` is the original script copied unchanged. It creates database `company` and a password-protected application user granted access to it, then tables `employees` (102 rows) and `roles` (100 rows). Spring never runs it (`spring.sql.init.mode: never`).
 

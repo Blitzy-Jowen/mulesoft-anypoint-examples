@@ -32,6 +32,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration;
 import org.springframework.boot.autoconfigure.jdbc.JdbcTemplateAutoConfiguration;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.jdbc.CannotGetJdbcConnectionException;
@@ -51,7 +52,8 @@ import ch.qos.logback.core.read.ListAppender;
  * {@link UnconfiguredDataSource} as the only {@code DataSource}, logs exactly one WARN naming {@code jdbc.url} and
  * {@code JDBC_URL} without any value, and makes the {@code JdbcTemplate}'s first query fail with Spring's
  * {@link CannotGetJdbcConnectionException} around the data source's {@link SQLNonTransientConnectionException}. A
- * configured URL leaves Spring Boot's Hikari pool in place and logs nothing.
+ * configured URL leaves Spring Boot's Hikari pool in place and logs nothing; with the classpath
+ * {@code application.yml} loaded, that pool carries the file's fail-fast connection and validation timeouts.
  *
  * <p>The URL is set through a {@link MapPropertySource} rather than {@code withPropertyValues}, which trims values,
  * so whitespace-only URLs reach the condition unchanged. The log oracle is a Logback {@link ListAppender} on
@@ -136,6 +138,27 @@ class DataSourceConfigTest {
         });
 
         assertTrue(appender.list.isEmpty(), appender.list::toString);
+    }
+
+    /**
+     * With the classpath {@code application.yml} loaded and only {@code jdbc.url} supplied, as a deployment supplies
+     * it, Boot's Hikari pool carries that file's {@code spring.datasource.hikari} timeouts instead of HikariCP's
+     * defaults of 30000 ms and 5000 ms, so a request gives up on an unreachable database after 1000 ms.
+     */
+    @Test
+    void configuredUrlAppliesApplicationYmlPoolTimeouts() {
+        contextRunner.withInitializer(new ConfigDataApplicationContextInitializer())
+                .withInitializer(context -> context.getEnvironment().getPropertySources()
+                        .addFirst(new MapPropertySource("jdbcUrl", Map.of("jdbc.url", H2_URL))))
+                .run(context -> {
+                    assertNull(context.getStartupFailure());
+                    HikariDataSource dataSource =
+                            assertInstanceOf(HikariDataSource.class, context.getBean(DataSource.class));
+                    assertEquals(H2_URL, dataSource.getJdbcUrl());
+                    assertEquals(1000, dataSource.getConnectionTimeout());
+                    assertEquals(500, dataSource.getValidationTimeout());
+                    assertEquals(1, context.getBean(JdbcTemplate.class).queryForObject("select 1", Integer.class));
+                });
     }
 
     private ApplicationContextRunner withDataSourceUrl(String url) {

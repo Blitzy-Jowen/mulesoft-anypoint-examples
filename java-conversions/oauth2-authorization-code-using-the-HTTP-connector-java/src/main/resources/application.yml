@@ -11,7 +11,8 @@ spring:
     name: oauth2-authorization-code-using-the-HTTP-connector-java
   web:
     resources:
-      add-mappings: false            # SC-1: unknown paths reach GlobalExceptionHandler (no-listener 404)
+      # No static resource handler: a path the routes admit but no controller maps would get SC-1's no-listener 404.
+      add-mappings: false            # every admitted path has a controller; SC-10 answers every other path first
   mvc:
     dispatch-trace-request: true     # the listeners declare no allowedMethods: TRACE is accepted too
 

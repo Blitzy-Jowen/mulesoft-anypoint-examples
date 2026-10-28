@@ -16,6 +16,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
@@ -25,7 +26,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
@@ -142,9 +142,9 @@ class ImportLeadsToSfdcIT {
 
     /**
      * Every Lead ID read back for {@link #EMAIL1} or {@link #EMAIL2}, deleted in {@link #tearDown()}; static, as the
-     * original's list. Copy-on-write because Awaitility evaluates its conditions, which add to it, on its own thread.
+     * original's list. Touched only from the test thread, because {@link #awaitLead(String, Duration)} polls in it.
      */
-    private static final CopyOnWriteArrayList<String> leadIds = new CopyOnWriteArrayList<>();
+    private static final List<String> leadIds = new ArrayList<>();
 
     @TempDir
     static Path tempDir;
@@ -158,8 +158,8 @@ class ImportLeadsToSfdcIT {
     /** Whether {@code leads.csv} reached the input directory, so the job may have created Leads. */
     private boolean fileDropped;
 
-    /** Whether the latest Lead query threw; written on Awaitility's thread, read in {@link #tearDown()}. */
-    private volatile boolean lastQueryFailed;
+    /** Whether the latest Lead query threw; written by {@link #findLead(String)}, read in {@link #tearDown()}. */
+    private boolean lastQueryFailed;
 
     /*
      * The same check LiveCredentialsGate makes. The gate is what reports the class as skipped; this assumption still
@@ -261,18 +261,37 @@ class ImportLeadsToSfdcIT {
     }
 
     /**
-     * Waits until the query for {@code email} returns a Lead.
+     * Waits up to {@link #IMPORT_TIMEOUT} until the query for {@code email} returns a Lead, as
+     * {@link #awaitLead(String, Duration)} does.
+     *
+     * @return the first matching Lead, standing in for the original's {@code query-single}
+     */
+    private Map<String, Object> awaitLead(String email) {
+        return awaitLead(email, IMPORT_TIMEOUT);
+    }
+
+    /**
+     * Waits up to {@code timeout} until the query for {@code email} returns a Lead.
+     *
+     * <p>Polled on the test thread: each query adds to {@link #leadIds}, which {@link #tearDown()} deletes and
+     * clears, and a query still running on Awaitility's own thread after a timeout could add an ID once the cleanup
+     * is done, leaving that Lead behind. On the test thread no query outlives the wait, so the wait returns or throws
+     * only once every ID its queries read back is in the list. Every Salesforce call a query makes is bounded by the
+     * client's 10 s connect and read timeouts, so a round can overrun the timeout by no more than those allow.
      *
      * <p>Exceptions are deliberately not ignored: a failing query (for example a rejected login) fails the test at
      * once with the vendor's exception, because repeating it every few seconds would repeat failed logins against
      * the reused sandbox user and count towards its lockout. The client's executor already re-logs in once after an
      * expired session.
      *
+     * @param email   the e-mail the Lead is queried by
+     * @param timeout how long the wait polls; a query still running when it passes completes, and its answer counts
      * @return the first matching Lead, standing in for the original's {@code query-single}
      */
-    private Map<String, Object> awaitLead(String email) {
+    Map<String, Object> awaitLead(String email, Duration timeout) {
         List<Map<String, Object>> leads = await("Lead " + email + " imported into Salesforce")
-                .atMost(IMPORT_TIMEOUT)
+                .atMost(timeout)
+                .pollInSameThread()
                 .pollDelay(Duration.ZERO)
                 .pollInterval(QUERY_POLL_INTERVAL)
                 .until(() -> findLead(email), found -> !found.isEmpty());
@@ -294,8 +313,8 @@ class ImportLeadsToSfdcIT {
         lastQueryFailed = false;
         for (Map<String, Object> lead : leads) {
             Object id = lead.get(ID);
-            if (id != null) {
-                leadIds.addIfAbsent(id.toString());
+            if (id != null && !leadIds.contains(id.toString())) {
+                leadIds.add(id.toString());
             }
         }
         return leads;

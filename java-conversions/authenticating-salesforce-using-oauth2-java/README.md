@@ -71,7 +71,7 @@ Tier 2A verification points: the plan chose these values where the original plat
 - The absent `Content-Type` of the `200` text, because the flow's `set-payload` names no MIME type and the Mule listener sent none for such a payload.
 - The callback-error 500 body, and the 404 default.
 
-## Connector failure modes (AAP 0.4.8)
+### Connector failure modes (AAP 0.4.8)
 
 Every Salesforce call (the code exchange, the refresh grant and the contact query) runs through SC-9 `client/UpstreamCallExecutor` with `upstream` `Salesforce`. `client/SalesforceFailureClassifier` classifies the Partner API failures. These responses are the only behaviour the original did not have.
 
@@ -201,7 +201,7 @@ java -jar target/authenticating-salesforce-using-oauth2-java-1.0.0-SNAPSHOT.jar
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
-## Live test (Tier 2B)
+### Live test (Tier 2B)
 
 `SalesforceOauthIT` runs under failsafe (`mvn -B verify`) against the existing Salesforce org and connected app, reusing the existing credentials; no new sandbox is needed.
 
@@ -225,7 +225,7 @@ java -jar target/authenticating-salesforce-using-oauth2-java-1.0.0-SNAPSHOT.jar
 | `service/SalesforceOAuthServiceTest` | the authorization URL and `redirect_uri` from the original connector settings, its encoding and parameter order; the redirect without a token; the callback exchange, token storage and query; refresh renewal, a refresh without a refresh token or refused by Salesforce (token cleared, next `/` redirects), other refresh failures (token kept); a rejected session whose refresh error body stalls or is reset, through the real token and Partner API clients → unavailable, token kept, nothing retried; callbacks with an error, without a code, with a failed exchange or an incomplete token response (nothing stored); masked tokens |
 | `service/ContactQueryServiceTest` | the original SOQL run exactly once; three contacts counted and each logged at INFO in record order; zero contacts; upstream and Partner API failures reaching the caller as the same instance |
 | `client/SalesforceTokenClientTest` | against a WireMock token endpoint: the authorization-code and refresh-token forms in order; every token field parsed; error bodies, an absent or unreadable one included → `TokenEndpointException`; a read timeout, a connection reset and a closed port → unavailable with the socket's own message, never retried. Against a raw loopback endpoint (`support/LoopbackHttpStub`), for both grants: an error status whose body then stalls past the read timeout or is reset → unavailable with the socket's own message, one request |
-| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login mode, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, `HashMap` records; session mode without login, one refresh and retry after `INVALID_SESSION_ID`, rebuild on a changed session; the failure modes per operation; the 10 s default timeouts |
+| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login mode, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, `HashMap` records; session mode without login, one refresh and retry after `INVALID_SESSION_ID`, rebuild on a changed session; the failure modes per operation; the 10 s default timeouts; concurrent callers sharing the one login, re-login or session refresh in flight, its timeout included; paging that fails, with no further `queryMore`, on a repeated query locator, records beyond the reported size or pages beyond what that size allows |
 | `client/SalesforceFailureClassifierTest`, `client/UpstreamCallExecutorTest`, `exception/UpstreamExceptionHandlerTest` | SC-9 and the Salesforce classification: one re-authentication and retry on `INVALID_SESSION_ID`, no retry on `REQUEST_LIMIT_EXCEEDED` (no `Retry-After`) or on any timeout or connectivity cause, a failed re-authentication ending the attempt, the 502/429/503 bodies and precedence over a catch-all advice |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
@@ -266,9 +266,9 @@ java -jar target/authenticating-salesforce-using-oauth2-java-1.0.0-SNAPSHOT.jar
 
 This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 889 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`SalesforceOauthIT`, no `application-it.yml`).
-- `mvn -B test`: `BUILD SUCCESS`; 889 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 93 of 93 lines (100.0%) of `service/SalesforceOAuthService` (with its nested records) and `service/ContactQueryService`; the project has no `mapper` package. Total project LINE coverage: 96.5% (882 of 914 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 898 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`SalesforceOauthIT`, no `application-it.yml`).
+- `mvn -B test`: `BUILD SUCCESS`; 898 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 93 of 93 lines (100.0%) of `service/SalesforceOAuthService` (with its nested records) and `service/ContactQueryService`; the project has no `mapper` package. Total project LINE coverage: 96.2% (920 of 956 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=11`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `SalesforceOauthIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 
@@ -287,4 +287,3 @@ The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never 
 ## Licence
 
 Apache License 2.0. `LICENSE` and `NOTICE` are copied unchanged from `authenticating-salesforce-using-oauth2/`.
-

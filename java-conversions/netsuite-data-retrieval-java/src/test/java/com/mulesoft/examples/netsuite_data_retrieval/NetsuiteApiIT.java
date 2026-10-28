@@ -62,10 +62,12 @@ import com.mulesoft.examples.netsuite_data_retrieval.support.NetsuiteTestRecords
  * {@link NetsuiteTestRecords#deleteCustomerInNetsuite} deletes it in {@code finally}. When the create's answer is lost
  * or carries no record ID, the cleanup finds the customer by that external ID and deletes it, so neither a failed
  * assertion nor an unknown create outcome leaves this run's customer in the account, and no other customer is
- * touched. The create is never retried: {@link NetsuiteRestClient} repeats a request only after a 401, which NetSuite
- * answers before processing it, and the cleanup only looks up and deletes. The request is repeated until the new
- * customer appears, because SuiteQL may list a record shortly after it is created. The opportunities and items
- * searches are read-only.
+ * touched. The create goes through {@link NetsuiteRestClient#createRecord} and its SC-9 executor, so it is retried
+ * exactly once after an HTTP 401: the cached token is evicted and the create is sent again, which is safe because
+ * NetSuite rejected the first request before processing it. A timeout or connectivity failure is never retried, nor is
+ * a 429 rate limit, the test adds no retry of its own, and the cleanup only looks up and deletes. The request is
+ * repeated until the new customer appears, because SuiteQL may list a record shortly after it is created. The
+ * opportunities and items searches are read-only.
  *
  * <p>Every select custom field a response carries ({@code SelectCustomFieldRef__*},
  * {@code MultiSelectCustomFieldRef__*}) must hold a {@code typeId} that is a NetSuite internal ID, the Tier 2B evidence

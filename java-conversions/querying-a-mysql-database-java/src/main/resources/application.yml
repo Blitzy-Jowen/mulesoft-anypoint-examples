@@ -22,6 +22,13 @@ spring:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
   datasource:
     url: ${jdbc.url}    # original db:generic-config url key bound to Boot's DataSource (AAP 0.6.6); credentials stay inside the URL
+    # db:generic-config declares no pooling profile, so the original's non-pooled data source failed a request as soon
+    # as its connection was refused. HikariCP's 30000 ms default would hold every request 30 s while the database is
+    # unreachable; 1000 ms bounds that and leaves headroom for pool-borrow waits under load. HikariCP rejects values
+    # below 250 ms and reads 0 as no limit.
+    hikari:
+      connection-timeout: 1000   # ms
+      validation-timeout: 500    # ms; below connection-timeout, as HikariCP requires, so checking a dead pooled connection cannot outlast it
   sql:
     init:
       mode: never       # never auto-run import.sql or any schema/data script

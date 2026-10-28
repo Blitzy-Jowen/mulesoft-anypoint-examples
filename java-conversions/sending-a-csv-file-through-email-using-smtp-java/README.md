@@ -65,31 +65,31 @@ The ERROR and WARN lines name the file and the exception's class, throw site and
 
 ## Configuration keys
 
-Every key of `src/main/resources/application.yml` that the original's placeholders or fixed values map to (AAP 0.4.6, 0.6.6). A key with no default has no value until it is supplied. It is written `${ENV_NAME:}` with a `# TODO: supply …` comment, and is set through the named environment variable or a `--key=value` argument.
+Every key of `src/main/resources/application.yml` that the original's placeholders or fixed values map to, with the Java type its value binds to (AAP 0.4.6, 0.6.6). A key with no default has no value until it is supplied. It is written `${ENV_NAME:}` with a `# TODO: supply …` comment, and is set through the named environment variable or a `--key=value` argument.
 
-| Key | Default | Env variable | Original source | Notes |
-|---|---|---|---|---|
-| `smtp.host` | none (`${SMTP_HOST:}`) | `SMTP_HOST` | `host="${smtp.host}"` (`csv-to-smtp.xml:20`) | TODO. The SMTP server, bound to `spring.mail.host`. The original README uses Gmail's `smtp.gmail.com` (`README.md:25`) |
-| `smtp.port` | `587` | `SMTP_PORT` (relaxed binding) | hard-coded `port="587"` on the endpoint (`csv-to-smtp.xml:20`; `README.md:26`) | default. Configurable now, with the same value; bound to `spring.mail.port` |
-| `smtp.user` | none (`${SMTP_USER:}`) | `SMTP_USER` | `user="${smtp.user}"` (`csv-to-smtp.xml:20`) | TODO. The SMTP login, bound to `spring.mail.username`. Supply the plain address (`senderemailid@gmail.com`). The original README required the URL-encoded `senderemailid%40gmail.com` (`README.md:27`), and its test passed a separate `smtp.user_enc` as `smtp.user` (`SendingACsvFileThroughEmailUsingSmtpIT.java:93,96`), because Mule built an endpoint URI from it. `JavaMailSender` uses the value as is |
-| `smtp.password` | none (`${SMTP_PASSWORD:}`) | `SMTP_PASSWORD` | `password="${smtp.password}"` (`csv-to-smtp.xml:20`) | TODO (secret). The SMTP password or app password, bound to `spring.mail.password` |
-| `mail.from` | none (`${MAIL_FROM:}`) | `MAIL_FROM` | `from="${mail.from}"` (`csv-to-smtp.xml:20`) | TODO. The sender address, read by `client/CsvMailSender` |
-| `mail.to` | none (`${MAIL_TO:}`) | `MAIL_TO` | `to="${mail.to}"` (`csv-to-smtp.xml:20`) | TODO. The recipient address. A comma-separated list is allowed, as the endpoint's `to` attribute allowed one |
-| `mail.subject` | none (`${MAIL_SUBJECT:}`) | `MAIL_SUBJECT` | `subject="${mail.subject}"` (`csv-to-smtp.xml:20`) | TODO. The subject. The original README's example is `Export from Excel` (`README.md:32`); its test used `Mule flow completed!` (`SendingACsvFileThroughEmailUsingSmtpIT.java:100`) |
-| `csv-email.input-dir` | `src/main/resources/input` | `CSV_EMAIL_INPUT_DIR` | the hard-coded `path` of the `file:inbound-endpoint` (`csv-to-smtp.xml:5`; `README.md:18-20`) | new key. Relative paths resolve against the working directory |
-| `csv-email.polling-frequency` | `1000` | `CSV_EMAIL_POLLING_FREQUENCY` | none: Mule's default `pollingFrequency`, because the endpoint declares none | new key. Milliseconds between the end of one poll and the start of the next; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
+| Key | Type | Default | Env variable | Original source | Notes |
+|---|---|---|---|---|---|
+| `smtp.host` | `String` | none (`${SMTP_HOST:}`) | `SMTP_HOST` | `host="${smtp.host}"` (`csv-to-smtp.xml:20`) | TODO. The SMTP server, bound to `spring.mail.host`. The original README uses Gmail's `smtp.gmail.com` (`README.md:25`) |
+| `smtp.port` | `Integer` | `587` | `SMTP_PORT` (relaxed binding) | hard-coded `port="587"` on the endpoint (`csv-to-smtp.xml:20`; `README.md:26`) | default. Configurable now, with the same value; bound to `spring.mail.port` |
+| `smtp.user` | `String` | none (`${SMTP_USER:}`) | `SMTP_USER` | `user="${smtp.user}"` (`csv-to-smtp.xml:20`) | TODO. The SMTP login, bound to `spring.mail.username`. Supply the plain address (`senderemailid@gmail.com`). The original README required the URL-encoded `senderemailid%40gmail.com` (`README.md:27`), and its test passed a separate `smtp.user_enc` as `smtp.user` (`SendingACsvFileThroughEmailUsingSmtpIT.java:93,96`), because Mule built an endpoint URI from it. `JavaMailSender` uses the value as is |
+| `smtp.password` | `String` | none (`${SMTP_PASSWORD:}`) | `SMTP_PASSWORD` | `password="${smtp.password}"` (`csv-to-smtp.xml:20`) | TODO (secret). The SMTP password or app password, bound to `spring.mail.password` |
+| `mail.from` | `String` | none (`${MAIL_FROM:}`) | `MAIL_FROM` | `from="${mail.from}"` (`csv-to-smtp.xml:20`) | TODO. The sender address, read by `client/CsvMailSender` |
+| `mail.to` | `String` | none (`${MAIL_TO:}`) | `MAIL_TO` | `to="${mail.to}"` (`csv-to-smtp.xml:20`) | TODO. The recipient address. A comma-separated list is allowed, as the endpoint's `to` attribute allowed one; `client/CsvMailSender` splits it with `InternetAddress.parse` |
+| `mail.subject` | `String` | none (`${MAIL_SUBJECT:}`) | `MAIL_SUBJECT` | `subject="${mail.subject}"` (`csv-to-smtp.xml:20`) | TODO. The subject. The original README's example is `Export from Excel` (`README.md:32`); its test used `Mule flow completed!` (`SendingACsvFileThroughEmailUsingSmtpIT.java:100`) |
+| `csv-email.input-dir` | `String` (a directory path, opened with `Path.of`) | `src/main/resources/input` | `CSV_EMAIL_INPUT_DIR` | the hard-coded `path` of the `file:inbound-endpoint` (`csv-to-smtp.xml:5`; `README.md:18-20`) | new key. Relative paths resolve against the working directory |
+| `csv-email.polling-frequency` | `String` | `1000` | `CSV_EMAIL_POLLING_FREQUENCY` | none: Mule's default `pollingFrequency`, because the endpoint declares none | new key. The fixed delay between the end of one poll and the start of the next, read as `@Scheduled(fixedDelayString)` reads it: milliseconds as a positive whole number, or a positive ISO-8601 duration (for example `PT1S`, the default's equivalent; text whose first or second character is `P` or `p` is read as a duration). The value is not trimmed. A zero, negative or unreadable value stops start-up with an error naming the key and the value |
 
-Spring settings that reproduce the original. They are fixed in `application.yml`, and the keys above are what to change:
+Spring settings that reproduce the original. They are fixed in `application.yml`, and the keys above are what to change. Type is the Java type of the Spring Boot property each binds to:
 
-| Setting | Value | Reproduces |
-|---|---|---|
-| `spring.main.web-application-type` | `none` | no HTTP listener in the original |
-| `spring.application.name` | `sending-a-csv-file-through-email-using-smtp-java` | application name in log lines |
-| `spring.mail.host`, `spring.mail.port`, `spring.mail.username`, `spring.mail.password` | `${smtp.host}`, `${smtp.port}`, `${smtp.user}`, `${smtp.password}` | the endpoint's `host`, `port`, `user` and `password` (`csv-to-smtp.xml:20`) |
-| `spring.mail.protocol` | `smtp` | the SMTP transport |
-| `spring.mail.default-encoding` | `UTF-8` | `encoding=UTF-8` of `mule-deploy.properties`; `CsvMailSender` also names UTF-8 for the subject and body |
-| `spring.mail.properties[mail.smtp.auth]`, `spring.mail.properties[mail.smtp.starttls.enable]` | `true`, `true` | the `smtp:gmail-connector` preset of authenticated STARTTLS (`csv-to-smtp.xml:3`) |
-| `spring.mail.properties[mail.smtp.connectiontimeout]`, `[mail.smtp.timeout]`, `[mail.smtp.writetimeout]` | `10000` each | `responseTimeout="10000"` of the endpoint: connect, read and write timeouts in milliseconds |
+| Setting | Type | Value | Reproduces |
+|---|---|---|---|
+| `spring.main.web-application-type` | `WebApplicationType` | `none` | no HTTP listener in the original |
+| `spring.application.name` | `String` | `sending-a-csv-file-through-email-using-smtp-java` | application name in log lines |
+| `spring.mail.host`, `spring.mail.port`, `spring.mail.username`, `spring.mail.password` | `String`, `Integer`, `String`, `String` | `${smtp.host}`, `${smtp.port}`, `${smtp.user}`, `${smtp.password}` | the endpoint's `host`, `port`, `user` and `password` (`csv-to-smtp.xml:20`) |
+| `spring.mail.protocol` | `String` | `smtp` | the SMTP transport |
+| `spring.mail.default-encoding` | `Charset` | `UTF-8` | `encoding=UTF-8` of `mule-deploy.properties`; `CsvMailSender` also names UTF-8 for the subject and body |
+| `spring.mail.properties[mail.smtp.auth]`, `spring.mail.properties[mail.smtp.starttls.enable]` | `Map<String, String>` entries (`String` values) | `true`, `true` | the `smtp:gmail-connector` preset of authenticated STARTTLS (`csv-to-smtp.xml:3`) |
+| `spring.mail.properties[mail.smtp.connectiontimeout]`, `[mail.smtp.timeout]`, `[mail.smtp.writetimeout]` | `Map<String, String>` entries (`String` values) | `10000` each | `responseTimeout="10000"` of the endpoint: connect, read and write timeouts in milliseconds |
 
 - Original-to-new key map. Every flow key keeps its name: `smtp.host`, `smtp.user`, `smtp.password`, `mail.from`, `mail.to` and `mail.subject`. `smtp.port`, `csv-email.input-dir` and `csv-email.polling-frequency` are new keys for values the original fixed. The original test read the never-committed `mule.test.properties` (`SendingACsvFileThroughEmailUsingSmtpIT.java:44,91-95`); its test-only keys `smtp.user_enc` and `imap.host` are dropped, because the unit tier uses GreenMail instead of a Gmail account read back over IMAPS. `mule-app.properties` was empty. No credential, host or address is hard-coded anywhere.
 - `validateConnections="true"` of the Gmail connector is not reproduced. Start-up never contacts the SMTP server, so the application starts with every TODO key unset. Each polled file is then mapped and logged, and its send is refused before any connection with `MailPreparationException` `SMTP mail settings are not configured: smtp.host (SMTP_HOST), smtp.user (SMTP_USER), smtp.password (SMTP_PASSWORD), mail.from (MAIL_FROM), mail.to (MAIL_TO)`, which `CsvMailSender` also logs at ERROR; the file is deleted. Supply the keys before dropping files.
@@ -169,7 +169,7 @@ Running the example, as the original README's steps do (`README.md:18-38`):
 
 `src/test/resources/application-test.yml` is profile `test` (Configuration keys). `src/test/resources/email.txt` is the original's expected mail body, copied unchanged.
 
-## Shared components
+### Shared components
 
 Copied with their unit tests, with only the `package` line changed, and registered in the shared-component register of the root `DECISIONS.md` (AAP 0.4.4):
 

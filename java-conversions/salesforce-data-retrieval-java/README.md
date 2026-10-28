@@ -58,7 +58,7 @@ No listener for endpoint: /favicon.ico
 
 The first exchange is the catch branch, which keeps `Content-Type: text/plain;charset=UTF-8`. A query that succeeds is answered `200 OK` with its `Content-Length` and no `Content-Type`.
 
-## Connector failure modes (AAP 0.4.8)
+### Connector failure modes (AAP 0.4.8)
 
 Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client/UpstreamCallExecutor` and is classified by `client/SalesforceFailureClassifier`. These three responses are the only behaviour the original did not have. They take precedence over the `Invalid Salesforce query.` catch-all, because `exception/UpstreamExceptionHandler` runs at the highest `@Order`; the catch-all still answers every other failure.
 
@@ -73,7 +73,7 @@ Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client
 - The connect and read timeouts are 10 s each (`sfdc.connect-timeout`, `sfdc.read-timeout`), the Mule default response timeout.
 - With `sfdc.auth-endpoint` pointed at a closed port, both `GET /` and the POST above answer `503` with `{ "message": "Failed to send request to <endpoint>", "upstream": "Salesforce" }` (measured on this build).
 
-## Query hardening (AAP 0.4.10)
+### Query hardening (AAP 0.4.10)
 
 The original concatenated the form values into SOQL (`salesforce-id-retrieval.xml:27`). `service/SalesforceRetrievalService#query` builds the same SOQL text, but checks the input first:
 
@@ -182,7 +182,7 @@ java -jar target/salesforce-data-retrieval-java-1.0.0-SNAPSHOT.jar
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
-## Live tests (Tier 2B)
+### Live tests (Tier 2B)
 
 `SalesforceIdRetrievalIT` runs under failsafe (`mvn -B verify`) against a real org, reusing the existing Salesforce credentials; no new sandbox is needed.
 
@@ -209,7 +209,7 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 | `mapper/DwXmlWriterTest`, `mapper/ParseTemplateRendererTest` | SC-4 XML bytes; SC-14 template substitution with the template kept byte-identical |
 | `exception/SalesforceRetrievalExceptionHandlerTest` | POST failures → the catch branch's 200 `Invalid Salesforce query.`; a GET failure → SC-1's 500; upstream exceptions win on both; an unmapped path, a wrong method and the `HEAD`/`OPTIONS` guard keep SC-1's 404 and 405; the advice's scope and `@Order`; a successful POST left untouched, with its `Content-Length` and no `Content-Type` |
 | `exception/UpstreamExceptionHandlerTest`, `client/UpstreamCallExecutorTest`, `client/SalesforceFailureClassifierTest` | SC-9 and the Salesforce classification: re-login and one retry on `INVALID_SESSION_ID`, no retry on `REQUEST_LIMIT_EXCEEDED` (no `Retry-After`) or on any timeout or connectivity cause, 502/429/503 bodies, precedence over a catch-all advice |
-| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, `HashMap` records, session mode, the failure modes per operation, the 10 s default timeouts |
+| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, `HashMap` records, session mode, the failure modes per operation, the 10 s default timeouts; concurrent callers sharing the one login, re-login or session refresh in flight, its timeout included; paging that fails, with no further `queryMore`, on a repeated query locator, records beyond the reported size or pages beyond what that size allows |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes |
 | `config/ListenerMethodFilterTest` | the filter alone: letter cases of `GET` and `POST` on `/` (also with a query string or under a context path) reach the chain as `GET` and `POST` with everything else unchanged; other method tokens on `/`, letter cases on any other path, and a request without a method or URI pass unchanged |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
@@ -249,9 +249,9 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 1050 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 2 tests, both skipped (`SalesforceIdRetrievalIT`, no `application-it.yml`).
-- `mvn -B test`: `BUILD SUCCESS`; 1050 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 357 of 361 lines (98.9%) of `service/SalesforceRetrievalService`, `mapper/SObjectOptionsMapper`, `mapper/QueryResultFormatter`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 96.0% (1069 of 1113 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 1059 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 2 tests, both skipped (`SalesforceIdRetrievalIT`, no `application-it.yml`).
+- `mvn -B test`: `BUILD SUCCESS`; 1059 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 357 of 361 lines (98.9%) of `service/SalesforceRetrievalService`, `mapper/SObjectOptionsMapper`, `mapper/QueryResultFormatter`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 95.8% (1107 of 1155 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=11`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `SalesforceIdRetrievalIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

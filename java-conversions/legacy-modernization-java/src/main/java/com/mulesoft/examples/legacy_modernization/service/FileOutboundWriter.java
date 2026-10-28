@@ -46,9 +46,13 @@ import org.springframework.stereotype.Service;
  *       declares a {@code file:connector}, so {@code outputAppend} keeps its default {@code false}.</li>
  *   <li>The replacement is whole-file wherever the directory admits the new entry and the rename: the content is
  *       written in full to a hidden file {@code .<uuid>.tmp} beside the target, which is then renamed over the
- *       target atomically. A reader, in this process or another, therefore sees either the old or the new whole
- *       file, never an empty or partial one, and a write that fails leaves the existing file untouched and removes
- *       its temporary file.</li>
+ *       target. Where the file system supports an atomic rename, the rename is atomic, so a reader, in this process
+ *       or another, sees either the old or the new whole file, never an empty or partial one, and a write that fails
+ *       leaves the existing file untouched and removes its temporary file. On a file system that offers no atomic
+ *       rename, the writer falls back to a replacing move, which is not atomic: while it runs a reader can see the
+ *       target missing or incomplete, and a move that fails can leave the target incomplete or remove the existing
+ *       file; the temporary file is then removed and, as after a refused rename, a regular file left at the target
+ *       is overwritten in place, while with none left the write fails.</li>
  *   <li>The temporary file that replaces an existing file is created readable and writable by its owner only, so
  *       no other user can read the new content while it is written, and gets the replaced file's POSIX
  *       permissions just before it is renamed into place. A new file gets the permissions an ordinary create
@@ -159,13 +163,16 @@ public class FileOutboundWriter {
      * joined {@code address + "/" + filename}: its leading separators are dropped and the rest is resolved against
      * {@code dir}, every {@code ..} segment kept. The content goes to a temporary file beside the destination,
      * owner-only while it receives the content, which then gets the replaced file's POSIX permissions and is renamed
-     * over it atomically, under a lock that serialises writers of the same destination within the JVM. A new file
-     * gets the permissions an ordinary create gives it. A symbolic link at {@code dir/name} is followed and the file
-     * it links to is the one replaced or created. An existing file that is neither a regular file nor a directory is
-     * written in place, and so is an existing file in a directory that refuses the process the temporary file or its
-     * rename, as a sticky directory refuses the rename over a file another user owns; readers can then see it
-     * part-written. A writer created with a temporary-file observer shows it the temporary file once it holds the
-     * content, and an {@link IOException} of the observer ends the write as a failed write does.
+     * over it, under a lock that serialises writers of the same destination within the JVM. The rename is atomic
+     * where the file system supports an atomic rename; on one that does not, it is a replacing move, which is not
+     * atomic, so readers can see the destination missing or incomplete while it runs. A new file gets the permissions
+     * an ordinary create gives it. A symbolic link at {@code dir/name} is followed and the file it links to is the one
+     * replaced or created. An existing file that is neither a regular file nor a directory is written in place, and so
+     * is an existing file in a directory that refuses the process the temporary file or its rename, as a sticky
+     * directory refuses the rename over a file another user owns, and a regular file that a failed replacing move
+     * leaves at the destination; readers can then see it part-written. A writer created with a temporary-file observer
+     * shows it the temporary file once it holds the content, and an {@link IOException} of the observer ends the
+     * write as a failed write does.
      *
      * @param dir     the target directory, created with its missing parents
      * @param name    the resolved output file name, a leading separator not taking it out of {@code dir}
@@ -179,7 +186,7 @@ public class FileOutboundWriter {
      *                              it; an {@link InvalidPathException} when {@code name} is no valid path; otherwise
      *                              the {@link IOException} of the directory that cannot be created or the file that
      *                              cannot be written. The existing file is left as it was, unless it was being
-     *                              written in place
+     *                              written in place or a failed replacing move removed it
      */
     public Path write(Path dir, String name, byte[] content) throws IOException {
         Objects.requireNonNull(dir, "dir");

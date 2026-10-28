@@ -86,7 +86,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 - Override any key on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`):
 
   ```sh
-  export FTP_HOST=<FTP host> FTP_USER=<FTP user> FTP_PASSWORD=<FTP password>
+  export FTP_HOST='<FTP host>' FTP_USER='<FTP user>' FTP_PASSWORD='<FTP password>'
   mvn spring-boot:run -Dspring-boot.run.arguments="--http.port=9090 --ftp.port=2121"
   HTTP_PORT=9090 java -jar target/upload-to-ftp-after-converting-json-to-xml-java-1.0.0-SNAPSHOT.jar
   ```
@@ -134,7 +134,7 @@ Run from `java-conversions/upload-to-ftp-after-converting-json-to-xml-java/`:
 mvn -B clean install    # build, surefire tests, JaCoCo check, repackaged jar installed locally
 mvn -B clean package    # build, surefire tests, JaCoCo report and check (LINE >= 0.80 over service/** and mapper/**)
 mvn -B test             # surefire tests only
-FTP_HOST=<FTP host> FTP_USER=<FTP user> FTP_PASSWORD=<FTP password> mvn spring-boot:run    # listener on 0.0.0.0:8081
+FTP_HOST='<FTP host>' FTP_USER='<FTP user>' FTP_PASSWORD='<FTP password>' mvn spring-boot:run    # listener on 0.0.0.0:8081
 java -jar target/upload-to-ftp-after-converting-json-to-xml-java-1.0.0-SNAPSHOT.jar
 ```
 

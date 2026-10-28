@@ -38,7 +38,7 @@ File disposition follows Mule 3.8's default file connector (SC-5), because the o
 - Relative directories resolve against the working directory, exactly as the original resolved them against its application directory: the project directory under `mvn spring-boot:run`.
 - The endpoint's `responseTimeout="10000"` is not carried: a one-way file endpoint sends no reply.
 
-## Flow `CreateNewSalesforceAccountFlow`
+### Flow `CreateNewSalesforceAccountFlow`
 
 `service/AccountImportService#importAccounts(byte[])` runs the processors after the file endpoint in the flow's order:
 
@@ -57,7 +57,7 @@ File disposition follows Mule 3.8's default file connector (SC-5), because the o
    The lookup runs once per record while that record is mapped and receives the record as read, so its console line and log line interleave record by record, as in the original.
 3. **Create the Accounts.** One SC-15 `SalesforcePartnerClient#create("Account", accounts)` call carries every record of the file, as `sfdc:create type="Account"` received `#[payload]` (xml:21-23). The records are neither chunked, filtered nor de-duplicated. A field whose value is `null` is not sent. The save results are returned unchanged and discarded by the trigger: as in the original, a per-record error in them (a duplicate rule or a rejected value, for example) is neither raised nor logged.
 
-### Region lookup (`LookUpSalesRegionFlow`)
+#### Region lookup (`LookUpSalesRegionFlow`)
 
 `service/SalesRegionLookupService` reimplements the Groovy component "Get Region by State" (xml:27-52) in plain Java, without a script engine, followed by the logger "Log the Region" (xml:53). `processingStrategy="synchronous"` becomes a direct method call on the mapping thread.
 
@@ -85,35 +85,7 @@ State to lookup is: CA
 INFO c.m.e.d.s.SalesRegionLookupService       : Region is : West Coast
 ```
 
-## Mule-to-Java mapping
-
-| Mule construct (`dataweave-with-flowreflookup`) | Java construct (`com.mulesoft.examples.dataweave_with_flowreflookup`) |
-|---|---|
-| `sfdc:config` with `${sfdc.user}`, `${sfdc.password}`, `${sfdc.securityToken}` (xml:3) | SC-15 `client/SalesforcePartnerClient` in login mode, configured by SC-15 `config/SalesforceProperties` (`sfdc.username`, `sfdc.password`, `sfdc.securityToken`); one `PartnerConnection`, created lazily on the first call and re-created on re-authentication |
-| flow `CreateNewSalesforceAccountFlow` (xml:6) | `trigger/CompaniesFileTrigger` → `service/AccountImportService#importAccounts(byte[])` |
-| `file:inbound-endpoint` (xml:7) | `trigger/CompaniesFileTrigger` (`poll()`, `pollOnce()`) over SC-5 `trigger/FileInboundPoller` |
-| `dw:transform-message` "CSV to Maps": the polled CSV read by DataWeave 1.0 | SC-4 `mapper/DwCsvReader#read` |
-| `dw:set-payload` `%dw 1.0` / `%output application/java` / `payload map { … }` (header line 9) | `mapper/AccountMapper#map`: one `LinkedHashMap` per row, keys `Name`, `BillingStreet`, `BillingCity`, `BillingState`, `BillingPostalCode`, `Region__c` |
-| `lookup("LookUpSalesRegionFlow", $).region` (xml:18), flow `LookUpSalesRegionFlow` (xml:26), its Groovy `scripting:component` (xml:27-52) and `logger` (xml:53) | `service/SalesRegionLookupService#lookUpSalesRegion(Map)`, called by `AccountMapper` for each row |
-| `sfdc:create type="Account"` with `#[payload]` (xml:21-23) | `SalesforcePartnerClient#create("Account", records)`: one SOAP Partner API `create` call carrying every record of the file, through SC-9 `client/UpstreamCallExecutor` and `client/SalesforceFailureClassifier` |
-| Mule default exception strategy (none declared) | `FileInboundPoller`: ERROR log, then the move to `companies.move-to-dir` |
-| `mule-deploy.properties` (`config.resources=dataweave-with-flowref.xml`) | `DataweaveWithFlowreflookupApplication` (`@SpringBootApplication`, `@EnableScheduling`) |
-| `mule-app.properties` (comments only) | `src/main/resources/application.yml` |
-| `DataWeaveWithFlowRefIT` (`FunctionalTestCase`, `MuleClient`, live org) | `DataWeaveWithFlowRefTest` (surefire, mocked client) and `DataWeaveWithFlowRefIT` (failsafe, live org) |
-| test sub-flows `selectAccountFromSalesforce` (`sfdc:query-single`) and `deleteAccountFromSalesforce` (`sfdc:delete`) of `src/test/resources/testflows/test-flows.xml` | `SalesforcePartnerClient#query` and `SalesforcePartnerClient#delete` inside `DataWeaveWithFlowRefIT` |
-| `src/test/resources/mule.test.properties` (never committed) | `src/test/resources/application-it.yml` (git-ignored; template `application-it.yml.example`) |
-
-Shared components (register in the root [`DECISIONS.md`](../../DECISIONS.md)). The project carries copies, each with only its `package` line changed and with its tests:
-
-- SC-4 `mapper/DwCsvReader` (test `mapper/DwCsvReaderTest`) from `import-contacts-into-salesforce-java`;
-- SC-5 `trigger/FileInboundPoller` (test `trigger/FileInboundPollerTest`) from `processing-orders-with-dataweave-and-APIkit-java`;
-- SC-9 `client/UpstreamCallExecutor`, `client/UpstreamCall`, `client/UpstreamAction`, `client/UpstreamSystem`, `client/UpstreamFailureClassifier`, `client/UpstreamFailureKind`, `exception/UpstreamAuthenticationException`, `exception/UpstreamRateLimitException` and `exception/UpstreamUnavailableException` (test `client/UpstreamCallExecutorTest`) from `salesforce-data-retrieval-java`, without `UpstreamExceptionHandler`: there is no HTTP caller to answer;
-- SC-15 `client/SalesforcePartnerClient`, `client/SalesforceFailureClassifier` and `config/SalesforceProperties` (tests `client/SalesforcePartnerClientTest`, `client/SalesforceFailureClassifierTest`) from `salesforce-data-retrieval-java`;
-- ST-2 `FixtureParityTest` and the `SCENARIOS.md` format from `hello-world-java`.
-
-It carries no SC-1 and no ST-1, because it has no HTTP listener.
-
-## Connector failure modes (AAP 0.4.8)
+### Connector failure modes (AAP 0.4.8)
 
 Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client/UpstreamCallExecutor` and is classified by `client/SalesforceFailureClassifier`. The project is file-triggered, so no caller receives a 502, 429 or 503: the classification is logged at ERROR with the upstream name `Salesforce`, and the file is then moved as after any handled failure (SC-5). These three responses are the only behaviour the conversion adds.
 
@@ -131,8 +103,9 @@ Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client
 Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, and `sfdc.auth-endpoint` pointed at a closed local port (timestamps and thread prefixes removed). The two records are mapped, and their regions looked up, before the lazy `login` fails:
 
 ```console
-$ java -jar target/dataweave-with-flowreflookup-java-1.0.0-SNAPSHOT.jar --companies.input-dir=target/run/in --companies.move-to-dir=target/run/out --companies.polling-frequency=2000 --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0 --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
-$ cp src/main/resources/companies.csv target/run/companies.csv.part && mv target/run/companies.csv.part target/run/in/companies.csv
+$ CLOSED_PORT=1   # any loopback port nothing listens on
+$ java -jar target/dataweave-with-flowreflookup-java-1.0.0-SNAPSHOT.jar --companies.input-dir=target/run/in --companies.move-to-dir=target/run/out --companies.polling-frequency=2000 "--sfdc.auth-endpoint=http://127.0.0.1:${CLOSED_PORT}/services/Soap/u/65.0" --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
+$ cp src/main/resources/companies.csv target/run/companies.csv.part && mv target/run/companies.csv.part target/run/in/companies.csv   # in a second terminal, while the application runs
 State to lookup is: FL
 INFO  c.m.e.d.s.SalesRegionLookupService       : Region is : South East
 State to lookup is: CA
@@ -174,9 +147,39 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
   SFDC_USERNAME='<user>' SFDC_PASSWORD='<password>' SFDC_SECURITYTOKEN='<token>' java -jar target/dataweave-with-flowreflookup-java-1.0.0-SNAPSHOT.jar --sfdc.auth-endpoint=https://test.salesforce.com/services/Soap/u/65.0 --companies.input-dir=target/run/in --companies.move-to-dir=target/run/out
   ```
 
-  An external `application.yml` (for example `--spring.config.additional-location=<file>`) outside the repository works as well.
+  An external `application.yml` (for example `'--spring.config.additional-location=<file>'`) outside the repository works as well.
 
-## Behaviours stubbed, externalized or changed
+## Mule-to-Java mapping
+
+| Mule construct (`dataweave-with-flowreflookup`) | Java construct (`com.mulesoft.examples.dataweave_with_flowreflookup`) |
+|---|---|
+| `sfdc:config` with `${sfdc.user}`, `${sfdc.password}`, `${sfdc.securityToken}` (xml:3) | SC-15 `client/SalesforcePartnerClient` in login mode, configured by SC-15 `config/SalesforceProperties` (`sfdc.username`, `sfdc.password`, `sfdc.securityToken`); one `PartnerConnection`, created lazily on the first call and re-created on re-authentication |
+| flow `CreateNewSalesforceAccountFlow` (xml:6) | `trigger/CompaniesFileTrigger` → `service/AccountImportService#importAccounts(byte[])` |
+| `file:inbound-endpoint` (xml:7) | `trigger/CompaniesFileTrigger` (`poll()`, `pollOnce()`) over SC-5 `trigger/FileInboundPoller` |
+| `dw:transform-message` "CSV to Maps": the polled CSV read by DataWeave 1.0 | SC-4 `mapper/DwCsvReader#read` |
+| `dw:set-payload` `%dw 1.0` / `%output application/java` / `payload map { … }` (header line 9) | `mapper/AccountMapper#map`: one `LinkedHashMap` per row, keys `Name`, `BillingStreet`, `BillingCity`, `BillingState`, `BillingPostalCode`, `Region__c` |
+| `lookup("LookUpSalesRegionFlow", $).region` (xml:18), flow `LookUpSalesRegionFlow` (xml:26), its Groovy `scripting:component` (xml:27-52) and `logger` (xml:53) | `service/SalesRegionLookupService#lookUpSalesRegion(Map)`, called by `AccountMapper` for each row |
+| `sfdc:create type="Account"` with `#[payload]` (xml:21-23) | `SalesforcePartnerClient#create("Account", records)`: one SOAP Partner API `create` call carrying every record of the file, through SC-9 `client/UpstreamCallExecutor` and `client/SalesforceFailureClassifier` |
+| Mule default exception strategy (none declared) | `FileInboundPoller`: ERROR log, then the move to `companies.move-to-dir` |
+| `mule-deploy.properties` (`config.resources=dataweave-with-flowref.xml`) | `DataweaveWithFlowreflookupApplication` (`@SpringBootApplication`, `@EnableScheduling`) |
+| `mule-app.properties` (comments only) | `src/main/resources/application.yml` |
+| `DataWeaveWithFlowRefIT` (`FunctionalTestCase`, `MuleClient`, live org) | `DataWeaveWithFlowRefTest` (surefire, mocked client) and `DataWeaveWithFlowRefIT` (failsafe, live org) |
+| test sub-flows `selectAccountFromSalesforce` (`sfdc:query-single`) and `deleteAccountFromSalesforce` (`sfdc:delete`) of `src/test/resources/testflows/test-flows.xml` | `SalesforcePartnerClient#query` and `SalesforcePartnerClient#delete` inside `DataWeaveWithFlowRefIT` |
+| `src/test/resources/mule.test.properties` (never committed) | `src/test/resources/application-it.yml` (git-ignored; template `application-it.yml.example`) |
+
+Shared components (register in the root [`DECISIONS.md`](../../DECISIONS.md)). The project carries copies, each with only its `package` line changed and with its tests:
+
+- SC-4 `mapper/DwCsvReader` (test `mapper/DwCsvReaderTest`) from `import-contacts-into-salesforce-java`;
+- SC-5 `trigger/FileInboundPoller` (test `trigger/FileInboundPollerTest`) from `processing-orders-with-dataweave-and-APIkit-java`;
+- SC-9 `client/UpstreamCallExecutor`, `client/UpstreamCall`, `client/UpstreamAction`, `client/UpstreamSystem`, `client/UpstreamFailureClassifier`, `client/UpstreamFailureKind`, `exception/UpstreamAuthenticationException`, `exception/UpstreamRateLimitException` and `exception/UpstreamUnavailableException` (test `client/UpstreamCallExecutorTest`) from `salesforce-data-retrieval-java`, without `UpstreamExceptionHandler`: there is no HTTP caller to answer;
+- SC-15 `client/SalesforcePartnerClient`, `client/SalesforceFailureClassifier` and `config/SalesforceProperties` (tests `client/SalesforcePartnerClientTest`, `client/SalesforceFailureClassifierTest`) from `salesforce-data-retrieval-java`;
+- ST-2 `FixtureParityTest` and the `SCENARIOS.md` format from `hello-world-java`.
+
+It carries no SC-1 and no ST-1, because it has no HTTP listener.
+
+## Behaviours stubbed or externalized
+
+This section also lists the behaviours the conversion changed.
 
 - Externalized: the Salesforce credentials, which the original also read from placeholders, are `TODO` keys with environment-variable fallbacks; `sfdc.user` is renamed `sfdc.username`. The file endpoint's path, move directory and polling frequency, hard-coded in the original, are configurable keys with the original values as defaults; the login URL and timeouts, defaults of the original connector, are configurable keys.
 - Changed: the Groovy script of `LookUpSalesRegionFlow` and DataWeave's `lookup` are plain Java method calls; no script engine and no DataWeave runtime is involved. `BillingState` is upper-cased locale-independently, as DataWeave's `upper`; the lookup upper-cases under the JVM default locale, as the script's `toUpperCase()` did. A line terminator inside a state value is escaped in the printed `State to lookup is:` copy only, so each lookup writes one console line.
@@ -220,7 +223,7 @@ Within one polling interval the console shows the two lookups of [Region lookup]
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
-## Live test (Tier 2B)
+### Live test (Tier 2B)
 
 `DataWeaveWithFlowRefIT` runs under failsafe (`mvn -B verify`) against a real org, reusing the existing Salesforce credentials of the original example; no new sandbox is procured.
 
@@ -250,7 +253,7 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 | `service/SalesRegionLookupServiceTest` | every state of the five lists resolves to its region; lower- and mixed-case states (`fl`, `ca`, `Ny`) are upper-cased first; states outside every list and a missing state give `UNKNOWN`; one `State to lookup is: <state>` line on standard output and one INFO `Region is : <region>` per call; upper-casing under the JVM default locale; line terminators escaped on the console line only |
 | `mapper/AccountMapperTest` | the six keys in script order for both shipped rows; Universal Exports → `South East`; `upper` applied to `BillingState` without modifying the input row; values passed through without coercion or trimming (a postal code keeps its leading zero); a missing state gives a `null` `BillingState` and `UNKNOWN`; unmapped columns ignored; one lookup per row, in row order, with the raw row; one state per region through the real lookup; empty input, `null` input and `null` rows |
 | `mapper/DwCsvReaderTest` | SC-4: header row, `,` separator, `"` quoting with the `""` and backslash escapes, LF, CRLF and lone-CR record ends, skipped empty lines, untrimmed string values |
-| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the `create`, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and 10 s default timeouts |
+| `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, one lazily created connection reused, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, session mode; one re-login and retry after `INVALID_SESSION_ID`, no retry after `REQUEST_LIMIT_EXCEEDED`, a read timeout that never re-sends the `create`, `INVALID_LOGIN` rethrown unchanged; the production login endpoint and 10 s default timeouts; concurrent callers sharing the one login, re-login or session refresh in flight, its timeout included; paging that fails, with no further `queryMore`, on a repeated query locator, records beyond the reported size or pages beyond what that size allows |
 | `client/SalesforceFailureClassifierTest`, `client/UpstreamCallExecutorTest` | SC-9 and the Salesforce classification: re-login and one retry on `INVALID_SESSION_ID`, no retry on `REQUEST_LIMIT_EXCEEDED` (no `Retry-After`) or on any timeout or connectivity cause, the unchanged rethrow of every other failure, ERROR lines without vendor text |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
@@ -278,10 +281,10 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 The root `SUMMARY.md` carries the same row for this project (AAP 0.8.7). Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 780 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`DataWeaveWithFlowRefIT`: `src/test/resources/application-it.yml not supplied`).
-- `mvn -B clean package`: `BUILD SUCCESS`; 780 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
-- `mvn -B test`: `BUILD SUCCESS`; 780 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 128 of 128 lines (100.0%) of `service/AccountImportService`, `service/SalesRegionLookupService`, `mapper/AccountMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 92.2% (695 of 754 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 789 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`DataWeaveWithFlowRefIT`: `src/test/resources/application-it.yml not supplied`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 789 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
+- `mvn -B test`: `BUILD SUCCESS`; 789 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 128 of 128 lines (100.0%) of `service/AccountImportService`, `service/SalesRegionLookupService`, `mapper/AccountMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 92.1% (733 of 796 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `DataWeaveWithFlowRefIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

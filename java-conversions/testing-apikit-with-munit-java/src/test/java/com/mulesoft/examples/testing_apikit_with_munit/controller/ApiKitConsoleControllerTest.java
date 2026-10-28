@@ -20,8 +20,10 @@ import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -52,7 +54,7 @@ import org.springframework.http.MediaType;
  * <p>The class is copied with SC-17 into every RAML-backed project and differs between copies in its
  * {@code package} line and the {@link HttpTestClient} import alone. Everything project-specific is derived at run
  * time from the {@code apikit.base-path}, {@code apikit.console-path} and {@code apikit.raml} properties and from
- * the classpath: the console root, the RAML text and directory, its first {@code !include} and the console files
+ * the classpath: the console root, the RAML text and directory, its {@code !include} targets and the console files
  * under {@code apikit-console/}. It only reads, so it shares the cached application context of the project's
  * other {@code @SpringBootTest} classes.
  */
@@ -96,6 +98,15 @@ class ApiKitConsoleControllerTest {
 
     /** Shortest {@code application.yml} line whose presence in a response counts as a leak of that file. */
     private static final int LEAK_LINE_MIN_LENGTH = 10;
+
+    /** Methods that send {@link #JSON_BODY}, as a client writing a resource would. */
+    private static final Set<String> METHODS_WITH_BODY = Set.of("POST", "PUT", "PATCH");
+
+    /** A small JSON request body. */
+    private static final String JSON_BODY = "{ \"id\": \"ABC\" }";
+
+    /** The {@code Origin} of a cross-origin request. */
+    private static final String ORIGIN = "https://example.invalid";
 
     @Value("${apikit.base-path}")
     private String basePath;
@@ -329,6 +340,64 @@ class ApiKitConsoleControllerTest {
     }
 
     /**
+     * Every file the RAML {@code !include}s is served relative to the API base path too, with the bytes the RAML's
+     * directory holds, and a HEAD gets the GET's status without its body. A RAML without includes has nothing to
+     * serve there.
+     */
+    @ParameterizedTest(name = "{0} <base>/<include>")
+    @ValueSource(strings = {"GET", "HEAD"})
+    void everyRamlIncludeIsServedRelativeToApiBase(String method) throws IOException {
+        for (String include : ramlIncludes()) {
+            String path = basePath + "/" + include;
+            byte[] expected = "HEAD".equals(method) ? new byte[0] : classpathBytes(ramlDir + include);
+
+            HttpTestClient.Response response = client.send(method, path, null, null);
+
+            assertEquals(200, response.status(), () -> method + " " + path + "\n" + response);
+            assertEquals("OK", response.reason(), () -> method + " " + path + "\n" + response);
+            assertArrayEquals(expected, response.body(), () -> method + " " + path + "\n" + response);
+        }
+    }
+
+    /**
+     * Every method but GET and HEAD on each file the RAML {@code !include}s, relative to the API base path, is
+     * APIkit's unknown resource: its 404 mapping, body byte for byte, rather than Spring's own 200 with
+     * {@code Allow} for OPTIONS or a 405 for the others, a non-standard method and the dispatched TRACE included.
+     * A RAML without includes has nothing to probe.
+     */
+    @ParameterizedTest(name = "{0} <base>/<include>")
+    @ValueSource(strings = {"OPTIONS", "POST", "PUT", "DELETE", "PATCH", "PROPFIND", "TRACE"})
+    void otherMethodOnRamlIncludeRelativeToApiBaseIsResourceNotFound(String method) throws IOException {
+        byte[] body = METHODS_WITH_BODY.contains(method) ? JSON_BODY.getBytes(StandardCharsets.UTF_8) : null;
+        Map<String, String> headers = body == null ? null : Map.of("Content-Type", MediaType.APPLICATION_JSON_VALUE);
+        for (String include : ramlIncludes()) {
+            String path = basePath + "/" + include;
+
+            HttpTestClient.Response response = client.send(method, path, headers, body);
+
+            assertIncludeNotFound(method + " " + path, response);
+        }
+    }
+
+    /**
+     * A CORS pre-flight to each file the RAML {@code !include}s, relative to the API base path, is answered as the
+     * plain OPTIONS request it is, whichever method it asks for: APIkit's 404, with no CORS header. A RAML without
+     * includes has nothing to probe.
+     */
+    @ParameterizedTest(name = "pre-flight for {0} on <base>/<include>")
+    @ValueSource(strings = {"GET", "POST"})
+    void preflightToRamlIncludeRelativeToApiBaseIsResourceNotFound(String requestedMethod) throws IOException {
+        Map<String, String> headers = Map.of("Origin", ORIGIN, "Access-Control-Request-Method", requestedMethod);
+        for (String include : ramlIncludes()) {
+            String path = basePath + "/" + include;
+
+            HttpTestClient.Response response = client.send("OPTIONS", path, headers, null);
+
+            assertIncludeNotFound("pre-flight for " + requestedMethod + " on " + path, response);
+        }
+    }
+
+    /**
      * A {@code ..} path below the console root, sent raw, reaches no file outside the console tree. Undertow or
      * the dispatcher may answer with APIkit's 404 or with SC-1's no-listener 404, so the status is asserted and
      * the body only for the absence of every trace of the classpath {@code application.yml}.
@@ -431,6 +500,23 @@ class ApiKitConsoleControllerTest {
                 () -> "Content-Type " + actual + " is not " + expected + "\n" + response);
     }
 
+    /**
+     * {@code response} to {@code request} is APIkit's 404 mapping as {@code application/json}, body byte for byte,
+     * without the {@code Allow}, {@code Access-Control-*} or {@code Vary} headers of Spring's own OPTIONS and CORS
+     * handling.
+     */
+    private static void assertIncludeNotFound(String request, HttpTestClient.Response response) {
+        assertEquals(404, response.status(), () -> request + "\n" + response);
+        assertEquals("Not Found", response.reason(), () -> request + "\n" + response);
+        assertEquals(MediaType.APPLICATION_JSON_VALUE, response.header("Content-Type"),
+                () -> request + "\n" + response);
+        assertEquals(NOT_FOUND, response.bodyAsString(), () -> request + "\n" + response);
+        assertTrue(response.headers().stream().map(Map.Entry::getKey).noneMatch(name ->
+                        name.equalsIgnoreCase("Allow") || name.equalsIgnoreCase("Vary")
+                                || name.regionMatches(true, 0, "Access-Control-", 0, "Access-Control-".length())),
+                () -> request + " carries an Allow, Access-Control-* or Vary header\n" + response);
+    }
+
     private static byte[] classpathBytes(String location) throws IOException {
         ClassPathResource resource = new ClassPathResource(location);
         assertTrue(resource.isReadable(), () -> "no readable classpath resource " + location);
@@ -463,5 +549,20 @@ class ApiKitConsoleControllerTest {
 
     private String ramlText() throws IOException {
         return new String(classpathBytes(ramlLocation), StandardCharsets.UTF_8);
+    }
+
+    /** Every distinct target the RAML {@code !include}s, in encounter order; comment lines declare none. */
+    private List<String> ramlIncludes() throws IOException {
+        Set<String> includes = new LinkedHashSet<>();
+        for (String line : LINE_BREAK.split(ramlText())) {
+            if (line.stripLeading().startsWith("#")) {
+                continue;
+            }
+            Matcher matcher = INCLUDE.matcher(line);
+            while (matcher.find()) {
+                includes.add(matcher.group(1));
+            }
+        }
+        return List.copyOf(includes);
     }
 }

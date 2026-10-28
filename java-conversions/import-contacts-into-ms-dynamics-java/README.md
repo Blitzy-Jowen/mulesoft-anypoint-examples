@@ -36,34 +36,7 @@ File disposition follows Mule 3.8's default file connector (SC-5), because the o
 - Relative directories resolve against the working directory: the project directory under `mvn spring-boot:run`.
 - The endpoint's `mimeType="application/csv"` and `responseTimeout="10000"` are not carried. The content is always read as CSV, and a one-way file endpoint sends no reply.
 
-## Mule-to-Java mapping
-
-| Mule construct (`import-contacts-into-ms-dynamics`) | Java construct (`com.mulesoft.examples.import_contacts_into_ms_dynamics`) |
-|---|---|
-| `dynamicscrm:config authenticationType="CRMONLINE"` with `${crm.username}`, `${crm.password}` and `organizationServiceUrl="${crm.service-url}"` (xml:3) | `config/DynamicsOAuthConfig`: the Microsoft Entra client-credentials token and the Dataverse `WebClient`, with the `dynamics.*` settings bound to `DynamicsOAuthConfig.DynamicsProperties`; `client/DynamicsWebApiClient` makes every call |
-| flow `crm-create-account` (xml:6) | `trigger/ContactsFileTrigger` → `service/DynamicsContactImportService#importContacts(byte[])` |
-| `file:inbound-endpoint` (xml:7) | `trigger/ContactsFileTrigger` (`poll()`, `pollOnce()`) over SC-5 `trigger/FileInboundPoller` |
-| the polled CSV read by DataWeave 1.0 as `application/csv` | SC-4 `mapper/DwCsvReader#read`: header row, comma separator, `"` quoting, string values |
-| `dw:set-payload` `%dw 1.0` / `%output application/java` / `payload map { firstname: $.firstname, lastname: $.surname, businessphone: $.phone, email: $.email }` (header line 9) | `mapper/DynamicsContactMapper#map`, the script's owner: one `LinkedHashMap` per row, with `firstname` ← `firstname`, `lastname` ← `surname`, `businessphone` ← `phone` and `email` ← `email` |
-| `foreach` (xml:21-30) | the loop of `DynamicsContactImportService#importContacts`, one record at a time in file order. A failing record ends the loop and later records are not sent, as a failure inside Mule's `foreach` ended the flow. Contacts created before it stay |
-| `dynamicscrm:create logicalName="contact"` with the attributes `firstname`, `lastname`, `emailaddress1` = `#[payload.email]` and `telephone1` = `#[payload.businessphone]` (xml:22-29) | `DynamicsContactMapper#toContactAttributes` builds those four attributes in that order. `DynamicsWebApiClient#createContact(Map)` makes one Dataverse `POST contacts` per record through SC-9 `client/UpstreamCallExecutor` and `client/DynamicsFailureClassifier` |
-| Mule default exception strategy (none declared) | `FileInboundPoller`: ERROR log, then the move to `contacts.move-to-dir` |
-| `mule-deploy.properties` (`config.resources=import-contacts-into-ms-dynamics.xml`) | `ImportContactsIntoMsDynamicsApplication` (`@SpringBootApplication`, `@EnableScheduling`) |
-| `mule-app.properties` (empty) | `src/main/resources/application.yml` |
-| `ImportContactsIntoMSDynamicsIT` (`FunctionalTestCase`, `MuleClient`, live CRM Online organization) | `ImportContactsIntoMSDynamicsTest` (surefire, WireMock Entra and Dataverse) and `ImportContactsIntoMSDynamicsIT` (failsafe, live Dataverse environment) |
-| test flows `selectContactFromDynamics` (`dsql:SELECT contactid,firstname,lastname FROM contact where emailaddress1 = '#[payload]'`) and `deleteContactFromDynamics` (`dynamicscrm:delete logicalName="contact"`) of `src/test/resources/testflows/test-flows.xml` | `DynamicsWebApiClient#findContactsByEmail(String)` and `DynamicsWebApiClient#deleteContact(String)`, used only by the tests |
-| `src/test/resources/mule.test.properties` (never committed) | `src/test/resources/application-it.yml` (git-ignored; template `application-it.yml.example`) |
-
-Shared components (register in the root [`DECISIONS.md`](../../DECISIONS.md), section 4). Each copy has only its package names changed and comes with its tests:
-
-- SC-4 `mapper/DwCsvReader`, from `import-contacts-into-salesforce-java`;
-- SC-5 `trigger/FileInboundPoller`, from `processing-orders-with-dataweave-and-APIkit-java`;
-- SC-9 `client/UpstreamCallExecutor`, `client/UpstreamCall`, `client/UpstreamAction`, `client/UpstreamSystem`, `client/UpstreamFailureClassifier`, `client/UpstreamFailureKind`, `exception/UpstreamAuthenticationException`, `exception/UpstreamRateLimitException` and `exception/UpstreamUnavailableException`, from `salesforce-data-retrieval-java`. `UpstreamExceptionHandler` is not copied, because there is no HTTP caller to answer;
-- ST-2 `FixtureParityTest` and the `SCENARIOS.md` format, from `hello-world-java`.
-
-The project carries no SC-1 and no ST-1, because it has no HTTP listener. `client/DynamicsFailureClassifier` is this project's own, the Dynamics row of the SC-9 classification.
-
-## Dataverse Web API contract
+### Dataverse Web API contract
 
 `client/DynamicsWebApiClient` and `config/DynamicsOAuthConfig` send exactly these requests:
 
@@ -78,7 +51,7 @@ The project carries no SC-1 and no ST-1, because it has no HTTP listener. `clien
 - No base URL is fixed at startup, and every credential is checked only when a call is made. The application therefore starts with every `dynamics.*` secret blank. The first import then fails with an `IllegalStateException` naming the missing key, for example `dynamics.service-url is not configured`, before any request is sent.
 - Logs name only the HTTP method and path, never a header, the token, the query or a body. `application.yml` holds the Spring codec, `HttpLogging`, `ExchangeFunctions` and Reactor Netty `HttpClientConnect` loggers at `INFO`, so a root `DEBUG` or `TRACE` level cannot write the access token, the contact data or the queried e-mail address either. The client secret travels in the token request's form body, which Spring's form writer always logs masked.
 
-## Connector failure modes (AAP 0.4.8)
+### Connector failure modes (AAP 0.4.8)
 
 Every Dataverse call and the token request it needs run through SC-9 `client/UpstreamCallExecutor` and are classified by `client/DynamicsFailureClassifier`. The project is file-triggered, so no caller receives a 502, 429 or 503. Instead the classification is logged at ERROR with the upstream name `Microsoft Dynamics 365`, the import ends, and the file is moved as after any handled failure.
 
@@ -97,10 +70,12 @@ Every Dataverse call and the token request it needs run through SC-9 `client/Ups
 Measured on this build. Both runs used target directories, `--contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out --contacts.polling-frequency=2000`, and `contacts.csv` was dropped into `target/run/in/` (timestamps and thread prefixes removed):
 
 ```console
-$ java -jar target/import-contacts-into-ms-dynamics-java-1.0.0-SNAPSHOT.jar <directories above>
+$ java -jar target/import-contacts-into-ms-dynamics-java-1.0.0-SNAPSHOT.jar --contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out --contacts.polling-frequency=2000
 ERROR c.m.e.i.trigger.FileInboundPoller        : Exception processing file contacts.csv: java.lang.IllegalStateException at com.mulesoft.examples.import_contacts_into_ms_dynamics.config.DynamicsOAuthConfig$DynamicsProperties.requireServiceUrl(DynamicsOAuthConfig.java:167)
 
-$ java -jar target/import-contacts-into-ms-dynamics-java-1.0.0-SNAPSHOT.jar <directories above> --dynamics.service-url=http://127.0.0.1:<closed port> --dynamics.oauth.token-uri=http://127.0.0.1:<closed port>/test-tenant/oauth2/v2.0/token --dynamics.oauth.tenant-id=test-tenant --dynamics.oauth.client-id=test-client-id --dynamics.oauth.client-secret=<any non-blank value>
+$ CLOSED_PORT=1   # any loopback port nothing listens on
+$ DUMMY_CLIENT_SECRET='<any non-blank value>'
+$ java -jar target/import-contacts-into-ms-dynamics-java-1.0.0-SNAPSHOT.jar --contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out --contacts.polling-frequency=2000 "--dynamics.service-url=http://127.0.0.1:${CLOSED_PORT}" "--dynamics.oauth.token-uri=http://127.0.0.1:${CLOSED_PORT}/test-tenant/oauth2/v2.0/token" --dynamics.oauth.tenant-id=test-tenant --dynamics.oauth.client-id=test-client-id "--dynamics.oauth.client-secret=${DUMMY_CLIENT_SECRET}"
 ERROR c.m.e.i.client.UpstreamCallExecutor      : Upstream Microsoft Dynamics 365 call failed [UNAVAILABLE]: org.springframework.web.reactive.function.client.WebClientRequestException at org.springframework.web.reactive.function.client.ExchangeFunctions$DefaultExchangeFunction.lambda$wrapException$9(ExchangeFunctions.java:136) <- io.netty.channel.AbstractChannel$AnnotatedConnectException <- java.net.ConnectException
 ERROR c.m.e.i.trigger.FileInboundPoller        : Exception processing file contacts.csv: com.mulesoft.examples.import_contacts_into_ms_dynamics.exception.UpstreamUnavailableException at com.mulesoft.examples.import_contacts_into_ms_dynamics.client.UpstreamCallExecutor.translate(UpstreamCallExecutor.java:276) <- org.springframework.web.reactive.function.client.WebClientRequestException <- io.netty.channel.AbstractChannel$AnnotatedConnectException <- java.net.ConnectException
 ```
@@ -141,10 +116,39 @@ Status:
   DYNAMICS_SERVICE_URL='https://<org>.crm.dynamics.com' DYNAMICS_OAUTH_TENANT_ID='<tenant id>' DYNAMICS_OAUTH_CLIENT_ID='<client id>' DYNAMICS_OAUTH_CLIENT_SECRET='<client secret>' mvn spring-boot:run
   ```
 
-  An external `application.yml` outside the repository (`--spring.config.additional-location=<file>`) works as well.
+  An external `application.yml` outside the repository (`'--spring.config.additional-location=<file>'`) works as well.
 - `src/test/resources/application-test.yml` (Spring profile `test`) fills the blank keys with obvious dummies (`test-tenant`, `test-client-id`, `test-client-secret`, `http://localhost:1`) that authenticate nowhere; each test replaces the URLs with its WireMock server's. Surefire and failsafe set `contacts.input-dir`, `contacts.move-to-dir` and `contacts.polling-frequency` (`3600000`) as system properties pointing under `target/`, so no test polls or moves files in `src/main/resources/input` or `src/main/resources/output`.
 
-## Behaviours stubbed, externalized or changed
+## Mule-to-Java mapping
+
+| Mule construct (`import-contacts-into-ms-dynamics`) | Java construct (`com.mulesoft.examples.import_contacts_into_ms_dynamics`) |
+|---|---|
+| `dynamicscrm:config authenticationType="CRMONLINE"` with `${crm.username}`, `${crm.password}` and `organizationServiceUrl="${crm.service-url}"` (xml:3) | `config/DynamicsOAuthConfig`: the Microsoft Entra client-credentials token and the Dataverse `WebClient`, with the `dynamics.*` settings bound to `DynamicsOAuthConfig.DynamicsProperties`; `client/DynamicsWebApiClient` makes every call |
+| flow `crm-create-account` (xml:6) | `trigger/ContactsFileTrigger` → `service/DynamicsContactImportService#importContacts(byte[])` |
+| `file:inbound-endpoint` (xml:7) | `trigger/ContactsFileTrigger` (`poll()`, `pollOnce()`) over SC-5 `trigger/FileInboundPoller` |
+| the polled CSV read by DataWeave 1.0 as `application/csv` | SC-4 `mapper/DwCsvReader#read`: header row, comma separator, `"` quoting, string values |
+| `dw:set-payload` `%dw 1.0` / `%output application/java` / `payload map { firstname: $.firstname, lastname: $.surname, businessphone: $.phone, email: $.email }` (header line 9) | `mapper/DynamicsContactMapper#map`, the script's owner: one `LinkedHashMap` per row, with `firstname` ← `firstname`, `lastname` ← `surname`, `businessphone` ← `phone` and `email` ← `email` |
+| `foreach` (xml:21-30) | the loop of `DynamicsContactImportService#importContacts`, one record at a time in file order. A failing record ends the loop and later records are not sent, as a failure inside Mule's `foreach` ended the flow. Contacts created before it stay |
+| `dynamicscrm:create logicalName="contact"` with the attributes `firstname`, `lastname`, `emailaddress1` = `#[payload.email]` and `telephone1` = `#[payload.businessphone]` (xml:22-29) | `DynamicsContactMapper#toContactAttributes` builds those four attributes in that order. `DynamicsWebApiClient#createContact(Map)` makes one Dataverse `POST contacts` per record through SC-9 `client/UpstreamCallExecutor` and `client/DynamicsFailureClassifier` |
+| Mule default exception strategy (none declared) | `FileInboundPoller`: ERROR log, then the move to `contacts.move-to-dir` |
+| `mule-deploy.properties` (`config.resources=import-contacts-into-ms-dynamics.xml`) | `ImportContactsIntoMsDynamicsApplication` (`@SpringBootApplication`, `@EnableScheduling`) |
+| `mule-app.properties` (empty) | `src/main/resources/application.yml` |
+| `ImportContactsIntoMSDynamicsIT` (`FunctionalTestCase`, `MuleClient`, live CRM Online organization) | `ImportContactsIntoMSDynamicsTest` (surefire, WireMock Entra and Dataverse) and `ImportContactsIntoMSDynamicsIT` (failsafe, live Dataverse environment) |
+| test flows `selectContactFromDynamics` (`dsql:SELECT contactid,firstname,lastname FROM contact where emailaddress1 = '#[payload]'`) and `deleteContactFromDynamics` (`dynamicscrm:delete logicalName="contact"`) of `src/test/resources/testflows/test-flows.xml` | `DynamicsWebApiClient#findContactsByEmail(String)` and `DynamicsWebApiClient#deleteContact(String)`, used only by the tests |
+| `src/test/resources/mule.test.properties` (never committed) | `src/test/resources/application-it.yml` (git-ignored; template `application-it.yml.example`) |
+
+Shared components (register in the root [`DECISIONS.md`](../../DECISIONS.md), section 4). Each copy has only its package names changed and comes with its tests:
+
+- SC-4 `mapper/DwCsvReader`, from `import-contacts-into-salesforce-java`;
+- SC-5 `trigger/FileInboundPoller`, from `processing-orders-with-dataweave-and-APIkit-java`;
+- SC-9 `client/UpstreamCallExecutor`, `client/UpstreamCall`, `client/UpstreamAction`, `client/UpstreamSystem`, `client/UpstreamFailureClassifier`, `client/UpstreamFailureKind`, `exception/UpstreamAuthenticationException`, `exception/UpstreamRateLimitException` and `exception/UpstreamUnavailableException`, from `salesforce-data-retrieval-java`. `UpstreamExceptionHandler` is not copied, because there is no HTTP caller to answer;
+- ST-2 `FixtureParityTest` and the `SCENARIOS.md` format, from `hello-world-java`.
+
+The project carries no SC-1 and no ST-1, because it has no HTTP listener. `client/DynamicsFailureClassifier` is this project's own, the Dynamics row of the SC-9 classification.
+
+## Behaviours stubbed or externalized
+
+This section also lists the behaviours the conversion changed.
 
 - Changed protocol: the original `dynamicscrm` connector (`mule-module-ms-dynamics-crm` 2.4.1) signed in to the CRM 2011 Organization SOAP service (`…/XRMServices/2011/Organization.svc`) with a username and password. The conversion calls the Dataverse Web API v9.2 with a Microsoft Entra OAuth 2.0 client-credentials token, as the plan's vendor research fixed (AAP 0.3.3, 0.4.6; root `DECISIONS.md` section 2, "Vendor API choices"). The created record is the same: entity `contact` with the four attributes `firstname`, `lastname`, `emailaddress1` and `telephone1`, one create per CSV row in file order.
 - Prerequisites the requester completes inside the existing tenant (AAP 0.2.4): an Entra app registration with a client secret, and a Dataverse application user for that app with a security role that allows create, read and delete on the `contact` table. No new tenant or sandbox is procured.
@@ -191,8 +195,7 @@ Within one polling interval the file moves to `src/main/resources/output/contact
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2).
 
-
-## Live test (Tier 2B)
+### Live test (Tier 2B)
 
 `ImportContactsIntoMSDynamicsIT` runs under failsafe (`mvn -B verify`) against a real Dataverse environment of the existing tenant; no new tenant is needed.
 
@@ -272,4 +275,3 @@ The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never 
 ## Licence
 
 Apache License 2.0. `LICENSE` and `NOTICE` are copied unchanged from `import-contacts-into-ms-dynamics/`.
-

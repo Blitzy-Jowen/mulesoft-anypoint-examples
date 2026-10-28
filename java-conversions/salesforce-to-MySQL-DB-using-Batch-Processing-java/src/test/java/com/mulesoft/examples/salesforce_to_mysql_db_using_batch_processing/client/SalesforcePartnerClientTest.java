@@ -36,6 +36,10 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
@@ -93,7 +97,8 @@ import com.sforce.ws.parser.XmlOutputStream;
  * counted exactly. The client runs behind a real {@link UpstreamCallExecutor} with the real
  * {@link SalesforceFailureClassifier}, which proves the approved failure handling end to end: one re-login and one
  * retry after {@code INVALID_SESSION_ID}, no retry after {@code REQUEST_LIMIT_EXCEEDED}, and no retry, ever, after a
- * read timeout or a refused connection.
+ * read timeout or a refused connection. Callers released together share one login, re-login or session refresh in
+ * flight, its timeout included, and send none of their own.
  *
  * <p>Both connection modes are covered: login mode (no {@link SessionSource} bean, credentials from
  * {@link SalesforceProperties}) and session mode (a {@link SessionSource} bean, as in
@@ -170,6 +175,9 @@ class SalesforcePartnerClientTest {
     private static final String[] USER_B = {"00520000003LtvGAAS", "Mule orgA Integration",
             "kicks+a-integration@mulesoft.com"};
 
+    /** Number of callers a concurrency test releases together. */
+    private static final int CONCURRENT_CALLERS = 5;
+
     private WireMockServer wm;
 
     private SalesforceProperties props;
@@ -239,6 +247,71 @@ class SalesforcePartnerClientTest {
         assertUserRecord(records.get(0), USER_A);
         assertUserRecord(records.get(1), USER_B);
     }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("pagesThatCannotFormAValidResult")
+    void queryAllFailsWithoutFurtherQueryMoreOncePagesCannotFormAValidResult(String queryAllResponse,
+            String firstQueryMoreResponse, String laterQueryMoreResponse, int queryMores, String message) {
+        stubLogin();
+        stubApi("queryAll", soap(queryAllResponse));
+        stubApiScenario("queryMore", soap(firstQueryMoreResponse), soap(laterQueryMoreResponse));
+
+        Throwable thrown = catchThrowable(() -> loginModeClient().queryAll(SOQL));
+
+        // Thrown by the client itself, outside the executor: neither wrapped, nor classified, nor retried.
+        assertThat(thrown).isExactlyInstanceOf(IllegalStateException.class).hasMessage(message).hasNoCause();
+        assertThat(thrown.getMessage()).doesNotContain(SESSION_1, QUERY_LOCATOR);
+        assertThat(apiRequests("queryMore")).hasSize(queryMores);
+        assertThat(apiRequests("queryAll")).hasSize(1);
+        assertThat(loginRequests()).hasSize(1);
+    }
+
+    /**
+     * A {@code queryAll} page that is not done, then the answers of the first and of every later {@code queryMore},
+     * with the number of {@code queryMore} requests made before the client fails and the message it fails with. In
+     * each case the other two checks would have let at least one more {@code queryMore} through.
+     */
+    static Stream<Arguments> pagesThatCannotFormAValidResult() {
+        String loopLocator = "01gxx0000000001-LOOP";
+        String secondLocator = "01gxx0000000001-4000";
+        String thirdLocator = "01gxx0000000001-6000";
+        return Stream.of(
+                Arguments.of(Named.of("queryMore keeps answering done=false with the same locator",
+                                queryResponse("queryAll", false, QUERY_LOCATOR, 5, userRecord(USER_A))),
+                        queryResponse("queryMore", false, loopLocator, 5, userRecord(USER_B)),
+                        queryResponse("queryMore", false, loopLocator, 5, userRecord(USER_B)),
+                        2,
+                        "Salesforce query paging did not advance: page 3 repeats a query locator already requested,"
+                                + " for a reported size of 5"),
+                Arguments.of(Named.of("a queryMore page takes the records beyond the reported size",
+                                queryResponse("queryAll", false, QUERY_LOCATOR, 2, userRecord(USER_A))),
+                        queryResponse("queryMore", false, secondLocator, 2, userRecord(USER_B), userRecord(USER_A)),
+                        queryResponse("queryMore", true, null, 2),
+                        1,
+                        "Salesforce returned 3 query records by page 2, more than the reported size of 2"),
+                Arguments.of(Named.of("fresh locators with empty pages beyond size + 1 pages",
+                                queryResponse("queryAll", false, QUERY_LOCATOR, 2, userRecord(USER_A))),
+                        queryResponse("queryMore", false, secondLocator, 2),
+                        queryResponse("queryMore", false, thirdLocator, 2),
+                        2,
+                        "Salesforce query is not done at page 3, the last page a reported size of 2 allows"));
+    }
+
+    @Test
+    void queryAllReturnsAResultReportedDoneAsItCameEvenBeyondItsReportedSize() throws Exception {
+        stubLogin();
+        stubApi("queryAll", soap(queryResponse("queryAll", false, QUERY_LOCATOR, 1, userRecord(USER_A))));
+        stubApi("queryMore", soap(queryResponse("queryMore", true, null, 1, userRecord(USER_B))));
+
+        List<Map<String, Object>> records = loginModeClient().queryAll(SOQL);
+
+        // The paging checks guard only a further queryMore: a result Salesforce reports done is never rejected.
+        assertThat(apiRequests("queryMore")).hasSize(1);
+        assertThat(records).hasSize(2);
+        assertUserRecord(records.get(0), USER_A);
+        assertUserRecord(records.get(1), USER_B);
+    }
+
 
     @Test
     void queryMakesOneRequestAndMapsTheRecordLikeQueryAll() throws Exception {
@@ -396,6 +469,99 @@ class SalesforcePartnerClientTest {
         client.reauthenticate();
         client.describeGlobal();
 
+        assertThat(loginRequests()).hasSize(2);
+        assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_1)).hasSize(1);
+        assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_2)).hasSize(1);
+    }
+
+    @Test
+    void concurrentFirstCallsShareOneSlowLoginAndAllSucceed() throws Exception {
+        // Far longer than the callers take to start and well below the 5 s read timeout, so every caller arrives
+        // while the one login is in flight and that login succeeds.
+        wm.stubFor(post(urlEqualTo(LOGIN_PATH)).willReturn(soap(loginResponse(SESSION_1)).withFixedDelay(1500)));
+        stubApi("describeGlobal", soap(describeGlobalResponse()));
+        SalesforcePartnerClient client = loginModeClient();
+
+        List<Caller> callers = callConcurrently(client, SalesforcePartnerClient::describeGlobal);
+
+        assertThat(callers).allSatisfy(caller -> assertThat(caller.failure).isNull());
+        assertThat(loginRequests()).hasSize(1);
+        assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_1)).hasSize(CONCURRENT_CALLERS);
+    }
+
+    @Test
+    void concurrentFirstCallsShareOneTimedOutLoginAndAllFailWithinAboutOneReadTimeout() throws Exception {
+        wm.stubFor(post(urlEqualTo(LOGIN_PATH)).willReturn(soap(loginResponse(SESSION_1)).withFixedDelay(3000)));
+        stubApi("describeGlobal", soap(describeGlobalResponse()));
+        // Well below the 3000 ms delay, so the one login times out.
+        props.setReadTimeout(Duration.ofSeconds(1));
+        SalesforcePartnerClient client = loginModeClient();
+
+        List<Caller> callers = callConcurrently(client, SalesforcePartnerClient::describeGlobal);
+
+        assertThat(callers).allSatisfy(caller -> assertThat(caller.failure)
+                .isInstanceOfSatisfying(UpstreamUnavailableException.class, e -> {
+                    assertThat(e.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
+                    assertThat(causes(e)).anyMatch(SocketTimeoutException.class::isInstance);
+                }));
+        // Every caller's failure carries the one vendor exception of the shared login, not a timeout of its own.
+        Throwable sharedFailure = callers.get(0).failure.getCause();
+        assertThat(sharedFailure).isNotNull();
+        assertThat(callers).allSatisfy(caller -> assertThat(caller.failure.getCause()).isSameAs(sharedFailure));
+        // A login per caller in turn would keep the last one waiting five read timeouts; sharing one takes one.
+        assertThat(callers).allSatisfy(caller -> assertThat(caller.elapsed).isLessThan(Duration.ofSeconds(3)));
+        // WireMock may journal a delayed request only once its response is written.
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertThat(loginRequests()).hasSize(1));
+        await().during(Duration.ofMillis(2500)).atMost(Duration.ofSeconds(5))
+                .untilAsserted(() -> assertThat(loginRequests()).hasSize(1));
+        assertThat(apiRequests("describeGlobal")).isEmpty();
+
+        // The failed login cached nothing: once Salesforce answers in time, the next call logs in afresh.
+        stubLogin();
+        client.describeGlobal();
+
+        assertThat(loginRequests()).hasSize(2);
+        assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_1)).hasSize(1);
+    }
+
+    @Test
+    void callerInterruptedWhileWaitingForTheLoginInFlightStopsWaitingWithItsInterruptFlagSet() throws Exception {
+        // Long enough to interrupt the waiting caller before the login answers, well below the 5 s read timeout.
+        wm.stubFor(post(urlEqualTo(LOGIN_PATH)).willReturn(soap(loginResponse(SESSION_1)).withFixedDelay(2000)));
+        stubApi("describeGlobal", soap(describeGlobalResponse()));
+        SalesforcePartnerClient client = loginModeClient();
+
+        List<Caller> callers = startCallers(client, 2, SalesforcePartnerClient::describeGlobal);
+        // One caller sends the login; the other is parked on its shared result.
+        Caller waiter = await().atMost(Duration.ofSeconds(5))
+                .until(() -> callers.stream().filter(Caller::isWaitingForRenewal).findFirst().orElse(null),
+                        Objects::nonNull);
+        Caller performer = callers.get(0) == waiter ? callers.get(1) : callers.get(0);
+        waiter.interrupt();
+        joinAll(callers);
+
+        assertThat(waiter.failure).isExactlyInstanceOf(InterruptedException.class);
+        assertThat(waiter.interruptedAfterCall).isTrue();
+        assertThat(waiter.elapsed).isLessThan(performer.elapsed);
+        assertThat(performer.failure).isNull();
+        assertThat(performer.interruptedAfterCall).isFalse();
+        assertThat(loginRequests()).hasSize(1);
+        assertThat(apiRequests("describeGlobal")).hasSize(1);
+    }
+
+    @Test
+    void concurrentReauthenticationsShareOneSlowRelogin() throws Exception {
+        // The re-login takes far longer than the callers take to start, well below the 5 s read timeout.
+        stubLoginSequence(1500);
+        stubApi("describeGlobal", soap(describeGlobalResponse()));
+        SalesforcePartnerClient client = loginModeClient();
+        client.describeGlobal();
+
+        List<Caller> callers = callConcurrently(client, SalesforcePartnerClient::reauthenticate);
+        client.describeGlobal();
+
+        assertThat(callers).allSatisfy(caller -> assertThat(caller.failure).isNull());
+        // The first login, then one re-login shared by every caller.
         assertThat(loginRequests()).hasSize(2);
         assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_1)).hasSize(1);
         assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_2)).hasSize(1);
@@ -646,6 +812,24 @@ class SalesforcePartnerClientTest {
     }
 
     @Test
+    void sessionModeConcurrentReauthenticationsShareOneSlowRefresh() throws Exception {
+        stubApi("describeGlobal", soap(describeGlobalResponse()));
+        // A refresh that, like the OAuth token exchange, takes far longer than the callers take to start.
+        TestSessionSource source = new TestSessionSource(apiUrl(), Duration.ofMillis(1500));
+        SalesforcePartnerClient client = sessionModeClient(source);
+        client.describeGlobal();
+
+        List<Caller> callers = callConcurrently(client, SalesforcePartnerClient::reauthenticate);
+        client.describeGlobal();
+
+        assertThat(callers).allSatisfy(caller -> assertThat(caller.failure).isNull());
+        assertThat(source.refreshCalls).hasValue(1);
+        assertThat(loginRequests()).isEmpty();
+        assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_1)).hasSize(1);
+        assertThat(requestsCarrying(apiRequests("describeGlobal"), SESSION_2)).hasSize(1);
+    }
+
+    @Test
     void sessionModeRebuildsTheConnectionWithoutRefreshWhenTheSuppliedSessionChanges() throws Exception {
         stubApi("queryAll", soap(queryResponse("queryAll", true, null, 1, userRecord(USER_A))));
         wm.stubFor(post(urlEqualTo(OTHER_INSTANCE_PATH)).withRequestBody(operation("queryAll"))
@@ -780,8 +964,16 @@ class SalesforcePartnerClientTest {
 
         private final AtomicInteger refreshCalls = new AtomicInteger();
 
+        private final Duration refreshDuration;
+
         TestSessionSource(String serviceEndpoint) {
+            this(serviceEndpoint, Duration.ZERO);
+        }
+
+        /** A source whose refresh takes {@code refreshDuration}, as a remote token exchange does. */
+        TestSessionSource(String serviceEndpoint, Duration refreshDuration) {
             this.serviceEndpoint = new AtomicReference<>(serviceEndpoint);
+            this.refreshDuration = refreshDuration;
         }
 
         @Override
@@ -791,8 +983,9 @@ class SalesforcePartnerClientTest {
         }
 
         @Override
-        public Session refresh() {
+        public Session refresh() throws InterruptedException {
             refreshCalls.incrementAndGet();
+            Thread.sleep(refreshDuration.toMillis());
             sessionId.set(SESSION_2);
             return new Session(sessionId.get(), serviceEndpoint.get());
         }
@@ -801,6 +994,92 @@ class SalesforcePartnerClientTest {
         void switchTo(String newSessionId, String newServiceEndpoint) {
             sessionId.set(newSessionId);
             serviceEndpoint.set(newServiceEndpoint);
+        }
+    }
+
+    /**
+     * A thread that makes one client call once released, recording what the call threw, how long it took and
+     * whether the thread was left interrupted. The fields are read after {@link Thread#join(long)}.
+     */
+    private static final class Caller extends Thread {
+
+        private final SalesforcePartnerClient client;
+
+        private final ClientCall call;
+
+        private final CountDownLatch ready;
+
+        private final CountDownLatch release;
+
+        private volatile Throwable failure;
+
+        private volatile Duration elapsed;
+
+        private volatile boolean interruptedAfterCall;
+
+        Caller(SalesforcePartnerClient client, ClientCall call, CountDownLatch ready, CountDownLatch release) {
+            this.client = client;
+            this.call = call;
+            this.ready = ready;
+            this.release = release;
+            setDaemon(true);
+        }
+
+        @Override
+        public void run() {
+            ready.countDown();
+            try {
+                release.await();
+            } catch (InterruptedException e) {
+                failure = e;
+                return;
+            }
+            long start = System.nanoTime();
+            try {
+                call.invoke(client);
+            } catch (Throwable thrown) {
+                failure = thrown;
+            }
+            elapsed = Duration.ofNanos(System.nanoTime() - start);
+            interruptedAfterCall = isInterrupted();
+        }
+
+        /** Whether the thread is parked waiting for the result of a renewal another caller performs. */
+        boolean isWaitingForRenewal() {
+            return getState() == State.WAITING && Stream.of(getStackTrace()).anyMatch(frame ->
+                    CompletableFuture.class.getName().equals(frame.getClassName())
+                            && "get".equals(frame.getMethodName()));
+        }
+    }
+
+    /** Releases {@link #CONCURRENT_CALLERS} callers of {@code call} together; returns them once all have finished. */
+    private static List<Caller> callConcurrently(SalesforcePartnerClient client, ClientCall call)
+            throws InterruptedException {
+        List<Caller> callers = startCallers(client, CONCURRENT_CALLERS, call);
+        joinAll(callers);
+        return callers;
+    }
+
+    /** Starts {@code count} callers of {@code call} and releases them together once every one is ready. */
+    private static List<Caller> startCallers(SalesforcePartnerClient client, int count, ClientCall call)
+            throws InterruptedException {
+        CountDownLatch ready = new CountDownLatch(count);
+        CountDownLatch release = new CountDownLatch(1);
+        List<Caller> callers = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            Caller caller = new Caller(client, call, ready, release);
+            caller.start();
+            callers.add(caller);
+        }
+        assertThat(ready.await(10, TimeUnit.SECONDS)).as("every caller started").isTrue();
+        release.countDown();
+        return callers;
+    }
+
+    private static void joinAll(List<Caller> callers) throws InterruptedException {
+        for (Caller caller : callers) {
+            caller.join(Duration.ofSeconds(30).toMillis());
+            assertThat(caller.isAlive()).as("%s finished", caller.getName()).isFalse();
         }
     }
 
@@ -855,10 +1134,18 @@ class SalesforcePartnerClientTest {
 
     /** The first login answers with {@link #SESSION_1}, every later one with {@link #SESSION_2}. */
     private void stubLoginSequence() {
+        stubLoginSequence(0);
+    }
+
+    /**
+     * The first login answers with {@link #SESSION_1} at once, every later one with {@link #SESSION_2} after
+     * {@code reloginDelayMillis}.
+     */
+    private void stubLoginSequence(int reloginDelayMillis) {
         wm.stubFor(post(urlEqualTo(LOGIN_PATH)).inScenario("login").whenScenarioStateIs(Scenario.STARTED)
                 .willReturn(soap(loginResponse(SESSION_1))).willSetStateTo("logged in again"));
         wm.stubFor(post(urlEqualTo(LOGIN_PATH)).inScenario("login").whenScenarioStateIs("logged in again")
-                .willReturn(soap(loginResponse(SESSION_2))));
+                .willReturn(soap(loginResponse(SESSION_2)).withFixedDelay(reloginDelayMillis)));
     }
 
     private void stubApi(String operation, ResponseDefinitionBuilder response) {

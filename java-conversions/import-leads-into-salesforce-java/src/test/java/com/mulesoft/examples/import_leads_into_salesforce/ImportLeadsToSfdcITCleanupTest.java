@@ -11,19 +11,25 @@ package com.mulesoft.examples.import_leads_into_salesforce;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.net.SocketTimeoutException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
@@ -58,6 +64,10 @@ import ch.qos.logback.core.read.ListAppender;
  * and its suppressed exception, and each failed delete result carries them in its errors' messages and fields. Every
  * event must name the failure by its class names or status codes alone and attach no throwable, which Logback would
  * print with all of that text, while every Lead is still deleted and nothing is thrown.
+ *
+ * <p>The live test's wait, {@code awaitLead}, is tested for the lifetime of its query: a query answered only after
+ * the wait's timeout must still be answered before the wait ends, on the thread that runs the wait, so that
+ * {@code tearDown()} finds the Lead ID it read back and deletes that Lead.
  */
 class ImportLeadsToSfdcITCleanupTest {
 
@@ -82,6 +92,12 @@ class ImportLeadsToSfdcITCleanupTest {
      */
     private static final List<String> UNDISCLOSED = List.of("s3cr3t-token", "hunter2", PERSONAL_EMAIL, "Burks",
             "vendor-message", "cause-message", "suppressed-message", "error-message", "error-field");
+
+    /** The timeout the late-query case gives the live test's wait, far shorter than the query it holds. */
+    private static final Duration LATE_QUERY_TIMEOUT = Duration.ofMillis(200);
+
+    /** Bounds each wait of the late-query case on a latch or a thread, so that a broken case fails, never hangs. */
+    private static final Duration LATCH_TIMEOUT = Duration.ofSeconds(10);
 
     private SalesforcePartnerClient client;
 
@@ -210,6 +226,64 @@ class ImportLeadsToSfdcITCleanupTest {
                 ReflectionTestUtils.invokeMethod(ImportLeadsToSfdcIT.class, "failureTypes", (Throwable) null));
     }
 
+    @Test
+    void leadQueryAnsweredAfterTheTimeoutIsRecordedBeforeTheWaitEndsAndDeletedInTearDown() throws Exception {
+        leadIds().clear();
+        CountDownLatch queryStarted = new CountDownLatch(1);
+        CountDownLatch releaseQuery = new CountDownLatch(1);
+        AtomicReference<Thread> queryThread = new AtomicReference<>();
+        Map<String, Object> lead = Map.of("Id", LEAD_ID1, "FirstName", "Ishmael");
+        when(client.query(anyString())).thenAnswer(invocation -> {
+            queryThread.set(Thread.currentThread());
+            queryStarted.countDown();
+            assertTrue(releaseQuery.await(LATCH_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), "query never released");
+            return List.of(lead);
+        }).thenReturn(List.of());
+        when(client.delete(anyList())).thenReturn(List.of(deleted(LEAD_ID1)));
+
+        // Stands in for JUnit's test thread, which runs tearDown() only once the wait has returned or thrown.
+        AtomicReference<Object> outcome = new AtomicReference<>();
+        Thread testThread = new Thread(() -> {
+            try {
+                outcome.set(liveTest.awaitLead(EMAIL1, LATE_QUERY_TIMEOUT));
+            } catch (Throwable failure) {
+                outcome.set(failure);
+            }
+        }, "late-query-test-thread");
+        testThread.setDaemon(true);
+        testThread.start();
+        try {
+            assertTrue(queryStarted.await(LATCH_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), "query never started");
+            testThread.join(LATE_QUERY_TIMEOUT.multipliedBy(3).toMillis());
+            assertTrue(testThread.isAlive(), "the wait ended while its query was still running");
+            assertTrue(leadIds().isEmpty());
+
+            releaseQuery.countDown();
+            testThread.join(LATCH_TIMEOUT.toMillis());
+            assertFalse(testThread.isAlive(), "the wait did not end once its query was answered");
+        } finally {
+            releaseQuery.countDown();
+            if (testThread.isAlive()) {
+                testThread.interrupt();
+                testThread.join(LATCH_TIMEOUT.toMillis());
+            }
+        }
+        assertSame(testThread, queryThread.get());
+        // Awaitility 4.2.2 times a condition that holds from its first success, so a query answered after the
+        // timeout still ends the wait with its Lead, not with a ConditionTimeoutException.
+        assertEquals(lead, outcome.get());
+        assertEquals(List.of(LEAD_ID1), leadIds());
+
+        liveTest.tearDown();
+
+        // The wait's one query and the two re-queries of tearDown(); the wait's thread has ended, so none can follow.
+        verify(client, times(3)).query(anyString());
+        verify(client).delete(List.of(LEAD_ID1));
+        verifyNoMoreInteractions(client);
+        assertTrue(leadIds().isEmpty());
+        assertEquals(List.of("INFO Deleted Salesforce Lead " + LEAD_ID1), loggedEvents());
+    }
+
     /**
      * A connection failure whose message, cause message and suppressed exception carry a token, a password and Lead
      * fields.
@@ -270,7 +344,7 @@ class ImportLeadsToSfdcITCleanupTest {
         return result;
     }
 
-    /** The live test's static list of the Lead IDs its cleanup deletes, a {@code CopyOnWriteArrayList<String>}. */
+    /** The live test's static list of the Lead IDs its cleanup deletes, an {@code ArrayList<String>}. */
     @SuppressWarnings("unchecked")
     private static List<String> leadIds() {
         return (List<String>) ReflectionTestUtils.getField(ImportLeadsToSfdcIT.class, "leadIds");

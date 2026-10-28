@@ -50,7 +50,7 @@ The original enabled the console (`apikit:config consoleEnabled="true" consolePa
 | GET `/api/console/?raml`, GET `/api/console?raml`, and GET `/api/` with `Accept: application/raml+yaml` | `leagues.raml` as `application/raml+yaml` with `Access-Control-Allow-Origin: *` and its `baseUri` rewritten to the listener URL |
 | GET `/api/<include>` and GET `/api/console/<include>` | each file the RAML `!include`s (`schemas/*.json`, `examples/*.json`), served relative to the RAML |
 
-A miss under the console path is answered with the APIkit 404. The class Javadoc of `ApiKitConsoleController` lists where these bytes are plan decisions rather than recorded original output (for example, the jar's `console/` tree is served rather than `console2/`, and the RAML is served as its raw file rather than re-dumped). Each is a Tier 2A verification point.
+A miss under the console path is answered with the APIkit 404, and so is every method but GET and HEAD on a RAML include (OPTIONS and a CORS pre-flight included). The class Javadoc of `ApiKitConsoleController` lists where these bytes are plan decisions rather than recorded original output (for example, the jar's `console/` tree is served rather than `console2/`, and the RAML is served as its raw file rather than re-dumped). Each is a Tier 2A verification point.
 
 ### Error responses
 
@@ -150,7 +150,7 @@ Open the console at `http://localhost:8080/api/console/`.
 |---|---|
 | `RestApiWithApiKitTest` | the ported original test (`rest-api-with-apikit/src/test/java/org/mule/examples/RestApiWithApiKitTest.java:81-101`): GET `/api/teams/BAR` equals `src/test/resources/reply.json` as a JSON tree, then DELETE `/api/teams/BAR` answers 204 |
 | `controller/TeamsControllerTest`, `PositionsControllerTest`, `FixtureControllerTest` | on the wire through ST-1, so status code, reason phrase, `Content-Type`, `Location` and body bytes are asserted: every RAML method's 2xx, the APIkit 404, 405, 415, 406 and 400 bodies as exact strings, the 409s, both renderings of a match, the no-listener 404 outside `/api`, and concurrent POSTs of one id creating exactly one team |
-| `controller/ApiKitConsoleControllerTest` | SC-17: the redirect, console page and files, RAML descriptor with rewritten `baseUri`, includes, and path-traversal probes answered with the 404 |
+| `controller/ApiKitConsoleControllerTest` | SC-17: the redirect, console page and files, RAML descriptor with rewritten `baseUri`, includes, and path-traversal probes answered with the 404; at `<api base>/<include>`, each RAML include served to GET with its bytes and to HEAD with an empty 200, and every other method (OPTIONS, POST, PUT, DELETE, PATCH, PROPFIND and TRACE are sent) and CORS pre-flights asking for GET or POST answered with the APIkit 404 and no `Allow`, `Access-Control-*` or `Vary` header |
 | `service/LeagueAPITest` | every `LeagueAPI` operation, both not-found and both conflict messages, the 20-team, 380-match fixture and standings computed from it |
 | `mapper/LeagueJsonMapperTest`, `mapper/JsonDateSerializerTest` | both renderings (JSONAssert `STRICT`), the three body readers, the date pattern and thread safety |
 | `exception/ApiKitExceptionHandlerTest`, `LeagueExceptionHandlerTest`, `GlobalExceptionHandlerTest` | SC-3 mappings and precedence, the 409, SC-1 defaults and log safety |
@@ -169,9 +169,9 @@ Open the console at `http://localhost:8080/api/console/`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 652 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 652 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 131 of 131 lines (`service/LeagueAPI`, `mapper/LeagueJsonMapper`, `mapper/JsonDateSerializer`). Total project LINE coverage: 89.9% (1200 of 1335 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 663 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 663 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 131 of 131 lines (`service/LeagueAPI`, `mapper/LeagueJsonMapper`, `mapper/JsonDateSerializer`). Total project LINE coverage: 89.7% (1204 of 1342 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported original assertions of `RestApiWithApiKitTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 

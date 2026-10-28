@@ -50,7 +50,7 @@ Date: <current date>
 
 The same 73 bytes are queued on `sales` as the message text (the charset shown is the JVM default, UTF-8 on the build host).
 
-## Messaging
+### Messaging
 
 | Property | Value |
 |---|---|
@@ -64,25 +64,25 @@ A failed send fails the request before anything is logged. After a successful se
 
 ## Configuration keys
 
-Every key of `src/main/resources/application.yml`. Status: `default` — a value the original fixed, overridable; `fixed` — a framework setting that reproduces the original listener or broker, not a key of the original.
+Every key of `src/main/resources/application.yml`, with the Java type each value binds to, read by `service/SalesQueueService`, `config/ArtemisClientConfig` and Spring Boot. Status: `default` — a value the original fixed, overridable; `fixed` — a framework setting that reproduces the original listener or broker, not a key of the original.
 
-| Key | Default | Original name | Status | Meaning |
-|---|---|---|---|---|
-| `http.port` | `8081` | `http.port`, the `${http.port}` placeholder (`json-to-jms.xml:4`), supplied at run time; original `README.md:17` uses 8081 | default | listener port |
-| `server.port` | `${http.port:8081}` | none | fixed | the Undertow port, resolved from `http.port`; set `http.port` instead |
-| `server.address` | `0.0.0.0` | none | fixed | listener host (`json-to-jms.xml:4`) |
-| `spring.application.name` | `sending-json-data-to-a-jms-queue-java` | none | fixed | name in log lines |
-| `spring.web.resources.add-mappings` | `false` | none | fixed | unserved paths reach SC-1's 404 |
-| `spring.mvc.dispatch-trace-request` | `true` | none | fixed | `TRACE` gets the 405, not the servlet's 200 echo |
-| `spring.autoconfigure.exclude` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the 404 |
-| `spring.artemis.mode` | `embedded` | none | fixed | in-VM broker in place of Mule's in-VM ActiveMQ |
-| `spring.artemis.embedded.enabled` | `true` | none | fixed | starts the in-VM broker; `false` with `mode: native` |
-| `spring.artemis.embedded.persistent` | `false` | none | fixed | non-persistent broker, as ActiveMQ's in-VM default |
-| `spring.artemis.embedded.queues` | `sales` | none | fixed | pre-creates queue `sales` |
-| `spring.jms.pub-sub-domain` | `false` | none | fixed | destinations are queues |
-| `spring.jms.template.delivery-mode` | `non-persistent` | none | fixed | Mule's non-persistent default delivery |
-| `jms.queue` | `sales` | none: inline `queue="sales"` (`json-to-jms.xml:9`) | default | destination queue, read by `service/SalesQueueService` |
-| `jms.call-timeout` | `10000` (ms) | none | default | bound on each blocking broker call; must be positive, or the application refuses to start |
+| Key | Type | Default | Original name | Status | Meaning |
+|---|---|---|---|---|---|
+| `http.port` | `Integer`, the type of `server.port`, which it feeds | `8081` | `http.port`, the `${http.port}` placeholder (`json-to-jms.xml:4`), supplied at run time; original `README.md:17` uses 8081 | default | listener port |
+| `server.port` | `Integer` | `${http.port:8081}` | none | fixed | the Undertow port, resolved from `http.port`; set `http.port` instead |
+| `server.address` | `InetAddress` | `0.0.0.0` | none | fixed | listener host (`json-to-jms.xml:4`) |
+| `spring.application.name` | `String` | `sending-json-data-to-a-jms-queue-java` | none | fixed | name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | unserved paths reach SC-1's 404 |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` gets the 405, not the servlet's 200 echo |
+| `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the 404 |
+| `spring.artemis.mode` | `ArtemisMode` (`embedded` or `native`) | `embedded` | none | fixed | in-VM broker in place of Mule's in-VM ActiveMQ |
+| `spring.artemis.embedded.enabled` | `boolean` | `true` | none | fixed | starts the in-VM broker; `false` with `mode: native` |
+| `spring.artemis.embedded.persistent` | `boolean` | `false` | none | fixed | non-persistent broker, as ActiveMQ's in-VM default |
+| `spring.artemis.embedded.queues` | `String[]` (queue names) | `sales` | none | fixed | pre-creates queue `sales` |
+| `spring.jms.pub-sub-domain` | `boolean` | `false` | none | fixed | destinations are queues |
+| `spring.jms.template.delivery-mode` | `DeliveryMode`, the enum of Boot's `JmsProperties` (`persistent` or `non-persistent`) | `non-persistent` | none | fixed | Mule's non-persistent default delivery |
+| `jms.queue` | `String` | `sales` | none: inline `queue="sales"` (`json-to-jms.xml:9`) | default | destination queue, read by `service/SalesQueueService` |
+| `jms.call-timeout` | `long` (milliseconds) | `10000` (ms) | none | default | bound on each blocking broker call; must be positive, or the application refuses to start |
 
 The example has no secrets, so `application.yml` holds no active TODO placeholder and the project has no `application-test.yml`; the tests run against the embedded broker.
 
@@ -91,10 +91,10 @@ Original-to-new key map:
 | Original | Converted |
 |---|---|
 | `http.port` (`mule-app.properties` is empty) | `http.port`, default `8081` |
-| Studio global element "Active MQ › Broker URL" (`README.md:25`; no property, blank means in-VM) | `spring.artemis.mode: native`, `spring.artemis.embedded.enabled: false` and `spring.artemis.broker-url`, for example `tcp://localhost:61616` |
+| Studio global element "Active MQ › Broker URL" (`README.md:25`; no property, blank means in-VM) | `spring.artemis.mode: native`, `spring.artemis.embedded.enabled: false` and `spring.artemis.broker-url` (`String`), for example `tcp://localhost:61616` |
 | inline `queue="sales"` | `jms.queue`, default `sales` |
 
-To use an external broker, replace the `mode` and `embedded` entries with the commented native-mode block of `application.yml`, or pass `--spring.artemis.mode=native --spring.artemis.embedded.enabled=false --spring.artemis.broker-url=tcp://localhost:61616` (environment `SPRING_ARTEMIS_MODE`, `SPRING_ARTEMIS_EMBEDDED_ENABLED`, `SPRING_ARTEMIS_BROKER_URL`). Broker credentials, when the broker needs them, come only from the environment, never from a committed file: `SPRING_ARTEMIS_USER` and `SPRING_ARTEMIS_PASSWORD`, which Spring Boot binds to `spring.artemis.user` and `spring.artemis.password` (the commented block reads the same values from `ARTEMIS_USER` and `ARTEMIS_PASSWORD`). The broker must speak the Artemis core protocol, which means an ActiveMQ Artemis broker; an ActiveMQ Classic 5.x broker does not accept it.
+To use an external broker, replace the `mode` and `embedded` entries with the commented native-mode block of `application.yml`, or pass `--spring.artemis.mode=native --spring.artemis.embedded.enabled=false --spring.artemis.broker-url=tcp://localhost:61616` (environment `SPRING_ARTEMIS_MODE`, `SPRING_ARTEMIS_EMBEDDED_ENABLED`, `SPRING_ARTEMIS_BROKER_URL`). Broker credentials, when the broker needs them, come only from the environment, never from a committed file: `SPRING_ARTEMIS_USER` and `SPRING_ARTEMIS_PASSWORD`, which Spring Boot binds to `spring.artemis.user` and `spring.artemis.password`, both `String` (the commented block reads the same values from `ARTEMIS_USER` and `ARTEMIS_PASSWORD`). The broker must speak the Artemis core protocol, which means an ActiveMQ Artemis broker; an ActiveMQ Classic 5.x broker does not accept it.
 
 ## Mule-to-Java mapping
 
@@ -111,7 +111,9 @@ To use an external broker, replace the `mode` and `embedded` entries with the co
 | `mule-deploy.properties` (loads `json-to-jms.xml`) | `com.mulesoft.examples.sending_json_data_to_a_jms_queue.SendingJsonDataToAJmsQueueApplication` |
 | `SendingJsonDataToJMSQueueIT` (`FunctionalTestCase`, `MuleClient`) | `SendingJsonDataToJMSQueueTest` (`@SpringBootTest`, ST-1 client, embedded broker) |
 
-## Behaviours kept, externalized or not reproduced
+## Behaviours stubbed or externalized
+
+Behaviours the conversion replaces or externalizes, together with those it keeps and those it does not reproduce:
 
 - Broker: the in-VM ActiveMQ 5.10 broker becomes an embedded, non-persistent Artemis 2.31.2 broker with queue `sales` pre-created; an external Artemis broker is configuration only (above).
 - Web console: the ActiveMQ console of the original README (`http://localhost:8161/admin/queues.jsp`, step 7) has no embedded equivalent. Inspect `sales` with a JMS client, or run against an external Artemis broker and use its console.

@@ -128,12 +128,12 @@ The framework settings that reproduce the original listener, connector and scatt
 - `mail.subject` is carried as a key (AAP 0.6.6). The original flow fixes the subject as the literal `Scatter gather example - aggregation` (`scatter-gather.xml:64`), which is the key's default, so an unset `MAIL_SUBJECT` sends the original subject; the original test also sets `mail.subject` (`ScatterGatherFlowControlIT.java:97`).
 - Unit tests run under profile `test` with `src/test/resources/application-test.yml`, which points the `smtp.*`, `mail.from` and `mail.to` keys at an in-process GreenMail server (sender `scatter@localhost`, recipient `receiver@localhost`) and turns STARTTLS off, because GreenMail's plain SMTP listener offers none. It sets no `mail.subject`, so tests receive the default subject. Those are GreenMail test values, not credentials. GreenMail binds a free port, which each test registers as `smtp.port` through `@DynamicPropertySource`.
 - The project calls no vendor system, so it has no `src/test/resources/application-it.yml` and no `application-it.yml.example`.
-- Supply the keys through the environment or on the command line:
+- Supply the keys through the environment or on the command line. Each value is single-quoted, inside the `spring-boot.run.arguments` string as well, so a value with spaces stays one argument. The shell still interprets `$`, `` ` ``, `\` and `"` inside that argument string's outer double quotes, so pass a password containing any of them, or a single quote, through its environment variable:
 
   ```sh
-  SMTP_HOST=<smtp host> SMTP_USER=<account> SMTP_PASSWORD=<password> MAIL_FROM=<sender> MAIL_TO=<recipient> \
+  SMTP_HOST='<smtp host>' SMTP_USER='<account>' SMTP_PASSWORD='<password>' MAIL_FROM='<sender>' MAIL_TO='<recipient>' \
     java -jar target/scatter-gather-flow-control-java-1.0.0-SNAPSHOT.jar
-  mvn spring-boot:run -Dspring-boot.run.arguments="--smtp.host=<smtp host> --smtp.user=<account> --smtp.password=<password> --mail.from=<sender> --mail.to=<recipient>"
+  mvn spring-boot:run -Dspring-boot.run.arguments="--smtp.host='<smtp host>' --smtp.user='<account>' --smtp.password='<password>' --mail.from='<sender>' --mail.to='<recipient>'"
   ```
 
 ## Mule-to-Java mapping
@@ -186,7 +186,7 @@ Run from `java-conversions/scatter-gather-flow-control-java/`:
 mvn -B clean install    # build, surefire tests, JaCoCo check, repackaged jar installed locally
 mvn -B clean package    # build, surefire tests, JaCoCo report and check (LINE >= 0.80 over service/** and mapper/**)
 mvn -B test             # surefire tests only
-SMTP_HOST=<smtp host> SMTP_USER=<account> SMTP_PASSWORD=<password> MAIL_FROM=<sender> MAIL_TO=<recipient> \
+SMTP_HOST='<smtp host>' SMTP_USER='<account>' SMTP_PASSWORD='<password>' MAIL_FROM='<sender>' MAIL_TO='<recipient>' \
   mvn spring-boot:run   # listener on 0.0.0.0:8081; the SMTP keys may also be passed as --smtp.host=... arguments
 ```
 

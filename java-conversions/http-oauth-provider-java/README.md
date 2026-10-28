@@ -1,10 +1,14 @@
 # HTTP OAuth2 Provider Example — Spring Boot conversion
 
-Spring Boot 3.2.12 / Java 17 conversion of the Mule EE 3.6 example [`http-oauth-provider`](../../http-oauth-provider/README.md) (category General). The original configures an Anypoint Enterprise Security OAuth 2.0 provider (`oauth2-provider:config`, provider name `SampleAPI`) and two flows: `protectedAuthcodeFlow`, which serves a payroll resource only to a valid bearer token, and `redirectFlow`, a demonstration helper that completes the OAuth dance in a browser. A user opens the provider's authorization URL, the resource owner `mule` logs in, the provider issues an authorization code and then an access token, and that token grants access to the payroll resource. The original folder stays unchanged beside this project and is the Tier 2A capture source.
+Spring Boot 3.2.12 / Java 17 conversion of the Mule EE 3.6 example [`http-oauth-provider`](../../http-oauth-provider/README.md) (category General). The original folder stays unchanged beside this project and is the Tier 2A capture source.
 
 The provider is hand-written over Spring MVC: no Spring Authorization Server and no Spring Security, so the original paths `/authorize` and `/token` stay as they were (AAP 0.6.4). Clients, authorization codes and access tokens live in in-memory stores and are lost on restart, as the provider module's default stores were (AAP 0.4.3). The application reaches no database, broker, file store or upstream service.
 
-## Endpoints
+## Original example
+
+The original configures an Anypoint Enterprise Security OAuth 2.0 provider (`oauth2-provider:config`, provider name `SampleAPI`) and two flows in `http-oauth-provider/src/main/app/http-oauth-provider.xml`: `protectedAuthcodeFlow`, which serves a payroll resource only to a valid bearer token, and `redirectFlow`, a demonstration helper that completes the OAuth dance in a browser. A user opens the provider's authorization URL, the resource owner `mule` logs in, the provider issues an authorization code and then an access token, and that token grants access to the payroll resource, as the [original README](../../http-oauth-provider/README.md) walks through.
+
+## Endpoints and triggers
 
 Two Undertow listeners, both bound to `localhost`, as the original's `http:listener-config host="localhost"` and provider module were (`http-oauth-provider.xml:26,43`; AAP 0.4.9):
 
@@ -77,71 +81,58 @@ Content-Length: 67
 {"name":"payroll","uri":"http://localhost:8082/resources/payroll"}
 ```
 
-## Configuration
+## Configuration keys
 
-Every key of `src/main/resources/application.yml`. Secrets have no value: each is `${ENV_NAME:}` with a `# TODO: supply …` comment (AAP 0.4.6).
+Every key of `src/main/resources/application.yml`, with the Java type its value binds to: the `oauth.provider.*` keys bind to `config/OAuthProviderProperties` (its nested `Owner` record for `owner.*`), the `listeners.*` keys to `config/ListenerPorts`, the two original ports to `int` arguments of `service/OAuthProviderService`, and `server.*`, `spring.*` and `logging.level.*` to Spring Boot's own properties. Secrets have no value: each is `${ENV_NAME:}` with a `# TODO: supply …` comment (AAP 0.4.6).
 
-| Key | Default | Purpose |
-|---|---|---|
-| `http.provider.port` | `8081` | provider listener (`/authorize`, `/token`) |
-| `http.listener.port` | `8082` | resource listener (`/resources`, `/redirect`); also the port in the payroll `uri` and the `/redirect` `Location` |
-| `server.port` | `${http.listener.port}` | the resource listener is the main Undertow port; set `http.listener.port`, not this key |
-| `server.address` | `localhost` | bind host of the resource listener |
-| `listeners.host` | `localhost` | default bind host of the additional listeners (SC-10) |
-| `listeners.disallowed-methods` | `[]` | neither listener restricts methods at the Undertow level |
-| `listeners.main.routes` | patterns `/resources`, `/redirect` | the only paths the resource listener serves (SC-10 routing) |
-| `listeners.additional[0]` | name `provider`, port `${http.provider.port}`, host `localhost`, patterns `/authorize`, `/token` | the provider listener and the only paths it serves |
-| `oauth.provider.provider-name` | `SampleAPI` | login page title and the `WWW-Authenticate` realm |
-| `oauth.provider.client-id` | none — `${OAUTH_PROVIDER_CLIENT_ID:}`, TODO (secret) | the registered client's ID |
-| `oauth.provider.client-secret` | none — `${OAUTH_PROVIDER_CLIENT_SECRET:}`, TODO (secret) | the registered client's secret |
-| `oauth.provider.client-name` | `Mule Bookstore` | shown on the login page |
-| `oauth.provider.client-description` | `Mule-powered On-line Bookstore` | shown on the login page |
-| `oauth.provider.client-type` | `CONFIDENTIAL` | `PUBLIC` would authenticate the client by its ID alone at `/token` |
-| `oauth.provider.redirect-uris` | `http://localhost*` | redirect-URI patterns; `*` matches any characters, a pattern without `*` matches exactly |
-| `oauth.provider.authorized-grant-types` | `AUTHORIZATION_CODE` | grant types the client may use |
-| `oauth.provider.scopes` | `READ_RESOURCE`, `POST_RESOURCE` | scopes the provider and the client declare |
-| `oauth.provider.resource-scope` | `READ_RESOURCE` | scope a token must carry for `/resources` |
-| `oauth.provider.token-ttl-seconds` | `86400` | access-token lifetime, also `expires_in` |
-| `oauth.provider.authorization-code-ttl-seconds` | `600` | authorization-code lifetime |
-| `oauth.provider.owner.username` | none — `${OAUTH_PROVIDER_OWNER_USERNAME:}`, TODO (secret) | the resource owner's username |
-| `oauth.provider.owner.password` | none — `${OAUTH_PROVIDER_OWNER_PASSWORD:}`, TODO (secret) | the resource owner's password |
-| `oauth.provider.owner.authorities` | `RESOURCE_OWNER` | the owner's authorities |
+`Original name` is the original's property, or the literal the key replaces, with its line in `mule-app.properties` or `http-oauth-provider.xml` (`xml:`); `none` marks a key new to the conversion. Status: `default` — a non-secret value, overridable; `TODO (secret)` — no value until supplied through the named environment variable or a `--key=value` argument; `fixed` — a setting that reproduces the original listeners, not a key of the original, so changing it changes behaviour.
+
+| Key | Type | Default | Original name | Status | Description |
+|---|---|---|---|---|---|
+| `http.provider.port` | `int` | `8081` | `http.provider.port` (unchanged), `8081` at `mule-app.properties:1`; read by `oauth2-provider:config port` (`xml:26`) and the `/redirect` `Location` (`xml:56`) | default | provider listener (`/authorize`, `/token`), opened through `listeners.additional[0].port`; also the port in the `/redirect` `Location` |
+| `http.listener.port` | `int` | `8082` | `http.listener.port` (unchanged), `8082` at `mule-app.properties:2`; read by `http:listener-config port` (`xml:43`), the payroll `uri` (`xml:47`) and the `/redirect` `Location` (`xml:56`) | default | resource listener (`/resources`, `/redirect`), opened through `server.port`; also the port in the payroll `uri` and the `/redirect` `Location` |
+| `server.port` | `Integer` | `${http.listener.port}`, so `8082` | none | fixed | the resource listener is the main Undertow port; set `http.listener.port`, not this key |
+| `server.address` | `InetAddress` | `localhost` | none | fixed | bind host of the resource listener, `http:listener-config host="localhost"` (`xml:43`) |
+| `listeners.host` | `String` | `localhost` | none | fixed | default bind host of the additional listeners (SC-10); an entry's own `host` takes precedence, and with neither set the listener binds `0.0.0.0` |
+| `listeners.disallowed-methods` | `List<String>` | `[]` | none | fixed | methods Undertow would reject with `405` on every listener; empty, so neither listener restricts methods at the Undertow level, as neither original `http:listener` set `allowedMethods` (`xml:45,54`) |
+| `listeners.main.routes[0].patterns` | `List<String>` | `/resources`, `/redirect` | none | fixed | the only paths the resource listener serves (SC-10 `PortRoutingFilter`), the original listener paths (`xml:45,54`); the route names no `servlet`, so `dispatcherServlet` serves them |
+| `listeners.additional[0].name` | `String` | `provider` | none | fixed | label of the provider listener in log lines and start-up errors |
+| `listeners.additional[0].port` | `int` | `${http.provider.port}`, so `8081` | none | fixed | port of the provider listener, the SC-10 additional Undertow listener, as `oauth2-provider:config port` (`xml:26`); set `http.provider.port`, not this key. A port outside 1–65535 stops start-up |
+| `listeners.additional[0].host` | `String` | `localhost` | none | fixed | bind host of the provider listener; the original provider served `localhost` |
+| `listeners.additional[0].routes[0].patterns` | `List<String>` | `/authorize`, `/token` | none | fixed | the only paths the provider listener serves: the provider module's authorization and token endpoints, at `/authorize` and `/token` as the original README shows them; the route names no `servlet`, so `dispatcherServlet` serves them |
+| `oauth.provider.provider-name` | `String` | `SampleAPI` | literal `providerName="SampleAPI"` (`xml:26`) | default | login page title and the `WWW-Authenticate` realm |
+| `oauth.provider.client-id` | `String` | none: `${OAUTH_PROVIDER_CLIENT_ID:}` | literal `clientId="myclientid"` (`xml:28`), repeated in the `/redirect` `Location` (`xml:56`) | TODO (secret), `OAUTH_PROVIDER_CLIENT_ID` | the registered client's ID |
+| `oauth.provider.client-secret` | `String` | none: `${OAUTH_PROVIDER_CLIENT_SECRET:}` | literal `secret="myclientsecret"` (`xml:28`), repeated in the `/redirect` `Location` (`xml:56`) | TODO (secret), `OAUTH_PROVIDER_CLIENT_SECRET` | the registered client's secret |
+| `oauth.provider.client-name` | `String` | `Mule Bookstore` | literal `clientName="Mule Bookstore"` (`xml:28`) | default | shown on the login page |
+| `oauth.provider.client-description` | `String` | `Mule-powered On-line Bookstore` | literal `description="Mule-powered On-line Bookstore"` (`xml:28`) | default | shown on the login page |
+| `oauth.provider.client-type` | `String` | `CONFIDENTIAL` | literal `type="CONFIDENTIAL"` (`xml:28`) | default | `PUBLIC` (compared ignoring case) would authenticate the client by its ID alone at `/token`; any other value requires the client secret |
+| `oauth.provider.redirect-uris` | `List<String>` | `http://localhost*` | literal `oauth2-provider:redirect-uri` `http://localhost*` (`xml:30`) | default | redirect-URI patterns; `*` matches any characters, a pattern without `*` matches exactly |
+| `oauth.provider.authorized-grant-types` | `List<String>` | `AUTHORIZATION_CODE` | literal `oauth2-provider:authorized-grant-type` `AUTHORIZATION_CODE` (`xml:33`) | default | grant types the client may use; without `AUTHORIZATION_CODE` (compared ignoring case) every authorization request gets `unsupported_response_type` |
+| `oauth.provider.scopes` | `List<String>` | `READ_RESOURCE`, `POST_RESOURCE` | literals `scopes="READ_RESOURCE POST_RESOURCE"` of `oauth2-provider:config` (`xml:26`) and the client's two `oauth2-provider:scope` elements (`xml:36-37`), the same set | default | scopes the provider and the client declare; an authorization request for any other scope gets `invalid_scope` |
+| `oauth.provider.resource-scope` | `String` | `READ_RESOURCE` | literal `oauth2-provider:validate scopes="READ_RESOURCE"` (`xml:46`) | default | scope a token must carry for `/resources` |
+| `oauth.provider.token-ttl-seconds` | `long` | `86400` | none: the original sets no lifetime; the value is the conversion's reading of the provider module's default, a Tier 2A verification point | default | access-token lifetime in seconds, also `expires_in` |
+| `oauth.provider.authorization-code-ttl-seconds` | `long` | `600` | none: the original sets no lifetime; the value is the conversion's reading of the provider module's default, a Tier 2A verification point | default | authorization-code lifetime in seconds |
+| `oauth.provider.owner.username` | `String` | none: `${OAUTH_PROVIDER_OWNER_USERNAME:}` | literal `name="mule"` of the Spring Security `ss:user` (`xml:16`) | TODO (secret), `OAUTH_PROVIDER_OWNER_USERNAME` | the resource owner's username |
+| `oauth.provider.owner.password` | `String` | none: `${OAUTH_PROVIDER_OWNER_PASSWORD:}` | literal `password="mule"` of the Spring Security `ss:user` (`xml:16`) | TODO (secret), `OAUTH_PROVIDER_OWNER_PASSWORD` | the resource owner's password |
+| `oauth.provider.owner.authorities` | `List<String>` | `RESOURCE_OWNER` | literal `authorities="RESOURCE_OWNER"` of the Spring Security `ss:user` (`xml:16`) | default | the owner's authorities |
 
 Fixed framework settings that reproduce the original listeners (not keys of the original; changing them changes behaviour):
 
-| Key | Value | Why |
-|---|---|---|
-| `spring.application.name` | `http-oauth-provider-java` | application name in log lines |
-| `spring.web.resources.add-mappings` | `false` | an unserved path reaches the no-listener 404, not the static resource handler |
-| `spring.mvc.dispatch-trace-request` | `true` | `TRACE` runs the flows of `/resources` and `/redirect` and gets the 405 on `/authorize` and `/token`, instead of the servlet's echo |
-| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `WARN` | below these levels the loggers would write the client secret, codes, tokens and the owner's password, which the original never logged; a logger's own level outranks `logging.level.root`, `--debug` and `--trace` |
-| `logging.level.org.springframework.web.servlet.mvc.method.annotation`, `logging.level.org.springframework.web.method.HandlerMethod`, `logging.level.io.undertow.request.io` | `INFO` | as above |
+| Key | Type | Value | Why |
+|---|---|---|---|
+| `spring.application.name` | `String` | `http-oauth-provider-java` | application name in log lines |
+| `spring.web.resources.add-mappings` | `boolean` | `false` | an unserved path reaches the no-listener 404, not the static resource handler |
+| `spring.mvc.dispatch-trace-request` | `boolean` | `true` | `TRACE` runs the flows of `/resources` and `/redirect` and gets the 405 on `/authorize` and `/token`, instead of the servlet's echo |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `WARN` | below `INFO` it writes request lines with their query (`client_secret`, `code`, `access_token`), the redirect view's URL with its code and, with `spring.mvc.log-request-details`, the parameters and headers (`Authorization`, `Location`); `WARN`, not `INFO`, because its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation` | `LogLevel` | `INFO` | below `INFO` it writes response bodies, the token JSON among them, and resolved exception messages |
+| `logging.level.org.springframework.web.method.HandlerMethod` | `LogLevel` | `INFO` | below `INFO` it writes handler arguments: the owner's password, the client secret, the code and the `Authorization` header |
+| `logging.level.io.undertow.request.io` | `LogLevel` | `INFO` | below `INFO` it writes request-parse failures quoting a query value that does not decode |
 
-Original names and where they live now:
-
-| Original | Converted key |
-|---|---|
-| `http.provider.port=8081`, `http.listener.port=8082` (`mule-app.properties:1-2`) | same names, same defaults |
-| literal `clientId="myclientid"` and `secret="myclientsecret"` (`http-oauth-provider.xml:28`), repeated in the `/redirect` `Location` (`xml:56`) | `oauth.provider.client-id`, `oauth.provider.client-secret` |
-| Spring Security user `name="mule" password="mule"` with `authorities="RESOURCE_OWNER"` (`xml:16`) | `oauth.provider.owner.username`, `oauth.provider.owner.password`, `oauth.provider.owner.authorities` |
-| `providerName="SampleAPI"`, `scopes="READ_RESOURCE POST_RESOURCE"` (`xml:26`); `clientName`, `description`, `type` (`xml:28`); redirect URI (`xml:30`); grant type (`xml:33`); client scopes (`xml:36-37`); validate scope (`xml:46`) | the matching `oauth.provider.*` keys above |
+The four `logging.level` keys keep the client secret, codes, tokens and the owner's password, which the original never logged, out of the log: a logger's own level outranks `logging.level.root`, `--debug` and `--trace`.
 
 - The original demo values (`myclientid`/`myclientsecret`, owner `mule`/`mule`) live only in `src/test/resources/application-test.yml`, Spring profile `test`, which surefire activates in every test JVM.
 - Fail closed: while `oauth.provider.client-id` is blank every authorization request is rejected (`invalid_client` once its `response_type` passes); while the client ID or (for a `CONFIDENTIAL` client) the secret is blank every token request gets `invalid_client`; while the owner username or password is blank every login is rejected. At startup one WARN line names each blank key, never a value: `OAuth provider credentials are not configured (<keys>): authorization and token requests are rejected until they are supplied` (`config/OAuthProviderConfigurationCheck`).
 - There is no `application-it.yml`: this is not a connector project, so it has no live-sandbox tier.
-
-## Behaviours kept, externalized and plan-chosen
-
-- Kept: the owner, client and scope checks of the original and nothing more (AAP 0.4.1): no authentication layer is added. The resource map is a `java.util.HashMap`, as the MEL map literal was, so the JSON keeps the key order `name`, `uri`. The `/redirect` `Location` is the original template verbatim, `&&` and unencoded values included.
-- Externalized: the four credentials (Configuration above). Nothing is stubbed: the original calls no other system.
-- Plan-chosen platform defaults. The original provider module generated these responses and the repository records none of them, so each is the conversion's reading and a Tier 2A verification point: a captured fixture governs, the code is changed to match, and the change is recorded in root `DECISIONS.md` (AAP 0.4.7, 0.8.4):
-  1. The token JSON: its keys and their order, `expires_in` as a number, no refresh token, and the `Cache-Control: no-store` and `Pragma: no-cache` headers.
-  2. The code lifetime (600 s) and single use, and the token lifetime (86400 s).
-  3. The `/authorize` and `/token` error statuses, codes, descriptions and bodies.
-  4. The rejected-login answer: `401` with the login page and `Invalid username or password`.
-  5. The `/resources` rejections: statuses, `WWW-Authenticate` values and `{ "message": ... }` bodies.
-  6. The bearer token read from the header only.
-  7. The login page markup. The platform-generated original page is not in the repository; the authored `templates/login.html` keeps the field names `username` and `password` that the original test fills (AAP 0.3.5).
 
 ## Mule-to-Java mapping
 
@@ -169,6 +160,19 @@ Shared components, copied with only the `package` line (and, in tests, the packa
 
 `config/RequestBodyDrainRegistration`, `config/OAuthProviderConfigurationCheck` and the wire tests `config/PreflightDispatchListenerTest`, `config/RequestBodyDrainFilterTest` and `config/SensitiveLogLevelsTest` are this project's own.
 
+## Behaviours stubbed or externalized
+
+- Kept: the owner, client and scope checks of the original and nothing more (AAP 0.4.1): no authentication layer is added. The resource map is a `java.util.HashMap`, as the MEL map literal was, so the JSON keeps the key order `name`, `uri`. The `/redirect` `Location` is the original template verbatim, `&&` and unencoded values included.
+- Externalized: the four credentials (Configuration keys above). Nothing is stubbed: the original calls no other system.
+- Plan-chosen platform defaults. The original provider module generated these responses and the repository records none of them, so each is the conversion's reading and a Tier 2A verification point: a captured fixture governs, the code is changed to match, and the change is recorded in root `DECISIONS.md` (AAP 0.4.7, 0.8.4):
+  1. The token JSON: its keys and their order, `expires_in` as a number, no refresh token, and the `Cache-Control: no-store` and `Pragma: no-cache` headers.
+  2. The code lifetime (600 s) and single use, and the token lifetime (86400 s).
+  3. The `/authorize` and `/token` error statuses, codes, descriptions and bodies.
+  4. The rejected-login answer: `401` with the login page and `Invalid username or password`.
+  5. The `/resources` rejections: statuses, `WWW-Authenticate` values and `{ "message": ... }` bodies.
+  6. The bearer token read from the header only.
+  7. The login page markup. The platform-generated original page is not in the repository; the authored `templates/login.html` keeps the field names `username` and `password` that the original test fills (AAP 0.3.5).
+
 ## Build, run and test
 
 Prerequisites: JDK 17 and Maven 3.9. `mvn test` needs no Mule licence, credential or external server. Run from `java-conversions/http-oauth-provider-java/`:
@@ -178,9 +182,9 @@ mvn -B clean install    # build, surefire tests, JaCoCo check, repackaged jar in
 mvn -B clean package    # build, surefire tests, JaCoCo report and check
 mvn -B test             # surefire tests only
 
-# run with your own client and owner credentials
-export OAUTH_PROVIDER_CLIENT_ID=<client-id> OAUTH_PROVIDER_CLIENT_SECRET=<client-secret>
-export OAUTH_PROVIDER_OWNER_USERNAME=<username> OAUTH_PROVIDER_OWNER_PASSWORD=<password>
+# run with your own client and owner credentials: replace each <placeholder> with its value, keeping the quotes
+export OAUTH_PROVIDER_CLIENT_ID='<client-id>' OAUTH_PROVIDER_CLIENT_SECRET='<client-secret>'
+export OAUTH_PROVIDER_OWNER_USERNAME='<username>' OAUTH_PROVIDER_OWNER_PASSWORD='<password>'
 mvn spring-boot:run     # provider on localhost:8081, resources on localhost:8082
 java -jar target/http-oauth-provider-java-1.0.0-SNAPSHOT.jar
 
@@ -194,6 +198,8 @@ mvn spring-boot:test-run -Dspring-boot.run.profiles=test
 - JaCoCo gate: LINE covered ratio of at least 0.80 over `service/**` and `mapper/**` (this project has no `mapper` package), checked at `prepare-package`; a lower ratio fails `mvn clean package` and `mvn clean install`. The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate`.
 - Reports: `target/surefire-reports/`, `target/site/jacoco/` (`index.html`, `jacoco.csv`) and `target/fixture-parity/summary.properties`.
 - Tests never use the default ports: the Spring tests reserve free loopback ports for both listeners (`DEFINED_PORT`), because the SC-10 provider listener needs a concrete port and the `/redirect` `Location` and payroll `uri` embed both. `FixtureParityTest` starts no application context while no fixture exists. Once fixtures are captured, it replays them with the provider listener pinned to the capture port `8081` by each fixture's `state.properties` (the `/redirect` `Location` names that port and the replay substitutes only the targeted listener's port); a `-Dhttp.provider.port` setting does not override it, so port 8081 must then be free (`SCENARIOS.md`, Notes for this project).
+
+## Tests
 
 | Test class | What it asserts |
 |---|---|
@@ -214,7 +220,7 @@ mvn spring-boot:test-run -Dspring-boot.run.profiles=test
 
 `support/HttpTestClient` (ST-1) is an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
 
-## Parity fixtures
+## Fixture parity (ST-2)
 
 The scenarios, the fixture contract and the capture procedure are in [`src/test/resources/fixtures/SCENARIOS.md`](src/test/resources/fixtures/SCENARIOS.md). Every scenario has `"upstream": []`, because the original makes no outbound call. Status in the last run (`target/fixture-parity/summary.properties`: `verified=0`, `unverified=19`, `failed=0`):
 

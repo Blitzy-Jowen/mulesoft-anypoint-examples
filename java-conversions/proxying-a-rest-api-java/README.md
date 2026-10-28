@@ -180,10 +180,10 @@ mvn spring-boot:run     # listener on 0.0.0.0:8081, upstream https://api.box.com
 java -jar target/proxying-a-rest-api-java-1.0.0-SNAPSHOT.jar
 ```
 
-Pass the key store either through the `KEYSTORE_*` environment variables or as arguments, for example:
+Pass the key store either through the `KEYSTORE_*` environment variables or as arguments. Each value inside `spring-boot.run.arguments` is single-quoted, so a value with spaces stays one argument. The shell still interprets `$`, `` ` ``, `\` and `"` inside the outer double quotes, so pass a password containing any of them, or a single quote, through its `KEYSTORE_*` variable. For example:
 
 ```sh
-mvn spring-boot:run -Dspring-boot.run.arguments="--keystore.path=/absolute/path/to/keystore.jks --keystore.key=<store password> --keystore.password=<key password>"
+mvn spring-boot:run -Dspring-boot.run.arguments="--keystore.path='/absolute/path/to/keystore.jks' --keystore.key='<store password>' --keystore.password='<key password>'"
 java -jar target/proxying-a-rest-api-java-1.0.0-SNAPSHOT.jar --http.port=9090 --proxy.upstream-url=https://api.example.com:443
 ```
 

@@ -52,7 +52,7 @@ The original enabled the console (`apikit:config consoleEnabled="true" consolePa
 | GET `/api/console/?raml`, GET `/api/console?raml`, and GET `/api/` with `Accept: application/raml+yaml` | `api/currency.raml` as `application/raml+yaml` with `Access-Control-Allow-Origin: *` and its `baseUri` rewritten to the listener URL (`http://localhost:<port>/api`) |
 | GET `/api/currency-schema.json` and GET `/api/console/currency-schema.json` | the schema the RAML `!include`s, served relative to the RAML (`application/octet-stream`, by the console's extension table) |
 
-A miss under the console path is answered with the APIkit 404. The class Javadoc of `ApiKitConsoleController` lists where these bytes are plan decisions rather than recorded original output (for example, the jar's `console/` tree is served rather than `console2/`, and the RAML is served as its raw file rather than re-dumped). Each is a Tier 2A verification point.
+A miss under the console path is answered with the APIkit 404, and so is every method but GET and HEAD on a RAML include (OPTIONS and a CORS pre-flight included). The class Javadoc of `ApiKitConsoleController` lists where these bytes are plan decisions rather than recorded original output (for example, the jar's `console/` tree is served rather than `console2/`, and the RAML is served as its raw file rather than re-dumped). Each is a Tier 2A verification point.
 
 ### Order file trigger
 
@@ -192,7 +192,7 @@ Open the console at `http://localhost:8081/api/console/`.
 |---|---|
 | `ProcessingOrdersWithDataweaveAndApikitTest` | the ported original test (`processing-orders-with-dataweave-and-APIkit/src/test/java/org/mule/examples/ProcessingOrdersWithDataweaveAndApikitIT.java:52-78`): `orders.xml` dropped into the input directory of the running application, then `orders.json` and `report.csv` equal `src/test/resources/expected/orders.json` and `expected/report.csv` with all whitespace removed, within the original's 5 s budget; nothing is mocked, the currencies come from the application's own `GET /api/currencies`, and the input file is deleted |
 | `controller/CurrencyControllerTest` | on the wire through ST-1, so status code, reason phrase, `Content-Type` and body bytes are asserted: GET 200 with `currency.json` byte for byte, the APIkit 405 for POST, PUT, DELETE, OPTIONS and HEAD, the 406, the APIkit 404 under `/api`, and the no-listener 404 outside it |
-| `controller/ApiKitConsoleControllerTest` | SC-17: the redirect, console page and files, RAML descriptor with rewritten `baseUri`, the `currency-schema.json` include, and path-traversal probes answered with the 404 |
+| `controller/ApiKitConsoleControllerTest` | SC-17: the redirect, console page and files, RAML descriptor with rewritten `baseUri`, the `currency-schema.json` include, and path-traversal probes answered with the 404; at `<api base>/<include>`, each RAML include served to GET with its bytes and to HEAD with an empty 200, and every other method (OPTIONS, POST, PUT, DELETE, PATCH, PROPFIND and TRACE are sent) and CORS pre-flights asking for GET or POST answered with the APIkit 404 and no `Allow`, `Access-Control-*` or `Vary` header |
 | `service/CurrencyServiceTest` | the rendered template equals the original `currency.json` (length and SHA-256) |
 | `service/OrderFlowServiceTest` | the bundled input produces both expected files byte for byte; processor order (currency call, one parse read by both scripts, `orders.json`, then `report.csv`); every failure propagates with no file written, or with `report.csv` unattempted after a failed `orders.json` write; inline-DTD internal entities (text in a title and an author, a whole `item`, a price and a year, an entity inside an entity) give byte-identical outputs to their text written out, and `Pre &t; Post` and `&au;`, with `t` and `au` declared as `Inline` and `Ann Author`, give `"title": "Pre Inline Post"` and `"author": "Ann Author"`; an external general entity, an external parameter entity and an external DTD subset (`file:///etc/passwd`) are never loaded; a billion-laughs file fails with the parser's entity-expansion `SAXParseException` and writes nothing |
 | `trigger/OrderFileTriggerTest` | the trigger test of AAP 0.8.2, with only the currency client mocked: one on-demand poll writes both expected files and deletes the input; a currency failure or a malformed XML file still consumes the input and writes nothing; `poll()` is scheduled at `${orders.polling-frequency:1000}` |
@@ -218,9 +218,9 @@ Open the console at `http://localhost:8081/api/console/`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 704 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 704 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 421 of 461 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 89.6% (1305 of 1456 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 715 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 715 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 421 of 461 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 89.5% (1309 of 1463 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project: it has no `FixtureParityTest` and no `SCENARIOS.md`. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported original assertions of `ProcessingOrdersWithDataweaveAndApikitTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 
