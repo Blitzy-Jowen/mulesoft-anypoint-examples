@@ -49,8 +49,10 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
  * {@code o:errorDetails[0].detail}, else its {@code title}, else the OAuth 2.0 token error format's
  * {@code error_description}, else its {@code error}. A response without such text is described by its status, and
  * a failure without a response neutrally, as {@link #upstreamMessage(Throwable)} lists. No {@code WebClient}
- * exception text reaches the caller, because it carries the request URL or the remote address; nor do request
- * headers, and with them the bearer token.
+ * exception text is returned for these modes: a response exception of the NetSuite clients carries only
+ * {@code "<code> <reason phrase>"}, because {@code NetsuiteRestClient#responseExceptionsWithoutRequest()} has it
+ * built without the request, and a request exception can name the remote address. Request headers, and with them
+ * the bearer token, never reach the caller either.
  *
  * <p>This project holds the reference copy. {@code netsuite-data-retrieval-java} carries an identical copy in which
  * only the {@code package} line differs, so the class depends on nothing but the JDK, Spring, Jackson and its SC-9
@@ -129,10 +131,12 @@ public class NetsuiteFailureClassifier implements UpstreamFailureClassifier {
      *       {@link UpstreamFailureClassifier#isUnavailable(Throwable)} accepts, and
      *       {@code "NetSuite call failed"} otherwise.</li>
      * </ul>
-     * The exceptions' own messages are never returned, because they name the request URL, as in
-     * {@code "401 Unauthorized from POST https://..."}, or the remote address that {@code WebClient} copies from the
-     * transport failure. A chain without a {@code WebClient} exception, such as the {@code IllegalStateException} of
-     * a missing setting, gets the inherited lookup.
+     * The exceptions' own messages are never returned: a response exception of the NetSuite clients carries only
+     * its status, as in {@code "401 Unauthorized"} (the request method and URL that {@code WebClient} appends are left
+     * out through {@code NetsuiteRestClient#responseExceptionsWithoutRequest()}), and a request exception can name
+     * the remote address that {@code WebClient} copies from the transport failure. A chain without a
+     * {@code WebClient} exception, such as the {@code IllegalStateException} of a missing setting, gets the inherited
+     * lookup.
      *
      * @param failure the classified throwable; never {@code null}
      * @return NetSuite's error text, the status or neutral description above, or, without a {@code WebClient}

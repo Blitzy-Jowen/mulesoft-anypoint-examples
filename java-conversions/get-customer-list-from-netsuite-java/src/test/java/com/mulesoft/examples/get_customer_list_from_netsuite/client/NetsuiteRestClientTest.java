@@ -26,6 +26,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.github.tomakehurst.wiremock.client.MappingBuilder;
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
@@ -71,6 +72,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeEach;
@@ -89,12 +91,16 @@ import org.springframework.boot.test.context.ConfigDataApplicationContextInitial
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
+import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.ClientRequest;
 import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.ExchangeFunction;
+import org.springframework.web.reactive.function.client.UnknownHttpStatusCodeException;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClientConfig;
 
@@ -488,6 +494,151 @@ class NetsuiteRestClientTest {
                         "Unexpected NetSuite response: items is not an array"),
                 Arguments.of("{\"items\": [], \"hasMore\": \"false\"}",
                         "Unexpected NetSuite response: hasMore is not a boolean"));
+    }
+
+    /**
+     * A server that keeps answering {@code hasMore} {@code true} with items fails the read once the next offset
+     * reaches the page's numeric {@code totalResults}, after exactly the requests that reach it, rather than looping.
+     */
+    @ParameterizedTest(name = "{0}: {2} request(s) for {1}")
+    @MethodSource("pagesReportingMorePastTotalResults")
+    void pagedReadsFailOnceMoreIsReportedAtOrPastTotalResults(PagedRead read, String pageBody, int requests) {
+        read.answerEveryPage(pageBody);
+
+        assertThatThrownBy(() -> read.ids(client))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Unexpected NetSuite response: hasMore is true at or past totalResults");
+        read.verifyPageRequests(requests);
+    }
+
+    static Stream<Arguments> pagesReportingMorePastTotalResults() {
+        return Stream.of(PagedRead.values()).flatMap(read -> Stream.of(
+                Arguments.of(read,
+                        "{\"count\": 1, \"hasMore\": true, \"totalResults\": 1, \"items\": [{\"id\": \"9\"}]}", 1),
+                Arguments.of(read,
+                        "{\"count\": 1, \"hasMore\": true, \"totalResults\": 3, \"items\": [{\"id\": \"9\"}]}", 3),
+                Arguments.of(read,
+                        "{\"count\": 1, \"hasMore\": true, \"totalResults\": 0, \"items\": [{\"id\": \"9\"}]}", 1),
+                // Without count the offset advances by the item count, and the bound follows it.
+                Arguments.of(read,
+                        "{\"hasMore\": true, \"totalResults\": 4, \"items\": [{\"id\": \"1\"}, {\"id\": \"2\"}]}", 2),
+                // A decimal totalResults is compared by value.
+                Arguments.of(read,
+                        "{\"count\": 1, \"hasMore\": true, \"totalResults\": 2.0, \"items\": [{\"id\": \"9\"}]}", 2)));
+    }
+
+    /**
+     * A server that keeps answering {@code hasMore} {@code true} with items and no usable {@code totalResults} fails
+     * the read on the last page the cap allows, after exactly {@link NetsuiteRestClient#MAX_PAGES} requests.
+     */
+    @ParameterizedTest(name = "{0}: {1}")
+    @MethodSource("pagesThatNeverEndTheRead")
+    void pagedReadsFailAfterMaxPagesThatStillReportMore(PagedRead read, String pageBody) {
+        read.answerEveryPage(pageBody);
+
+        assertThatThrownBy(() -> read.ids(client))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Unexpected NetSuite response: hasMore is still true after " + NetsuiteRestClient.MAX_PAGES
+                        + " pages");
+        read.verifyPageRequests(NetsuiteRestClient.MAX_PAGES);
+    }
+
+    static Stream<Arguments> pagesThatNeverEndTheRead() {
+        return Stream.of(PagedRead.values()).flatMap(read -> Stream.of(
+                Arguments.of(read, "{\"count\": 1, \"hasMore\": true, \"items\": [{\"id\": \"9\"}]}"),
+                // A totalResults that is not a number bounds nothing.
+                Arguments.of(read,
+                        "{\"count\": 1, \"hasMore\": true, \"totalResults\": \"1\", \"items\": [{\"id\": \"9\"}]}"),
+                // 2^64, which a conversion to long would truncate to 0: compared exactly, no offset reaches it.
+                Arguments.of(read, "{\"count\": 1, \"hasMore\": true, \"totalResults\": 18446744073709551616,"
+                        + " \"items\": [{\"id\": \"9\"}]}")));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("pagedReads")
+    void pagedReadsWhosePagesCarryAConsistentTotalResultsReturnEveryRow(PagedRead read) {
+        read.answerPage(0, "{\"count\": 2, \"hasMore\": true, \"offset\": 0, \"totalResults\": 5,"
+                + " \"items\": [{\"id\": \"1\"}, {\"id\": \"2\"}]}");
+        read.answerPage(2, "{\"count\": 2, \"hasMore\": true, \"offset\": 2, \"totalResults\": 5,"
+                + " \"items\": [{\"id\": \"3\"}, {\"id\": \"4\"}]}");
+        // The last page ends exactly at totalResults with hasMore false.
+        read.answerPage(4, "{\"count\": 1, \"hasMore\": false, \"offset\": 4, \"totalResults\": 5,"
+                + " \"items\": [{\"id\": \"5\"}]}");
+
+        assertThat(read.ids(client)).containsExactly("1", "2", "3", "4", "5");
+        read.verifyPageRequests(3);
+    }
+
+    static Stream<PagedRead> pagedReads() {
+        return Stream.of(PagedRead.values());
+    }
+
+    /**
+     * The client's two paged reads, {@link NetsuiteRestClient#suiteQl(String)} and
+     * {@link NetsuiteRestClient#listRecordIds(String)}, each with the WireMock endpoint its pages are requested from,
+     * so that a paging case runs against both.
+     */
+    enum PagedRead {
+        SUITE_QL {
+            @Override
+            void answerEveryPage(String pageBody) {
+                netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(okJson(pageBody)));
+            }
+
+            @Override
+            void answerPage(int offset, String pageBody) {
+                netsuite.stubFor(post(urlPathEqualTo(SUITEQL))
+                        .withQueryParam("offset", equalTo(String.valueOf(offset)))
+                        .willReturn(okJson(pageBody)));
+            }
+
+            @Override
+            List<String> ids(NetsuiteRestClient client) {
+                return client.suiteQl("SELECT id FROM customer").stream()
+                        .map(row -> String.valueOf(row.get("id")))
+                        .toList();
+            }
+
+            @Override
+            void verifyPageRequests(int pages) {
+                netsuite.verify(pages, postRequestedFor(urlPathEqualTo(SUITEQL)));
+            }
+        },
+        LIST_RECORD_IDS {
+            @Override
+            void answerEveryPage(String pageBody) {
+                netsuite.stubFor(get(urlPathEqualTo(CUSTOMER_RECORDS)).willReturn(okJson(pageBody)));
+            }
+
+            @Override
+            void answerPage(int offset, String pageBody) {
+                netsuite.stubFor(get(urlPathEqualTo(CUSTOMER_RECORDS))
+                        .withQueryParam("offset", equalTo(String.valueOf(offset)))
+                        .willReturn(okJson(pageBody)));
+            }
+
+            @Override
+            List<String> ids(NetsuiteRestClient client) {
+                return client.listRecordIds("customer");
+            }
+
+            @Override
+            void verifyPageRequests(int pages) {
+                netsuite.verify(pages, getRequestedFor(urlPathEqualTo(CUSTOMER_RECORDS)));
+            }
+        };
+
+        /** Answers every page request of this read, whatever its offset, with {@code pageBody}. */
+        abstract void answerEveryPage(String pageBody);
+
+        /** Answers the page request of this read at {@code offset} with {@code pageBody}. */
+        abstract void answerPage(int offset, String pageBody);
+
+        /** Runs this read and returns the {@code id} of each item, as text, in arrival order. */
+        abstract List<String> ids(NetsuiteRestClient client);
+
+        /** Asserts that exactly {@code pages} page requests of this read reached WireMock. */
+        abstract void verifyPageRequests(int pages);
     }
 
     @Test
@@ -1055,7 +1206,7 @@ class NetsuiteRestClientTest {
 
     /**
      * A token endpoint that rejects the client is an authentication failure whose message is NetSuite's text, or its
-     * status, and never {@code WebClient}'s exception message, which names the token URL.
+     * status. Its cause, NetSuite's response exception, names the status alone, never the token URL.
      */
     @ParameterizedTest(name = "{0}")
     @MethodSource("tokenRejections")
@@ -1067,7 +1218,10 @@ class NetsuiteRestClientTest {
         assertThatThrownBy(() -> client.suiteQl("SELECT id FROM customer"))
                 .isInstanceOfSatisfying(UpstreamAuthenticationException.class, e -> {
                     assertThat(e.getSystem()).isEqualTo(UpstreamSystem.NETSUITE);
-                    assertThat(e.getCause()).hasMessageContaining(netsuite.baseUrl() + TOKEN);
+                    assertThat(e.getCause()).isInstanceOf(WebClientResponseException.Unauthorized.class)
+                            .hasMessage("401 Unauthorized")
+                            .hasMessageNotContaining(netsuite.baseUrl())
+                            .hasMessageNotContaining(TOKEN);
                     assertThat(e).hasMessage(expected);
                     assertThat(e.getMessage()).doesNotContain(netsuite.baseUrl()).doesNotContain(TOKEN);
                 });
@@ -1101,6 +1255,98 @@ class NetsuiteRestClientTest {
                         e -> assertThat(e.getStatusCode().value()).isEqualTo(400));
         netsuite.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL)));
         netsuite.verify(1, postRequestedFor(urlPathEqualTo(TOKEN)));
+    }
+
+    /**
+     * Each kind of NetSuite request with an error answer that no approved mode covers, the status-specific exception
+     * {@code WebClient} raises for it, that exception's message, and the NetSuite API requests made (none when the
+     * token request is the one answered).
+     */
+    static Stream<Arguments> unclassifiedErrorAnswers() {
+        Consumer<NetsuiteRestClient> suiteQl = c -> c.suiteQl("SELECT id FROM customer");
+        return Stream.of(
+                Arguments.of("SuiteQL POST", post(urlPathEqualTo(SUITEQL)), suiteQl, 500,
+                        WebClientResponseException.InternalServerError.class, "500 Internal Server Error", 1),
+                Arguments.of("SuiteQL POST, non-standard status", post(urlPathEqualTo(SUITEQL)), suiteQl, 599,
+                        UnknownHttpStatusCodeException.class, "Unknown status code [599]", 1),
+                Arguments.of("record GET", get(urlPathEqualTo(CUSTOMER_RECORDS + "/107")),
+                        (Consumer<NetsuiteRestClient>) c -> c.getRecord("customer", "107"), 404,
+                        WebClientResponseException.NotFound.class, "404 Not Found", 1),
+                Arguments.of("record list GET", get(urlPathEqualTo(CUSTOMER_RECORDS)),
+                        (Consumer<NetsuiteRestClient>) c -> c.listRecordIds("customer"), 403,
+                        WebClientResponseException.Forbidden.class, "403 Forbidden", 1),
+                Arguments.of("metadata catalog GET", get(urlPathEqualTo(CUSTOMER_CATALOG)),
+                        (Consumer<NetsuiteRestClient>) c -> c.metadataCatalog("customer"), 502,
+                        WebClientResponseException.BadGateway.class, "502 Bad Gateway", 1),
+                Arguments.of("record create POST", post(urlPathEqualTo(CUSTOMER_RECORDS)),
+                        (Consumer<NetsuiteRestClient>) c -> c.createRecord("customer", Map.of("companyName", "A")),
+                        400, WebClientResponseException.BadRequest.class, "400 Bad Request", 1),
+                Arguments.of("record DELETE", delete(urlPathEqualTo(CUSTOMER_RECORDS + "/107")),
+                        (Consumer<NetsuiteRestClient>) c -> c.deleteRecord("customer", "107"), 409,
+                        WebClientResponseException.Conflict.class, "409 Conflict", 1),
+                // Newer than the fixture's token stub at the same priority, so this answers the token request.
+                Arguments.of("token POST", post(urlPathEqualTo(TOKEN)).atPriority(1), suiteQl, 503,
+                        WebClientResponseException.ServiceUnavailable.class, "503 Service Unavailable", 0));
+    }
+
+    /**
+     * An unclassified NetSuite error answer reaches the caller, once, as the {@code WebClientResponseException}
+     * subclass of its status with NetSuite's headers and body, charset included, and with a message that is the
+     * status alone: {@code WebClient}'s own message appends the request method and URL, which name the account's
+     * NetSuite host and would reach SC-1's 500 body.
+     */
+    @ParameterizedTest(name = "{0} {3}")
+    @MethodSource("unclassifiedErrorAnswers")
+    void unclassifiedErrorAnswerIsItsStatusExceptionWithoutTheRequestMethodOrUrl(String name, MappingBuilder request,
+            Consumer<NetsuiteRestClient> call, int status, Class<? extends WebClientResponseException> type,
+            String message, int apiRequests) {
+        // ISO-8859-1 bytes, so the body text reads back only when the exception keeps the answer's charset.
+        MediaType contentType = MediaType.parseMediaType("application/json;charset=ISO-8859-1");
+        String text = "{\"title\": \"Fehler\", \"status\": " + status
+                + ", \"o:errorDetails\": [{\"detail\": \"Ung\u00fcltige Anfrage.\"}]}";
+        byte[] body = text.getBytes(StandardCharsets.ISO_8859_1);
+        netsuite.stubFor(request.willReturn(aResponse().withStatus(status)
+                .withHeader("Content-Type", contentType.toString()).withBody(body)));
+
+        assertThatThrownBy(() -> call.accept(client))
+                .isExactlyInstanceOf(type)
+                .hasMessage(message)
+                .isInstanceOfSatisfying(WebClientResponseException.class, e -> {
+                    assertThat(e.getMessage()).doesNotContain(netsuite.baseUrl(), "/services/rest");
+                    assertThat(e.getRequest()).isNull();
+                    assertThat(e.getStatusCode().value()).isEqualTo(status);
+                    assertThat(e.getHeaders().getContentType()).isEqualTo(contentType);
+                    assertThat(e.getResponseBodyAsByteArray()).isEqualTo(body);
+                    assertThat(e.getResponseBodyAsString()).isEqualTo(text);
+                    assertThat(e.getResponseBodyAs(byte[].class)).isEqualTo(body);
+                });
+        netsuite.verify(1, postRequestedFor(urlPathEqualTo(TOKEN)));
+        assertThat(netsuite.findAll(anyRequestedFor(anyUrl())))
+                .filteredOn(recorded -> !recorded.getUrl().startsWith(TOKEN))
+                .hasSize(apiRequests);
+    }
+
+    /**
+     * A 2xx answer whose body cannot be read, for example one past the client's 16 MB buffer, fails once with the
+     * {@code WebClientResponseException} that {@code WebClient} raises with the read failure as its cause; a filter
+     * of the client's builder, inside the client's own, fails the read here. The message is the status and that
+     * cause, never the request method or URL.
+     */
+    @Test
+    void unreadableSuccessfulAnswerFailsWithoutTheRequestMethodOrUrl() {
+        netsuite.stubFor(post(urlPathEqualTo(SUITEQL)).willReturn(okJson("{\"hasMore\": false, \"items\": []}")));
+        IllegalStateException readFailure = new IllegalStateException("body read failed");
+        // The body is read to its end, its buffers discarded and so released, before the read fails.
+        ExchangeFilterFunction failingRead = ExchangeFilterFunction.ofResponseProcessor(response -> Mono.just(
+                response.mutate().body(body -> body.thenMany(Flux.<DataBuffer>error(readFailure))).build()));
+        NetsuiteRestClient unreadable = newClient(props, WebClient.builder().filter(failingRead));
+
+        assertThatThrownBy(() -> unreadable.suiteQl("SELECT id FROM customer"))
+                .isExactlyInstanceOf(WebClientResponseException.class)
+                .hasCauseReference(readFailure)
+                .hasMessage("200 OK, but response failed with cause: java.lang.IllegalStateException: body read failed")
+                .isInstanceOfSatisfying(WebClientResponseException.class, e -> assertThat(e.getRequest()).isNull());
+        assertOneTokenRequestAndOneCall();
     }
 
     @ParameterizedTest(name = "{0}")

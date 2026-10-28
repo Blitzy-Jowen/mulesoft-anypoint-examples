@@ -65,9 +65,12 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.mapper.DwX
  * <p>Selection follows DataWeave's single-value selector: each {@code .key} takes the first entry with that local
  * name, and a selector that misses, or that is applied to a value that is not an object, yields {@code null},
  * which the writer prints as {@code null}. A document whose root is not {@code summary} therefore gives
- * {@code null} for all three keys. The selected {@code customer} and {@code orderItems} objects are written as
- * read: an order with several items keeps one {@code "item"} key per {@code <item>} element, in document order,
- * rather than an array, and every leaf stays the string the reader produced.
+ * {@code null} for all three keys. A selected element with neither text nor element children is written
+ * {@code ""}, the empty string DataWeave 1.0's XML reader read it as: the {@code <orderItems/>} the 1080 service
+ * answers for an order whose items it did not read gives {@code "orderItems": ""}, and an empty
+ * {@code <firstName/>} gives {@code "firstName": ""}. The selected {@code customer} and {@code orderItems}
+ * objects are written as read: an order with several items keeps one {@code "item"} key per {@code <item>}
+ * element, in document order, rather than an array, and every leaf stays the string the reader produced.
  *
  * <p>Transformation only: no I/O, no configuration, no logging. Stateless and thread-safe.
  */

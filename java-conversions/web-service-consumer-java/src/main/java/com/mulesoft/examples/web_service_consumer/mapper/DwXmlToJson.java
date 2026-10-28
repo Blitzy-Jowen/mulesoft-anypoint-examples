@@ -53,7 +53,11 @@ import org.xml.sax.SAXParseException;
  *       processing instructions between child elements, pretty-printing whitespace included, are ignored.</li>
  *   <li>Any other element is a leaf: the concatenation of its text and CDATA content, untrimmed, as a
  *       {@link String} (numbers stay strings, {@code <count>2</count>} reads as {@code "2"}). A leaf with no
- *       text or CDATA node at all, such as {@code <count/>}, reads as {@code null}.</li>
+ *       text or CDATA node at all ({@code <count/>}, {@code <count></count>}, or a leaf holding only comments,
+ *       processing instructions or attributes) reads as the empty string {@code ""}, as DataWeave 1.0's XML
+ *       reader read it (its {@code nullValueOn} default is {@code none}). An element never reads as
+ *       {@code null}; only {@link #select} and {@link #convert} return {@code null}, for a selector that misses
+ *       or a {@code null} document.</li>
  * </ul>
  *
  * <p>Parsing is namespace-aware and rejects DOCTYPE declarations, so neither external entities nor entity
@@ -167,7 +171,7 @@ public class DwXmlToJson {
      *
      * @param element the element to convert
      * @return a {@link DwObject} when the element has element children; otherwise its text as a
-     *         {@link String}, or {@code null} when it has no text or CDATA node
+     *         {@link String}, the empty string when it has no text or CDATA node; never {@code null}
      * @throws NullPointerException when {@code element} is {@code null}
      */
     public Object content(Element element) {
@@ -186,17 +190,14 @@ public class DwXmlToJson {
     }
 
     private static String text(Element leaf) {
-        StringBuilder text = null;
+        StringBuilder text = new StringBuilder();
         for (Node child = leaf.getFirstChild(); child != null; child = child.getNextSibling()) {
             short type = child.getNodeType();
             if (type == Node.TEXT_NODE || type == Node.CDATA_SECTION_NODE) {
-                if (text == null) {
-                    text = new StringBuilder();
-                }
                 text.append(child.getNodeValue());
             }
         }
-        return text != null ? text.toString() : null;
+        return text.toString();
     }
 
     private static String key(Element element) {

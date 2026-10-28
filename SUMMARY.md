@@ -12,6 +12,9 @@ The rows of `foreach-processing-and-choice-routing-java`, `legacy-modernization-
 The evidence row of `querying-a-mysql-database-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-28 with `mvn -B test` on the tree that adds its fail-fast HikariCP timeouts and their tests.
 The row of `import-leads-into-salesforce-java` and the Tier 1 tests total under Totals were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that adds the late-query cleanup test of its live test.
 The rows of the seven SC-15 Salesforce projects (`salesforce-data-retrieval-java`, `import-contacts-into-salesforce-java`, `import-leads-into-salesforce-java`, `authenticating-salesforce-using-oauth2-java`, `salesforce-data-synchronization-using-watermarking-and-batch-processing-java`, `salesforce-to-MySQL-DB-using-Batch-Processing-java`, `dataweave-with-flowreflookup-java`) and of the four SC-17 RAML projects (`rest-api-with-apikit-java`, `testing-apikit-with-munit-java`, `processing-orders-with-dataweave-and-APIkit-java`, `netsuite-data-retrieval-java`), and the Tier 1 tests total under Totals, were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that adds the single-flight Salesforce login, the bounded `queryMore` paging and the APIkit 404 for every method but GET and HEAD on a RAML include alias.
+The rows of `service-orchestration-and-choice-routing-java` and `web-service-consumer-java` were re-measured on 2026-10-28 with `mvn -B clean install` on the tree whose SC-4 `DwXmlToJson` reads an element without text as the empty string, and the Tier 1 tests total under Totals was updated to match.
+The rows of `service-orchestration-and-choice-routing-java` and `websphere-mq-java` were re-measured on 2026-10-28 with `mvn -B clean install` and `mvn -B test` on the tree whose SC-12 held connects claim their deliveries when their request arrives and take them only while that claim is current, the orchestration row again once its `WebServiceConfig` SAAJ transformer-factory setting and test were merged, and the Tier 1 tests total under Totals was updated to match.
+The rows of `foreach-processing-and-choice-routing-java`, `get-customer-list-from-netsuite-java`, `importing-a-CSV-file-into-Mongo-DB-java`, `netsuite-data-retrieval-java` and `soap-webservice-security-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that adds the SOAP reply edge-case and malformed-CSV tests and the NetSuite single-flight token request, bounded paging and request-free error messages.
 
 ## Status
 
@@ -120,7 +123,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 23,765 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 23,896 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 85.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -134,9 +137,9 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | rest-api-with-apikit-java | 663 / 0 / 0 / 0 | 131 of 131 | 89.7% (1204 of 1342) | — |
 | testing-apikit-with-munit-java | 443 / 0 / 0 / 0 | 13 of 13 | 83.3% (686 of 824) | — |
 | processing-orders-with-dataweave-and-APIkit-java | 715 / 0 / 0 / 0 | 421 of 461 | 89.5% (1309 of 1463) | — |
-| web-service-consumer-java | 520 / 0 / 0 / 1 | 449 of 459 | 97.4% (799 of 820) | — |
+| web-service-consumer-java | 520 / 0 / 0 / 1 | 447 of 457 | 97.4% (797 of 818) | — |
 | xml-only-soap-webservice-java | 419 / 0 / 0 / 1 | 644 of 657 | 91.6% (1457 of 1591) | — |
-| service-orchestration-and-choice-routing-java | 941 / 0 / 0 / 1 | 1149 of 1157 | 92.7% (2859 of 3084) | — |
+| service-orchestration-and-choice-routing-java | 956 / 0 / 0 / 1 | 1173 of 1181 | 92.8% (2890 of 3114) | — |
 | jms-message-rollback-and-redelivery-java | 63 / 0 / 0 / 1 | 77 of 78 | 98.5% (201 of 204) | — |
 | sending-json-data-to-a-jms-queue-java | 272 / 0 / 0 / 1 | 163 of 163 | 98.1% (411 of 419) | — |
 | using-transactional-scope-in-jms-to-database-java | 97 / 0 / 0 / 1 | 115 of 119 | 96.6% (229 of 237) | — |
@@ -144,8 +147,8 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | import-contacts-into-salesforce-java | 701 / 0 / 0 / 1 | 92 of 92 | 91.7% (697 of 760) | 1 run, 1 skipped, 0 failed, 0 errors |
 | import-leads-into-salesforce-java | 800 / 0 / 0 / 1 | 341 of 346 | 96.4% (995 of 1032) | 1 run, 1 skipped, 0 failed, 0 errors |
 | authenticating-salesforce-using-oauth2-java | 898 / 0 / 0 / 1 | 93 of 93 | 96.2% (920 of 956) | 1 run, 1 skipped, 0 failed, 0 errors |
-| get-customer-list-from-netsuite-java | 675 / 0 / 0 / 1 | 257 of 261 | 95.8% (1243 of 1298) | 1 run, 1 skipped, 0 failed, 0 errors |
-| netsuite-data-retrieval-java | 1491 / 0 / 0 / 0 | 438 of 441 | 93.3% (1984 of 2126) | 3 run, 3 skipped, 0 failed, 0 errors |
+| get-customer-list-from-netsuite-java | 708 / 0 / 0 / 1 | 257 of 261 | 95.5% (1302 of 1363) | 1 run, 1 skipped, 0 failed, 0 errors |
+| netsuite-data-retrieval-java | 1524 / 0 / 0 / 0 | 438 of 441 | 93.2% (2043 of 2191) | 3 run, 3 skipped, 0 failed, 0 errors |
 | salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 766 / 0 / 0 / 1 | 339 of 350 | 96.6% (932 of 965) | 1 run, 1 skipped, 0 failed, 0 errors |
 | salesforce-to-MySQL-DB-using-Batch-Processing-java | 818 / 0 / 0 / 1 | 363 of 374 | 96.7% (1007 of 1041) | 1 run, 1 skipped, 0 failed, 0 errors |
 | adding-a-new-customer-to-workday-revenue-management-java | 577 / 0 / 0 / 1 | 73 of 73 | 96.4% (669 of 694) | 1 run, 1 skipped, 0 failed, 0 errors |
@@ -158,13 +161,13 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | exposing-a-restful-resource-using-the-HTTP-connector-java | 229 / 0 / 0 / 1 | 23 of 23 | 97.9% (281 of 287) | — |
 | extracting-data-from-LDAP-directory-java | 132 / 0 / 0 / 1 | 17 of 17 | 95.4% (332 of 348) | — |
 | filtering-a-message-java | 172 / 0 / 0 / 1 | 36 of 36 | 96.7% (265 of 274) | — |
-| foreach-processing-and-choice-routing-java | 498 / 0 / 0 / 1 | 77 of 78 | 88.3% (1400 of 1585) | — |
+| foreach-processing-and-choice-routing-java | 511 / 0 / 0 / 1 | 77 of 78 | 88.3% (1400 of 1585) | — |
 | hello-world-java | 452 / 0 / 0 / 1 | 2 of 2 | 96.9% (221 of 228) | — |
 | http-multipart-request-java | 302 / 0 / 0 / 1 | 158 of 185 | 92.1% (385 of 418) | — |
 | http-oauth-provider-java | 473 / 0 / 0 / 1 | 206 of 206 | 96.6% (744 of 770) | — |
 | http-request-response-with-logger-java | 175 / 0 / 0 / 1 | 5 of 5 | 96.8% (215 of 222) | — |
 | implementing-a-choice-exception-strategy-java | 180 / 0 / 0 / 1 | 34 of 34 | 97.8% (306 of 313) | — |
-| importing-a-CSV-file-into-Mongo-DB-java | 107 / 0 / 0 / 1 | 96 of 96 | 85.0% (300 of 353) | — |
+| importing-a-CSV-file-into-Mongo-DB-java | 108 / 0 / 0 / 1 | 96 of 96 | 85.0% (300 of 353) | — |
 | importing-a-csv-file-into-ms-sharepoint-java | 87 / 0 / 0 / 1 | 69 of 69 | 78.6% (433 of 551) | — |
 | importing-an-email-attachment-using-the-IMAP-connector-java | 280 / 0 / 0 / 1 | 372 of 395 | 95.1% (543 of 571) | — |
 | importing-an-email-attachment-using-the-POP3-connector-java | 218 / 0 / 0 / 1 | 374 of 397 | 93.7% (507 of 541) | — |
@@ -182,7 +185,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | scatter-gather-flow-control-java | 220 / 0 / 0 / 1 | 160 of 163 | 97.1% (409 of 421) | — |
 | sending-a-csv-file-through-email-using-smtp-java | 108 / 0 / 0 / 1 | 107 of 107 | 86.0% (283 of 329) | — |
 | sending-json-data-to-a-amqp-queue-java | 185 / 0 / 0 / 1 | 42 of 42 | 97.5% (394 of 404) | — |
-| soap-webservice-security-java | 519 / 0 / 0 / 1 | 2 of 2 | 88.3% (1659 of 1879) | — |
+| soap-webservice-security-java | 547 / 0 / 0 / 1 | 2 of 2 | 88.4% (1661 of 1879) | — |
 | track-a-custom-business-event-java | 237 / 0 / 0 / 1 | 129 of 129 | 98.3% (354 of 360) | — |
 | upload-to-ftp-after-converting-json-to-xml-java | 303 / 0 / 0 / 1 | 291 of 294 | 91.7% (552 of 602) | — |
-| websphere-mq-java | 303 / 0 / 0 / 1 | 406 of 409 | 95.9% (973 of 1015) | — |
+| websphere-mq-java | 311 / 0 / 0 / 1 | 432 of 435 | 96.0% (1000 of 1042) | — |

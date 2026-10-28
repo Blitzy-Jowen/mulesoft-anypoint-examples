@@ -30,8 +30,8 @@ import org.xml.sax.SAXParseException;
 /**
  * Contract of {@link DwXmlToJson}: XML read as DataWeave 1.0 read it, an element with element children as a
  * {@link DwXmlToJson.DwObject} whose repeated elements are repeated keys in document order, any other element
- * as its untrimmed text or {@code null}, names reduced to local names, and a hardened parser that rejects empty,
- * malformed and DOCTYPE-bearing payloads with the parser's diagnostic as the cause.
+ * as its untrimmed text or, without text, the empty string, names reduced to local names, and a hardened parser
+ * that rejects empty, malformed and DOCTYPE-bearing payloads with the parser's diagnostic as the cause.
  *
  * <p>Inputs are inline strings and bytes; no file or classpath resource is read, so the class is copied with
  * {@link DwXmlToJson} changing only the package line.
@@ -199,7 +199,7 @@ class DwXmlToJsonTest {
     }
 
     @Test
-    void leavesAreUntrimmedStringsAndLeavesWithoutTextAreNull() {
+    void leavesAreUntrimmedStringsAndLeavesWithoutTextAreEmpty() {
         Object content = reader.convert(reader.parse("<r>"
                 + "<padded> 2 </padded>"
                 + "<blank>   </blank>"
@@ -211,9 +211,11 @@ class DwXmlToJsonTest {
                 + "<selfClosed/>"
                 + "<onlyComment><!--c--></onlyComment>"
                 + "<onlyInstruction><?target data?></onlyInstruction>"
+                + "<attributed id=\"1\"/>"
                 + "</r>")).get("r");
 
         DwXmlToJson.DwObject r = (DwXmlToJson.DwObject) content;
+        // DataWeave 1.0's XML reader (nullValueOn none) read an element without text or CDATA as "", never null.
         assertThat(r.entrySet()).containsExactly(
                 entry("padded", " 2 "),
                 entry("blank", "   "),
@@ -221,10 +223,11 @@ class DwXmlToJsonTest {
                 entry("cdata", "a<b> & cd"),
                 entry("commented", "xy"),
                 entry("entities", "&<>"),
-                entry("empty", null),
-                entry("selfClosed", null),
-                entry("onlyComment", null),
-                entry("onlyInstruction", null));
+                entry("empty", ""),
+                entry("selfClosed", ""),
+                entry("onlyComment", ""),
+                entry("onlyInstruction", ""),
+                entry("attributed", ""));
     }
 
     @Test
@@ -278,6 +281,9 @@ class DwXmlToJsonTest {
         assertThat(reader.select(unqualified, null, "status")).isEqualTo("OK");
         assertThat(reader.select(unqualified, "", "status")).isEqualTo("OK");
         assertThat(reader.select(unqualified, tshirt, "status")).isNull();
+
+        // A selector that matches an empty root yields "", which DataWeave distinguishes from a miss's null.
+        assertThat(reader.select(reader.parse("<status/>"), null, "status")).isEqualTo("");
     }
 
     @Test
@@ -290,7 +296,7 @@ class DwXmlToJsonTest {
         DwXmlToJson.DwObject empty = reader.convert(reader.parse("<empty/>"));
         assertThat(empty.size()).isEqualTo(1);
         assertThat(empty.containsKey("empty")).isTrue();
-        assertThat(empty.get("empty")).isNull();
+        assertThat(empty.get("empty")).isEqualTo("");
     }
 
     @Test
@@ -375,7 +381,7 @@ class DwXmlToJsonTest {
         assertThat(item.getLocalName()).isNull();
         Object content = reader.content(parent);
         assertThat(((DwXmlToJson.DwObject) content).entrySet())
-                .containsExactly(entry("item", "1"), entry("plain", null));
+                .containsExactly(entry("item", "1"), entry("plain", ""));
     }
 
     @Test

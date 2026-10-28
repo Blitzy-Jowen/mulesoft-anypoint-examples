@@ -90,9 +90,10 @@ class WebControllerTest {
     private static final String SEARCH_PATH = "/2.0/search";
     private static final String TOKEN_PATH = "/api/oauth2/token";
 
+    /** The complete Content-Type of SC-1's 500 and of the echoed JSON request, with no charset parameter. */
     private static final String JSON = "application/json";
 
-    /** Content type of the no-listener 404 that SC-10's {@code PortRoutingFilter} writes. */
+    /** The complete Content-Type of the no-listener 404, with no charset parameter. */
     private static final String TEXT_PLAIN = "text/plain";
 
     /** The Box OAuth client of {@code application-test.yml}. */
@@ -165,7 +166,7 @@ class WebControllerTest {
 
         assertThat(post.statusLine()).as(post.toString()).isEqualTo("HTTP/1.1 302 Found");
         assertThat(post.header("Location")).isEqualTo(ORIGINAL_LOGIN_LOCATION);
-        assertThat(post.header("Content-Type")).isEqualTo(JSON);
+        assertThat(post.headers("Content-Type")).as(post.toString()).containsExactly(JSON);
         assertThat(post.body()).isEqualTo(sent);
 
         HttpTestClient.Response delete = client().delete("/web");
@@ -189,7 +190,7 @@ class WebControllerTest {
         HttpTestClient.Response response = client().get("/web/loginDone");
 
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
-        assertThat(response.header("Content-Type")).startsWith(JSON);
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly(JSON);
         assertThat(response.bodyAsString()).isEqualTo(NO_TOKEN_BODY);
         box.verify(0, getRequestedFor(urlPathEqualTo(SEARCH_PATH)));
     }
@@ -234,7 +235,7 @@ class WebControllerTest {
         HttpTestClient.Response response = client().get("/web/loginDone");
 
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
-        assertThat(response.header("Content-Type")).startsWith(JSON);
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly(JSON);
         assertThat(response.bodyAsString()).isEqualTo("{ \"message\": \"Response code 404 mapped as failure.\" }");
         box.verify(1, getRequestedFor(urlPathEqualTo(SEARCH_PATH)));
         box.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
@@ -250,7 +251,7 @@ class WebControllerTest {
         HttpTestClient.Response response = client().get("/web/loginDone");
 
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
-        assertThat(response.header("Content-Type")).startsWith(JSON);
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly(JSON);
         assertThat(response.bodyAsString()).startsWith("{ \"message\": ").endsWith(" }");
         box.verify(1, getRequestedFor(urlPathEqualTo(SEARCH_PATH)));
         box.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
@@ -332,9 +333,13 @@ class WebControllerTest {
         box.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
     }
 
+    /**
+     * The no-listener answer for {@code path}: 404, exactly one {@code Content-Type} header equal to the bare
+     * {@code text/plain} with no parameter, and the listener's text.
+     */
     private static void assertNoListener(HttpTestClient.Response response, String path) {
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 404 Not Found");
-        assertThat(response.header("Content-Type")).startsWith(TEXT_PLAIN);
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly(TEXT_PLAIN);
         assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: " + path);
     }
 

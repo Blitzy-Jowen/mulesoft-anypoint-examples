@@ -102,6 +102,7 @@ class BoxAuthorizationControllerTest {
     private static final String INVALID_GRANT_RESPONSE = "{\"error\":\"invalid_grant\","
             + "\"error_description\":\"Auth code doesn't exist or is invalid for the client\"}";
 
+    /** The complete Content-Type of the no-listener 404, with no charset parameter. */
     private static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
 
     @Autowired
@@ -431,10 +432,14 @@ class BoxAuthorizationControllerTest {
         assertThat(response.bodyAsString()).as(response::toString).isEqualTo(body);
     }
 
-    /** SC-10's no-listener answer for {@code path}, written by {@code PortRoutingFilter}. */
+    /**
+     * SC-10's no-listener answer for {@code path}, written by {@code PortRoutingFilter}: 404, exactly one
+     * {@code Content-Type} header equal to the bare {@link #NO_LISTENER_CONTENT_TYPE}, and the listener's text.
+     */
     private static void assertNoListener(HttpTestClient.Response response, String path) {
         assertThat(response.statusLine()).as(response::toString).isEqualTo("HTTP/1.1 404 Not Found");
-        assertThat(response.header("Content-Type")).as(response::toString).startsWith(NO_LISTENER_CONTENT_TYPE);
+        assertThat(response.headers("Content-Type")).as(response::toString)
+                .containsExactly(NO_LISTENER_CONTENT_TYPE);
         assertThat(response.bodyAsString()).as(response::toString).isEqualTo("No listener for endpoint: " + path);
     }
 

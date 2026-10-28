@@ -26,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -278,7 +279,7 @@ class UploadControllerTest {
                 multipart(new BodyPart("file", "rejected.txt", "text/plain", bytes("rejected"))));
 
         assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
-        assertEquals("text/plain", response.header("Content-Type"), response::toString);
+        assertContentType(response, "text/plain");
         assertArrayEquals(METHOD_NOT_ALLOWED_BODY, response.body(), response::toString);
         assertEquals(List.of(), storedFiles());
     }
@@ -288,6 +289,7 @@ class UploadControllerTest {
         HttpTestClient.Response response = client().send("HEAD", PATH, null, null);
 
         assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertContentType(response, "text/plain");
         assertEquals(0, response.body().length, response::toString);
         assertEquals(List.of(), storedFiles());
     }
@@ -308,9 +310,10 @@ class UploadControllerTest {
         assertEquals(headEnd + 2 * CRLF.length(), raw.length(), raw);
         List<String> lines = List.of(raw.substring(0, headEnd).split(CRLF));
         assertEquals("HTTP/1.1 405 Method Not Allowed", lines.get(0), raw);
-        assertTrue(lines.stream().anyMatch(line -> line.equalsIgnoreCase("Content-Type: text/plain")), raw);
-        assertTrue(lines.stream().anyMatch(line -> line.equalsIgnoreCase(
-                "Content-Length: " + METHOD_NOT_ALLOWED_BODY.length)), raw);
+        List<String> headerLines = lines.subList(1, lines.size());
+        assertEquals(List.of("text/plain"), headerValues(headerLines, "Content-Type"), raw);
+        assertEquals(List.of(String.valueOf(METHOD_NOT_ALLOWED_BODY.length)),
+                headerValues(headerLines, "Content-Length"), raw);
         assertEquals(List.of(), storedFiles());
     }
 
@@ -374,9 +377,7 @@ class UploadControllerTest {
         HttpTestClient.Response response = client().send(method, PATH, headers, body);
 
         assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
-        String responseType = response.header("Content-Type");
-        assertNotNull(responseType, response::toString);
-        assertTrue(responseType.startsWith("application/json"), response::toString);
+        assertContentType(response, "application/json");
         assertArrayEquals(MISSING_PART_BODY, response.body(), response::toString);
         assertEquals(List.of(), storedFiles());
     }
@@ -460,9 +461,7 @@ class UploadControllerTest {
                 multipart(new BodyPart("file", fileName, "text/plain", bytes("QA_SECURITY_CONTENT"))));
 
         assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
-        String responseType = response.header("Content-Type");
-        assertNotNull(responseType, response::toString);
-        assertTrue(responseType.startsWith("application/json"), response::toString);
+        assertContentType(response, "application/json");
         assertArrayEquals(STREAMING_FAILED_BODY, response.body(), response::toString);
         String body = new String(response.body(), StandardCharsets.UTF_8);
         assertFalse(body.contains(uploadDir.toString()), body);
@@ -476,7 +475,7 @@ class UploadControllerTest {
         HttpTestClient.Response response = client().get("/unknown");
 
         assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
-        assertEquals("text/plain", response.header("Content-Type"), response::toString);
+        assertContentType(response, "text/plain");
         assertArrayEquals(NO_LISTENER_BODY, response.body(), response::toString);
         assertEquals(List.of(), storedFiles());
     }
@@ -498,6 +497,27 @@ class UploadControllerTest {
 
     private HttpTestClient client() {
         return HttpTestClient.localhost(port);
+    }
+
+    /** Exactly one {@code Content-Type} header, equal to {@code expected} with no parameter appended. */
+    private static void assertContentType(HttpTestClient.Response response, String expected) {
+        assertEquals(List.of(expected), response.headers("Content-Type"), response::toString);
+    }
+
+    /**
+     * The values, in arrival order, of the raw header lines whose name before the first {@code :} equals {@code name}
+     * ignoring case, each trimmed of surrounding spaces and tabs as ST-1 trims them; every line must carry a name.
+     */
+    private static List<String> headerValues(List<String> headerLines, String name) {
+        List<String> values = new ArrayList<>();
+        for (String line : headerLines) {
+            int colon = line.indexOf(':');
+            assertTrue(colon > 0, () -> "malformed header line: " + line);
+            if (line.substring(0, colon).equalsIgnoreCase(name)) {
+                values.add(line.substring(colon + 1).replaceAll("^[ \t]+|[ \t]+$", ""));
+            }
+        }
+        return values;
     }
 
     /**

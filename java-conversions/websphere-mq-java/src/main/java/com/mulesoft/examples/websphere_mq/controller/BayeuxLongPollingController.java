@@ -74,9 +74,12 @@ import com.mulesoft.examples.websphere_mq.service.AjaxChannelBroker;
  *
  * <p>Connection phase: the first connect after a handshake is answered at once with whatever is queued, as Jetty
  * answered it, because {@code dojox.cometd} flushes the subscriptions and publications queued at page load only after
- * that first successful connect. Every later connect is held, on a wait thread rather than a request thread, until a
- * delivery is queued for the client or {@code ajax.connect-timeout-ms} passes. The wait takes nothing from the
- * client's queue: only the answer that claims the response drains it, and deliveries that response then refuses go
+ * that first successful connect. Every later connect claims the client's deliveries when its request arrives,
+ * superseding every older connect of the client, and is held, on a wait thread rather than a request thread, until a
+ * delivery is queued for the client, a newer connect supersedes it or {@code ajax.connect-timeout-ms} passes. The wait
+ * takes nothing from the client's queue: only the answer that owns the response drains it, and only while the
+ * connect's claim is still current, because the broker checks the claim and takes the queue in one step under the
+ * client's lock, so a superseded connect's response carries no delivery. Deliveries that response then refuses go
  * back to the front of the queue, while a request that times out or ends first retires its wait and leaves every
  * delivery for the client's next connect, so each delivery is accepted by exactly one response. Deliveries a
  * response has accepted are lost when the client has meanwhile gone away, as with Jetty. The held requests use Servlet
@@ -390,15 +393,19 @@ public class BayeuxLongPollingController {
     }
 
     /**
-     * Holds a connect until the broker has a delivery queued for the client or {@code ajax.connect-timeout-ms}
-     * passes, then answers with the replies and the deliveries. The request's own timeout, which the wait normally
-     * precedes by {@link #HOLD_GRACE_MS}, and the end of the request by an error or its completion retire the wait
-     * instead, leaving every queued delivery for the client's next connect; a timeout answers with the replies alone.
-     * {@link HeldConnect} makes these the one owner of the response.
+     * Claims the client's deliveries for this connect, superseding every older connect of the client, and holds the
+     * connect until the broker has a delivery queued for the client, a newer connect supersedes it or
+     * {@code ajax.connect-timeout-ms} passes, then answers with the replies and, while the claim is still current, the
+     * deliveries. The request's own timeout, which the wait normally precedes by {@link #HOLD_GRACE_MS}, and the end of
+     * the request by an error or its completion retire the wait instead, leaving every queued delivery for the client's
+     * next connect; a timeout answers with the replies alone. {@link HeldConnect} makes these the one owner of the
+     * response.
      */
     private DeferredResult<ResponseEntity<String>> hold(String clientId, List<Object> replies, String jsonp) {
         DeferredResult<ResponseEntity<String>> result = new DeferredResult<>(holdTimeoutMs);
-        HeldConnect held = new HeldConnect(clientId, replies, jsonp, result);
+        // Claimed on the request thread, so supersession follows the order the requests arrive in, not the order their
+        // wait threads start in.
+        HeldConnect held = new HeldConnect(clientId, broker.claimConnect(clientId), replies, jsonp, result);
         result.onTimeout(held::expire);
         result.onError(failure -> held.retire());
         result.onCompletion(held::retire);
@@ -597,10 +604,10 @@ public class BayeuxLongPollingController {
     /** Who owns a held connect's response: nobody yet, the wait thread's answer, or the request's own end. */
     private enum HoldState {
 
-        /** The wait thread is waiting for the broker; the response is unclaimed. */
+        /** The wait thread is waiting for the broker; nobody has taken the response yet. */
         WAITING,
 
-        /** The wait thread has claimed the response and answers it. */
+        /** The wait thread has taken the response and answers it. */
         ANSWERING,
 
         /** The request timed out or ended first; the wait thread answers nothing and drains nothing. */
@@ -608,15 +615,18 @@ public class BayeuxLongPollingController {
     }
 
     /**
-     * One held connect, the single owner of its response. Three parties can end it: the wait thread, once the broker
-     * has a delivery queued for the client or the connect timeout passes; the request's own timeout; and the end of
-     * the request by an error or its completion. Whoever moves the connect out of {@link HoldState#WAITING} first
-     * owns it:
+     * One held connect, the single owner of its response. It claimed the client's deliveries when its request
+     * arrived, superseding every older connect of the client, and a newer connect's claim supersedes it in turn.
+     * Three parties can end it: the wait thread, once the broker has a delivery queued for the client, a newer
+     * connect supersedes it or the connect timeout passes; the request's own timeout; and the end of the request by an
+     * error or its completion. Whoever moves the connect out of {@link HoldState#WAITING} first owns it:
      * <ul>
-     *   <li>the wait thread claims it to answer, and drains the client's queue only then and only when its wait was
-     *       still the client's newest and the response is still unset. Should the response nevertheless refuse the
-     *       answer, the drained deliveries go back to the front of the client's queue, so the next connect receives
-     *       each of them exactly once;</li>
+     *   <li>the wait thread takes it to answer, and drains the client's queue only then, only when its wait ended
+     *       current and the response is still unset, and only while its claim on the deliveries is still current:
+     *       the broker checks the claim and takes the queue in one step under the client's lock, so a connect
+     *       superseded at any moment before takes nothing and its response carries no delivery. Should the response
+     *       nevertheless refuse the answer, the drained deliveries go back to the front of the client's queue, so the
+     *       next connect receives each of them exactly once;</li>
      *   <li>the request's timeout, an error or the completion retires it: the wait thread is interrupted and ends
      *       without draining, so everything queued stays for the next connect, and a timeout answers the request with
      *       its replies alone.</li>
@@ -627,6 +637,10 @@ public class BayeuxLongPollingController {
     private final class HeldConnect {
 
         private final String clientId;
+
+        /** The claim on the client's deliveries this connect took as its request arrived. */
+        private final AjaxChannelBroker.ConnectClaim claim;
+
         private final List<Object> replies;
         private final String jsonp;
         private final DeferredResult<ResponseEntity<String>> result;
@@ -635,9 +649,19 @@ public class BayeuxLongPollingController {
         /** The wait thread's task once submitted; cancelling it interrupts the wait. */
         private volatile Future<?> waitTask;
 
-        HeldConnect(String clientId, List<Object> replies, String jsonp,
+        /**
+         * A connect waiting to be started.
+         *
+         * @param clientId the connecting client
+         * @param claim the claim on the client's deliveries taken as the request arrived
+         * @param replies the replies of the request's batch, the connect's included
+         * @param jsonp the callback-polling callback, or {@code null}
+         * @param result the request's pending response
+         */
+        HeldConnect(String clientId, AjaxChannelBroker.ConnectClaim claim, List<Object> replies, String jsonp,
                 DeferredResult<ResponseEntity<String>> result) {
             this.clientId = clientId;
+            this.claim = claim;
             this.replies = replies;
             this.jsonp = jsonp;
             this.result = result;
@@ -672,7 +696,7 @@ public class BayeuxLongPollingController {
         private void awaitAndAnswer() {
             boolean current;
             try {
-                current = broker.awaitDeliveries(clientId, connectTimeoutMs);
+                current = broker.awaitDeliveries(claim, connectTimeoutMs);
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 current = false;
@@ -681,16 +705,18 @@ public class BayeuxLongPollingController {
         }
 
         /**
-         * Claims the response and answers it with the replies, followed by the client's deliveries when
-         * {@code drain} is set and the response is still unset; deliveries the response refuses are restored to the
-         * client's queue. Does nothing once the connect is retired.
+         * Takes the response and answers it with the replies, followed by the client's deliveries when
+         * {@code drain} is set, the response is still unset and the connect's claim is still current; deliveries the
+         * response refuses are restored to the client's queue. Does nothing once the connect is retired.
          */
         private void answer(boolean drain) {
             if (!state.compareAndSet(HoldState.WAITING, HoldState.ANSWERING)) {
                 return;
             }
+            // The broker checks the claim and takes the queue in one step: a connect superseded since its wait ended
+            // takes nothing, and the deliveries stay for the newer connect.
             List<AjaxChannelBroker.Delivery> deliveries =
-                    drain && !result.isSetOrExpired() ? broker.drain(clientId) : List.of();
+                    drain && !result.isSetOrExpired() ? broker.drain(claim) : List.of();
             boolean accepted;
             try {
                 accepted = result.setResult(frame(HttpStatus.OK, withDeliveries(replies, deliveries), jsonp));
@@ -710,7 +736,7 @@ public class BayeuxLongPollingController {
             result.setResult(frame(HttpStatus.OK, replies, jsonp));
         }
 
-        /** Retires the connect unless the wait thread has claimed it, interrupting the wait. Never blocks. */
+        /** Retires the connect unless the wait thread has taken it to answer, interrupting the wait. Never blocks. */
         void retire() {
             if (state.compareAndSet(HoldState.WAITING, HoldState.RETIRED)) {
                 Future<?> task = waitTask;

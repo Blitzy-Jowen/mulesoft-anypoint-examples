@@ -14,6 +14,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Named.named;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -51,6 +52,14 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
@@ -67,13 +76,15 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 /**
  * Tests {@link NetsuiteTokenProvider} (SC-16) against WireMock standing in for NetSuite's OAuth 2.0 token endpoint,
  * signing with an RSA key generated for each test, together with the {@link NetsuiteProperties} derivations the token
  * URL and the assertion's {@code aud} claim rest on. They cover the client credentials request and its PS256 JWT
- * client assertion (AAP 0.3.3), caching until 60 s before the stated expiry, eviction, the configuration failures
+ * client assertion (AAP 0.3.3), caching until 60 s before the stated expiry, eviction, concurrent callers sharing
+ * one token request and its outcome without waiting longer than that request, the configuration failures
  * that name the {@code netsuite.oauth.*} key (AAP 0.4.6), the private-key loading failures whose caller-facing
  * message leaves the configured location and the cause to the log, and the unwrapped token-endpoint failure the
  * SC-9 classifier relies on (AAP 0.4.8). No Spring context starts and no classpath resource is read.
@@ -101,6 +112,15 @@ class NetsuiteTokenProviderTest {
 
     /** The assertion lifetime the provider signs, inside NetSuite's 60-minute limit. */
     private static final long ASSERTION_LIFETIME_SECONDS = 1800;
+
+    /** Callers released together on an empty cache in the concurrency tests. */
+    private static final int CONCURRENT_CALLERS = 8;
+
+    /** The token request's duration in the concurrency tests, long enough for every caller to arrive during it. */
+    private static final Duration SLOW_TOKEN_REQUEST = Duration.ofSeconds(2);
+
+    /** How long a concurrency test waits for any one call, so a call that never returns fails the test. */
+    private static final Duration CALL_LIMIT = Duration.ofSeconds(30);
 
     @TempDir
     Path tmp;
@@ -257,6 +277,111 @@ class NetsuiteTokenProviderTest {
         assertThat(provider.accessToken()).isEqualTo("tok-2");
 
         wm.verify(2, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+    }
+
+    /*
+     * The token endpoint answers slowly, so every caller arrives while the first caller's request is in flight and
+     * waits for it instead of sending its own: one request, the same token for all, and that token cached.
+     */
+    @Test
+    void concurrentCallersOnEmptyCacheShareOneTokenRequest() throws Exception {
+        wm.stubFor(post(urlPathEqualTo(TOKEN_PATH)).willReturn(okJson(tokenResponse("tok-1", "\"3600\""))
+                .withFixedDelay((int) SLOW_TOKEN_REQUEST.toMillis())));
+        NetsuiteTokenProvider provider = provider();
+
+        Burst burst = callTogether(provider, CONCURRENT_CALLERS);
+
+        assertThat(burst.outcomes()).hasSize(CONCURRENT_CALLERS).containsOnly("tok-1");
+        wm.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+        assertThat(provider.accessToken()).isEqualTo("tok-1");
+        wm.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+    }
+
+    /** Arranges a token request that fails once {@link #SLOW_TOKEN_REQUEST} has passed. */
+    @FunctionalInterface
+    private interface SlowTokenFailure {
+
+        void arrange(WireMockServer server, NetsuiteProperties settings);
+    }
+
+    /*
+     * NetSuite rejecting the assertion after a delay, and NetSuite not answering within the response timeout, which
+     * the stub's delay outlasts.
+     */
+    static Stream<Arguments> slowTokenFailures() {
+        return Stream.of(
+                Arguments.of(named("delayed 401", (SlowTokenFailure) (server, settings) ->
+                                server.stubFor(post(urlPathEqualTo(TOKEN_PATH)).willReturn(aResponse().withStatus(401)
+                                        .withHeader("Content-Type", "application/json")
+                                        .withBody("{\"error\":\"invalid_client\"}")
+                                        .withFixedDelay((int) SLOW_TOKEN_REQUEST.toMillis())))),
+                        (Consumer<Throwable>) failure -> assertThat(failure).isInstanceOfSatisfying(
+                                WebClientResponseException.class,
+                                e -> assertThat(e.getStatusCode().value()).isEqualTo(401))),
+                Arguments.of(named("read timeout", (SlowTokenFailure) (server, settings) -> {
+                    settings.setReadTimeout(SLOW_TOKEN_REQUEST);
+                    server.stubFor(post(urlPathEqualTo(TOKEN_PATH)).willReturn(okJson(tokenResponse("tok-late",
+                            "\"3600\"")).withFixedDelay((int) SLOW_TOKEN_REQUEST.multipliedBy(2).toMillis())));
+                }), (Consumer<Throwable>) failure ->
+                        assertThat(failure).isInstanceOf(WebClientRequestException.class)));
+    }
+
+    /*
+     * Callers arriving while a token request is in flight share its failure: the very exception it raised, unwrapped,
+     * so NetsuiteFailureClassifier still sees the 401 or the timeout. One request is sent and the burst ends after
+     * about that request's time, where callers queued behind one another would take a request's time each. The
+     * failure is not cached: the next call sends a new request.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("slowTokenFailures")
+    void concurrentCallersShareOneFailedTokenRequestWhichIsNotCached(SlowTokenFailure failing,
+            Consumer<Throwable> expectedFailure) throws Exception {
+        failing.arrange(wm, props);
+        NetsuiteTokenProvider provider = provider();
+
+        Burst burst = callTogether(provider, CONCURRENT_CALLERS);
+
+        Object shared = burst.outcomes().get(0);
+        assertThat(shared).isInstanceOfSatisfying(Throwable.class, expectedFailure);
+        assertThat(burst.outcomes()).hasSize(CONCURRENT_CALLERS)
+                .allSatisfy(outcome -> assertThat(outcome).isSameAs(shared));
+        wm.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+        assertThat(burst.elapsed()).isLessThan(SLOW_TOKEN_REQUEST.multipliedBy(CONCURRENT_CALLERS / 2));
+
+        // The most recently added stub wins, so NetSuite now answers at once.
+        stubToken("tok-1", "\"3600\"");
+        assertThat(provider.accessToken()).isEqualTo("tok-1");
+        wm.verify(2, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+    }
+
+    /*
+     * Eviction never waits for a token request in flight, which is left to finish: the token it obtains, issued in
+     * answer to that request, is cached and handed out afterwards without a second request.
+     */
+    @Test
+    void evictDoesNotWaitForTokenRequestInFlight() {
+        wm.stubFor(post(urlPathEqualTo(TOKEN_PATH)).willReturn(okJson(tokenResponse("tok-1", "\"3600\""))
+                .withFixedDelay((int) SLOW_TOKEN_REQUEST.multipliedBy(2).toMillis())));
+        NetsuiteTokenProvider provider = provider();
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<String> token = caller.submit(provider::accessToken);
+            // WireMock records a request when it arrives, before the delayed answer.
+            await().atMost(CALL_LIMIT)
+                    .until(() -> !wm.findAll(postRequestedFor(urlPathEqualTo(TOKEN_PATH))).isEmpty());
+
+            long start = System.nanoTime();
+            provider.evict();
+            Duration evictTime = Duration.ofNanos(System.nanoTime() - start);
+
+            assertThat(token).isNotDone();
+            assertThat(evictTime).isLessThan(Duration.ofSeconds(1));
+            assertThat(token).succeedsWithin(CALL_LIMIT).isEqualTo("tok-1");
+        } finally {
+            caller.shutdownNow();
+        }
+        assertThat(provider.accessToken()).isEqualTo("tok-1");
+        wm.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
     }
 
     @Test
@@ -448,6 +573,50 @@ class NetsuiteTokenProviderTest {
 
     private NetsuiteTokenProvider provider(Clock clock) {
         return new NetsuiteTokenProvider(props, WebClient.builder(), clock);
+    }
+
+    /**
+     * What a burst of concurrent {@code accessToken} calls ended with: each caller's token or exception, in the
+     * order the callers were started, and the time from their release until the last one returned.
+     */
+    private record Burst(List<Object> outcomes, Duration elapsed) {
+    }
+
+    /**
+     * Calls {@code accessToken} on {@code callers} threads, released together once every one of them is waiting,
+     * and collects each call's token or runtime exception. A call still running after {@link #CALL_LIMIT} fails the
+     * test.
+     */
+    private static Burst callTogether(NetsuiteTokenProvider provider, int callers)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        ExecutorService pool = Executors.newFixedThreadPool(callers);
+        try {
+            CountDownLatch ready = new CountDownLatch(callers);
+            CountDownLatch release = new CountDownLatch(1);
+            Callable<Object> call = () -> {
+                ready.countDown();
+                release.await();
+                try {
+                    return provider.accessToken();
+                } catch (RuntimeException e) {
+                    return e;
+                }
+            };
+            List<Future<Object>> calls = new ArrayList<>();
+            for (int i = 0; i < callers; i++) {
+                calls.add(pool.submit(call));
+            }
+            assertThat(ready.await(CALL_LIMIT.toMillis(), TimeUnit.MILLISECONDS)).isTrue();
+            long released = System.nanoTime();
+            release.countDown();
+            List<Object> outcomes = new ArrayList<>();
+            for (Future<Object> pending : calls) {
+                outcomes.add(pending.get(CALL_LIMIT.toMillis(), TimeUnit.MILLISECONDS));
+            }
+            return new Burst(outcomes, Duration.ofNanos(System.nanoTime() - released));
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     private void stubToken(String token, String expiresInJson) {

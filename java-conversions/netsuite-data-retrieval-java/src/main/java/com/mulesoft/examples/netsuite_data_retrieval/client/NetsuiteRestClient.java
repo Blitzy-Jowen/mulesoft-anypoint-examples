@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URI;
+import java.nio.charset.Charset;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -31,14 +32,22 @@ import java.util.function.LongFunction;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.reactive.ClientHttpConnector;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.stereotype.Component;
+import org.springframework.util.MimeType;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
+import org.springframework.web.reactive.function.client.UnknownHttpStatusCodeException;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import org.springframework.web.reactive.function.client.support.ClientResponseWrapper;
 import org.springframework.web.util.UriComponentsBuilder;
+import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClient;
 
 /**
@@ -61,7 +70,10 @@ import reactor.netty.http.client.HttpClient;
  *       401, which NetSuite answers before processing the request;</li>
  *   <li>fetches its bearer token inside the attempt, so the retry after a 401 carries a fresh token;</li>
  *   <li>lets {@code WebClientResponseException} (non-2xx answer) and {@code WebClientRequestException} (timeout,
- *       connection failure) reach the executor unwrapped, so {@link NetsuiteFailureClassifier} can classify them;</li>
+ *       connection failure) reach the executor unwrapped, so {@link NetsuiteFailureClassifier} can classify them;
+ *       the response exception, through the filter {@link #responseExceptionsWithoutRequest()}, carries NetSuite's
+ *       status, headers and body but not the request method or URL, so its message, which an unclassified failure
+ *       carries into the caller's 500 body, never names the account's NetSuite host;</li>
  *   <li>resolves {@link NetsuiteProperties#resolvedBaseUrl()} when it is made, so the application starts with every
  *       placeholder empty and the first call fails with an {@link IllegalStateException} naming the missing key.</li>
  * </ul>
@@ -96,12 +108,14 @@ import reactor.netty.http.client.HttpClient;
  * ({@code 50.0} stays {@code 50.0}). A read whose body is empty, is JSON {@code null} or is not an object fails with
  * an {@link IllegalStateException}, as does a page without its {@code items} array and boolean {@code hasMore} and a
  * metadata catalog without its {@code properties} object, so a malformed answer never reads as an empty result or
- * enters the cache; no such message carries any part of the body. The class and its public methods are not final,
- * so tests can mock it; one instance serves concurrent requests. Its two caches, the metadata catalogs and the
- * custom-field sources, live for the application run and hold successful reads only. Concurrent calls that miss the
- * same entry share one acquisition: the first registers its read and the others wait for that read's result, or
- * fail with its failure, which nothing caches, so a later call reads again. Entries are never acquired inside a map
- * computation, so a slow read of one key never holds up another.
+ * enters the cache. A paged read fails the same way when a page still reports {@code hasMore} although the next
+ * offset is at or past its numeric {@code totalResults}, or when its {@link #MAX_PAGES}-th page still does, so a
+ * server that keeps reporting more never keeps a read looping. No such message carries any part of the body. The
+ * class and its public methods are not final, so tests can mock it; one instance serves concurrent requests. Its
+ * two caches, the metadata catalogs and the custom-field sources, live for the application run and hold successful
+ * reads only. Concurrent calls that miss the same entry share one acquisition: the first registers its read and the
+ * others wait for that read's result, or fail with its failure, which nothing caches, so a later call reads again.
+ * Entries are never acquired inside a map computation, so a slow read of one key never holds up another.
  */
 @Component
 public class NetsuiteRestClient {
@@ -138,6 +152,14 @@ public class NetsuiteRestClient {
     /** The largest page NetSuite serves for SuiteQL results and record collections. */
     private static final int PAGE_LIMIT = 1000;
 
+    /**
+     * The most pages one paged read requests. At NetSuite's 1000-row page limit that is 1,000,000 rows, ten times the
+     * 100,000 results a SuiteQL query returns at most, so no legitimate read reaches it; a server still reporting
+     * {@code hasMore} after this many pages fails the read instead of keeping it looping. Package-private so tests
+     * can read it.
+     */
+    static final int MAX_PAGES = 1000;
+
     /** Oracle's limit on the expressions of one {@code IN} list, which SuiteQL inherits. */
     private static final int MAX_IN_LIST = 1000;
 
@@ -156,6 +178,8 @@ public class NetsuiteRestClient {
     private static final String HAS_MORE = "hasMore";
 
     private static final String COUNT = "count";
+
+    private static final String TOTAL_RESULTS = "totalResults";
 
     private static final String LINKS = "links";
 
@@ -220,6 +244,7 @@ public class NetsuiteRestClient {
         // No base URL: it is resolved from the properties on every request, so start-up needs no account.
         this.webClient = Objects.requireNonNull(builder, "builder").clone()
                 .clientConnector(connector(props))
+                .filters(filters -> filters.add(0, responseExceptionsWithoutRequest()))
                 .codecs(codecs -> codecs.defaultCodecs().maxInMemorySize(MAX_IN_MEMORY_SIZE))
                 .build();
     }
@@ -276,6 +301,69 @@ public class NetsuiteRestClient {
     }
 
     /**
+     * Returns the exchange filter that every NetSuite {@code WebClient} registers first, as its outermost filter, the
+     * token client of {@link NetsuiteTokenProvider} included: it keeps the request out of every
+     * {@code WebClientResponseException} raised for a NetSuite answer. Being outermost, it wraps the answer
+     * {@code WebClient} finally reads, whatever the builder's other filters do with it.
+     *
+     * <p>{@code WebClient} builds that exception from the response ({@code ClientResponse#createException()}) in two
+     * cases: an error status (4xx or 5xx), through its built-in status handler, and a 2xx answer whose body cannot be
+     * read, for example one larger than the client's in-memory buffer, with the read failure as the cause. The
+     * message it builds appends the request method and URL, as in
+     * {@code "400 Bad Request from POST https://<account>.suitetalk.api.netsuite.com/services/rest/query/v1/suiteql"}.
+     * The filter wraps each response so that in both cases the exception is the one {@code WebClient} builds, the
+     * status-specific subclass such as {@code WebClientResponseException.BadRequest} (an
+     * {@link UnknownHttpStatusCodeException} for a status without a standard reason phrase) with the same status,
+     * reason phrase, headers ({@code Retry-After} included), body bytes, body charset and body decoding, rebuilt
+     * without the request. Its message is therefore {@code "<code> <reason phrase>"}, for example
+     * {@code "400 Bad Request"}, or {@code "Unknown status code [599]"}, and its {@code getRequest()} is
+     * {@code null}. A failure {@link NetsuiteFailureClassifier} reports as {@code OTHER} reaches the caller unchanged,
+     * its message in the 500 body, so the account's NetSuite host and the API layout stay out of every answer.
+     *
+     * @return the filter; it holds no state, so one instance may serve any number of clients
+     */
+    public static ExchangeFilterFunction responseExceptionsWithoutRequest() {
+        return ExchangeFilterFunction.ofResponseProcessor(response -> Mono.just(new RequestFreeResponse(response)));
+    }
+
+    /**
+     * A NetSuite answer whose response exception carries everything but the request, as
+     * {@link #responseExceptionsWithoutRequest()} describes; every other method reaches the wrapped answer.
+     */
+    private static final class RequestFreeResponse extends ClientResponseWrapper {
+
+        RequestFreeResponse(ClientResponse response) {
+            super(response);
+        }
+
+        @Override
+        public Mono<WebClientResponseException> createException() {
+            ClientResponse response = response();
+            Charset charset = response.headers().contentType().map(MimeType::getCharset).orElse(null);
+            return response.createException().map(failure -> withoutRequest(failure, charset));
+        }
+
+        /** Overridden as well, because the wrapped answer's {@code createError()} uses its own exception. */
+        @Override
+        public <T> Mono<T> createError() {
+            return createException().flatMap(Mono::error);
+        }
+    }
+
+    /** Rebuilds a response exception, the type its status selects, with everything but its request. */
+    private static WebClientResponseException withoutRequest(WebClientResponseException failure, Charset charset) {
+        byte[] body = failure.getResponseBodyAsByteArray();
+        WebClientResponseException rebuilt = failure instanceof UnknownHttpStatusCodeException
+                ? new UnknownHttpStatusCodeException(failure.getStatusCode(), failure.getHeaders(), body, charset, null)
+                : WebClientResponseException.create(failure.getStatusCode(), failure.getStatusText(),
+                        failure.getHeaders(), body, charset, null);
+        // getResponseBodyAs decodes through the original's decoder, built from the client's codecs.
+        rebuilt.setBodyDecodeFunction(
+                type -> failure.getResponseBodyAs(ParameterizedTypeReference.forType(type.getType())));
+        return rebuilt;
+    }
+
+    /**
      * Escapes a value for use inside a SuiteQL string literal by doubling every single quote, so
      * {@code O'Brien} becomes {@code O''Brien}. The result carries no surrounding quotes; the caller writes them, for
      * example {@code "... WHERE lastname LIKE '" + suiteQlLiteral(lastName) + "%'"}. Backslash, {@code %} and
@@ -298,7 +386,9 @@ public class NetsuiteRestClient {
      * NetSuite reports {@code hasMore} {@code false} or a page holds no item. Each page is its own executor call,
      * and {@code offset} advances by the page's {@code count}, or by its item count when NetSuite states none. Only
      * a page such as {@code {"items": [], "hasMore": false}} is an empty result; a page that is not a JSON object
-     * with an {@code items} array and a boolean {@code hasMore} fails the read.
+     * with an {@code items} array and a boolean {@code hasMore} fails the read. So does a page that reports
+     * {@code hasMore} {@code true} although the next offset is at or past its numeric {@code totalResults}, and a
+     * {@link #MAX_PAGES}-th page that still reports it, so at most {@link #MAX_PAGES} pages are requested.
      *
      * <p>Each row keeps NetSuite's column keys (SuiteQL writes them lower-case, for example {@code email},
      * {@code firstname}, {@code lastname}) in their order and its values as parsed; only the per-row {@code links}
@@ -309,7 +399,9 @@ public class NetsuiteRestClient {
      * @return the rows in arrival order, unmodifiable
      * @throws IllegalArgumentException when {@code query} is {@code null}
      * @throws IllegalStateException    when a setting is missing (the message names the key), or a page is empty,
-     *         is not a JSON object, or lacks its {@code items} array of objects or its boolean {@code hasMore}
+     *         is not a JSON object, or lacks its {@code items} array of objects or its boolean {@code hasMore}, or
+     *         reports {@code hasMore} {@code true} at or past its {@code totalResults} or on the
+     *         {@link #MAX_PAGES}-th page
      * @throws RuntimeException         the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged for failures the classifier reports as {@code OTHER} (for example a 400 for an invalid query)
      */
@@ -363,13 +455,16 @@ public class NetsuiteRestClient {
 
     /**
      * Lists the internal IDs of every record of a type: {@code GET /services/rest/record/v1/{type}}, paged by
-     * {@code limit=1000&offset=<n>} exactly as {@link #suiteQl(String)} pages, each page its own executor call.
+     * {@code limit=1000&offset=<n>} exactly as {@link #suiteQl(String)} pages, each page its own executor call, and
+     * failing as it fails on a page that reports {@code hasMore} {@code true} at or past its {@code totalResults} or
+     * on the {@link #MAX_PAGES}-th page.
      *
      * @param type the REST record type, for example {@code itemsupplyplan}
      * @return the {@code id} of each listed item that has one, as text, in arrival order, unmodifiable
      * @throws IllegalArgumentException when {@code type} is {@code null} or blank
      * @throws IllegalStateException    when a setting is missing, or a page is empty, is not a JSON object, or lacks
-     *         its {@code items} array of objects or its boolean {@code hasMore}
+     *         its {@code items} array of objects or its boolean {@code hasMore}, or reports {@code hasMore}
+     *         {@code true} at or past its {@code totalResults} or on the {@link #MAX_PAGES}-th page
      * @throws RuntimeException         the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged
      */
@@ -553,7 +648,7 @@ public class NetsuiteRestClient {
      *         empty, with no request made, for {@code null} or empty input
      * @throws IllegalStateException when a setting is missing, or a lookup page is not the SuiteQL page
      *         {@link #suiteQl(String)} requires (a JSON object with an {@code items} array of objects and a boolean
-     *         {@code hasMore})
+     *         {@code hasMore}), or the lookup's paging fails as {@link #suiteQl(String)} describes
      * @throws RuntimeException      the SC-9 upstream exceptions, or NetSuite's {@code WebClient*Exception}
      *         unchanged; a call that waited on a concurrent lookup throws that lookup's exception
      */
@@ -741,15 +836,23 @@ public class NetsuiteRestClient {
      * {@code false} or the page holds no item, the latter guarding against a server that keeps reporting more
      * without delivering it.
      *
+     * <p>A server that keeps reporting more while delivering items is stopped by two bounds, each failing the read
+     * rather than returning a partial result: a page whose {@code hasMore} is {@code true} although the next offset
+     * is at or past its numeric {@code totalResults} (a {@code totalResults} that is absent or not a number bounds
+     * nothing), and a {@link #MAX_PAGES}-th page whose {@code hasMore} is still {@code true}, so a read never makes
+     * more than {@link #MAX_PAGES} page requests.
+     *
      * @param pageCall the request of the page at a given offset
      * @return the items of every page, in arrival order
      * @throws IllegalStateException when a page is empty, is not a JSON object, or lacks the {@code items} array of
-     *         objects or the boolean {@code hasMore}, so a malformed page never reads as the end of the result
+     *         objects or the boolean {@code hasMore}, so a malformed page never reads as the end of the result, or
+     *         when a page reports more past its {@code totalResults} or the {@link #MAX_PAGES}-th page still reports
+     *         more
      */
     private List<Map<String, Object>> collectPages(LongFunction<UpstreamCall<String>> pageCall) {
         List<Map<String, Object>> collected = new ArrayList<>();
         long offset = 0;
-        while (true) {
+        for (int pages = 1; ; pages++) {
             Map<String, Object> page = parse(exchange(pageCall.apply(offset)));
             List<Map<String, Object>> items = items(page);
             boolean hasMore = hasMore(page);
@@ -760,7 +863,29 @@ public class NetsuiteRestClient {
             Object count = page.get(COUNT);
             long advance = count instanceof Number number ? number.longValue() : 0;
             offset += advance > 0 ? advance : items.size();
+            if (reachesTotalResults(page, offset)) {
+                throw new IllegalStateException(
+                        "Unexpected NetSuite response: hasMore is true at or past totalResults");
+            }
+            if (pages >= MAX_PAGES) {
+                throw new IllegalStateException(
+                        "Unexpected NetSuite response: hasMore is still true after " + MAX_PAGES + " pages");
+            }
         }
+    }
+
+    /**
+     * Whether {@code offset} is at or past the page's {@code totalResults}, compared exactly whatever the size of
+     * the number; {@code false} when {@code totalResults} is absent or not a number.
+     */
+    private static boolean reachesTotalResults(Map<String, Object> page, long offset) {
+        if (!(page.get(TOTAL_RESULTS) instanceof Number totalResults)) {
+            return false;
+        }
+        BigDecimal total = totalResults instanceof BigDecimal decimal
+                ? decimal
+                : new BigDecimal(totalResults.toString());
+        return BigDecimal.valueOf(offset).compareTo(total) >= 0;
     }
 
     @SuppressWarnings("unchecked")

@@ -26,9 +26,10 @@ import org.junit.jupiter.params.provider.MethodSource;
  * {@code payload.ns0#ListInventoryResponse} ({@code %namespace ns0 http://mulesoft.org/tshirt-service},
  * {@code %output application/json}): the {@code ListInventoryResponse} root in the T-shirt namespace is selected
  * whatever its prefix, and its content, not the wrapper, is written as DataWeave 1.0 JSON with one repeated
- * {@code "inventory"} key per item in document order and string leaves; a document whose root misses the selector,
- * an empty root and a {@code null} document all yield the JSON literal {@code null}, the DataWeave JSON writer's
- * rendering of a selector that yields null.
+ * {@code "inventory"} key per item in document order and string leaves; a document whose root misses the selector
+ * and a {@code null} document yield the JSON literal {@code null}, the DataWeave JSON writer's rendering of a
+ * selector that yields null, while an empty root yields the JSON string {@code ""}, as DataWeave 1.0's XML reader
+ * read an element without text.
  *
  * <p>The sample is the original example's {@code sample_data/ListInventoryResponse.xml}, inlined because that file
  * is a Studio preview input and is not carried. The mapper is built directly over a real {@link DwXmlToJson} and
@@ -168,15 +169,22 @@ class ListInventoryResponseMapperTest {
                                 + "</inventory></x:ListInventoryResponse>"),
                 Arguments.of("ListInventoryResponse in no namespace",
                         "<ListInventoryResponse><inventory><productCode>1</productCode></inventory>"
-                                + "</ListInventoryResponse>"),
-                Arguments.of("empty ListInventoryResponse",
-                        "<ns2:ListInventoryResponse xmlns:ns2=\"http://mulesoft.org/tshirt-service\"/>"));
+                                + "</ListInventoryResponse>"));
     }
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("responsesTheSelectorMisses")
-    void responseTheSelectorMissesOrThatIsEmptyIsWrittenAsJsonNull(String variant, String xml) {
+    void responseTheSelectorMissesIsWrittenAsJsonNull(String variant, String xml) {
         assertThat(mapper.toJson(xml == null ? null : reader.parse(xml))).isEqualTo("null");
+    }
+
+    @Test
+    void emptyResponseIsWrittenAsJsonEmptyString() {
+        // The selector matches; DataWeave 1.0's XML reader read the element without text as "", not null.
+        String json = mapper.toJson(
+                reader.parse("<ns2:ListInventoryResponse xmlns:ns2=\"http://mulesoft.org/tshirt-service\"/>"));
+
+        assertThat(json).isEqualTo("\"\"");
     }
 
     @Test

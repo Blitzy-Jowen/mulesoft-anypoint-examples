@@ -53,8 +53,9 @@ import com.mulesoft.examples.exposing_a_restful_resource_using_the_http_connecto
  * <p>Every test starts a fresh application context, so the store is empty and the id counter is at 0, as in a freshly
  * deployed original, and the first stored person always gets id {@code 1}.
  *
- * <p>Content-Types written by Spring's string converter are compared by type and subtype, because it adds the
- * {@code charset} parameter to {@code text/plain} but not to {@code application/json}. The success replies of
+ * <p>Content-Type is asserted as exactly one header carrying its complete value, so a duplicated header or an added
+ * parameter such as {@code charset} fails: the platform defaults send bare {@code text/plain} and
+ * {@code application/json}, and error cases assert the raw status line. The success replies of
  * {@code storePersonFlow} and {@code retrievePersonFlow}, whose untyped {@code set-payload}s the Mule listener sent
  * without a Content-Type, are asserted to carry none, with a {@code Content-Length} equal to their body bytes.
  *
@@ -108,7 +109,7 @@ class PersonControllerTest {
 
         assertEquals(200, response.status(), response::toString);
         assertEquals("OK", response.reason(), response::toString);
-        assertMediaType(MediaType.APPLICATION_JSON, response);
+        assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         assertEquals("[]", response.bodyAsString());
     }
 
@@ -119,7 +120,7 @@ class PersonControllerTest {
         HttpTestClient.Response response = client.get("/person");
 
         assertEquals(200, response.status(), response::toString);
-        assertMediaType(MediaType.APPLICATION_JSON, response);
+        assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         assertEquals("[" + personJson + "]", response.bodyAsString());
     }
 
@@ -127,8 +128,8 @@ class PersonControllerTest {
     void putPersonIsMethodNotAllowed() {
         HttpTestClient.Response response = client.put("/person", "application/json", personJson);
 
-        assertEquals(405, response.status(), response::toString);
-        assertMediaType(MediaType.TEXT_PLAIN, response);
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
         assertEquals("Method not allowed for endpoint: /person", response.bodyAsString());
     }
 
@@ -137,15 +138,17 @@ class PersonControllerTest {
         // ST-1 reads no body for HEAD, so the Content-Length of the 405 cannot make the read block.
         HttpTestClient.Response response = client.send("HEAD", "/person", null, null);
 
-        assertEquals(405, response.status(), response::toString);
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
+        assertEquals(0, response.body().length, response::toString);
     }
 
     @Test
     void unservedPathReturnsNoListener404() {
         HttpTestClient.Response response = client.get("/people");
 
-        assertEquals(404, response.status(), response::toString);
-        assertMediaType(MediaType.TEXT_PLAIN, response);
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
         assertEquals("No listener for endpoint: /people", response.bodyAsString());
     }
 
@@ -221,8 +224,8 @@ class PersonControllerTest {
     void postToPersonItemIsMethodNotAllowed() {
         HttpTestClient.Response response = client.send("POST", "/person/1", JSON_CONTENT_TYPE, personJsonBytes);
 
-        assertEquals(405, response.status(), response::toString);
-        assertMediaType(MediaType.TEXT_PLAIN, response);
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
         assertEquals("Method not allowed for endpoint: /person/1", response.bodyAsString());
     }
 
@@ -230,8 +233,8 @@ class PersonControllerTest {
     void optionsPersonIsMethodNotAllowed() {
         HttpTestClient.Response response = client.send("OPTIONS", "/person", Map.of(), null);
 
-        assertEquals(405, response.status(), response::toString);
-        assertMediaType(MediaType.TEXT_PLAIN, response);
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
         assertEquals("Method not allowed for endpoint: /person", response.bodyAsString());
     }
 
@@ -269,8 +272,8 @@ class PersonControllerTest {
         HttpTestClient.Response response = client.get("/person/abc");
 
         // Integer.valueOf (line 31) fails, and the choice exception strategy has no branch for it.
-        assertEquals(500, response.status(), response::toString);
-        assertMediaType(MediaType.APPLICATION_JSON, response);
+        assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         assertEquals("{ \"message\": \"For input string: \\\"abc\\\"\" }", response.bodyAsString());
     }
 
@@ -280,7 +283,9 @@ class PersonControllerTest {
 
         HttpTestClient.Response response = client.send("HEAD", "/person/1", null, null);
 
-        assertEquals(405, response.status(), response::toString);
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
+        assertEquals(0, response.body().length, response::toString);
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -299,8 +304,8 @@ class PersonControllerTest {
      * location, so only the envelope is compared.
      */
     private static void assertUnhandledFailure(HttpTestClient.Response response) {
-        assertEquals(500, response.status(), response::toString);
-        assertMediaType(MediaType.APPLICATION_JSON, response);
+        assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         String body = response.bodyAsString();
         assertTrue(body.startsWith("{ \"message\": \""), () -> "unexpected 500 body: " + body);
         assertTrue(body.endsWith("\" }"), () -> "unexpected 500 body: " + body);
@@ -317,13 +322,8 @@ class PersonControllerTest {
         assertArrayEquals(expected, response.body(), response::toString);
     }
 
-    /** Asserts the response's Content-Type has the type and subtype of {@code expected}, whatever its parameters. */
-    private static void assertMediaType(MediaType expected, HttpTestClient.Response response) {
-        String contentType = response.header(HttpHeaders.CONTENT_TYPE);
-        assertNotNull(contentType, () -> "no Content-Type in\n" + response);
-        MediaType actual = MediaType.parseMediaType(contentType);
-        assertTrue(actual.isCompatibleWith(expected), () -> "Content-Type " + contentType + " is not " + expected);
-        assertEquals(expected.getType(), actual.getType(), contentType);
-        assertEquals(expected.getSubtype(), actual.getSubtype(), contentType);
+    /** Exactly one {@code Content-Type} header, equal to {@code expected} with no parameter appended. */
+    private static void assertContentType(HttpTestClient.Response response, String expected) {
+        assertEquals(List.of(expected), response.headers(HttpHeaders.CONTENT_TYPE), response::toString);
     }
 }

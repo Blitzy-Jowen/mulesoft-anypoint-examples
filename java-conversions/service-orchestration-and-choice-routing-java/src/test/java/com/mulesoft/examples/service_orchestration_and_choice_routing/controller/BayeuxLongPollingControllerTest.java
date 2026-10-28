@@ -330,6 +330,49 @@ class BayeuxLongPollingControllerTest {
     }
 
     @Test
+    void connectSupersededAfterItsWaitEndedCarriesNoDeliveryAndTheNewerConnectReceivesItOnce() throws Exception {
+        PausingBroker pausing = pausingBroker();
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        String clientId = handshake(mvc);
+        exchange(mvc, batch(connect(clientId)));
+        exchange(mvc, batch(subscribe(clientId, OUT)));
+        pausing.pauseAfterNextWait();
+        ArrayNode older;
+        ArrayNode newer;
+        try {
+            MvcResult olderStarted = start(mvc, batch(connect(clientId)));
+            assertThat(pausing.paused.await(LONG_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                    .as("the older connect's wait ended current by its timeout, before any delivery").isTrue();
+
+            pausing.blockBeforeNextWait();
+            MvcResult newerStarted = start(mvc, batch(connect(clientId)));
+            assertThat(pausing.blockedBeforeWait.await(PROMPT_MS, TimeUnit.MILLISECONDS))
+                    .as("the newer connect claimed on its request and its wait is kept from starting").isTrue();
+            broker.publish(OUT, "contested");
+
+            pausing.release.countDown();
+            older = parse(finish(mvc, olderStarted));
+
+            pausing.unblock.countDown();
+            newer = parse(finish(mvc, newerStarted));
+        } finally {
+            pausing.release.countDown();
+            pausing.unblock.countDown();
+        }
+        ArrayNode later = exchange(mvc, batch(connect(clientId)));
+
+        JsonNode olderConnected = single(older);
+        assertThat(olderConnected.path("channel").asText()).isEqualTo(CONNECT_CHANNEL);
+        assertThat(olderConnected.path("successful").asBoolean()).as(older.toString()).isTrue();
+        assertThat(find(newer, CONNECT_CHANNEL).path("successful").asBoolean()).as(newer.toString()).isTrue();
+        assertThat(deliveries(newer)).as(newer.toString())
+                .extracting(delivery -> delivery.path("data").asText())
+                .containsExactly("contested");
+        assertThat(deliveries(later)).as(later.toString()).isEmpty();
+        assertThat(pausing.deliveringDrains).as("only the newer connect drained").hasValue(1);
+    }
+
+    @Test
     void connectBeyondTheHeldConnectBoundIsAnsweredAtOnceWithWhatIsQueued() throws Exception {
         BlockingBroker blocking = replaceBroker(new BlockingBroker(brokerEnvironment()));
         MockMvc mvc = mvc(LONG_TIMEOUT_MS);
@@ -797,10 +840,11 @@ class BayeuxLongPollingControllerTest {
     }
 
     /**
-     * A broker whose held-connect wait thread a race test can pause once, right after its wait saw deliveries or
-     * right after it drained them, until the test releases it. The pause notes an interrupt instead of obeying it, as
-     * a thread delayed between two steps would. It also signals the first wait's start and its interruption, and
-     * counts the drains that took deliveries.
+     * A broker whose held-connect wait thread a race test can pause once, right after its wait ended current or
+     * right after it drained deliveries, until the test releases it, and whose next wait a test can keep from starting
+     * until it unblocks it. The pause notes an interrupt instead of obeying it, as a thread delayed between two steps
+     * would. It also signals the first wait's start and its interruption, and counts the drains that took deliveries,
+     * by a held connect's claim or by client.
      */
     static final class PausingBroker extends AjaxChannelBroker {
 
@@ -809,9 +853,12 @@ class BayeuxLongPollingControllerTest {
         final CountDownLatch paused = new CountDownLatch(1);
         final CountDownLatch interruptedWhilePaused = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
+        final CountDownLatch blockedBeforeWait = new CountDownLatch(1);
+        final CountDownLatch unblock = new CountDownLatch(1);
         final AtomicInteger deliveringDrains = new AtomicInteger();
         private final AtomicBoolean pauseAfterWait = new AtomicBoolean();
         private final AtomicBoolean pauseAfterDrain = new AtomicBoolean();
+        private final AtomicBoolean blockBeforeWait = new AtomicBoolean();
 
         PausingBroker(MockEnvironment environment) {
             super(environment);
@@ -825,12 +872,21 @@ class BayeuxLongPollingControllerTest {
             pauseAfterDrain.set(true);
         }
 
+        void blockBeforeNextWait() {
+            blockBeforeWait.set(true);
+        }
+
         @Override
-        public boolean awaitDeliveries(String clientId, long timeoutMs) throws InterruptedException {
+        public boolean awaitDeliveries(AjaxChannelBroker.ConnectClaim claim, long timeoutMs)
+                throws InterruptedException {
             waitsStarted.countDown();
+            if (blockBeforeWait.compareAndSet(true, false)) {
+                blockedBeforeWait.countDown();
+                unblock.await(LONG_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            }
             boolean current;
             try {
-                current = super.awaitDeliveries(clientId, timeoutMs);
+                current = super.awaitDeliveries(claim, timeoutMs);
             } catch (InterruptedException interrupted) {
                 waitsInterrupted.countDown();
                 throw interrupted;
@@ -843,7 +899,21 @@ class BayeuxLongPollingControllerTest {
 
         @Override
         public List<AjaxChannelBroker.Delivery> drain(String clientId) {
-            List<AjaxChannelBroker.Delivery> drained = super.drain(clientId);
+            return counted(super.drain(clientId));
+        }
+
+        @Override
+        public List<AjaxChannelBroker.Delivery> drain(AjaxChannelBroker.ConnectClaim claim) {
+            return counted(super.drain(claim));
+        }
+
+        /**
+         * Counts a drain that took deliveries, pausing after it when the test asked to.
+         *
+         * @param drained what the drain took
+         * @return {@code drained}
+         */
+        private List<AjaxChannelBroker.Delivery> counted(List<AjaxChannelBroker.Delivery> drained) {
             if (!drained.isEmpty()) {
                 deliveringDrains.incrementAndGet();
                 if (pauseAfterDrain.compareAndSet(true, false)) {
@@ -884,9 +954,10 @@ class BayeuxLongPollingControllerTest {
         }
 
         @Override
-        public boolean awaitDeliveries(String clientId, long timeoutMs) throws InterruptedException {
+        public boolean awaitDeliveries(AjaxChannelBroker.ConnectClaim claim, long timeoutMs)
+                throws InterruptedException {
             release.await(LONG_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            return super.awaitDeliveries(clientId, timeoutMs);
+            return super.awaitDeliveries(claim, timeoutMs);
         }
     }
 

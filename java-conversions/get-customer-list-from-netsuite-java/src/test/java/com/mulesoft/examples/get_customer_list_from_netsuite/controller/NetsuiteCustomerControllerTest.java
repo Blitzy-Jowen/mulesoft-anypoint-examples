@@ -134,6 +134,12 @@ class NetsuiteCustomerControllerTest {
             + "\"status\":400,\"o:errorDetails\":[{\"detail\":\"Invalid search query.\","
             + "\"o:errorCode\":\"INVALID_PARAMETER\"}]}";
 
+    private static final String SERVER_ERROR_BODY =
+            "{\"type\":\"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.1\","
+            + "\"title\":\"Internal Server Error\","
+            + "\"status\":500,\"o:errorDetails\":[{\"detail\":\"An unexpected error occurred.\","
+            + "\"o:errorCode\":\"UNEXPECTED_ERROR\"}]}";
+
     private static final WireMockServer WIRE_MOCK = new WireMockServer(options().dynamicPort());
 
     /** A throwaway RSA key the token provider signs its client assertions with; WireMock never checks them. */
@@ -347,20 +353,34 @@ class NetsuiteCustomerControllerTest {
     }
 
     /**
-     * Any other NetSuite failure is rethrown unchanged: the flow declares no exception strategy, so it gets the
-     * platform default 500.
+     * NetSuite failures no approved mode covers: an invalid query's 400 and a 500 with NetSuite's REST error body,
+     * and a 503 without a body, which is still not a timeout or connectivity failure. Each comes with the message
+     * of the platform default 500 it gets: the status code and reason phrase alone.
      */
-    @Test
-    void otherUpstreamFailureIsNotRetriedAndKeepsThePlatformDefault500() {
-        stubSuiteQl(jsonResponse(400, BAD_REQUEST_BODY));
+    static Stream<Arguments> unclassifiedUpstreamFailures() {
+        return Stream.of(
+                Arguments.of(jsonResponse(400, BAD_REQUEST_BODY), "400 Bad Request"),
+                Arguments.of(jsonResponse(500, SERVER_ERROR_BODY), "500 Internal Server Error"),
+                Arguments.of(aResponse().withStatus(503), "503 Service Unavailable"));
+    }
+
+    /**
+     * Any other NetSuite failure is rethrown unchanged: the flow declares no exception strategy, so it gets the
+     * platform default 500, whose message never names NetSuite's address or the request path.
+     */
+    @ParameterizedTest(name = "NetSuite answers {1}")
+    @MethodSource("unclassifiedUpstreamFailures")
+    void otherUpstreamFailureIsNotRetriedAndKeepsThePlatformDefault500(ResponseDefinitionBuilder answer,
+            String message) {
+        stubSuiteQl(answer);
 
         HttpTestClient.Response response = client().get(CUSTOMERS_A);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(response.reason()).isEqualTo("Internal Server Error");
         assertMediaType(response, MediaType.APPLICATION_JSON);
-        assertThat(response.bodyAsString()).startsWith("{ \"message\": \"").contains("400 Bad Request")
-                .doesNotContain("\"upstream\"");
+        assertThat(response.bodyAsString()).isEqualTo("{ \"message\": \"" + message + "\" }")
+                .doesNotContain(WIRE_MOCK.baseUrl(), "/services/rest");
         WIRE_MOCK.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL_PATH)));
         WIRE_MOCK.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
     }

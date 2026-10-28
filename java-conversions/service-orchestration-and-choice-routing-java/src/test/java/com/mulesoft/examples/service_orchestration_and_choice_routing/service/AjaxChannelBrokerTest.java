@@ -829,7 +829,7 @@ class AjaxChannelBrokerTest {
         assertThat(broker.awaitMessages(client, -1)).isEmpty();
         assertThat(broker.awaitMessages(client, 50)).isEmpty();
         assertThat(broker.awaitMessages(null, 50)).isEmpty();
-        assertThat(broker.drain(null)).isEmpty();
+        assertThat(broker.drain((String) null)).isEmpty();
     }
 
     @Test
@@ -882,10 +882,11 @@ class AjaxChannelBrokerTest {
         if (published) {
             broker.publish(OUTBOUND, "m1");
         }
+        AjaxChannelBroker.ConnectClaim claim = broker.claimConnect(client);
 
         assertThat(assertTimeoutPreemptively(Duration.ofMillis(WAIT_MS / 2),
-                () -> broker.awaitDeliveries(client, timeoutMs))).isTrue();
-        assertThat(broker.drain(client)).isEqualTo(published
+                () -> broker.awaitDeliveries(claim, timeoutMs))).isTrue();
+        assertThat(broker.drain(claim)).isEqualTo(published
                 ? List.of(new AjaxChannelBroker.Delivery(OUTBOUND, "m1"))
                 : List.of());
     }
@@ -904,7 +905,7 @@ class AjaxChannelBrokerTest {
         AjaxChannelBroker broker = broker(new MockEnvironment());
         String client = broker.handshake();
         broker.subscribe(client, OUTBOUND);
-        DeliveryWait older = startAwaitingDeliveries(broker, client, WAIT_MS);
+        DeliveryWait older = startAwaitingDeliveries(broker, broker.claimConnect(client), WAIT_MS);
 
         release.apply(broker, client);
 
@@ -913,8 +914,48 @@ class AjaxChannelBrokerTest {
 
     static Stream<Arguments> staleDeliveryWaitReleases() {
         return Stream.of(
-                Arguments.of("a newer connect",
-                        (ClientAction) (broker, clientId) -> startAwaitingDeliveries(broker, clientId, WAIT_MS)),
+                Arguments.of("a newer connect", (ClientAction) AjaxChannelBroker::claimConnect),
+                Arguments.of("a newer awaitMessages call",
+                        (ClientAction) (broker, clientId) -> startWaiting(broker, clientId, WAIT_MS)),
+                Arguments.of("disconnect", (ClientAction) AjaxChannelBroker::disconnect),
+                Arguments.of("shutdown", (ClientAction) (broker, clientId) -> broker.shutdown()));
+    }
+
+    @Test
+    void connectSupersededAfterItsWaitEndedCurrentTakesNothingAndTheNewerConnectTakesTheDelivery()
+            throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        AjaxChannelBroker.ConnectClaim older = broker.claimConnect(client);
+        assertThat(broker.awaitDeliveries(older, 0)).as("the older connect's wait ended current").isTrue();
+
+        AjaxChannelBroker.ConnectClaim newer = broker.claimConnect(client);
+        broker.publish(OUTBOUND, "m1");
+
+        assertThat(broker.drain(older)).as("the superseded connect takes nothing").isEmpty();
+        assertThat(broker.drain(newer)).containsExactly(new AjaxChannelBroker.Delivery(OUTBOUND, "m1"));
+        assertThat(broker.drain(newer)).isEmpty();
+    }
+
+    @ParameterizedTest(name = "removed by {0}")
+    @MethodSource("claimedClientRemovals")
+    void claimOfARemovedClientWaitsForNothingAndTakesNothing(String description, ClientAction removal) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        AjaxChannelBroker.ConnectClaim claim = broker.claimConnect(client);
+        broker.publish(OUTBOUND, "m1");
+
+        removal.apply(broker, client);
+
+        assertThat(assertTimeoutPreemptively(Duration.ofMillis(WAIT_MS / 2),
+                () -> broker.awaitDeliveries(claim, WAIT_MS))).isFalse();
+        assertThat(broker.drain(claim)).isEmpty();
+    }
+
+    static Stream<Arguments> claimedClientRemovals() {
+        return Stream.of(
                 Arguments.of("disconnect", (ClientAction) AjaxChannelBroker::disconnect),
                 Arguments.of("shutdown", (ClientAction) (broker, clientId) -> broker.shutdown()));
     }
@@ -922,18 +963,30 @@ class AjaxChannelBrokerTest {
     @ParameterizedTest
     @NullSource
     @ValueSource(strings = "00000000000000000000000000000000")
-    void awaitDeliveriesForAnUnknownClientEndsStaleAtOnce(String clientId) {
+    void claimOfAnUnknownClientEndsStaleAtOnceAndTakesNothing(String clientId) {
         AjaxChannelBroker broker = broker(new MockEnvironment());
+        AjaxChannelBroker.ConnectClaim claim = broker.claimConnect(clientId);
 
         assertThat(assertTimeoutPreemptively(Duration.ofMillis(WAIT_MS / 2),
-                () -> broker.awaitDeliveries(clientId, WAIT_MS))).isFalse();
+                () -> broker.awaitDeliveries(claim, WAIT_MS))).isFalse();
+        assertThat(broker.drain(claim)).isEmpty();
+        assertThat(broker.isKnownClient(clientId)).isFalse();
+    }
+
+    @Test
+    void nullClaimIsRejected() {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+
+        assertThatThrownBy(() -> broker.awaitDeliveries(null, 0)).isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> broker.drain((AjaxChannelBroker.ConnectClaim) null))
+                .isInstanceOf(NullPointerException.class);
     }
 
     @Test
     void interruptedDeliveryWaitThrowsInterruptedExceptionAndKeepsTheClient() throws Exception {
         AjaxChannelBroker broker = broker(new MockEnvironment());
         String client = broker.handshake();
-        DeliveryWait wait = startAwaitingDeliveries(broker, client, WAIT_MS);
+        DeliveryWait wait = startAwaitingDeliveries(broker, broker.claimConnect(client), WAIT_MS);
 
         wait.thread().interrupt();
 
@@ -950,13 +1003,14 @@ class AjaxChannelBrokerTest {
         broker.subscribe(client, OUTBOUND);
         broker.publish(OUTBOUND, "m1");
         List<AjaxChannelBroker.Delivery> undelivered = broker.drain(client);
-        DeliveryWait waiting = startAwaitingDeliveries(broker, client, WAIT_MS);
+        AjaxChannelBroker.ConnectClaim claim = broker.claimConnect(client);
+        DeliveryWait waiting = startAwaitingDeliveries(broker, claim, WAIT_MS);
 
         broker.restore(client, undelivered);
 
         assertThat(waiting.result()).isTrue();
         broker.publish(OUTBOUND, "m2");
-        undelivered = broker.drain(client);
+        undelivered = broker.drain(claim);
         broker.publish(OUTBOUND, "m3");
 
         broker.restore(client, undelivered);
@@ -1031,13 +1085,15 @@ class AjaxChannelBrokerTest {
         }
     }
 
-    @Test
-    void idleClientExpiresWhileClientWithHeldConnectStaysKnown() throws Exception {
+    @ParameterizedTest(name = "connect held by {0}")
+    @MethodSource("heldConnects")
+    void idleClientExpiresWhileClientWithHeldConnectStaysKnown(String description, HeldConnectStarter heldConnect,
+            Object releasedWith) throws Exception {
         AjaxChannelBroker broker = broker(new MockEnvironment().withProperty("ajax.max-interval-ms", "50"));
         // The idle client comes first, so no sweep runs between the waiting client's handshake and its connect.
         String idle = broker.handshake();
         String waiting = broker.handshake();
-        Waiter waiter = startWaiting(broker, waiting, WAIT_MS);
+        Future<?> held = heldConnect.start(broker, waiting);
 
         // Publishing runs the idle-client sweep, at most once per half max interval.
         await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(20)).until(() -> {
@@ -1049,7 +1105,18 @@ class AjaxChannelBrokerTest {
 
         broker.disconnect(waiting);
 
-        assertThat(waiter.result()).isEmpty();
+        assertThat(held.get(WAIT_MS, TimeUnit.MILLISECONDS)).isEqualTo(releasedWith);
+    }
+
+    static Stream<Arguments> heldConnects() {
+        return Stream.of(
+                Arguments.of("awaitMessages",
+                        (HeldConnectStarter) (broker, clientId) -> startWaiting(broker, clientId, WAIT_MS).task(),
+                        List.of()),
+                Arguments.of("awaitDeliveries",
+                        (HeldConnectStarter) (broker, clientId) ->
+                                startAwaitingDeliveries(broker, broker.claimConnect(clientId), WAIT_MS).task(),
+                        false));
     }
 
     @ParameterizedTest(name = "removed by {0}")
@@ -1112,6 +1179,7 @@ class AjaxChannelBrokerTest {
     static Stream<Arguments> clientActivities() {
         return Stream.of(
                 Arguments.of("drain", (ClientAction) AjaxChannelBroker::drain),
+                Arguments.of("connect claim", (ClientAction) AjaxChannelBroker::claimConnect),
                 Arguments.of("subscribe", (ClientAction) (broker, clientId) -> broker.subscribe(clientId, OUTBOUND)),
                 Arguments.of("unsubscribe",
                         (ClientAction) (broker, clientId) -> broker.unsubscribe(clientId, OUTBOUND)),
@@ -1403,12 +1471,18 @@ class AjaxChannelBrokerTest {
     }
 
     /**
-     * Starts {@link AjaxChannelBroker#awaitDeliveries(String, long)} on its own thread and returns once the call is
-     * waiting (or has already returned).
+     * Starts {@link AjaxChannelBroker#awaitDeliveries(AjaxChannelBroker.ConnectClaim, long)} on its own thread and
+     * returns once the call is waiting (or has already returned).
+     *
+     * @param broker the broker
+     * @param claim the connect's claim
+     * @param timeoutMs the wait's timeout
+     * @return the waiting call and its thread
      */
-    private static DeliveryWait startAwaitingDeliveries(AjaxChannelBroker broker, String clientId, long timeoutMs) {
-        FutureTask<Boolean> task = new FutureTask<>(() -> broker.awaitDeliveries(clientId, timeoutMs));
-        Thread thread = new Thread(task, "await-deliveries-" + clientId);
+    private static DeliveryWait startAwaitingDeliveries(AjaxChannelBroker broker,
+            AjaxChannelBroker.ConnectClaim claim, long timeoutMs) {
+        FutureTask<Boolean> task = new FutureTask<>(() -> broker.awaitDeliveries(claim, timeoutMs));
+        Thread thread = new Thread(task, "await-deliveries");
         thread.setDaemon(true);
         thread.start();
         await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(5))
@@ -1444,6 +1518,13 @@ class AjaxChannelBrokerTest {
     interface ClientAction {
 
         void apply(AjaxChannelBroker broker, String clientId);
+    }
+
+    /** Starts a held connect of one client on its own thread and returns it once it is waiting. */
+    @FunctionalInterface
+    interface HeldConnectStarter {
+
+        Future<?> start(AjaxChannelBroker broker, String clientId);
     }
 
     /** Yields a client ID of a broker, setting up whatever state the ID needs. */

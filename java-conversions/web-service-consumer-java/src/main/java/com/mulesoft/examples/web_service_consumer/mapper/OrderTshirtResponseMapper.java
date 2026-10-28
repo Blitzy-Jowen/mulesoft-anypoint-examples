@@ -23,8 +23,8 @@ import org.w3c.dom.Document;
  * </pre>
  * The input is the SOAP body payload the {@code OrderTshirt} operation returned. DataWeave read it with its XML
  * reader ({@link DwXmlToJson}: local-name keys, namespace prefixes and URIs dropped, string leaves, an element with
- * no text {@code null}) and wrote the whole document with its JSON writer ({@link DwJsonWriter}: two-space
- * indentation, {@code "key": value}, LF line ends, no trailing line feed). For the response
+ * no text the empty string {@code ""}) and wrote the whole document with its JSON writer ({@link DwJsonWriter}:
+ * two-space indentation, {@code "key": value}, LF line ends, no trailing line feed). For the response
  * {@code <ns2:OrderTshirtResponse xmlns:ns2="http://mulesoft.org/tshirt-service"><orderId>1</orderId></ns2:OrderTshirtResponse>}
  * the result is:
  * <pre>{@code

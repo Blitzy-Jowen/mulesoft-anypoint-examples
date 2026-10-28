@@ -155,6 +155,47 @@ class OrderSummaryJsonMapperTest {
               "orderItems": null
             }""";
 
+    private static final String ALL_EMPTY = """
+            {
+              "orderId": "",
+              "customer": "",
+              "orderItems": ""
+            }""";
+
+    /**
+     * The summary the 1080 service answers for a page order: the items are not read from the request, so
+     * {@code orderItems} comes back as the empty element {@code <orderItems/>}.
+     */
+    private static final String ITEMLESS_SUMMARY = "<summary><orderId>77</orderId><customer>"
+            + "<address>1 Main St</address><firstName>Ann</firstName><lastName>Lee</lastName></customer>"
+            + "<orderItems/></summary>";
+
+    private static final String EXPECTED_ITEMLESS = """
+            {
+              "orderId": "77",
+              "customer": {
+                "address": "1 Main St",
+                "firstName": "Ann",
+                "lastName": "Lee"
+              },
+              "orderItems": ""
+            }""";
+
+    /** An itemless order placed with the page's customer fields left blank. */
+    private static final String BLANK_CUSTOMER_SUMMARY = "<summary><orderId>78</orderId><customer>"
+            + "<address/><firstName/><lastName/></customer><orderItems/></summary>";
+
+    private static final String EXPECTED_BLANK_CUSTOMER = """
+            {
+              "orderId": "78",
+              "customer": {
+                "address": "",
+                "firstName": "",
+                "lastName": ""
+              },
+              "orderItems": ""
+            }""";
+
     private final OrderSummaryJsonMapper mapper = new OrderSummaryJsonMapper(new DwXmlToJson(), new DwJsonWriter());
 
     @Test
@@ -218,12 +259,26 @@ class OrderSummaryJsonMapperTest {
         return Stream.of(
                 arguments(named("root is the envelope, not summary", REPLY), ALL_NULL),
                 arguments(named("summary is a leaf", "<summary>12</summary>"), ALL_NULL),
-                arguments(named("selected elements are empty", "<summary><orderId/><customer/><orderItems/></summary>"),
-                        ALL_NULL),
                 arguments(named("customer and orderItems absent", "<summary><orderId>12</orderId></summary>"),
                         ORDER_ID_ONLY),
                 arguments(named("repeated orderId selects the first",
                         "<summary><orderId>12</orderId><orderId>13</orderId></summary>"), ORDER_ID_ONLY));
+    }
+
+    /** DataWeave 1.0's XML reader read an element without text as "", so a selector that hits one writes "". */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("emptySelectedElements")
+    void writesEmptyStringForEmptyElements(String summaryXml, String expected) {
+        assertThat(mapper.toJson(summaryXml)).isEqualTo(expected);
+    }
+
+    static Stream<Arguments> emptySelectedElements() {
+        return Stream.of(
+                arguments(named("selected elements are empty", "<summary><orderId/><customer/><orderItems/></summary>"),
+                        ALL_EMPTY),
+                arguments(named("itemless 1080 reply", ITEMLESS_SUMMARY), EXPECTED_ITEMLESS),
+                arguments(named("itemless 1080 reply with blank customer leaves", BLANK_CUSTOMER_SUMMARY),
+                        EXPECTED_BLANK_CUSTOMER));
     }
 
     @ParameterizedTest

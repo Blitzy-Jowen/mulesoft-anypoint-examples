@@ -133,7 +133,7 @@ The copied pages call the flows with `mule.rpc(channel, data, callback)` from `/
 | `/orders/soap` | `orderProxy` (`mule-config.xml:38-42`) | the published envelope posted unchanged to `orders.soap.url` (timeout `orders.soap.proxy-timeout-ms`, 10000 ms) | the service's reply text |
 | `/orders/manufacturers` | `manufacturers` (`mule-config.xml:43-46`) | none | `["Samsung","Philips","Sony"]` |
 
-- As implemented, the `/orders/request` reply carries `"orderItems": null`. The DataWeave-faithful order XML writes one `<orderItems>` element per item, without the `<item>` wrapper that the SOAP `Order` binding reads, so the 1080 service receives an order without items and only audits it. The mapper keeps the original script's output on purpose. Which shape the original produced is a Tier 2A verification point.
+- As implemented, the `/orders/request` reply carries `"orderItems": ""`. The DataWeave-faithful order XML writes one `<orderItems>` element per item, without the `<item>` wrapper that the SOAP `Order` binding reads, so the 1080 service receives an order without items and only audits it. It answers `<orderItems/>`, which DataWeave 1.0's XML reader read as the empty string (its `nullValueOn` default is `none`); an empty customer field is `""` the same way. The unchanged page then reads an `orderItems` length of 0 and switches to the Confirmation tab with an empty table. The mapper keeps the original script's output on purpose. Which shape the original produced is a Tier 2A verification point.
 - No flow declares an exception strategy. A failing step, a SOAP fault answered by the 1080 service included, ends the call: the broker logs the exception's type and publishes no reply. A handler that has not returned within `ajax.response-timeout-ms` (10000 ms) is cancelled, and no reply is published. What the original replied in these cases is a Tier 2A verification point.
 - Bayeux protocol, as `BayeuxLongPollingController` speaks it:
   - Meta channels:
@@ -295,6 +295,7 @@ The Type column gives the Java type each value binds to, taken from the code or 
 - `spring.webservices.path` keeps Boot's default `/services`. `messageDispatcherServlet` is reached only through the SC-10 named-servlet forwards of `/orders` and `/samsung/orders`, so a request to `/services/**` matches no route and gets the no-listener 404.
 - Set in code rather than in keys:
   - `config/XaTransactionConfig` gives queue `inhouseOrder` a redelivery delay of 1000 ms and unlimited delivery attempts, and gives its listener container one consumer in JTA transactions;
+  - `config/WebServiceConfig` sets the JVM system property `saaj.use.default.transformer.factory` to `true` at start-up unless it is already set, so SAAJ uses the JDK's transformer factory directly instead of running a service lookup over every jar for each message it parses or writes (the lookup finds the same factory, so no byte changes), and `-Dsaaj.use.default.transformer.factory=false` keeps the lookup;
   - `AjaxChannelBroker` bounds its queues (500 deliveries per client, 500 held messages per cached channel, 16 running handlers, 500 waiting publications);
   - `BayeuxLongPollingController` holds at most 512 connects at once.
 - Override a port on the command line or through the environment (relaxed binding maps `PORTS_SAMSUNG` to `ports.samsung`). The Samsung and price URLs follow their port keys. `orders.soap.url` names port 1080 literally, so set it as well when `server.port` changes:
@@ -367,7 +368,7 @@ Each of these is a plan default or a kept declaration that the source alone does
 - The price service: `GET` against the POST-only listener, `POST` against the `@GET` resource, the listener path `api` without a wildcard, the reply's `text/plain` without a charset, and the empty `404` that `POST /api` gets from Jersey, without a `Content-Type` or a body.
 - The in-house outcome that follows from the price lookup failing on every delivery.
 - `totalValue`: its string concatenation, the value stored in `order_audits.total_value`, and the branch `#[sessionVars.totalValue] > 5000` selects.
-- The `/orders/request` reply shape that the DataWeave semantics produce (`"orderItems": null`), and the replies of the Ajax flows when a step fails or times out.
+- The `/orders/request` reply shape that the DataWeave semantics produce (`"orderItems": ""`), and the replies of the Ajax flows when a step fails or times out.
 - Response Content-Types: none on `/populate`, `text/plain` on the price, `text/xml;charset=utf-8` on SOAP replies, and `text/json;charset=UTF-8` on `/ajax/cometd`.
 - The SOAP response headers, which carry neither the `Accept` nor the `SOAPAction` request header SAAJ keeps on every message, the raw UTF-8 of characters outside the Basic Multilingual Plane, and the `soap:Client` fault for an envelope sent with a Content-Type other than `text/xml`.
 - The 405 answered to `HEAD /populate`, and the Jetty MIME table, redirect, method handling and CORS pre-flight answer behind the docroot.
@@ -426,6 +427,7 @@ Notes:
 | `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, forwarding to the named servlet, an empty TLS password named in the start-up failure |
 | `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server`, `soap:Client` and `soap:MustUnderstand` faults, the boundary 405 and faults; this project registers no WSDL, which the publisher test accepts |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight dispatched as a plain `OPTIONS` request |
+| `config/WebServiceConfigTest` | `saaj.use.default.transformer.factory` set to `true` when absent, at context refresh as well, and left unchanged when already `true` or `false`; the factory it selects is the one the JAXP service lookup finds |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, Content-Types and bodies |
 | `FixtureParityTest` | ST-2 fixture replay ([Fixture parity](#fixture-parity-st-2)); skipped while no fixture is captured |
 
@@ -502,12 +504,12 @@ This is the project's row of the root [`SUMMARY.md`](../../SUMMARY.md) (AAP 0.8.
 
 The run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 941 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 941 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`, nested classes counted with their outer class: 99.3%, 1149 of 1157 lines.
-  - `service`: `AjaxChannelBroker` 389 of 392, `AjaxOrderService` 35 of 35, `AuditService` 86 of 87, `InHouseOrderService` 26 of 26, `OrderOrchestrationService` 65 of 65, `PriceCacheService` 4 of 4, `ProductPriceService` 2 of 2, `SamsungOrderService` 35 of 35, `SamsungServiceImpl` 7 of 7.
-  - `mapper`: `AjaxOrderXmlMapper` 73 of 73, `DwJsonWriter` 86 of 86, `DwXmlToJson` 94 of 98, `DwXmlWriter` 170 of 170, `OrderRequestMapper` 6 of 6, `OrderSummaryJsonMapper` 12 of 12, `PurchaseReceiptMapper` 6 of 6, `SoapEnvelopeTransformer` 53 of 53.
-  - Total project LINE coverage: 92.7% (2859 of 3084 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 956 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 956 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`, nested classes counted with their outer class: 99.3%, 1173 of 1181 lines.
+  - `service`: `AjaxChannelBroker` 415 of 418, `AjaxOrderService` 35 of 35, `AuditService` 86 of 87, `InHouseOrderService` 26 of 26, `OrderOrchestrationService` 65 of 65, `PriceCacheService` 4 of 4, `ProductPriceService` 2 of 2, `SamsungOrderService` 35 of 35, `SamsungServiceImpl` 7 of 7.
+  - `mapper`: `AjaxOrderXmlMapper` 73 of 73, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `DwXmlWriter` 170 of 170, `OrderRequestMapper` 6 of 6, `OrderSummaryJsonMapper` 12 of 12, `PurchaseReceiptMapper` 6 of 6, `SoapEnvelopeTransformer` 53 of 53.
+  - Total project LINE coverage: 92.8% (2890 of 3114 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=19`, `failed=0`. `post-orders-samsung-rejected` is `UNREACHABLE` and counted in none.
 - Runtime check of the packaged jar, on free ports: `/populate`, the `reply.xml` exchange, the quantity-5 order, the Samsung `purchase`, the price `POST` and `GET`, the 405, 404 and fault answers, the in-house path and the Bayeux `/orders/manufacturers` and `/orders/request` replies answered as this README states.
 

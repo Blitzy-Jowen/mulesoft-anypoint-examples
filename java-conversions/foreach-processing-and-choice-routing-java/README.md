@@ -193,7 +193,7 @@ curl 'http://localhost:18080/mule/TheCreditAgencyService?wsdl'
 | `controller/BankEndpointTest` | on the wire: the exact `getLoanQuote` response on each of the five banks (the random rate matched by pattern), each port answering as its own bank on its base path and on `/*`, the credit-score rate bands, `BankService.wsdl`, the no-listener 404 for another bank's path, and the faults for unreadable requests, unknown operations and a failing bank |
 | `service/LoanBrokerServiceTest` | every reachable branch with mocked clients: the required-field choice and its `otherwise`, `Integer.parseInt` failures, both reachable bank `when`s with the original bank URIs, the boundary amounts that never select Bank 5, the lowest-quote rule, failure propagation, and the four original logger messages |
 | `service/BankTest`, `service/DefaultCreditAgencyTest` | the ported mock services: rate ranges, ordering and score bands; credit score and history ranges, generator wiring and the ported `toString` |
-| `client/CreditAgencyClientTest`, `client/BankClientTest` | the outbound wire contract over a mocked transport (target `<basePath>/*`, `arg0` shape, `return` parsing, faults surfacing unwrapped) and the `loanbroker.response-timeout` read timeout against a peer that never answers |
+| `client/CreditAgencyClientTest`, `client/BankClientTest` | the outbound wire contract over a mocked transport (target `<basePath>/*`, `arg0` shape, `return` parsing, faults surfacing unwrapped); an empty SOAP Body failing in the client with a `NullPointerException` and a response wrapper without `return` yielding `null`, over the mocked transport and over real HTTP against WireMock, with the loan flow's outcome for each through `LoanBrokerController` (the catch branch's `Error processing loan request`, or the lowest remaining quote); and the `loanbroker.response-timeout` read timeout against a peer that never answers |
 | `config/WebServiceConfigTest` | the shared `WebServiceTemplate`: each request sent exactly once on a reset, end of stream or timeout, `Content-Length` framing, `SOAPAction: ""`, and replies, faults and HTTP errors read as expected |
 | `exception/LoanBrokerExceptionHandlerTest` | the catch branch's precedence over SC-1 and its scoping to the loan broker, the 200 `Error processing loan request` reply without `Content-Type`, and the single ERROR line |
 | `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, forwarding to the named servlet, the additional listener registration, an empty TLS password named in the start-up failure |
@@ -250,8 +250,8 @@ This project passes no POST-only path to `SoapListenerBoundaryAdapter`, because 
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 498 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 498 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 511 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 511 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 77 of 78 lines: `service/LoanBrokerService` 48 of 49, `service/Bank` 20 of 20, `service/DefaultCreditAgency` 9 of 9 (the project has no `mapper` package). Total project LINE coverage: 88.3% (1400 of 1585 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=15`, `failed=0`; `get-root-bank5-otherwise` is `UNREACHABLE` and counted in none.
 

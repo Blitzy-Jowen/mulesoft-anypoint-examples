@@ -153,7 +153,7 @@ class TwitterSearchControllerTest {
         Response response = client().get("/");
 
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
-        assertThat(response.header("Content-Type")).startsWith("application/json");
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly("application/json");
         assertThat(response.bodyAsString())
                 .startsWith("{ \"message\": ")
                 .isEqualTo(ErrorResponse.json(expected.getMessage()));
@@ -169,7 +169,7 @@ class TwitterSearchControllerTest {
         Response response = client().get("/");
 
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
-        assertThat(response.header("Content-Type")).startsWith("application/json");
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly("application/json");
         assertThat(response.bodyAsString())
                 .isEqualTo(ErrorResponse.json(new TwitterException("boom").getMessage()))
                 .isEqualTo("{ \"message\": \"boom\" }");
@@ -188,7 +188,7 @@ class TwitterSearchControllerTest {
         Response response = client().get(target);
 
         assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 404 Not Found");
-        assertThat(response.header("Content-Type")).startsWith("text/plain");
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly("text/plain");
         assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: " + reportedPath);
         verifyNoInteractions(twitterSearchClient);
     }

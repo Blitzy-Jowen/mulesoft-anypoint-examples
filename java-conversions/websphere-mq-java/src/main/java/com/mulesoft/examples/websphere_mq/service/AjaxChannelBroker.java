@@ -256,6 +256,34 @@ public class AjaxChannelBroker {
     }
 
     /**
+     * The claim one held {@code /meta/connect} holds on its client's deliveries, from {@link #claimConnect(String)}.
+     * It stays current until the client's next claim or its removal, and only a current claim can take deliveries.
+     * It is opaque: only the broker mints and checks claims.
+     */
+    public static final class ConnectClaim {
+
+        /** The claim of a {@code null} or unknown client. It is never current, so it waits for and takes nothing. */
+        private static final ConnectClaim UNCLAIMED = new ConnectClaim(null, 0L);
+
+        /** The session the claim was minted on; {@code null} only for {@link #UNCLAIMED}. */
+        private final ClientSession session;
+
+        /** The session's claim counter when the claim was minted. */
+        private final long generation;
+
+        /**
+         * A claim minted by a session alone, under its lock.
+         *
+         * @param session the session the claim is minted on, {@code null} only for {@link #UNCLAIMED}
+         * @param generation the session's claim counter for this claim
+         */
+        private ConnectClaim(ClientSession session, long generation) {
+            this.session = session;
+            this.generation = generation;
+        }
+    }
+
+    /**
      * Whether inbound results are kept off the {@code replyTo} channel ({@code ajax.disable-reply-to}).
      *
      * @return {@code true} when replies are disabled
@@ -277,7 +305,7 @@ public class AjaxChannelBroker {
     /**
      * Stops the handler executor, interrupting running handlers and dropping waiting calls, stops the response
      * timeouts, and removes every client, releasing each waiting {@link #awaitMessages(String, long)} call with an
-     * empty result and each waiting {@link #awaitDeliveries(String, long)} call with {@code false}. A later
+     * empty result and each waiting {@link #awaitDeliveries(ConnectClaim, long)} call with {@code false}. A later
      * publication on an inbound channel is refused and logged at INFO.
      */
     @PreDestroy
@@ -376,7 +404,7 @@ public class AjaxChannelBroker {
     /**
      * Removes a client with its subscriptions and queued deliveries, and releases its waiting
      * {@link #awaitMessages(String, long)} call with an empty result or its waiting
-     * {@link #awaitDeliveries(String, long)} call with {@code false}. An unknown client is ignored.
+     * {@link #awaitDeliveries(ConnectClaim, long)} call with {@code false}. An unknown client is ignored.
      *
      * @param clientId the client ID
      */
@@ -393,7 +421,8 @@ public class AjaxChannelBroker {
     }
 
     /**
-     * Returns and removes every delivery queued for a client.
+     * Returns and removes every delivery queued for a client, without regard to any connect's claim. A held connect
+     * takes its deliveries with {@link #drain(ConnectClaim)} instead, which takes nothing once its claim is superseded.
      *
      * @param clientId the client ID
      * @return the deliveries in queue order; empty for an unknown client
@@ -410,8 +439,10 @@ public class AjaxChannelBroker {
      * Waits for deliveries for a client, as a held {@code /meta/connect} does. Returns at once when deliveries are
      * queued; otherwise waits up to {@code timeoutMs} for the first one and then returns everything queued.
      *
-     * <p>Bayeux allows one outstanding connect per client, so a newer call for the same client releases an older
-     * waiting one with an empty list and the deliveries go to the newest.
+     * <p>Bayeux allows one outstanding connect per client, so the call claims the client's deliveries as it starts,
+     * as {@link #claimConnect(String)} does: a newer call or claim for the same client supersedes it and releases it
+     * with an empty list, and the deliveries go to the newest. Whether the call is still the newest and the taking of
+     * the queue are one step under the client's lock, so a superseded call never returns a delivery.
      *
      * @param clientId the client ID
      * @param timeoutMs the longest wait in milliseconds; zero or less does not wait
@@ -427,24 +458,63 @@ public class AjaxChannelBroker {
     }
 
     /**
-     * Waits for deliveries for a client like {@link #awaitMessages(String, long)}, but takes nothing: the caller
-     * drains the queue only once it knows its response can still carry the deliveries, and otherwise leaves them for
-     * the client's next connect. Like {@link #awaitMessages(String, long)}, a newer wait for the same client
-     * supersedes an older one.
+     * Claims a client's deliveries for one held {@code /meta/connect}, as its request arrives. Bayeux allows one
+     * outstanding connect per client, so the claim supersedes every older claim and every waiting
+     * {@link #awaitMessages(String, long)} call of the client: an older claim's waiting
+     * {@link #awaitDeliveries(ConnectClaim, long)} ends at once with {@code false}, and its
+     * {@link #drain(ConnectClaim)} takes nothing from then on. Records activity of the client.
      *
      * @param clientId the client ID
-     * @param timeoutMs the longest wait in milliseconds; zero or less does not wait
-     * @return {@code true} when deliveries are queued or the time has passed while this was still the client's newest
-     *         wait, so the caller may drain; {@code false} when a newer wait superseded it, the client was
-     *         disconnected or removed, or is unknown or {@code null}, so the caller must not drain
-     * @throws InterruptedException when the waiting thread is interrupted
+     * @return the connect's claim; for a {@code null} or unknown client, a claim that is never current
      */
-    public boolean awaitDeliveries(String clientId, long timeoutMs) throws InterruptedException {
+    public ConnectClaim claimConnect(String clientId) {
         ClientSession session = clientId == null ? null : clients.get(clientId);
         if (session == null) {
+            return ConnectClaim.UNCLAIMED;
+        }
+        return session.claim();
+    }
+
+    /**
+     * Waits for deliveries for a held connect without taking any: returns once a delivery is queued, the claim is
+     * superseded, the client is removed or {@code timeoutMs} passes, and leaves the queue to
+     * {@link #drain(ConnectClaim)}, so the caller takes the deliveries only once it knows its response can still carry
+     * them. While it waits, the client counts as having a held connect, which idle expiry spares.
+     *
+     * @param claim the connect's claim from {@link #claimConnect(String)}
+     * @param timeoutMs the longest wait in milliseconds; zero or less does not wait
+     * @return {@code true} when the claim was still current as the wait ended, with deliveries queued or the time
+     *         passed; {@code false} when a newer claim superseded it, the client was disconnected or removed, or the
+     *         claim is that of a {@code null} or unknown client. Either way, {@link #drain(ConnectClaim)} checks the
+     *         claim again as it takes the deliveries
+     * @throws NullPointerException when {@code claim} is {@code null}
+     * @throws InterruptedException when the waiting thread is interrupted
+     */
+    public boolean awaitDeliveries(ConnectClaim claim, long timeoutMs) throws InterruptedException {
+        Objects.requireNonNull(claim, "claim");
+        if (claim.session == null) {
             return false;
         }
-        return session.awaitQueued(timeoutMs);
+        return claim.session.awaitClaimed(claim.generation, timeoutMs);
+    }
+
+    /**
+     * Returns and removes every delivery queued for a client while the held connect's claim is still current.
+     * Whether the claim is current and the taking of the queue are one step under the client's lock, so a connect
+     * superseded at any moment before, even one whose wait ended current, takes nothing and leaves every delivery for
+     * the newer connect. Records activity of the client when the claim is current.
+     *
+     * @param claim the connect's claim from {@link #claimConnect(String)}
+     * @return the deliveries in queue order; empty when nothing is queued, when a newer claim superseded this one,
+     *         when the client was disconnected or removed, or for the claim of a {@code null} or unknown client
+     * @throws NullPointerException when {@code claim} is {@code null}
+     */
+    public List<Delivery> drain(ConnectClaim claim) {
+        Objects.requireNonNull(claim, "claim");
+        if (claim.session == null) {
+            return List.of();
+        }
+        return claim.session.drainClaimed(claim.generation);
     }
 
     /**
@@ -1044,50 +1114,116 @@ public class AjaxChannelBroker {
             }
         }
 
-        /** Waits as {@link #awaitQueued(long)} does, then returns and removes the queue unless the wait ended stale. */
+        /**
+         * Claims the deliveries, waits as {@link #awaitClaimed(long, long)} does, then returns and removes the queue
+         * unless the claim was superseded or the session closed: all under one hold of the session's lock.
+         */
         List<Delivery> await(long timeoutMs) throws InterruptedException {
             lock.lock();
             try {
-                return waitLocked(timeoutMs) ? drainLocked() : List.of();
+                long generation = claimLocked();
+                return waitLocked(generation, timeoutMs) ? drainLocked() : List.of();
             } finally {
                 lock.unlock();
             }
         }
 
         /**
-         * Waits until a delivery is queued or {@code timeoutMs} passes, taking nothing from the queue.
+         * Mints a claim that supersedes every older one, as {@link #claimLocked()} does.
          *
-         * @return whether the wait ended current: the session is open and no newer wait has started since
+         * @return the new claim, current until the next claim or the session's close
          */
-        boolean awaitQueued(long timeoutMs) throws InterruptedException {
+        ConnectClaim claim() {
             lock.lock();
             try {
-                return waitLocked(timeoutMs);
+                return new ConnectClaim(this, claimLocked());
             } finally {
                 lock.unlock();
             }
         }
 
         /**
-         * The wait of one connect, for a caller holding the session's lock. It supersedes any older wait, which
-         * then ends stale, and counts as a waiter until it ends, so the idle sweep spares the session meanwhile.
+         * Waits until a delivery is queued, the claim is superseded, the session closes or {@code timeoutMs} passes,
+         * taking nothing from the queue.
          *
-         * @return whether the wait ended current: the session is open and no newer wait has started since
+         * @param generation the claim's generation
+         * @param timeoutMs the longest wait in milliseconds; zero or less does not wait
+         * @return whether the claim is still current: the session is open and no newer claim has been minted
+         * @throws InterruptedException when the waiting thread is interrupted
          */
-        private boolean waitLocked(long timeoutMs) throws InterruptedException {
+        boolean awaitClaimed(long generation, long timeoutMs) throws InterruptedException {
+            lock.lock();
+            try {
+                return waitLocked(generation, timeoutMs);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * Returns and removes every queued delivery, recording the activity, when the claim is still current;
+         * otherwise takes nothing. The check and the removal are one step under the session's lock.
+         *
+         * @param generation the claim's generation
+         * @return the deliveries in queue order; empty when nothing is queued or the claim is no longer current
+         */
+        List<Delivery> drainClaimed(long generation) {
+            lock.lock();
+            try {
+                if (!isCurrentLocked(generation)) {
+                    return List.of();
+                }
+                lastActivityNanos = System.nanoTime();
+                return drainLocked();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * Mints the next claim generation, for a caller holding the session's lock: every older claim is superseded
+         * from now on and its waiting connect woken, so it ends stale at once. Records the activity.
+         *
+         * @return the new claim's generation
+         */
+        private long claimLocked() {
             long generation = ++waiterGeneration;
             changed.signalAll();
+            lastActivityNanos = System.nanoTime();
+            return generation;
+        }
+
+        /**
+         * The wait of one claimed connect, for a caller holding the session's lock. It counts as a waiter until it
+         * ends, so the idle sweep spares the session meanwhile.
+         *
+         * @param generation the claim's generation
+         * @param timeoutMs the longest wait in milliseconds; zero or less does not wait
+         * @return whether the claim is still current: the session is open and no newer claim has been minted
+         * @throws InterruptedException when the waiting thread is interrupted
+         */
+        private boolean waitLocked(long generation, long timeoutMs) throws InterruptedException {
             waiters++;
             lastActivityNanos = System.nanoTime();
             try {
                 long remaining = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
-                while (queue.isEmpty() && !closed && generation == waiterGeneration && remaining > 0) {
+                while (queue.isEmpty() && isCurrentLocked(generation) && remaining > 0) {
                     remaining = changed.awaitNanos(remaining);
                 }
             } finally {
                 waiters--;
                 lastActivityNanos = System.nanoTime();
             }
+            return isCurrentLocked(generation);
+        }
+
+        /**
+         * Whether a claim is current, for a caller holding the session's lock.
+         *
+         * @param generation the claim's generation
+         * @return whether the session is open and no newer claim has been minted
+         */
+        private boolean isCurrentLocked(long generation) {
             return !closed && generation == waiterGeneration;
         }
 

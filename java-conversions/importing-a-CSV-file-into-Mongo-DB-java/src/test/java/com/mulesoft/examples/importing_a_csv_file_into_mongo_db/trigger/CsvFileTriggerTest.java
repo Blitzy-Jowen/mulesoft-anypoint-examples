@@ -8,10 +8,12 @@
 
 package com.mulesoft.examples.importing_a_csv_file_into_mongo_db.trigger;
 
+import static com.mulesoft.examples.importing_a_csv_file_into_mongo_db.service.CustomerImportService.COLLECTION;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -26,11 +28,16 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 
+import org.bson.Document;
+import org.bson.types.ObjectId;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -40,26 +47,39 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mulesoft.examples.importing_a_csv_file_into_mongo_db.mapper.CustomerDocumentMapper;
+import com.mulesoft.examples.importing_a_csv_file_into_mongo_db.mapper.DwCsvReader;
 import com.mulesoft.examples.importing_a_csv_file_into_mongo_db.service.CustomerImportService;
+
+import de.bwaldvogel.mongo.MongoServer;
+import de.bwaldvogel.mongo.backend.memory.MemoryBackend;
 
 /**
  * Trigger test of {@link CsvFileTrigger}, the replacement of the only inbound endpoint of flow
  * {@code csv-to-mongodbFlow1} in {@code importing-a-CSV-file-into-Mongo-DB/src/main/app/csv-to-mongodb.xml} (l.9),
  * {@code <file:inbound-endpoint path="src/main/resources/input" responseTimeout="10000"/>}. The original has no HTTP
- * listener, so this test stands in for its endpoint test (AAP 0.8.2): one happy path and two failure cases, an
- * unreachable MongoDB and a malformed CSV.
+ * listener, so this test stands in for its endpoint test (AAP 0.8.2): one happy path, two failure cases (an
+ * unreachable MongoDB, and an import that throws for another reason) and a malformed CSV, which {@link DwCsvReader}
+ * reads leniently by its documented rules rather than rejecting it.
  *
  * <p>The endpoint declares no {@code file:connector}, {@code pollingFrequency} or {@code moveToDirectory}, so the
  * Mule defaults hold: a poll every 1000 ms, and every handed file deleted once the flow returns, after a completed
  * flow and after one the default exception strategy ended alike. SC-5 {@link FileInboundPoller} reproduces that, so
  * a failure never escapes the poll and the file is never handed over a second time.
  *
- * <p>No Spring context is started and {@link CustomerImportService} is mocked; the flow body is covered by
- * {@code service/CustomerImportServiceTest} and the ported {@code ImportCSVfileIntoMongoDBTest}. The input directory
- * is a {@link TempDir}, so {@code src/main/resources/input} and the classpath {@code input.csv} are never touched, and
- * polls run on demand through the single-run method, never by waiting for the schedule.
+ * <p>No Spring context is started. The file-disposition cases mock {@link CustomerImportService}; the flow body is
+ * covered by {@code service/CustomerImportServiceTest} and the ported {@code ImportCSVfileIntoMongoDBTest}. The
+ * malformed-CSV case runs the real service, {@link DwCsvReader} and {@link CustomerDocumentMapper} over a
+ * {@link MongoTemplate} on a {@link MongoClient} connected to mongo-java-server, an in-memory MongoDB wire-protocol
+ * server bound to a free loopback port, started before the class and shut down after it, and asserts the documents
+ * the server stores. The input directory is a {@link TempDir}, so {@code src/main/resources/input} and the classpath
+ * {@code input.csv} are never touched, and polls run on demand through the single-run method, never by waiting for
+ * the schedule.
  */
 class CsvFileTriggerTest {
 
@@ -75,6 +95,26 @@ class CsvFileTriggerTest {
     /** The {@code csv-import.polling-frequency} {@code application.yml} sets: Mule's default of 1000 ms. */
     private static final String POLLING_FREQUENCY = "1000";
 
+    /** Database of the malformed-CSV case: the one the original test counted in. */
+    private static final String DB_NAME = "customers";
+
+    /**
+     * The sample's header and CRLF line ends, then one record for each shape {@link DwCsvReader} reads leniently
+     * rather than rejecting: a short row; a long row; characters after a closing quote; and, with no line end after
+     * it, a quoted field that is never closed, so it runs to the end of the input, separators included.
+     */
+    private static final String MALFORMED_CSV = "firstname,surname,phone,email\r\n"
+            + "Jane,Roe\r\n"
+            + "Max,Mustermann,0301234567,max@example.com,Berlin,10115\r\n"
+            + "\"Ann\"ie,Lee,0401234567,annie@example.com\r\n"
+            + "Bob,\"Smith,0501234567,bob@example.com";
+
+    private static MongoServer mongoServer;
+
+    private static MongoClient mongoClient;
+
+    private static MongoTemplate mongoTemplate;
+
     @TempDir
     Path inputDir;
 
@@ -85,6 +125,26 @@ class CsvFileTriggerTest {
     @BeforeAll
     static void originalInputIsIntact() {
         assertEquals(72, INPUT.length, "size of the original input.csv");
+    }
+
+    @BeforeAll
+    static void startMongoServer() {
+        mongoServer = new MongoServer(new MemoryBackend());
+        mongoClient = MongoClients.create(mongoServer.bindAndGetConnectionString());
+        mongoTemplate = new MongoTemplate(mongoClient, DB_NAME);
+    }
+
+    @AfterAll
+    static void stopMongoServer() {
+        try {
+            if (mongoClient != null) {
+                mongoClient.close();
+            }
+        } finally {
+            if (mongoServer != null) {
+                mongoServer.shutdownNow();
+            }
+        }
     }
 
     @BeforeEach
@@ -123,16 +183,49 @@ class CsvFileTriggerTest {
     }
 
     @Test
-    @DisplayName("Malformed CSV -> the poll does not throw, the file is consumed and never retried")
-    void malformedCsvConsumesFileWithoutRetry() throws IOException {
-        // The path a DwCsvReader parse failure takes out of CustomerImportService.importCsv.
-        doThrow(new IllegalArgumentException("malformed CSV"))
+    @DisplayName("Import throws -> the poll does not throw, the file is consumed and never retried")
+    void importFailureConsumesFileWithoutRetry() throws IOException {
+        // An injected failure other than data access. It is not a parse failure: the dropped bytes are the valid
+        // sample, and DwCsvReader rejects no malformed input either (malformedCsvIsImportedLenientlyAndConsumed).
+        doThrow(new IllegalArgumentException("import failed"))
                 .when(customerImportService).importCsv(any());
         Path file = dropInput();
 
         int count = assertDoesNotThrow(() -> trigger.pollOnce());
 
         assertConsumedWithoutRetry(count, file);
+    }
+
+    @Test
+    @DisplayName("Malformed CSV -> imported leniently through the real reader and mapper, the file deleted and never"
+            + " retried")
+    void malformedCsvIsImportedLenientlyAndConsumed() throws IOException {
+        CsvFileTrigger realImport = new CsvFileTrigger(
+                new CustomerImportService(mongoTemplate, new DwCsvReader(), new CustomerDocumentMapper()),
+                inputDir.toString(), POLLING_FREQUENCY);
+        Path file = Files.write(inputDir.resolve(INPUT_CSV), MALFORMED_CSV.getBytes(StandardCharsets.UTF_8));
+        assertFalse(mongoTemplate.collectionExists(COLLECTION), "the run starts on the collection-absent branch");
+
+        int count = assertDoesNotThrow(() -> realImport.pollOnce());
+
+        assertEquals(1, count);
+        assertTrue(mongoTemplate.collectionExists(COLLECTION), "the absent collection is created");
+        List<Document> stored = storedCustomers();
+        for (Document customer : stored) {
+            assertInstanceOf(ObjectId.class, customer.remove("_id"), "the driver's generated _id");
+        }
+        // Whole-document equality: a null below is a key stored with a BSON null, not an absent key, and no
+        // document carries the long row's column_4 or column_5. The memory backend returns the save order.
+        assertEquals(List.of(
+                customer("Jane", "Roe", null, null),
+                customer("Max", "Mustermann", "0301234567", "max@example.com"),
+                customer("Annie", "Lee", "0401234567", "annie@example.com"),
+                customer("Bob", "Smith,0501234567,bob@example.com", null, null)), stored);
+        assertFalse(Files.exists(file), "no moveToDirectory, so the processed file is deleted");
+        assertTrue(listing(inputDir).isEmpty());
+        assertEquals(0, realImport.pollOnce());
+        assertEquals(4, mongoTemplate.getCollection(COLLECTION).countDocuments(), "no record is saved twice");
+        verifyNoInteractions(customerImportService);
     }
 
     @Test
@@ -202,6 +295,19 @@ class CsvFileTriggerTest {
         assertTrue(listing(inputDir).isEmpty());
         assertEquals(0, trigger.pollOnce());
         verify(customerImportService, times(1)).importCsv(any());
+    }
+
+    /** Reads the {@value CustomerImportService#COLLECTION} collection through the driver, as the server holds it. */
+    private static List<Document> storedCustomers() {
+        return mongoTemplate.getCollection(COLLECTION).find().into(new ArrayList<>());
+    }
+
+    /** The document {@link CustomerDocumentMapper} writes: its four keys in script order, a missing value null. */
+    private static Document customer(String firstname, String surname, String phone, String email) {
+        return new Document(CustomerDocumentMapper.FIRSTNAME, firstname)
+                .append(CustomerDocumentMapper.SURNAME, surname)
+                .append(CustomerDocumentMapper.PHONE, phone)
+                .append(CustomerDocumentMapper.EMAIL, email);
     }
 
     private static byte[] classpath(String location) {

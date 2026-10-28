@@ -30,6 +30,8 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.Date;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -51,6 +53,15 @@ import org.springframework.web.reactive.function.client.WebClient;
  * {@code exp} under NetSuite's 60-minute limit. The token it returns lasts 60 minutes; it is reused until 60 s before
  * the expiry the token response states, so no call starts with a token about to lapse.
  *
+ * <p>Concurrent callers never queue behind one another's token requests. A valid cached token is read without
+ * locking. When a new one is needed, one caller sends the token request and every caller arriving while it is in
+ * flight waits for its outcome instead of sending another, so a burst of calls on an empty or expired cache costs one
+ * request, and each caller waits at most as long as that one request, whose connection and response the connect
+ * timeout {@code netsuite.connect-timeout} and the response timeout {@code netsuite.read-timeout} of
+ * {@code NetsuiteRestClient.connector} bound (10 s each by default). Every one of them receives its token, or the
+ * exception it failed with, unwrapped. A failure is not cached, so the next call after it sends a new request. No
+ * lock is held while a request is in flight, so {@link #evict()} never waits for one.
+ *
  * <p>Every setting comes from {@link NetsuiteProperties} and is read when first needed, so the application starts
  * with every credential placeholder empty and the first token request fails with an {@link IllegalStateException}
  * naming the missing key. The private key is read once, on first use, and kept in memory.
@@ -58,7 +69,9 @@ import org.springframework.web.reactive.function.client.WebClient;
  * <p>Failures of the token request itself propagate unwrapped ({@code WebClientResponseException} for a non-2xx
  * answer, {@code WebClientRequestException} for a timeout or connection failure): {@code NetsuiteRestClient} fetches
  * the token inside the call it hands to {@code UpstreamCallExecutor}, whose NetSuite classifier turns a 401 into
- * {@link #evict()} plus one retry and a timeout or connectivity failure into a 503 with no retry.
+ * {@link #evict()} plus one retry and a timeout or connectivity failure into a 503 with no retry. The token client
+ * carries the filter {@code NetsuiteRestClient#responseExceptionsWithoutRequest()}, so the response exception holds
+ * NetSuite's status, headers and body but neither the request method nor the token URL.
  *
  * <p>Neither the assertion, the token, the key nor the token response body is ever logged or placed in an exception
  * message; logs name only the token URL, the expiry instant and, when the private key cannot be loaded, its
@@ -110,9 +123,17 @@ public class NetsuiteTokenProvider {
             .disable(StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION)
             .build();
 
-    private String cachedToken;
+    /** Guards {@link #inFlight} and every write of {@link #cachedToken}; never held while a request is in flight. */
+    private final Object tokenLock = new Object();
 
-    private Instant expiresAt;
+    /** Guards the first load of {@link #privateKey}; shared with nothing else. */
+    private final Object keyLock = new Object();
+
+    /** The current token with its expiry, read without locking; {@code null} until fetched and after eviction. */
+    private volatile CachedToken cachedToken;
+
+    /** The token request in flight, which callers arriving meanwhile wait for; {@code null} when there is none. */
+    private CompletableFuture<CachedToken> inFlight;
 
     private volatile PrivateKey privateKey;
 
@@ -140,6 +161,7 @@ public class NetsuiteTokenProvider {
         // No base URL: the token URL is resolved from the properties on every request, so start-up needs no account.
         this.webClient = Objects.requireNonNull(builder, "builder").clone()
                 .clientConnector(NetsuiteRestClient.connector(props))
+                .filters(filters -> filters.add(0, NetsuiteRestClient.responseExceptionsWithoutRequest()))
                 .build();
     }
 
@@ -147,6 +169,13 @@ public class NetsuiteTokenProvider {
      * Returns a valid access token: the cached one while it has more than 60 s left, otherwise a new one from the
      * token endpoint, which is then cached until the expiry its response states ({@code expires_in}, a number or a
      * numeric string; 3600 s when absent or unparsable).
+     *
+     * <p>A valid cached token is returned without locking. When a new one is needed and another caller's token
+     * request is already in flight, this call sends none of its own: it waits for that request and returns its
+     * token, or throws the exception it failed with, so the wait lasts at most as long as that one request, whose
+     * connection and response {@code netsuite.connect-timeout} and {@code netsuite.read-timeout} bound (10 s each by
+     * default). Otherwise this call sends the request, and callers arriving meanwhile wait for it in the same way. A
+     * failure is not cached: the first call after it sends a new request.
      *
      * @return the bearer token
      * @throws IllegalStateException when a setting the request needs is missing or invalid (the message names the
@@ -157,11 +186,75 @@ public class NetsuiteTokenProvider {
      * @throws org.springframework.web.reactive.function.client.WebClientRequestException on a timeout or connection
      *         failure, unwrapped
      */
-    public synchronized String accessToken() {
+    public String accessToken() {
         Instant now = clock.instant();
-        if (cachedToken != null && now.isBefore(expiresAt.minusSeconds(EXPIRY_MARGIN_SECONDS))) {
-            return cachedToken;
+        CachedToken cached = cachedToken;
+        if (cached != null && cached.usableAt(now)) {
+            return cached.value();
         }
+        CompletableFuture<CachedToken> request;
+        boolean sender;
+        synchronized (tokenLock) {
+            cached = cachedToken;
+            if (cached != null && cached.usableAt(now)) {
+                return cached.value();
+            }
+            sender = inFlight == null;
+            if (sender) {
+                inFlight = new CompletableFuture<>();
+            }
+            request = inFlight;
+        }
+        return sender ? send(request, now) : await(request).value();
+    }
+
+    /**
+     * Sends the token request {@code request} stands for and settles it. On success the token is cached before the
+     * request is deregistered, so a caller arriving at any moment finds one or the other. On failure the request is
+     * deregistered before its waiters are released, so the failure is never cached and the next call sends anew.
+     * Either way every waiter receives this call's outcome, and the throwable reaches this caller unchanged.
+     */
+    private String send(CompletableFuture<CachedToken> request, Instant now) {
+        CachedToken fetched;
+        try {
+            fetched = fetchToken(now);
+        } catch (Throwable failure) {
+            synchronized (tokenLock) {
+                inFlight = null;
+            }
+            // Wrapped here, so join() hands each waiter this exact throwable as the cause, whatever its type.
+            request.completeExceptionally(new CompletionException(failure));
+            throw failure;
+        }
+        synchronized (tokenLock) {
+            cachedToken = fetched;
+            inFlight = null;
+        }
+        request.complete(fetched);
+        return fetched.value();
+    }
+
+    /**
+     * Waits for the token request another caller sent and returns its token, or rethrows the runtime exception or
+     * error it failed with, unchanged.
+     */
+    private static CachedToken await(CompletableFuture<CachedToken> request) {
+        try {
+            return request.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("NetSuite token request failed", cause);
+        }
+    }
+
+    /** Requests a new token from the token endpoint, with an assertion issued at {@code now}, and returns it. */
+    private CachedToken fetchToken(Instant now) {
         String tokenUrl = props.tokenUrl();
         String assertion = createClientAssertion(now);
         LOG.debug("Requesting NetSuite access token from {}", tokenUrl);
@@ -182,20 +275,24 @@ public class NetsuiteTokenProvider {
             throw new IllegalStateException("NetSuite token response did not contain access_token");
         }
         long expiresIn = expiresInSeconds(response.get("expires_in"));
-        cachedToken = token.asText();
-        expiresAt = now.plusSeconds(expiresIn);
-        LOG.info("Obtained NetSuite access token from {}, valid until {}", tokenUrl, expiresAt);
-        return cachedToken;
+        CachedToken fetched = new CachedToken(token.asText(), now.plusSeconds(expiresIn));
+        LOG.info("Obtained NetSuite access token from {}, valid until {}", tokenUrl, fetched.expiresAt());
+        return fetched;
     }
 
     /**
      * Discards the cached token, so the next {@link #accessToken()} requests a new one. This is the
      * re-authentication step {@code UpstreamCallExecutor} runs after NetSuite rejects a token
      * ({@code tokenProvider::evict} as an {@link UpstreamAction}).
+     *
+     * <p>It never waits for a token request in flight. That request is left to finish, and the token it obtains is
+     * cached and handed to its waiters: NetSuite issues it in answer to that request, so it is not the token whose
+     * rejection led to the eviction.
      */
-    public synchronized void evict() {
-        cachedToken = null;
-        expiresAt = null;
+    public void evict() {
+        synchronized (tokenLock) {
+            cachedToken = null;
+        }
         LOG.debug("Evicted cached NetSuite access token");
     }
 
@@ -235,7 +332,7 @@ public class NetsuiteTokenProvider {
     private PrivateKey privateKey() {
         PrivateKey key = privateKey;
         if (key == null) {
-            synchronized (this) {
+            synchronized (keyLock) {
                 key = privateKey;
                 if (key == null) {
                     key = loadPrivateKey(props.requirePrivateKeyPath());
@@ -351,5 +448,25 @@ public class NetsuiteTokenProvider {
             }
         }
         return DEFAULT_EXPIRES_IN_SECONDS;
+    }
+
+    /**
+     * A token and the instant it expires, published together in one volatile write, so no reader sees one without
+     * the other. {@link #toString()} leaves the token out, since nothing may log it.
+     *
+     * @param value     the bearer token
+     * @param expiresAt the expiry the token response states
+     */
+    private record CachedToken(String value, Instant expiresAt) {
+
+        /** Whether the token may still be handed out at {@code now}: it has more than the 60 s margin left. */
+        boolean usableAt(Instant now) {
+            return now.isBefore(expiresAt.minusSeconds(EXPIRY_MARGIN_SECONDS));
+        }
+
+        @Override
+        public String toString() {
+            return "CachedToken[expiresAt=" + expiresAt + "]";
+        }
     }
 }

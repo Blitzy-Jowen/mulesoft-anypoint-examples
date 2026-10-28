@@ -60,7 +60,7 @@ The project has no non-HTTP trigger: no file poller, scheduler, queue listener o
    }
    ```
 
-3. If the selector misses (no response, another root element, or the element outside the T-shirt namespace) or selects an empty element, the reply is `200` with the four characters `null`.
+3. If the selector misses (no response, another root element, or the element outside the T-shirt namespace), the reply is `200` with the four characters `null`. If it selects an empty element, the reply is `200` with the two characters `""`, because DataWeave 1.0's XML reader read an element without text as the empty string.
 
 ### Failures
 
@@ -82,7 +82,7 @@ The original declares no exception strategy, so the `404` and `500` above are pl
 - the `500` body for unhandled failures and its message text (`post-orders-malformed-json`), and the `404` text (`get-unknown-path`);
 - acceptance of methods other than the original test's `POST` (`put-orders`, `get-inventory`);
 - XML writer edge cases (`DwXmlWriter`, which builds the `OrderTshirt` request): null and empty elements, escaping, and the trailing line feed it never writes;
-- XML-to-JSON of empty elements (`null`), and the empty `/orders` reply and `null` `/inventory` reply when the service returns no payload;
+- XML-to-JSON of empty elements (`""`), and the empty `/orders` reply and `null` `/inventory` reply when the service returns no payload;
 - the outbound envelope as SAAJ writes it: the `SOAP-ENV` prefix, an empty `SOAP-ENV:Header` on `ListInventory`, and the `Accept`, `Cache-Control` and `Pragma` request headers of `HttpURLConnection`. Replay compares each recorded upstream request's method, URL, body and headers (`SCENARIOS.md`), and the original's CXF stack may have written them differently.
 
 ### Sample requests
@@ -184,7 +184,7 @@ Status: `default` — a non-secret value, overridable; `TODO` — no value (`${E
 The four DataWeave scripts are each owned by exactly the class named above (AAP 0.5.8). They reproduce these DataWeave 1.0 formats through the SC-4 classes:
 
 - XML output (`DwXmlWriter`): the declaration `<?xml version='1.0' encoding='UTF-8'?>`, a line feed, then one element per line, indented with one tab per depth, LF line ends, and nothing after the root end tag. An element with neither text nor children is `<q/>`, and one with empty text is `<q></q>`. Text escapes `&`, `<` and `>`, and attribute values also escape `"`. A character XML 1.0 forbids fails the write with its code point named.
-- XML-to-JSON (`DwXmlToJson`): keys are element local names, and namespace prefixes, URIs and attributes are dropped. A repeated element is a repeated key, never an array. Leaves are untrimmed strings, and an element with no text is `null`. A DOCTYPE fails the parse.
+- XML-to-JSON (`DwXmlToJson`): keys are element local names, and namespace prefixes, URIs and attributes are dropped. A repeated element is a repeated key, never an array. Leaves are untrimmed strings, and an element with no text is the empty string `""` (DataWeave 1.0's `nullValueOn` default, `none`). A DOCTYPE fails the parse.
 - JSON output (`DwJsonWriter`): two-space indentation, `"key": value`, one entry per line, LF line ends, no trailing line feed; an empty object is `{}`.
 
 ## Behaviours stubbed or externalized
@@ -223,8 +223,8 @@ TSHIRT_API_KEY='<key>' java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT
 | `service/TshirtOrderServiceTest` | both flows with only the SOAP client mocked. An absent or empty inventory body sends the empty `ListInventory` request, and an XML body is sent as it is. A body neither flow can read is rejected before the client is called. Every client failure reaches the caller as the same instance after exactly one call. The original contains-assertions are kept. |
 | `client/TshirtServiceClientTest` | against WireMock: one SOAP 1.1 `POST` per operation with the WSDL's `soapAction`. `OrderTshirt` carries the `AuthenticationHeader` with the configured key and refuses to send without one; `ListInventory` sends no header. No response or an empty Body yields `null`. A SOAP fault, an HTTP error without a fault, a read timeout and a refused connection surface as the Spring WS exceptions, never retried, and a fault without a fault string as the fixed message. Characters outside the BMP are sent as UTF-8 bytes. A connect or read timeout below 1 ms (zero, negative or sub-millisecond) or above `Integer.MAX_VALUE` ms fails construction naming its key; an unset timeout reaches the connection as 10 s. |
 | `mapper/OrderTshirtRequestMapperTest` | script 12: members in body order, a repeated key or array item once per occurrence, `null` as an empty element, decimals with their scale, a scalar or `null` body under the root; empty, malformed and top-level-array bodies rejected; exact bytes in `DwXmlWriter` layout for the original `message.json` |
-| `mapper/OrderTshirtResponseMapperTest` | script 28: the whole response document as DataWeave JSON, local-name keys, string leaves, an element without text as `null`, no trailing line feed; a `null` document yields `null` |
-| `mapper/ListInventoryResponseMapperTest` | script 41: the five-item sample (the original Studio `ListInventoryResponse.xml`, inlined) as repeated `"inventory"` keys in document order; a root that misses the selector, an empty root and a `null` document yield the JSON literal `null` |
+| `mapper/OrderTshirtResponseMapperTest` | script 28: the whole response document as DataWeave JSON, local-name keys, string leaves, an element without text as `""`, no trailing line feed; a `null` document yields `null` |
+| `mapper/ListInventoryResponseMapperTest` | script 41: the five-item sample (the original Studio `ListInventoryResponse.xml`, inlined) as repeated `"inventory"` keys in document order; a root that misses the selector and a `null` document yield the JSON literal `null`, and an empty root the JSON string `""` |
 | `mapper/DwXmlWriterTest`, `mapper/DwXmlToJsonTest`, `mapper/DwJsonWriterTest` | SC-4 byte contracts, copied with their classes: declaration, tab layout and no trailing line feed; DataWeave XML reading with repeated keys and a hardened parser; DataWeave JSON layout, values and escaping |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the `404`, `405` and `500` status lines, `Content-Type` headers and body bytes, `ErrorResponse` escaping and the bounded ERROR log line |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing |
@@ -273,7 +273,7 @@ Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
 - `mvn -B clean package`: `BUILD SUCCESS`; 520 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
 - `mvn -B test`: `BUILD SUCCESS`; 520 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 449 of 459 lines. `service/TshirtOrderService` covers 13 of 13. The `mapper` package covers 436 of 446: `DwXmlWriter` 170 of 170, `DwJsonWriter` 86 of 86, `DwXmlToJson` 94 of 98, `OrderTshirtRequestMapper` 74 of 80, `OrderTshirtResponseMapper` 7 of 7 and `ListInventoryResponseMapper` 5 of 5. Total project LINE coverage: 97.4% (799 of 820 lines).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 447 of 457 lines. `service/TshirtOrderService` covers 13 of 13. The `mapper` package covers 434 of 444: `DwXmlWriter` 170 of 170, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `OrderTshirtRequestMapper` 74 of 80, `OrderTshirtResponseMapper` 7 of 7 and `ListInventoryResponseMapper` 5 of 5. Total project LINE coverage: 97.4% (797 of 818 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

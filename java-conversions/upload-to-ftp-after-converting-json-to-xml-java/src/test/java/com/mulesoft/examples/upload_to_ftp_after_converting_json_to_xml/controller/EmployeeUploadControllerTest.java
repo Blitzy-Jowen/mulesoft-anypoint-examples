@@ -10,12 +10,14 @@ package com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.control
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +28,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockftpserver.core.MockFtpServerException;
 import org.mockftpserver.fake.FakeFtpServer;
 import org.mockftpserver.fake.UserAccount;
 import org.mockftpserver.fake.filesystem.DirectoryEntry;
@@ -37,7 +40,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.io.ClassPathResource;
-import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -82,8 +84,8 @@ class EmployeeUploadControllerTest {
     private static final String UPLOADED_FILE_NAME = "muleExample.xml";
     private static final String UPLOADED_FILE = UPLOAD_DIR + "/" + UPLOADED_FILE_NAME;
 
-    private static final long START_TIMEOUT_MILLIS = 10_000;
-    private static final long START_POLL_MILLIS = 10;
+    private static final Duration START_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration START_POLL_INTERVAL = Duration.ofMillis(10);
 
     private static final String ROOT = "/";
     private static final String CONTENT_TYPE = "Content-Type";
@@ -242,9 +244,8 @@ class EmployeeUploadControllerTest {
     void unknownPathReturnsNoListener404() {
         HttpTestClient.Response response = http.get("/other");
 
-        assertThat(response.status()).as("%s", response).isEqualTo(404);
-        assertThat(response.reason()).as("%s", response).isEqualTo("Not Found");
-        assertThat(contentType(response).equalsTypeAndSubtype(MediaType.TEXT_PLAIN)).as("%s", response).isTrue();
+        assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 404 Not Found");
+        assertThat(response.headers(CONTENT_TYPE)).as("%s", response).containsExactly("text/plain");
         assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: /other");
         assertNothingUploaded();
     }
@@ -263,32 +264,27 @@ class EmployeeUploadControllerTest {
         return http.send(method, ROOT, Map.of(CONTENT_TYPE, "application/json"), classpath("message.json"));
     }
 
-    /** 200 {@code OK}, XML in UTF-8, the expected document, and the same bytes as the only uploaded file. */
+    /**
+     * 200 {@code OK}, exactly one {@code Content-Type} of XML in UTF-8 as the controller spells it, the expected
+     * document, and the same bytes as the only uploaded file.
+     */
     private static void assertUploadedXml(HttpTestClient.Response response) {
-        assertThat(response.httpVersion()).as("%s", response).isEqualTo("HTTP/1.1");
-        assertThat(response.status()).as("%s", response).isEqualTo(200);
-        assertThat(response.reason()).as("%s", response).isEqualTo("OK");
-        MediaType contentType = contentType(response);
-        assertThat(contentType.equalsTypeAndSubtype(MediaType.APPLICATION_XML)).as("%s", response).isTrue();
-        assertThat(contentType.getCharset()).as("%s", response).isEqualTo(UTF_8);
+        assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 200 OK");
+        assertThat(response.headers(CONTENT_TYPE)).as("%s", response).containsExactly("application/xml;charset=UTF-8");
         assertThat(response.body()).as("body was:%n%s", response.bodyAsString())
                 .isEqualTo(EXPECTED_XML.getBytes(UTF_8));
         assertThat(uploadedBytes()).isEqualTo(response.body());
         assertThat(uploadDirectoryNames()).containsExactly(UPLOADED_FILE_NAME);
     }
 
-    /** The unhandled-exception reply of SC-1 (AAP 0.4.7), with APIkit's spacing of the message member. */
+    /**
+     * The unhandled-exception reply of SC-1 (AAP 0.4.7): exactly one bare {@code application/json} header and
+     * APIkit's spacing of the message member.
+     */
     private static void assertPlatform500(HttpTestClient.Response response) {
-        assertThat(response.status()).as("%s", response).isEqualTo(500);
-        assertThat(response.reason()).as("%s", response).isEqualTo("Internal Server Error");
-        assertThat(contentType(response).equalsTypeAndSubtype(MediaType.APPLICATION_JSON)).as("%s", response).isTrue();
+        assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 500 Internal Server Error");
+        assertThat(response.headers(CONTENT_TYPE)).as("%s", response).containsExactly("application/json");
         assertThat(response.bodyAsString()).startsWith(ERROR_BODY_PREFIX).endsWith("\" }");
-    }
-
-    /** Parses the single {@code Content-Type} header the response carries. */
-    private static MediaType contentType(HttpTestClient.Response response) {
-        assertThat(response.headers(CONTENT_TYPE)).as("%s", response).hasSize(1);
-        return MediaType.parseMediaType(response.header(CONTENT_TYPE));
     }
 
     private static void assertNothingUploaded() {
@@ -301,20 +297,80 @@ class EmployeeUploadControllerTest {
         server.setServerControlPort(0);
         server.addUserAccount(new UserAccount(FTP_USER, FTP_PASSWORD, FTP_HOME));
         server.setFileSystem(fileSystemWithUploadDir());
-        server.start();
-        long deadline = System.currentTimeMillis() + START_TIMEOUT_MILLIS;
-        while (!server.isStarted() || server.getServerControlPort() <= 0) {
-            if (System.currentTimeMillis() >= deadline) {
-                throw new IllegalStateException("FakeFtpServer did not start");
+        return startAndAwait(server, START_TIMEOUT);
+    }
+
+    /**
+     * Starts {@code server} and waits at most {@code timeout} for it to listen on its control port.
+     *
+     * <p>Every failure after {@code start()} is called stops the server before it propagates, because its thread may
+     * already run and a failed class initialization keeps no instance anyone could stop: {@code start()}'s own
+     * failure, which comes after it launched the server thread, the bounded wait timing out, and any other exception
+     * or error. The stop waits for the server thread to end even when interrupted, and a failure of {@code stop()}
+     * other than an interrupted wait is attached to the propagating one as suppressed. An exception is reported as an
+     * {@link IllegalStateException} naming the timeout; an {@link Error} propagates unchanged.
+     *
+     * <p>The caller's interrupt status survives: Awaitility waits uninterruptibly and re-asserts an interrupt it
+     * received, {@code start()} reports an interrupted wait for its server thread as a {@link MockFtpServerException}
+     * caused by the {@link InterruptedException}, whose flag is restored here, and an interrupt received while the
+     * stop waits for the server thread is restored once the stop has ended.
+     */
+    private static FakeFtpServer startAndAwait(FakeFtpServer server, Duration timeout) {
+        try {
+            server.start();
+            // Polled on this thread: the condition is a lambda of this class, which no other thread can run until the
+            // static initializer that starts FTP has finished.
+            await().atMost(timeout)
+                    .pollInterval(START_POLL_INTERVAL)
+                    .pollInSameThread()
+                    .until(() -> server.isStarted() && server.getServerControlPort() > 0);
+            return server;
+        } catch (RuntimeException e) {
+            IllegalStateException failure =
+                    new IllegalStateException("FakeFtpServer did not start within " + timeout.toMillis() + " ms", e);
+            throw stopAfterFailedStart(server, failure, e.getCause() instanceof InterruptedException);
+        } catch (Error e) {
+            throw stopAfterFailedStart(server, e, false);
+        }
+    }
+
+    /**
+     * Stops a server whose start failed and returns {@code failure} for the caller to throw.
+     *
+     * <p>{@code stop()} closes the control socket and then joins the server thread, and an interrupt ends that join
+     * while the thread may still run, so the stop is made uninterruptible: the flag is cleared before the first
+     * {@code stop()}, and each time {@code stop()} reports an interrupted join as a {@link MockFtpServerException}
+     * caused by the {@link InterruptedException}, the interrupt is noted and {@code stop()} is called again, which
+     * repeats the harmless socket close and resumes the join, until it returns normally. That exception is not a
+     * failure of the stop and is not attached to {@code failure}. Any other exception or error from {@code stop()}
+     * ends the attempts and is attached to {@code failure} as suppressed. Once the attempts end, the flag is restored
+     * when an interrupt was pending before the stop, arrived during it, or is reported by {@code interruptConsumed} as
+     * one the failed start already cleared.
+     */
+    private static <T extends Throwable> T stopAfterFailedStart(FakeFtpServer server, T failure,
+            boolean interruptConsumed) {
+        boolean interrupted = Thread.interrupted() || interruptConsumed;
+        try {
+            while (true) {
+                try {
+                    server.stop();
+                    return failure;
+                } catch (MockFtpServerException e) {
+                    if (!(e.getCause() instanceof InterruptedException)) {
+                        failure.addSuppressed(e);
+                        return failure;
+                    }
+                    interrupted = true;
+                } catch (RuntimeException | Error e) {
+                    failure.addSuppressed(e);
+                    return failure;
+                }
             }
-            try {
-                Thread.sleep(START_POLL_MILLIS);
-            } catch (InterruptedException e) {
+        } finally {
+            if (interrupted) {
                 Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted while waiting for FakeFtpServer to start", e);
             }
         }
-        return server;
     }
 
     /*

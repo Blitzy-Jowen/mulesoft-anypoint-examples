@@ -21,7 +21,7 @@ import org.junit.jupiter.params.provider.MethodSource;
  * Contract of {@link OrderTshirtResponseMapper}, the owner of the {@code orderTshirt} script
  * {@code %output application/json --- payload}: the {@code OrderTshirt} response document is written whole in
  * DataWeave 1.0 JSON layout, keyed by local names with the namespace dropped, leaves as strings, an element without
- * text as {@code null}, and no trailing line feed; a {@code null} document yields {@code null}.
+ * text as the empty string {@code ""}, and no trailing line feed; a {@code null} document yields {@code null}.
  *
  * <p>The original example's Studio sample {@code sample_data/OrderTshirtResponse.xml} is not carried, so it is
  * inlined byte for byte. Inputs are parsed with the project's own {@link DwXmlToJson}, and the mapper is built over
@@ -74,12 +74,12 @@ class OrderTshirtResponseMapperTest {
     }
 
     @Test
-    void elementWithoutTextIsWrittenAsNull() {
+    void elementWithoutTextIsWrittenAsEmptyString() {
         String json = mapper.toJson(reader.parse("<OrderTshirtResponse><orderId/></OrderTshirtResponse>"));
 
         assertThat(json).isEqualTo("{\n"
                 + "  \"OrderTshirtResponse\": {\n"
-                + "    \"orderId\": null\n"
+                + "    \"orderId\": \"\"\n"
                 + "  }\n"
                 + "}");
     }

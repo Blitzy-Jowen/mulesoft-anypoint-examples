@@ -35,8 +35,10 @@ import org.w3c.dom.Document;
  *   <li>namespace prefixes and attributes are dropped; layout is two-space indentation, LF line ends and no
  *       trailing line feed;</li>
  *   <li>a selector that misses (no payload, another root, or {@code ListInventoryResponse} outside the
- *       {@code ns0} namespace) or selects an empty element yields null, which the JSON writer writes as the
- *       four characters {@code null}.</li>
+ *       {@code ns0} namespace) yields null, which the JSON writer writes as the four characters {@code null};</li>
+ *   <li>a selector that matches an empty {@code ListInventoryResponse} yields the empty string, as DataWeave
+ *       1.0's XML reader read an element without text, which the JSON writer writes as the two characters
+ *       {@code ""}.</li>
  * </ul>
  * For the original sample {@code sample_data/ListInventoryResponse.xml} (five items) the result is:
  * <pre>{@code
@@ -83,8 +85,9 @@ public class ListInventoryResponseMapper {
      *
      * @param doc the SOAP Body child returned by the {@code ListInventory} operation; may be {@code null}
      * @return the JSON text without a trailing line feed, never {@code null}; the JSON literal {@code null} when
-     *         the document is {@code null}, its root is not {@code ListInventoryResponse} in {@link #NAMESPACE}, or
-     *         that root is empty, because the selector then yields null and the JSON writer writes it as such
+     *         the document is {@code null} or its root is not {@code ListInventoryResponse} in {@link #NAMESPACE},
+     *         because the selector then yields null and the JSON writer writes it as such; the JSON string
+     *         {@code ""} when that root is empty, because the selector then yields the empty string
      */
     public String toJson(Document doc) {
         return dwJsonWriter.write(dwXmlToJson.select(doc, NAMESPACE, ROOT));

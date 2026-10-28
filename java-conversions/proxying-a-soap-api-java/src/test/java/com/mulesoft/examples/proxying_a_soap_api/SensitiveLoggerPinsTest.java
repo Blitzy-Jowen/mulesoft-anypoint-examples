@@ -42,7 +42,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -57,10 +56,11 @@ import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.NestedTestConfiguration;
+import org.springframework.test.context.TestContextManager;
 
+import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.http.Fault;
-import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 
 import com.mulesoft.examples.proxying_a_soap_api.controller.SoapProxyController;
 import com.mulesoft.examples.proxying_a_soap_api.support.HttpTestClient;
@@ -80,6 +80,12 @@ import com.mulesoft.examples.proxying_a_soap_api.support.HttpTestClient;
  * before the context starts holds those lines. Every exchange also requires a line below INFO that an unpinned logger
  * wrote for it, so no case can pass because nothing was logged. The logger levels this class's contexts set are put
  * back afterwards, and both contexts are closed, so no later test runs at TRACE.
+ *
+ * <p>The outcome does not depend on how the class is selected: {@code -Dtest='SensitiveLoggerPinsTest*'} also selects
+ * {@link UnreachableUpstream} as a class of its own, which then runs before the outer tests. The WireMock server lives
+ * exactly as long as the outer class container, the outer context starts before either class's first test, and both
+ * classes discard their context after their last test, so no later run reuses a context bound to an upstream port
+ * that is no longer served.
  */
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -161,23 +167,42 @@ class SensitiveLoggerPinsTest {
     /** The logger levels set before this class's contexts started, by logger name. */
     private static final Map<String, Level> LEVELS_BEFORE = new HashMap<>();
 
-    @RegisterExtension
-    static WireMockExtension upstream = WireMockExtension.newInstance()
-            .options(wireMockConfig().dynamicPort().bindAddress(LOOPBACK).gzipDisabled(true))
-            .build();
+    /**
+     * The WireMock server standing in for the upstream, on a dynamic loopback port; {@code null} outside the run of
+     * the outer class container. It is started and stopped by this class's own {@code @BeforeAll} and
+     * {@code @AfterAll}, which JUnit runs for the outer class container alone. A {@code WireMockExtension} registered
+     * here would be inherited by {@link UnreachableUpstream} and would stop the server when that nested container
+     * ends, so every outer test running after it would proxy to a closed port.
+     */
+    private static WireMockServer upstream;
 
     @LocalServerPort
     int port;
 
     @DynamicPropertySource
     static void upstreamLocations(DynamicPropertyRegistry registry) {
-        registry.add("proxy.upstream-url", () -> "http://" + LOOPBACK + ":" + upstream.getPort() + UPSTREAM_PATH);
+        registry.add("proxy.upstream-url", () -> "http://" + LOOPBACK + ":" + upstream.port() + UPSTREAM_PATH);
         registry.add("proxy.wsdl-location", () -> "http://" + WSDL_USER + ":" + WSDL_PASSWORD + "@" + LOOPBACK + ":"
-                + upstream.getPort() + WSDL_PATH);
+                + upstream.port() + WSDL_PATH);
     }
 
+    /**
+     * Prepares the outer class container in the one order it needs, in this one method because JUnit does not order
+     * several {@code @BeforeAll} methods: the logger levels are recorded before any of this class's contexts starts,
+     * the upstream is started and stubbed before the outer context reads the WSDL, and then the outer context is
+     * started, under the output capture of the outer class container. Otherwise the enclosing instance created for
+     * {@link UnreachableUpstream} would start it when that class runs first, under the nested container's capture,
+     * which is discarded when the nested container ends, and the outer tests would never see the start-up lines. The
+     * outer tests get this same context from the context cache.
+     */
     @BeforeAll
-    static void recordLevels() {
+    static void prepareOuterContainer() throws IOException {
+        recordLevels();
+        startUpstream();
+        new TestContextManager(SensitiveLoggerPinsTest.class).getTestContext().getApplicationContext();
+    }
+
+    private static void recordLevels() {
         LEVELS_BEFORE.clear();
         for (Logger logger : loggerContext().getLoggerList()) {
             if (logger.getLevel() != null) {
@@ -187,12 +212,13 @@ class SensitiveLoggerPinsTest {
     }
 
     /**
-     * The WSDL and its schema, served only to the configured credentials, so a context that starts proves the
-     * start-up read carried them. Stubbed before the context starts, which reads them once; WireMock drops these
-     * stubs before each test.
+     * Starts the upstream, then stubs the WSDL and its schema, served only to the configured credentials, so a context
+     * that starts proves the start-up read carried them. The outer context reads them once at start-up;
+     * {@link #resetUpstream()} drops these stubs before each test.
      */
-    @BeforeAll
-    static void stubUpstreamWsdl() throws IOException {
+    private static void startUpstream() throws IOException {
+        upstream = new WireMockServer(wireMockConfig().dynamicPort().bindAddress(LOOPBACK).gzipDisabled(true));
+        upstream.start();
         upstream.stubFor(get(urlEqualTo(WSDL_PATH)).withBasicAuth(WSDL_USER, WSDL_PASSWORD)
                 .willReturn(aResponse().withStatus(200)
                         .withHeader("Content-Type", "text/xml;charset=UTF-8")
@@ -204,6 +230,15 @@ class SensitiveLoggerPinsTest {
     }
 
     @AfterAll
+    static void stopUpstream() {
+        WireMockServer server = upstream;
+        upstream = null;
+        if (server != null) {
+            server.stop();
+        }
+    }
+
+    @AfterAll
     static void restoreLevels() {
         for (Logger logger : loggerContext().getLoggerList()) {
             Level before = LEVELS_BEFORE.get(logger.getName());
@@ -212,6 +247,12 @@ class SensitiveLoggerPinsTest {
                 logger.setLevel(before);
             }
         }
+    }
+
+    /** Forgets the previous test's stubs and journaled requests, the outer tests' and the nested test's alike. */
+    @BeforeEach
+    void resetUpstream() {
+        upstream.resetAll();
     }
 
     @BeforeEach
@@ -320,7 +361,7 @@ class SensitiveLoggerPinsTest {
     @Test
     void wsdlReadWithConfiguredCredentialsAndServedToCallerWithoutLoggingEither(CapturedOutput output) {
         // The WSDL in its diagnostic form, without the user information it was read with.
-        String wsdl = "URL [http://" + LOOPBACK + ":" + upstream.getPort() + WSDL_PATH + "]";
+        String wsdl = "URL [http://" + LOOPBACK + ":" + upstream.port() + WSDL_PATH + "]";
         // Written by the unpinned WsdlQueryPublisher at DEBUG when it answers ?wsdl.
         String serving = "Serving WSDL " + wsdl + " for ";
         long servingBefore = lines(output, "DEBUG", serving);

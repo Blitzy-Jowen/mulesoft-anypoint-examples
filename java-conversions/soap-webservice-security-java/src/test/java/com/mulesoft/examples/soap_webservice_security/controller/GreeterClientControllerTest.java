@@ -8,6 +8,13 @@
 
 package com.mulesoft.examples.soap_webservice_security.controller;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
+import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -16,6 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.times;
@@ -28,10 +36,14 @@ import java.nio.charset.Charset;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -44,12 +56,15 @@ import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.oxm.UnmarshallingFailureException;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
 import org.springframework.ws.client.WebServiceIOException;
 
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.mulesoft.examples.soap_webservice_security.SoapWebserviceSecurityApplication;
 import com.mulesoft.examples.soap_webservice_security.client.SecureGreeterClient;
 import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient;
@@ -68,15 +83,17 @@ import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient.Res
  * class stands in for the client front's. Every response is read off the socket by ST-1 {@link HttpTestClient}, so
  * the raw status line, the headers and the body bytes are asserted as sent. {@link SecureGreeterClient} is a Spring
  * spy: unless a test stubs it, each client type really calls its Greeter path on the SOAP listener, through that
- * path's WS-Security enforcement, with the demo credentials of profile {@code test}.
+ * path's WS-Security enforcement, with the demo credentials of profile {@code test}. Replies the Greeter endpoint never
+ * sends come from a WireMock stand-in on a dynamic port, at which a test points the unsecure client's endpoint.
  *
  * <p>Covered: the six {@code when} branches end to end, the {@code otherwise} branch (unknown, case-variant, empty and
- * missing type) without any SOAP call, the catch branch for a stubbed failure, a real transport failure and a real
- * SOAP security fault, the {@code text/plain} setter on every branch, every HTTP method (extension tokens such as
- * {@code PROPFIND} included), CORS pre-flights answered exactly as plain {@code OPTIONS} requests without any
- * {@code Access-Control-*} or {@code Vary} header, the query-string-only binding (last value wins, UTF-8 decoding, a
- * missing name greeting {@code null}), and the SC-10 no-listener 404 for the client path on the SOAP listener and for
- * the SOAP paths on the client listener.
+ * missing type) without any SOAP call, the catch branch for a stubbed failure, a real transport failure, a real SOAP
+ * security fault and a real 200 reply without a {@code greetResponse} (no entity, an empty SOAP Body, a payload the
+ * Greeter marshaller binds to no class, a {@code greet} element), the {@code text/plain} setter on every branch,
+ * every HTTP method (extension tokens such as {@code PROPFIND} included), CORS pre-flights answered exactly as plain
+ * {@code OPTIONS} requests without any {@code Access-Control-*} or {@code Vary} header, the query-string-only binding
+ * (last value wins, UTF-8 decoding, a missing name greeting {@code null}), and the SC-10 no-listener 404 for the
+ * client path on the SOAP listener and for the SOAP paths on the client listener.
  */
 // The SOAP listener runs on RANDOM_PORT (@LocalServerPort) rather than a pre-allocated DEFINED_PORT: the conversion
 // maps the originals' fixed ports to RANDOM_PORT plus @DynamicPropertySource, as SoapWebserviceSecurityTest does, and a
@@ -110,6 +127,19 @@ class GreeterClientControllerTest {
      */
     private static final int CLIENT_PORT = TestSocketUtils.findAvailableTcpPort();
 
+    /** The Greeter path of the unsecure client. */
+    private static final String UNSECURE_SERVICE_PATH = "/services/unsecure";
+
+    /** Namespace of the Greeter's {@code greet} and {@code greetResponse} elements. */
+    private static final String GREETER_NS = "http://security.example.mule.mulesoft.com/";
+
+    /**
+     * A WireMock stand-in for the Greeter service, on a dynamic port, for replies the Greeter endpoint never sends,
+     * started and stopped by this class's own {@code @BeforeAll} and {@code @AfterAll}. The application context never
+     * reads its port: a test points the spied client's endpoint at it.
+     */
+    private static final WireMockServer GREETER_STUB = new WireMockServer(wireMockConfig().dynamicPort());
+
     /** The sub-flow method each {@code when} branch of the choice runs, called with {@link #NAME}. */
     private static final Map<String, Consumer<SecureGreeterClient>> SUB_FLOWS = Map.of(
             "unsecure", client -> client.unsecure(NAME),
@@ -132,6 +162,22 @@ class GreeterClientControllerTest {
         registry.add("ports.client", () -> CLIENT_PORT);
         // The outbound Greeter calls go to the SOAP listener on localhost instead of the original 0.0.0.0.
         registry.add("soap-security.client.host", () -> "localhost");
+    }
+
+    @BeforeAll
+    static void startGreeterStub() {
+        GREETER_STUB.start();
+    }
+
+    @AfterAll
+    static void stopGreeterStub() {
+        GREETER_STUB.stop();
+    }
+
+    /** Forgets the previous test's stubs and journaled requests. */
+    @BeforeEach
+    void resetGreeterStub() {
+        GREETER_STUB.resetAll();
     }
 
     @AfterEach
@@ -207,6 +253,51 @@ class GreeterClientControllerTest {
 
         assertTextReply(response, ERROR);
         verify(secureGreeterClient).unsecure(NAME);
+    }
+
+    /**
+     * The real unsecure client calls the {@link #GREETER_STUB} stand-in, which answers 200 without a
+     * {@code greetResponse}; the client's failure for that reply, raised after one request, reaches the catch branch.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("greeterRepliesWithoutGreetResponse")
+    void greeterReplyWithoutGreetResponseIsAnsweredWithTheCatchStrategyPayload(String reply,
+            ResponseDefinitionBuilder greeterReply, Class<? extends RuntimeException> expectedFailure) {
+        GREETER_STUB.stubFor(post(urlPathEqualTo(UNSECURE_SERVICE_PATH)).willReturn(greeterReply));
+        doReturn(URI.create(GREETER_STUB.baseUrl() + UNSECURE_SERVICE_PATH))
+                .when(secureGreeterClient).endpoint("unsecure");
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        doAnswer(invocation -> {
+            try {
+                return invocation.callRealMethod();
+            } catch (Throwable thrown) {
+                failure.set(thrown);
+                throw thrown;
+            }
+        }).when(secureGreeterClient).unsecure(NAME);
+
+        Response response = clientPort().get(UNSECURE_JOHN);
+
+        assertTextReply(response, ERROR);
+        assertNotNull(failure.get(), response::toString);
+        assertEquals(expectedFailure, failure.get().getClass(), failure.get()::toString);
+        verify(secureGreeterClient).unsecure(NAME);
+        GREETER_STUB.verify(1, postRequestedFor(urlPathEqualTo(UNSECURE_SERVICE_PATH)));
+        GREETER_STUB.verify(1, anyRequestedFor(anyUrl()));
+    }
+
+    static Stream<Arguments> greeterRepliesWithoutGreetResponse() {
+        return Stream.of(
+                // The explicit Content-Length keeps WireMock from answering the client's Accept-Encoding: gzip with
+                // a gzip entity of an empty document, which is not a reply without an entity.
+                Arguments.of("no entity, Content-Length 0",
+                        aResponse().withStatus(200).withHeader(HttpHeaders.CONTENT_LENGTH, "0"),
+                        IllegalStateException.class),
+                Arguments.of("empty SOAP Body", soapReply(""), IllegalStateException.class),
+                Arguments.of("payload the Greeter marshaller binds to no class",
+                        soapReply("<x:other xmlns:x=\"urn:other\"/>"), UnmarshallingFailureException.class),
+                Arguments.of("greet element", soapReply("<ns2:greet xmlns:ns2=\"" + GREETER_NS + "\"><name>" + NAME
+                        + "</name></ns2:greet>"), IllegalStateException.class));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -349,6 +440,15 @@ class GreeterClientControllerTest {
 
     private URI soapUri(String path) {
         return URI.create("http://localhost:" + soapPort + "/services/" + path);
+    }
+
+    /** 200 with a SOAP 1.1 envelope whose Body holds {@code bodyContent}, empty included. */
+    private static ResponseDefinitionBuilder soapReply(String bodyContent) {
+        return aResponse()
+                .withStatus(200)
+                .withHeader(HttpHeaders.CONTENT_TYPE, "text/xml;charset=UTF-8")
+                .withBody("<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body>"
+                        + bodyContent + "</soap:Body></soap:Envelope>");
     }
 
     /** 200 OK, {@code text/plain}, and the body text {@code expected}. */

@@ -63,8 +63,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
@@ -79,6 +79,7 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.core.env.Environment;
+import org.springframework.oxm.UnmarshallingFailureException;
 import org.springframework.oxm.jaxb.Jaxb2Marshaller;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
@@ -93,10 +94,10 @@ import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.w3c.dom.Document;
 import org.xml.sax.InputSource;
 
+import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.http.Fault;
-import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.soap_webservice_security.SoapWebserviceSecurityApplication;
@@ -106,6 +107,7 @@ import com.mulesoft.examples.soap_webservice_security.config.SAMLCallbackHandler
 import com.mulesoft.examples.soap_webservice_security.config.SoapSecurityProperties;
 import com.mulesoft.examples.soap_webservice_security.config.WebServiceConfig;
 import com.mulesoft.examples.soap_webservice_security.config.WrongPasswordCallback;
+import com.mulesoft.examples.soap_webservice_security.model.soap.Greet;
 
 /**
  * Unit test of {@link SecureGreeterClient}, the replacement of the original CXF {@code SecureClient}, the six
@@ -147,6 +149,13 @@ class SecureGreeterClientTest {
             + "<ns2:greetResponse xmlns:ns2=\"http://security.example.mule.mulesoft.com/\"><name>" + GREETING
             + "</name></ns2:greetResponse></soap:Body></soap:Envelope>";
 
+    /** The request element {@code greet}, which the Greeter marshaller binds to {@code Greet}. */
+    private static final String GREET_PAYLOAD = "<ns2:greet xmlns:ns2=\"http://security.example.mule.mulesoft.com/\">"
+            + "<name>" + NAME + "</name></ns2:greet>";
+
+    /** An element the Greeter marshaller binds to no class. */
+    private static final String UNBOUND_PAYLOAD = "<x:other xmlns:x=\"urn:other\"/>";
+
     private static final Map<String, String> NAMESPACES = namespaces();
 
     /** Milliseconds; the Mule default response timeout that {@code soap-security.client.response-timeout} keeps. */
@@ -159,15 +168,29 @@ class SecureGreeterClientTest {
     private static final ApplicationContextRunner PROPERTIES_BINDING =
             new ApplicationContextRunner().withUserConfiguration(PropertiesBinding.class);
 
-    @RegisterExtension
-    static final WireMockExtension WIREMOCK = WireMockExtension.newInstance()
-            .options(WireMockConfiguration.wireMockConfig().dynamicPort())
-            .build();
+    /**
+     * The WireMock Greeter service, on a dynamic port. It is started and stopped by this class's own
+     * {@code @BeforeAll} and {@code @AfterAll}, which JUnit runs for the outer class container alone. A
+     * {@code WireMockExtension} registered here would be inherited by {@link ResponseTimeout} and
+     * {@link UnderRootTrace} and would stop the server when either nested container ends, so every outer test running
+     * after it, as when the nested classes are selected first, would call a closed port.
+     */
+    static final WireMockServer WIREMOCK = new WireMockServer(WireMockConfiguration.wireMockConfig().dynamicPort());
 
     /** The client derives each Greeter URL as {@code <base-url>/<path>}, so the base URL carries {@code /services}. */
     @DynamicPropertySource
     static void greeterService(DynamicPropertyRegistry registry) {
         registry.add("soap-security.client.base-url", () -> WIREMOCK.baseUrl() + "/services");
+    }
+
+    @BeforeAll
+    static void startGreeterService() {
+        WIREMOCK.start();
+    }
+
+    @AfterAll
+    static void stopGreeterService() {
+        WIREMOCK.stop();
     }
 
     @Autowired
@@ -511,6 +534,93 @@ class SecureGreeterClientTest {
         assertThat(causes(failure)).anyMatch(SocketException.class::isInstance);
         WIREMOCK.verify(1, postRequestedFor(urlPathEqualTo(SERVICES + path)));
         WIREMOCK.verify(1, anyRequestedFor(anyUrl()));
+    }
+
+    /**
+     * The service answers 200 without a {@code greetResponse}. Spring WS reads a reply without an entity or with an
+     * empty SOAP Body as no payload, and the Greeter marshaller reads a {@code greet} element as {@code Greet}; the
+     * client accepts only {@code GreetResponse}, so each raises {@link IllegalStateException} naming what the service
+     * answered with. Responses are not validated, so every client type fails alike, after exactly one request.
+     */
+    @ParameterizedTest(name = "{0} -> /services/{1}, {2}")
+    @MethodSource("repliesWithoutGreetResponseOfEveryClientType")
+    void replyWithoutGreetResponseRaisesIllegalStateExceptionAfterExactlyOneRequest(String clientType, String path,
+            ReplyWithoutGreetResponse reply) {
+        WIREMOCK.stubFor(post(urlPathEqualTo(SERVICES + path)).atPriority(1).willReturn(reply.response().get()));
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> client.invoke(clientType, NAME));
+
+        assertThat(failure).isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("The Greeter service at " + WIREMOCK.baseUrl() + SERVICES + path
+                        + " answered with " + reply.answered() + " instead of greetResponse");
+        WIREMOCK.verify(1, postRequestedFor(urlPathEqualTo(SERVICES + path)));
+        WIREMOCK.verify(1, anyRequestedFor(anyUrl()));
+    }
+
+    /**
+     * The service answers 200 with a SOAP Body element the Greeter marshaller binds to no class: the reply fails to
+     * unmarshal before the client sees a payload, and the marshaller's failure propagates after exactly one request.
+     */
+    @ParameterizedTest(name = "{0} -> /services/{1}")
+    @MethodSource("clientTypesAndPaths")
+    void payloadTheGreeterMarshallerDoesNotBindFailsToUnmarshalAfterExactlyOneRequest(String clientType,
+            String path) {
+        WIREMOCK.stubFor(post(urlPathEqualTo(SERVICES + path)).atPriority(1)
+                .willReturn(soapReply(UNBOUND_PAYLOAD)));
+
+        UnmarshallingFailureException failure = assertThrows(UnmarshallingFailureException.class,
+                () -> client.invoke(clientType, NAME));
+
+        assertThat(failure).isExactlyInstanceOf(UnmarshallingFailureException.class)
+                .hasMessage("JAXB unmarshalling exception");
+        assertThat(causes(failure)).anyMatch(cause -> String.valueOf(cause.getMessage())
+                .contains("unexpected element (uri:\"urn:other\", local:\"other\")"));
+        WIREMOCK.verify(1, postRequestedFor(urlPathEqualTo(SERVICES + path)));
+        WIREMOCK.verify(1, anyRequestedFor(anyUrl()));
+    }
+
+    /** Every client type with its Greeter path, in the order of the original choice. */
+    static Stream<Arguments> clientTypesAndPaths() {
+        return Stream.of(
+                Arguments.of(SecureGreeterClient.CLIENT_TYPE_UNSECURE, SecureGreeterClient.PATH_UNSECURE),
+                Arguments.of(SecureGreeterClient.CLIENT_TYPE_USERNAME_TOKEN, SecureGreeterClient.PATH_USERNAME),
+                Arguments.of(SecureGreeterClient.CLIENT_TYPE_USERNAME_TOKEN_SIGNED, SecureGreeterClient.PATH_SIGNED),
+                Arguments.of(SecureGreeterClient.CLIENT_TYPE_USERNAME_TOKEN_ENCRYPTED,
+                        SecureGreeterClient.PATH_ENCRYPTED),
+                Arguments.of(SecureGreeterClient.CLIENT_TYPE_SAML_TOKEN, SecureGreeterClient.PATH_SAML),
+                Arguments.of(SecureGreeterClient.CLIENT_TYPE_SAML_TOKEN_SIGNED, SecureGreeterClient.PATH_SIGNED_SAML));
+    }
+
+    /** Each {@link ReplyWithoutGreetResponse} for each client type and its Greeter path. */
+    static Stream<Arguments> repliesWithoutGreetResponseOfEveryClientType() {
+        return clientTypesAndPaths().flatMap(typeAndPath -> repliesWithoutGreetResponse()
+                .map(reply -> Arguments.of(typeAndPath.get()[0], typeAndPath.get()[1], reply)));
+    }
+
+    static Stream<ReplyWithoutGreetResponse> repliesWithoutGreetResponse() {
+        return Stream.of(
+                // The explicit Content-Length keeps WireMock from answering the client's Accept-Encoding: gzip with
+                // a gzip entity of an empty document, which is not a reply without an entity.
+                new ReplyWithoutGreetResponse("no entity, Content-Length 0",
+                        () -> aResponse().withStatus(200).withHeader("Content-Length", "0"), "no payload"),
+                new ReplyWithoutGreetResponse("empty SOAP Body", () -> soapReply(""), "no payload"),
+                new ReplyWithoutGreetResponse("greet element", () -> soapReply(GREET_PAYLOAD), Greet.class.getName()));
+    }
+
+    /**
+     * A 200 reply without a {@code greetResponse}.
+     *
+     * @param name     the case's display name
+     * @param response builds the stub's response
+     * @param answered what the client's failure names in place of {@code greetResponse}
+     */
+    record ReplyWithoutGreetResponse(String name, Supplier<ResponseDefinitionBuilder> response, String answered) {
+
+        @Override
+        public String toString() {
+            return name;
+        }
     }
 
     /** A context of its own whose client gives up reading after {@code soap-security.client.response-timeout}. */
@@ -940,6 +1050,15 @@ class SecureGreeterClientTest {
                 .withBody("<soap:Envelope xmlns:soap=\"" + SOAP_NS + "\"" + extraNamespaces + "><soap:Body>"
                         + "<soap:Fault><faultcode>" + faultCode + "</faultcode><faultstring>" + faultString
                         + "</faultstring></soap:Fault></soap:Body></soap:Envelope>");
+    }
+
+    /** 200 with a SOAP 1.1 envelope whose Body holds {@code bodyContent}, empty included. */
+    private static ResponseDefinitionBuilder soapReply(String bodyContent) {
+        return aResponse()
+                .withStatus(200)
+                .withHeader("Content-Type", "text/xml;charset=UTF-8")
+                .withBody("<soap:Envelope xmlns:soap=\"" + SOAP_NS + "\"><soap:Body>" + bodyContent
+                        + "</soap:Body></soap:Envelope>");
     }
 
     /** The only request the stub received. */

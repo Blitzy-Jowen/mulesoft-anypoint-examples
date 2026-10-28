@@ -49,6 +49,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -361,7 +362,8 @@ class ApplicationLogLevelsTest {
      * sees the leak, none of them. Once the reply is read, and for a request the servlet serves once the dispatcher
      * has published the {@link ServletRequestHandledEvent} that follows its last log line of the request, the oracle
      * names every logger whose message or exception text carried the value searched for. A successful search of each
-     * resource still writes its flow's success message.
+     * resource still writes its flow's success message, and a search NetSuite answers with a 500 gets SC-1's 500,
+     * whose message names neither NetSuite's address nor the request path.
      *
      * <p>The context is discarded after the class; the enclosing class restores the levels and appenders after each
      * test.
@@ -572,6 +574,23 @@ class ApplicationLogLevelsTest {
                     .filteredOn(event -> SEARCH_SERVICE.equals(event.getLoggerName()))
                     .extracting(ILoggingEvent::getLevel, ILoggingEvent::getFormattedMessage)
                     .containsExactly(tuple(Level.INFO, message));
+        }
+
+        /**
+         * NetSuite's 500 to a search reaches the caller as SC-1's platform-default 500 whose message is the status
+         * code and reason phrase alone: neither NetSuite's address nor the path of the failed SuiteQL request.
+         */
+        @ParameterizedTest(name = "{0}")
+        @EnumSource(value = Exchange.class, names = {"CUSTOMERS_UPSTREAM_FAILURE", "OPPORTUNITIES_UPSTREAM_FAILURE"})
+        void upstreamFailureAnswersThePlatformDefault500WithoutTheUpstreamUrl(Exchange exchange) {
+            stubNetsuite(exchange.suiteQlAnswer);
+
+            HttpTestClient.Response response = HttpTestClient.localhost(port).get(exchange.path);
+
+            assertThat(response.status()).as("%s", response).isEqualTo(500);
+            assertThat(response.header("Content-Type")).startsWith(MediaType.APPLICATION_JSON_VALUE);
+            assertThat(response.bodyAsString()).isEqualTo("{ \"message\": \"500 Internal Server Error\" }")
+                    .doesNotContain(netsuite.baseUrl(), "/services/rest");
         }
 
         /**
