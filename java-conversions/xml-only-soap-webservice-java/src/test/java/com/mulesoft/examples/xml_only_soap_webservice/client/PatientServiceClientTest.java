@@ -15,6 +15,7 @@ import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.SocketException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -43,6 +44,7 @@ import org.xmlunit.xpath.JAXPXPathEngine;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
+import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.xml_only_soap_webservice.config.SoapEnvelopeStyleInterceptor;
 import com.mulesoft.examples.xml_only_soap_webservice.config.WebServiceConfig;
 
@@ -156,6 +158,25 @@ class PatientServiceClientTest {
                 .checkForSimilar()
                 .build();
         assertThat(diff.hasDifferences()).as("payload carried unchanged: %s", diff).isFalse();
+    }
+
+    /**
+     * U+1F600 lies outside the Basic Multilingual Plane: the original proxy client sent it as its four UTF-8 bytes,
+     * where SAAJ alone writes {@code &#128512;}.
+     */
+    @Test
+    void sendsCharactersOutsideTheBmpAsRawUtf8() throws Exception {
+        stubPatientService(200, UPSERT_PATIENT_RESPONSE_ENVELOPE);
+        String firstName = "Zo\u00eb-\u674e-\uD83D\uDE00";
+        String upsertPatient = UPSERT_PATIENT.replace("<firstName>Nial</firstName>",
+                "<firstName>" + firstName + "</firstName>");
+
+        client.send(parse(upsertPatient).getDocumentElement());
+
+        LoggedRequest request = upstream.findAll(postRequestedFor(urlEqualTo(WebServiceConfig.PATIENT_PATH))).get(0);
+        assertThat(new String(request.getBody(), StandardCharsets.UTF_8))
+                .contains("<firstName>" + firstName + "</firstName>").doesNotContain("&#");
+        assertThat(request.getHeader("Content-Length")).isEqualTo(Integer.toString(request.getBody().length));
     }
 
     @Test

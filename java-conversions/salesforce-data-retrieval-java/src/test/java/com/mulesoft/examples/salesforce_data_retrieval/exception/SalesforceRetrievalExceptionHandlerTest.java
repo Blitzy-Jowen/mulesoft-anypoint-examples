@@ -22,6 +22,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -252,15 +253,17 @@ class SalesforceRetrievalExceptionHandlerTest {
     }
 
     @Test
-    @DisplayName("a successful POST query passes through untouched by every advice")
+    @DisplayName("a successful POST query passes through untouched by every advice, untyped as the original's payload")
     void successfulPostIsNotTouchedByAdvice() throws Exception {
         String records = "Email=a@b.c\nId=1\nName=Mule\n";
+        byte[] recordBytes = records.getBytes(StandardCharsets.UTF_8);
         given(service.query(anyMap())).willReturn(records);
 
         mockMvc.perform(postForm())
                 .andExpect(status().isOk())
-                .andExpect(content().contentType(TEXT_UTF8))
-                .andExpect(content().string(records))
+                .andExpect(header().doesNotExist(HttpHeaders.CONTENT_TYPE))
+                .andExpect(header().longValue(HttpHeaders.CONTENT_LENGTH, recordBytes.length))
+                .andExpect(content().bytes(recordBytes))
                 .andExpect(result -> assertThat(result.getResolvedException()).isNull());
 
         verify(service).query(Map.of("object", "user", "field", "email", "searchKey", "name", "searchValue", "mule"));

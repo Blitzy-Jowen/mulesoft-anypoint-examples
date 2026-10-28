@@ -11,6 +11,7 @@ package com.mulesoft.examples.netsuite_data_retrieval.controller;
 import java.util.List;
 import java.util.Set;
 
+import com.mulesoft.examples.netsuite_data_retrieval.config.ApiKitAcceptNegotiator;
 import com.mulesoft.examples.netsuite_data_retrieval.service.NetsuiteSearchService;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -19,6 +20,7 @@ import jakarta.validation.ConstraintViolationException;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -41,8 +43,9 @@ import org.springframework.web.bind.annotation.RestController;
  * <p>Nothing is caught here; the advices answer every failure:
  * <ul>
  *   <li>a method the resource does not declare, HEAD and OPTIONS included, raises
- *       {@link HttpRequestMethodNotSupportedException}, an {@code Accept} header excluding JSON raises
- *       {@code HttpMediaTypeNotAcceptableException}, and a repeated {@code name} raises
+ *       {@link HttpRequestMethodNotSupportedException}, an {@code Accept} header excluding JSON, or one under which
+ *       {@link ApiKitAcceptNegotiator} chooses no declared type once {@code name} has passed its check, raises
+ *       {@link HttpMediaTypeNotAcceptableException}, and a repeated {@code name} raises
  *       {@link ConstraintViolationException}; {@code ApiKitExceptionHandler} answers them with APIkit's 405, 406
  *       and 400 mappings;</li>
  *   <li>a NetSuite authentication, throttling or connectivity failure reaches {@code UpstreamExceptionHandler}
@@ -77,10 +80,13 @@ public class CustomersController {
      * Routes to flow {@code get:/customers:netsuite-api-config}.
      *
      * @param name    the {@code name} query parameter, the company name prefix; {@code null} when absent
-     * @param request the current request, whose method and repeated parameters are checked
+     * @param request the current request, whose method and repeated parameters are checked and whose
+     *                {@code Accept} header is negotiated
      * @return 200, {@code Content-Type: application/json}, with the customers as the service rendered them
      * @throws HttpRequestMethodNotSupportedException for a HEAD request, which the RAML does not declare
      * @throws ConstraintViolationException           when {@code name} is sent more than once
+     * @throws HttpMediaTypeNotAcceptableException    when APIkit's negotiation chooses no declared type for the
+     *                                                {@code Accept} header of a valid request
      * @throws Exception                              the service's exceptions, unchanged
      */
     @GetMapping(path = CUSTOMERS_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
@@ -92,6 +98,7 @@ public class CustomersController {
             throw new HttpRequestMethodNotSupportedException(request.getMethod(), SUPPORTED_METHODS);
         }
         requireSingleValue(request, NAME);
+        ApiKitAcceptNegotiator.negotiate(request);
         String json = netsuiteSearchService.getCustomers(name);
         // The bare media type the RAML declares, UTF-8 bytes; whether the original added a charset parameter is a
         // Tier 2A verification point, settled by a captured fixture.

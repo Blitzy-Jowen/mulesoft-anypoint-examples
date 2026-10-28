@@ -50,6 +50,12 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-undertow</artifactId>
         </dependency>
+        <!-- CmisAtomPubClient transport under RestClient: its automatic retries can be switched off, so no repository
+             request is ever re-sent, which the JDK HttpURLConnection does once for a GET after a connection failure. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -14,6 +14,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.ok;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -27,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClientResponseException;
 
@@ -170,6 +172,25 @@ class ProductPriceClientTest {
                         .withBody(price.getBytes(StandardCharsets.ISO_8859_1))));
 
         assertEquals(price, client.getPrice(PRODUCT_ID));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, -1, Integer.MIN_VALUE})
+    void constructorRejectsNonPositiveTimeout(int timeoutMs) {
+        // httpclient5 reads a zero timeout as no limit on connecting, reading or leasing a connection.
+        IllegalArgumentException thrown =
+                assertThrows(IllegalArgumentException.class, () -> clientWithTimeout(timeoutMs));
+
+        assertEquals("orders.price.timeout-ms must be between 1 and " + Integer.MAX_VALUE + ", was " + timeoutMs,
+                thrown.getMessage());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, Integer.MAX_VALUE})
+    void constructorAcceptsTimeoutBounds(int timeoutMs) {
+        ProductPriceClient boundaryClient = assertDoesNotThrow(() -> clientWithTimeout(timeoutMs));
+
+        boundaryClient.close();
     }
 
     private static ProductPriceClient clientWithTimeout(int timeoutMs) {

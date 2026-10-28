@@ -56,21 +56,21 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.suppo
  * Guards the CMIS service account ({@code cmis.username}, {@code cmis.password}) against the log under
  * {@code logging.level.root=TRACE}.
  *
- * <p>{@code CmisAtomPubClient} sends every AtomPub request over the JDK {@code HttpURLConnection} with an HTTP Basic
- * {@code Authorization} header for that account. Below {@code INFO} the JDK logger
- * {@code sun.net.www.protocol.http.HttpURLConnection}, bridged into Logback, writes every request's and response's
- * headers, so a root {@code DEBUG} or {@code TRACE} would print the account in Base64 on each of the three requests
- * one {@code /cmis} call makes; {@code application.yml} pins that logger to {@code INFO}.
+ * <p>{@code CmisAtomPubClient} sends every AtomPub request over Apache httpclient5 with an HTTP Basic
+ * {@code Authorization} header for that account. Below {@code INFO} httpclient5's loggers
+ * {@code org.apache.hc.client5.http.headers} and {@code org.apache.hc.client5.http.wire} write every request's and
+ * response's headers and bytes, so a root {@code DEBUG} or {@code TRACE} would print the account in Base64 on each of
+ * the three requests one {@code /cmis} call makes; {@code application.yml} pins both loggers to {@code INFO}.
  *
  * <p>The whole application runs at root {@code TRACE} on a random port with sentinel credentials assembled at run
  * time, against WireMock playing the OpenKM AtomPub surface of {@code DocumentIntegrationUsingTheCmisConnectorTest}
  * (service document, folder entry by path, children-feed create). One empty {@code POST /cmis} through ST-1 must
  * return the created document's ID, WireMock must have received the sentinel Basic credentials on all three
  * requests, so they really crossed the transport, and the captured console output must hold no
- * {@code Authorization} header, no Base64 token and neither sentinel, while it does hold {@code TRACE} lines and a
- * {@code FINE} record of another JDK logger, so the capture is known to see every level the bridge passes. The test
- * restores the logger levels it found and closes its context, so later test classes see the logging configuration
- * they would have seen without it.
+ * {@code Authorization} header, no Base64 token and neither sentinel, while it does hold {@code TRACE} lines,
+ * httpclient5's own {@code DEBUG} lines for the exchanges and a {@code FINE} record of a JDK logger, so the capture is
+ * known to see every level the transport and the JDK bridge write. The test restores the logger levels it found and
+ * closes its context, so later test classes see the logging configuration they would have seen without it.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = "logging.level.root=TRACE")
@@ -99,7 +99,10 @@ class CmisCredentialLoggingTest {
     /** Every form in which the service account could reach the log; none may. */
     private static final List<String> SECRETS = List.of(TOKEN, USERNAME, PASSWORD);
 
-    /** A JDK logger outside the pinned one, whose {@code FINE} record proves the bridge passes JDK records. */
+    /** The text httpclient5's {@code InternalHttpClient} logs at {@code DEBUG} as it starts each exchange. */
+    private static final String TRANSPORT_DEBUG_MESSAGE = "preparing request execution";
+
+    /** A JDK logger, whose {@code FINE} record proves the bridge passes JDK records. */
     private static final String JDK_PROBE_LOGGER = CmisCredentialLoggingTest.class.getName() + ".jdk";
     private static final String JDK_PROBE_MESSAGE = "jdk-fine-probe-" + UUID.randomUUID();
 
@@ -189,8 +192,10 @@ class CmisCredentialLoggingTest {
         String log = output.getAll();
         assertTrue(log.lines().anyMatch(line -> line.contains(" TRACE ")),
                 "the capture holds TRACE lines, so it sees the root level configured");
+        assertTrue(log.lines().anyMatch(line -> line.contains(" DEBUG ") && line.contains(TRANSPORT_DEBUG_MESSAGE)),
+                "the capture holds httpclient5's DEBUG lines, so it sees the transport the exchanges ran over");
         assertTrue(log.lines().anyMatch(line -> line.contains(" DEBUG ") && line.contains(JDK_PROBE_MESSAGE)),
-                "the capture holds the FINE record of another JDK logger, so the JDK bridge passes FINE records");
+                "the capture holds the FINE record of a JDK logger, so the JDK bridge passes FINE records");
     }
 
     private static void assertLogHoldsNoServiceAccount(String log) {

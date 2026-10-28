@@ -387,7 +387,8 @@ class PathScopedSecurityInterceptorTest {
 
     /**
      * A secured path understands the {@code wsse:Security} header it processes; the unsecure path declines it, so a
-     * {@code mustUnderstand} header there is answered by Spring WS as CXF answered a service without WS-Security.
+     * {@code mustUnderstand} header there gets CXF's MustUnderstand fault, as CXF answered a service without
+     * WS-Security.
      */
     @Test
     void securityHeaderIsUnderstoodOnlyOnSecuredPaths() throws Exception {

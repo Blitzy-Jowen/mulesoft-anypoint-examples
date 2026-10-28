@@ -1,1 +1,8 @@
 target/
+
+# IBM MQ client diagnostics (log, trace, FFDC) that land in the working directory when their location is not
+# wmq.client.diagnostics-dir (config/IbmMqConfig), for example because an operator names a relative path for them
+mqjms.log*
+mqjms*.tr[cz]*
+mqjavaclient_*.tr[cz]*
+FFDC/

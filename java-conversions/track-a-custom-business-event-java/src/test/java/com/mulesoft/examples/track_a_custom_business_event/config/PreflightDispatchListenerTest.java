@@ -22,10 +22,10 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Stream;
 
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.ImportAutoConfiguration;
 import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration;
 import org.springframework.boot.autoconfigure.http.HttpMessageConvertersAutoConfiguration;
@@ -52,9 +52,10 @@ import com.mulesoft.examples.track_a_custom_business_event.support.HttpTestClien
  * original listener declares no {@code allowedMethods} and applies no CORS policy
  * (track-a-custom-business-event/src/main/app/custom-business-events.xml:5).
  *
- * <p>The cases run the real controller, services and SC-1 handler on Undertow ({@link WireConfig}, random port) and
- * send requests through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the
- * listener writes them. The response Content-Type is compared between the two requests only, not to a fixed value.
+ * <p>The cases run the real controller, services, {@link ListenerPathConfig} and SC-1 handler on Undertow
+ * ({@link WireConfig}, random port) and send requests through ST-1 {@link HttpTestClient}, so the status line,
+ * headers and body bytes are asserted as the listener writes them. The response Content-Type is compared between the
+ * two requests only, not to a fixed value.
  */
 @SpringBootTest(classes = PreflightDispatchListenerTest.WireConfig.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -101,17 +102,24 @@ class PreflightDispatchListenerTest {
         assertNoCorsHeaders(preflight);
     }
 
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() {
+    /**
+     * A path no listener serves, and the listener's path with {@code ;} segment parameters, which
+     * {@link ListenerPathConfig} refuses after the pre-flight has selected the {@code OPTIONS} handler.
+     *
+     * @param path the unserved request path
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"/unknown", PATH + ";x=1"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String path) {
         HttpTestClient client = HttpTestClient.localhost(port);
-        HttpTestClient.Response plain = client.send("OPTIONS", "/unknown", null, null);
+        HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
 
-        HttpTestClient.Response preflight = client.send("OPTIONS", "/unknown", preflightHeaders("POST", null), null);
+        HttpTestClient.Response preflight = client.send("OPTIONS", path, preflightHeaders("POST", null), null);
 
         assertSameResponse(plain, preflight);
         assertEquals("HTTP/1.1 404 Not Found", preflight.statusLine(), preflight::toString);
         assertEquals("text/plain", preflight.header("Content-Type"), preflight::toString);
-        assertArrayEquals("No listener for endpoint: /unknown".getBytes(StandardCharsets.UTF_8), preflight.body(),
+        assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), preflight.body(),
                 preflight::toString);
         assertNoCorsHeaders(preflight);
     }
@@ -158,16 +166,16 @@ class PreflightDispatchListenerTest {
     }
 
     /**
-     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig} and the
-     * listener's own beans.
+     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig},
+     * {@link ListenerPathConfig} and the listener's own beans.
      *
      * <p>It names the web auto-configurations rather than enabling auto-configuration and scans nothing, so the
      * context holds the listener and nothing else; and it is not a {@code @SpringBootConfiguration}, so the
      * project's other {@code @SpringBootTest} classes still find exactly one application class.
      */
     @Configuration(proxyBeanMethods = false)
-    @Import({PreflightDispatchConfig.class, BusinessEventController.class, PriceDiscountService.class,
-            BusinessEventTracker.class, GlobalExceptionHandler.class})
+    @Import({PreflightDispatchConfig.class, ListenerPathConfig.class, BusinessEventController.class,
+            PriceDiscountService.class, BusinessEventTracker.class, GlobalExceptionHandler.class})
     @ImportAutoConfiguration({
             PropertyPlaceholderAutoConfiguration.class,
             ServletWebServerFactoryAutoConfiguration.class,

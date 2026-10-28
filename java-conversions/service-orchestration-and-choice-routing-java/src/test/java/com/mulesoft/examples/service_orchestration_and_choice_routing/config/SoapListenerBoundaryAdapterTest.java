@@ -86,6 +86,12 @@ class SoapListenerBoundaryAdapterTest {
      */
     private static final String GENERIC_CXF_FAULT_STRING = "Fault occurred while processing.";
 
+    /**
+     * CXF's default {@code org.apache.cxf.stax.maxElementDepth}, the root element counting as depth 1: the deepest
+     * nesting the original listeners read.
+     */
+    private static final int CXF_MAX_ELEMENT_DEPTH = 100;
+
     private SoapListenerBoundaryAdapter adapter;
     private AtomicInteger receiverCalls;
     private WebServiceMessageReceiver echo;
@@ -121,7 +127,8 @@ class SoapListenerBoundaryAdapterTest {
         MockHttpServletResponse response = handle(request(method, POST_ONLY_PATH, body));
 
         assertThat(response.getStatus()).isEqualTo(405);
-        assertThat(response.getContentType()).isEqualTo("text/plain;charset=UTF-8");
+        assertThat(response.getContentType()).isEqualTo("text/plain");
+        assertThat(response.getHeader("Content-Type")).isEqualTo("text/plain").doesNotContainIgnoringCase("charset");
         assertThat(response.getContentAsString(StandardCharsets.UTF_8))
                 .isEqualTo("Method not allowed for endpoint: " + POST_ONLY_PATH);
         assertThat(response.getHeader("Allow")).isNull();
@@ -160,6 +167,24 @@ class SoapListenerBoundaryAdapterTest {
         MockHttpServletResponse response = handle(request(method, ALL_METHODS_PATH, body));
 
         assertThat(fault(response, "faultstring")).isEqualTo(parserMessage(body == null ? "" : body));
+    }
+
+    /**
+     * A well-formed envelope nested deeper than CXF's limit is refused before the receiver runs, with the message the
+     * JDK's parser reports under that limit; the parser without a limit reads the same bytes, so the depth alone is
+     * what the fault answers.
+     */
+    @ParameterizedTest(name = "elements nested {0} deep")
+    @ValueSource(ints = { CXF_MAX_ELEMENT_DEPTH + 1, 3_000, 10_000 })
+    void envelopeNestedDeeperThanCxfLimitIsAnsweredWithClientFault(int depth) throws Exception {
+        String body = envelopeNestedTo(depth);
+        newParser().parse(new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+
+        MockHttpServletResponse response = handle(request("POST", ALL_METHODS_PATH, body));
+
+        assertClientFault(response);
+        assertThat(fault(response, "faultstring")).isEqualTo(parserMessage(newDepthLimitedParser(), body));
+        assertThat(receiverCalls).hasValue(0);
     }
 
     @Test
@@ -216,15 +241,59 @@ class SoapListenerBoundaryAdapterTest {
         assertThat(receiverCalls).hasValue(0);
     }
 
-    @ParameterizedTest(name = "POST {0}")
-    @ValueSource(strings = { ALL_METHODS_PATH, POST_ONLY_PATH })
-    void envelopeIsDispatchedToReceiverAndItsResponseRestyled(String path) throws Exception {
-        MockHttpServletResponse response = handle(request("POST", path, VALID_ENVELOPE));
+    static Stream<Arguments> envelopesTheListenerDispatches() {
+        return Stream.of(
+                Arguments.of("POST " + ALL_METHODS_PATH, "POST", ALL_METHODS_PATH, VALID_ENVELOPE),
+                Arguments.of("POST " + POST_ONLY_PATH, "POST", POST_ONLY_PATH, VALID_ENVELOPE),
+                Arguments.of("post " + POST_ONLY_PATH, "post", POST_ONLY_PATH, VALID_ENVELOPE),
+                Arguments.of("Post " + POST_ONLY_PATH, "Post", POST_ONLY_PATH, VALID_ENVELOPE),
+                Arguments.of("elements nested exactly CXF's limit deep", "POST", ALL_METHODS_PATH,
+                        envelopeNestedTo(CXF_MAX_ELEMENT_DEPTH)));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("envelopesTheListenerDispatches")
+    void envelopeIsDispatchedToReceiverAndItsResponseRestyled(String description, String method, String path,
+            String body) throws Exception {
+        MockHttpServletResponse response = handle(request(method, path, body));
 
         assertThat(response.getStatus()).isEqualTo(200);
         assertThat(receiverCalls).hasValue(1);
         assertThat(response.getContentType()).startsWith("text/xml");
         assertThat(response.getContentAsString(StandardCharsets.UTF_8)).isEqualTo(CXF_STYLE_ECHO_RESPONSE);
+    }
+
+    static Stream<Arguments> answersSentThroughTheBoundary() {
+        return Stream.of(
+                Arguments.of("dispatched response", VALID_ENVELOPE, false, 200),
+                Arguments.of("dispatched response whose receiver set a SOAPAction", VALID_ENVELOPE, true, 200),
+                Arguments.of("boundary soap:Client fault", MALFORMED_ENVELOPE, false, 500));
+    }
+
+    /**
+     * SAAJ keeps {@code Accept}, and {@code SOAPAction} once set or written, in every message's MIME headers, and
+     * Spring WS copies each MIME header onto the response; CXF wrote neither on a response.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("answersSentThroughTheBoundary")
+    void answerCarriesNoRequestHeaderButItsEntityHeaders(String description, String body,
+            boolean receiverSetsSoapAction, int status) throws Exception {
+        WebServiceMessageReceiver receiver = receiverSetsSoapAction
+                ? context -> {
+                    echo.receive(context);
+                    ((SoapMessage) context.getResponse()).setSoapAction("urn:example:echo");
+                }
+                : echo;
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        adapter.handle(request("POST", ALL_METHODS_PATH, body), response, receiver);
+
+        assertThat(response.getStatus()).isEqualTo(status);
+        assertThat(response.getHeaderNames()).as("response headers")
+                .noneMatch(name -> "Accept".equalsIgnoreCase(name) || "SOAPAction".equalsIgnoreCase(name));
+        assertThat(response.getContentType()).startsWith("text/xml");
+        assertThat(response.getHeader("Content-Length"))
+                .isEqualTo(Integer.toString(response.getContentAsByteArray().length));
     }
 
     private MockHttpServletResponse handle(MockHttpServletRequest request) throws Exception {
@@ -249,6 +318,17 @@ class SoapListenerBoundaryAdapterTest {
             request.setContent(body.getBytes(StandardCharsets.UTF_8));
         }
         return request;
+    }
+
+    /**
+     * A SOAP 1.1 envelope whose elements nest {@code depth} levels deep, the {@code Envelope} counting as level 1 and
+     * its {@code Body} as level 2; {@code depth} is at least 4.
+     */
+    private static String envelopeNestedTo(int depth) {
+        int textLevels = depth - 3;
+        return "<soapenv:Envelope xmlns:soapenv=\"" + SOAP11_NS + "\"><soapenv:Body>"
+                + "<e:echo xmlns:e=\"urn:example:echo\">" + "<text>".repeat(textLevels) + "hi"
+                + "</text>".repeat(textLevels) + "</e:echo></soapenv:Body></soapenv:Envelope>";
     }
 
     private static void assertClientFault(MockHttpServletResponse response) throws Exception {
@@ -294,7 +374,11 @@ class SoapListenerBoundaryAdapterTest {
 
     /** What the JDK's built-in namespace-aware parser reports for {@code body}, which is not well-formed XML. */
     private static String parserMessage(String body) throws Exception {
-        DocumentBuilder parser = newParser();
+        return parserMessage(newParser(), body);
+    }
+
+    /** What {@code parser} reports for {@code body}, which it refuses to read. */
+    private static String parserMessage(DocumentBuilder parser, String body) {
         SAXParseException failure = catchThrowableOfType(
                 () -> parser.parse(new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8))),
                 SAXParseException.class);
@@ -305,7 +389,18 @@ class SoapListenerBoundaryAdapterTest {
 
     /** The JDK's built-in parser, namespace-aware, reporting parse errors only by throwing them. */
     private static DocumentBuilder newParser() throws Exception {
+        return newParser(DocumentBuilderFactory.newDefaultInstance());
+    }
+
+    /** The parser of {@link #newParser()}, refusing elements nested deeper than {@link #CXF_MAX_ELEMENT_DEPTH}. */
+    private static DocumentBuilder newDepthLimitedParser() throws Exception {
         DocumentBuilderFactory factory = DocumentBuilderFactory.newDefaultInstance();
+        factory.setAttribute("jdk.xml.maxElementDepth", String.valueOf(CXF_MAX_ELEMENT_DEPTH));
+        return newParser(factory);
+    }
+
+    /** A parser from {@code factory}, namespace-aware, reporting parse errors only by throwing them. */
+    private static DocumentBuilder newParser(DocumentBuilderFactory factory) throws Exception {
         factory.setNamespaceAware(true);
         DocumentBuilder parser = factory.newDocumentBuilder();
         parser.setErrorHandler(new ErrorHandler() {

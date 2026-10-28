@@ -36,7 +36,8 @@ import ch.qos.logback.core.read.ListAppender;
 /**
  * Tests shared component SC-7, {@link BatchJobRunner} with {@link BatchJobResult}: the Mule 3.8 batch semantics the
  * runner reproduces (accept policy and accept expression, record variables, per-step failure capture, commit grouping,
- * {@code max-failed-records}, on-complete and the result counts), through the runner's public API only.
+ * {@code max-failed-records}, on-complete, the result counts and the level they are logged at), through the runner's
+ * public API only.
  *
  * <p>Every consumer of SC-7 carries this class with only its {@code package} line and its {@code BatchJobResult}
  * import changed, as it carries the runner, so it depends on the JDK, JUnit, AssertJ, SLF4J, Logback, the runner and
@@ -380,7 +381,8 @@ class BatchJobRunnerTest {
         assertThat(onCompleteCalls).hasValue(1);
         assertThat(completed.get()).isSameAs(result);
         assertThat(result.status()).isEqualTo(BatchJobResult.Status.FAILED_PROCESS_RECORDS);
-        assertCounts(result, 5, 3, 1);
+        // Records 0 and 1 stay in the uncommitted group and never reach step 'later', so only the failed one counts.
+        assertCounts(result, 5, 1, 1);
         assertWellFormed(result);
     }
 
@@ -425,11 +427,58 @@ class BatchJobRunnerTest {
 
         BatchJobResult result = runner.run(job, () -> payloads(10));
 
-        // Failures 1 and 3 are tolerated; failure 5 is the third and stops the job.
+        // Failures 1 and 3 are tolerated; failure 5 is the third and stops the job. Records 0, 2 and 4 passed step
+        // 'validate' but never reached step 'later', so they are neither processed nor successful.
         assertThat(processed).containsExactly(0, 1, 2, 3, 4, 5);
         assertThat(seenByLaterStep).isEmpty();
         assertThat(result.status()).isEqualTo(BatchJobResult.Status.FAILED_PROCESS_RECORDS);
-        assertCounts(result, 10, 6, 3);
+        assertCounts(result, 10, 3, 3);
+        assertWellFormed(result);
+    }
+
+    static Stream<Arguments> stopsInTheLastStep() {
+        return Stream.of(
+                Arguments.of("without a commit, the records before the failed one completed the last step",
+                        0, List.of(), 4L),
+                Arguments.of("with the commit group of the records before the failed one pending",
+                        COMMIT_SIZE, List.of(), 1L),
+                Arguments.of("with a group committed before the stop and the next one pending",
+                        2, List.of(List.of(0, 1)), 3L));
+    }
+
+    @ParameterizedTest(name = "stop in the last step {0}")
+    @MethodSource("stopsInTheLastStep")
+    void stopInTheLastStepCountsOnlyRecordsThatCompletedItAsSuccessful(String description, int commitSize,
+            List<List<Integer>> committedGroups, long processedRecords) throws Exception {
+        List<Integer> passedFirstStep = new ArrayList<>();
+        List<Integer> seenByLastStep = new ArrayList<>();
+        List<List<Integer>> committed = new ArrayList<>();
+        BatchJobRunner.Step.Builder<Integer> lastStep = BatchJobRunner.Step.<Integer>builder("last")
+                .processor(record -> {
+                    seenByLastStep.add(record.getPayload());
+                    if (record.getPayload() == 3) {
+                        throw new IllegalStateException("record 3 failed");
+                    }
+                });
+        if (commitSize > 0) {
+            lastStep.commit(commitSize, payloads -> committed.add(List.copyOf(payloads)));
+        }
+        BatchJobRunner.JobDefinition<Integer> job = BatchJobRunner.JobDefinition.<Integer>builder("lastStepJob")
+                .step(BatchJobRunner.Step.<Integer>builder("first")
+                        .processor(record -> passedFirstStep.add(record.getPayload()))
+                        .build())
+                .step(lastStep.build())
+                .build();
+
+        BatchJobResult result = runner.run(job, () -> payloads(6));
+
+        // Every record passed step 'first'; record 3 fails in step 'last' and, under max-failed-records 0, stops the
+        // job there. Records left in a pending group, and records 4 and 5, are neither successful nor failed.
+        assertThat(passedFirstStep).isEqualTo(payloads(6));
+        assertThat(seenByLastStep).containsExactly(0, 1, 2, 3);
+        assertThat(committed).isEqualTo(committedGroups);
+        assertThat(result.status()).isEqualTo(BatchJobResult.Status.FAILED_PROCESS_RECORDS);
+        assertCounts(result, 6, processedRecords, 1);
         assertWellFormed(result);
     }
 
@@ -633,6 +682,76 @@ class BatchJobRunnerTest {
         assertWellFormed(second);
     }
 
+    static Stream<Arguments> unsuccessfulJobs() {
+        return Stream.of(
+                // Records 0 and 1 completed the only step, record 2 failed and stopped the job, records 3 and 4 never
+                // ran.
+                Arguments.of("stopped in the process phase", BatchJobRunner.JobDefinition.<Integer>builder("warnJob")
+                        .step(failingStep("validate", payload -> payload == 2))
+                        .build(), BatchJobResult.Status.FAILED_PROCESS_RECORDS, 3L, 1L),
+                // Every record completed the only step; on-complete received SUCCESSFUL, then threw.
+                Arguments.of("failed in on-complete", BatchJobRunner.JobDefinition.<Integer>builder("warnJob")
+                        .step(failingStep("validate", payload -> false))
+                        .onComplete(jobResult -> {
+                            throw new IllegalStateException("on-complete saw secret@example.com");
+                        })
+                        .build(), BatchJobResult.Status.FAILED_ON_COMPLETE, 5L, 0L));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unsuccessfulJobs")
+    void unsuccessfulJobLogsItsFinalStatusAndCountsOnceAtWarnAfterOnComplete(String description,
+            BatchJobRunner.JobDefinition<Integer> job, BatchJobResult.Status status, long processed, long failed)
+            throws Exception {
+        BatchJobResult result = runner.run(job, () -> payloads(5));
+
+        assertThat(result.status()).isEqualTo(status);
+        assertCounts(result, 5, processed, failed);
+        List<ILoggingEvent> warnings = warnEvents();
+        assertThat(warnings).hasSize(1);
+        assertThat(warnings.get(0).getFormattedMessage()).isEqualTo(("Finished job instance '%s' of job 'warnJob' "
+                + "with status %s: loaded 5, processed %d, successful %d, failed %d, unprocessed %d")
+                .formatted(result.jobInstanceId(), status.name(), processed, processed - failed, failed,
+                        5 - processed));
+        assertThat(warnings.get(0).getThrowableProxy()).isNull();
+        // The WARN is the only final-result line and the last line logged, after on-complete and any ERROR it caused.
+        assertThat(finishedEvents()).containsExactlyElementsOf(warnings);
+        assertThat(appender.list.get(appender.list.size() - 1)).isSameAs(warnings.get(0));
+        assertWellFormed(result);
+    }
+
+    static Stream<Arguments> successfulJobs() {
+        return Stream.of(
+                Arguments.of("every record succeeds", 0L, 3, (Predicate<Integer>) payload -> false, 0L),
+                Arguments.of("failures within max-failed-records", 2L, 5,
+                        (Predicate<Integer>) payload -> payload % 2 == 1, 2L),
+                Arguments.of("empty input", 0L, 0, (Predicate<Integer>) payload -> true, 0L));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("successfulJobs")
+    void successfulJobLogsItsStatusAndCountsAtDebugAndNothingAtWarn(String description, long maxFailedRecords,
+            int recordCount, Predicate<Integer> fails, long failedRecords) throws Exception {
+        BatchJobRunner.JobDefinition<Integer> job = BatchJobRunner.JobDefinition.<Integer>builder("debugJob")
+                .maxFailedRecords(maxFailedRecords)
+                .step(failingStep("validate", fails))
+                .build();
+
+        BatchJobResult result = runner.run(job, () -> payloads(recordCount));
+
+        assertThat(result.status()).isEqualTo(BatchJobResult.Status.SUCCESSFUL);
+        assertCounts(result, recordCount, recordCount, failedRecords);
+        assertThat(warnEvents()).isEmpty();
+        List<ILoggingEvent> finished = finishedEvents();
+        assertThat(finished).hasSize(1);
+        assertThat(finished.get(0).getLevel()).isEqualTo(Level.DEBUG);
+        assertThat(finished.get(0).getFormattedMessage()).isEqualTo(("Finished job instance '%s' of job 'debugJob' "
+                + "with status SUCCESSFUL: loaded %d, processed %d, successful %d, failed %d, unprocessed 0")
+                .formatted(result.jobInstanceId(), recordCount, recordCount, recordCount - failedRecords,
+                        failedRecords));
+        assertWellFormed(result);
+    }
+
     @Test
     void jobInstanceIdIsARandomUuidThatDiffersPerRun() throws Exception {
         BatchJobRunner.JobDefinition<Integer> job = BatchJobRunner.JobDefinition.<Integer>builder("idJob").build();
@@ -741,6 +860,17 @@ class BatchJobRunnerTest {
 
     private List<ILoggingEvent> errorEvents() {
         return appender.list.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+    }
+
+    private List<ILoggingEvent> warnEvents() {
+        return appender.list.stream().filter(event -> event.getLevel() == Level.WARN).toList();
+    }
+
+    /** The final-result lines, at whatever level they were logged. */
+    private List<ILoggingEvent> finishedEvents() {
+        return appender.list.stream()
+                .filter(event -> event.getFormattedMessage().startsWith("Finished job instance '"))
+                .toList();
     }
 
     private static void assertCounts(BatchJobResult result, long loaded, long processed, long failed) {

@@ -23,3 +23,14 @@ login:
   # TODO: supply the login form password
   password: ${LOGIN_PASSWORD:}
   requester-host: localhost   # replaces http:request-config host="0.0.0.0" (xml:5); 0.0.0.0 is a bind address
+
+# Below the pinned levels these loggers write what the caller submitted, the password included, which the original
+# never logged. A logger's own level outranks logging.level.root and the groups that --debug and --trace raise, so
+# pinning each keeps the password out of the log at every root level.
+logging:
+  level:
+    # the request line with its query and, with spring.mvc.log-request-details, every form parameter; to log them it
+    # reads the form through the servlet parameters, consuming the body LoginController reads.
+    # WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    io.undertow.request.io: INFO   # request-parse failures quoting a query value that does not decode

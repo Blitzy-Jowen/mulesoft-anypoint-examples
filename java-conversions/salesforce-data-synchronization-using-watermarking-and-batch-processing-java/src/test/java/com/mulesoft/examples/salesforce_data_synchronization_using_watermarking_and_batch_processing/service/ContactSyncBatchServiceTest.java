@@ -48,6 +48,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.TimeZone;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
@@ -83,9 +84,9 @@ import com.sforce.ws.ConnectionException;
  * <p>The original {@code SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT} only checked that the job
  * succeeded. This test fixes every branch of the poll: the {@code YESTERDAY} default and the stored watermark in the
  * {@code sfdc:query} text, the {@code Batch_Step} INFO line per record ({@code Contact recently modified: #[payload]},
- * asserted on the service's own logger), the {@code MAX} selector over {@code LastModifiedDate} applied only after the
- * job ran, an empty poll leaving the watermark untouched, and a failed query propagating unchanged with the watermark
- * as it was.
+ * asserted on the service's own logger), the {@code MAX} selector over {@code LastModifiedDate} applied only after a
+ * successful job, an empty poll or an unsuccessful job leaving the watermark untouched, and a failed query propagating
+ * unchanged with the watermark as it was.
  *
  * <p>Every poll makes exactly one query: retries belong only to the SC-9 executor inside the client, and timeouts and
  * connectivity failures are never retried (AAP 0.4.8).
@@ -241,6 +242,45 @@ class ContactSyncBatchServiceTest {
         assertThat(stepLines()).isEmpty();
         verify(client, times(1)).query(anyString());
         verifyNoMoreInteractions(client);
+    }
+
+    /**
+     * The job of this example only logs, so it never fails with the real runner; a mocked runner returns each result
+     * that is not a success without failures, with and without a stored watermark.
+     */
+    static Stream<Arguments> unsuccessfulJobs() {
+        return Stream.of(null, JULY_4).flatMap(storedBefore -> Stream.of(
+                Arguments.of("stopped job, stored before: " + storedBefore,
+                        jobResult(BatchJobResult.Status.FAILED_PROCESS_RECORDS, 1, 0, 1), storedBefore),
+                Arguments.of("successful job with a failed record, stored before: " + storedBefore,
+                        jobResult(BatchJobResult.Status.SUCCESSFUL, 2, 1, 1), storedBefore),
+                Arguments.of("failed on-complete, stored before: " + storedBefore,
+                        jobResult(BatchJobResult.Status.FAILED_ON_COMPLETE, 2, 2, 0), storedBefore)));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unsuccessfulJobs")
+    void unsuccessfulJobKeepsTheWatermarkSoTheNextPollQueriesFromTheSameValue(String description,
+            BatchJobResult jobResult, String storedBefore) throws Exception {
+        if (storedBefore != null) {
+            store.store(WATERMARK_KEY, storedBefore);
+        }
+        Map<String, String> filesBefore = directorySnapshot();
+        BatchJobRunner runner = mock(BatchJobRunner.class);
+        when(runner.run(any(), any())).thenReturn(jobResult);
+        ContactSyncBatchService unsuccessful = new ContactSyncBatchService(client, runner, store, YESTERDAY);
+        stubQuery(contact(ID_1, "Jane Doe", JULY_5), contact(ID_2, "John Smith", JULY_7));
+
+        assertThat(unsuccessful.synchronize()).isSameAs(jobResult);
+        assertThat(unsuccessful.synchronize()).isSameAs(jobResult);
+
+        // Neither poll moves the watermark, so the second selects the first poll's Contacts again; nothing retries.
+        String query = QUERY_PREFIX + (storedBefore == null ? YESTERDAY : storedBefore);
+        assertThat(capturedQueries(2)).containsExactly(query, query);
+        verifyNoMoreInteractions(client);
+        verify(runner, times(2)).run(any(), any());
+        assertThat(store.current(WATERMARK_KEY)).isEqualTo(Optional.ofNullable(storedBefore));
+        assertThat(directorySnapshot()).isEqualTo(filesBefore);
     }
 
     @ParameterizedTest(name = "{0}")
@@ -449,6 +489,12 @@ class ContactSyncBatchServiceTest {
                 .map(ILoggingEvent::getFormattedMessage)
                 .filter(message -> message.startsWith(LOG_PREFIX))
                 .toList();
+    }
+
+    /** A result of the job over two loaded Contacts. */
+    private static BatchJobResult jobResult(BatchJobResult.Status status, long processed, long successful,
+            long failed) {
+        return new BatchJobResult(JOB_NAME, UUID.randomUUID().toString(), status, 2, processed, successful, failed, 0);
     }
 
     private static void assertSuccessful(BatchJobResult result, long records) {

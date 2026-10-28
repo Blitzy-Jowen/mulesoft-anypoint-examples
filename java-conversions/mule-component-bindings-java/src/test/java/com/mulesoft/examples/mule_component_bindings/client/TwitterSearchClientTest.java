@@ -22,6 +22,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -36,9 +37,11 @@ import java.net.SocketTimeoutException;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -51,10 +54,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
+import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.mule_component_bindings.config.StockStatsProperties;
 import com.mulesoft.examples.mule_component_bindings.mapper.TwitterResponseMapper;
 import com.mulesoft.examples.mule_component_bindings.model.Tweet;
@@ -73,11 +79,15 @@ import twitter4j.conf.ConfigurationBuilder;
  * against a WireMock stand-in for the Twitter v1.1 REST API: the search sends the query and date bounds signed
  * with the configured OAuth credentials and returns the parsed statuses, and sends no date bound it is not given;
  * the twitter4j instance is built on the first search, so construction needs no credentials, and is reused
- * afterwards; a rejected search or a response without {@code search_metadata} raises {@link TwitterException},
+ * afterwards; a credential without text fails each search, naming the first such key, before twitter4j is
+ * configured or any request is sent; a rejected search or a response without {@code search_metadata} raises
+ * {@link TwitterException},
  * a rejection carrying Twitter's status and error code and never sent twice; Spring binds the search service's
  * {@link TwitterSearchService.RawSearch} port to this client; the configuration pins 10 s connect and read timeouts
- * and no HTTP retry whatever twitter4j would otherwise inherit; and an upstream that never answers fails the search
- * once, after the 10 s read timeout, with a {@link SocketTimeoutException} cause.
+ * and no twitter4j retry whatever twitter4j would otherwise inherit; a connection reset or closed before any
+ * response gets the search re-sent once, unchanged, by the JDK transport under twitter4j, as documented on the
+ * client; and an upstream that never answers fails the search once, after the 10 s read timeout, with a
+ * {@link SocketTimeoutException} cause.
  */
 class TwitterSearchClientTest {
 
@@ -156,6 +166,58 @@ class TwitterSearchClientTest {
         wm.verify(2, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
     }
 
+    /**
+     * Each OAuth credential alone as {@code null}, empty and whitespace only, then two cases with several missing,
+     * which name the first in the order consumer key, consumer secret, access token, access token secret.
+     */
+    static Stream<Arguments> credentialsWithoutText() {
+        Map<String, String> messages = new LinkedHashMap<>();
+        messages.put("twitter.apiKey", "Twitter API key (twitter.apiKey) is not configured");
+        messages.put("twitter.apiSecret", "Twitter API secret (twitter.apiSecret) is not configured");
+        messages.put("twitter.accessKey", "Twitter access token (twitter.accessKey) is not configured");
+        messages.put("twitter.accessSecret", "Twitter access token secret (twitter.accessSecret) is not configured");
+        List<Arguments> cases = new ArrayList<>();
+        messages.forEach((key, message) -> {
+            for (String blank : Arrays.asList(null, "", "   ")) {
+                cases.add(Arguments.of(List.of(key), Named.of(blank == null ? "null" : '"' + blank + '"', blank),
+                        message));
+            }
+        });
+        cases.add(Arguments.of(List.copyOf(messages.keySet()), Named.of("\"\"", ""),
+                messages.get("twitter.apiKey")));
+        cases.add(Arguments.of(List.of("twitter.accessKey", "twitter.accessSecret"), Named.of("\"   \"", "   "),
+                messages.get("twitter.accessKey")));
+        return cases.stream();
+    }
+
+    @ParameterizedTest(name = "[{index}] {0} = {1}")
+    @MethodSource("credentialsWithoutText")
+    void credentialWithoutTextFailsEverySearchNamingItsKeyBeforeAnyRequest(List<String> blankKeys, String blank,
+            String expectedMessage) {
+        wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(okJson(SEARCH_RESPONSE)));
+        ReadCountingProperties properties = new ReadCountingProperties(properties(wm.baseUrl() + "/1.1/",
+                blankKeys.contains("twitter.apiKey") ? blank : "test-api-key",
+                blankKeys.contains("twitter.apiSecret") ? blank : "test-api-secret",
+                blankKeys.contains("twitter.accessKey") ? blank : "test-access-key",
+                blankKeys.contains("twitter.accessSecret") ? blank : "test-access-secret"));
+        TwitterSearchClient client = new TwitterSearchClient(properties);
+
+        // Searched twice: a failed check builds and caches nothing, so the second search is checked again.
+        for (int search = 1; search <= 2; search++) {
+            assertThatThrownBy(() -> client.search("$AAPL", "2014-10-26", "2014-11-04"))
+                    .as("search %d", search)
+                    .isExactlyInstanceOf(IllegalStateException.class)
+                    .hasMessage(expectedMessage)
+                    .hasNoCause();
+        }
+
+        // The check runs before twitter4j is configured, which is the only read of the REST base URL, and no
+        // request leaves the client.
+        assertThat(properties.restBaseUrlReads).hasValue(0);
+        wm.verify(0, anyRequestedFor(anyUrl()));
+        assertThat(wm.getAllServeEvents()).isEmpty();
+    }
+
     @Test
     void unauthorizedRaisesTwitterException() {
         wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(aResponse()
@@ -171,6 +233,31 @@ class TwitterSearchClientTest {
         assertThat(ex.getErrorCode()).isEqualTo(32);
         // Exactly one request: a rejected search is never retried.
         wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
+    }
+
+    /**
+     * Pins the documented transport re-send. twitter4j's own retries are off, but the JDK {@code HttpURLConnection}
+     * under twitter4j sends the bodiless search GET a second time, byte for byte with the same OAuth signature, when
+     * the connection is reset or closes before any response, as the original Twitter connector's twitter4j did over
+     * the same transport; the search then fails with a {@link TwitterException}. A timed-out search is sent once
+     * ({@link #searchWithNoResponseFailsOnceAfterTheTenSecondReadTimeout}).
+     */
+    @ParameterizedTest
+    @EnumSource(value = Fault.class, names = {"CONNECTION_RESET_BY_PEER", "EMPTY_RESPONSE"})
+    void connectionLostBeforeAnyResponseIsSentAgainOnceByTheJdkTransport(Fault fault) {
+        wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(aResponse().withFault(fault)));
+        TwitterSearchClient client = new TwitterSearchClient(properties());
+
+        TwitterException ex = assertThrows(TwitterException.class,
+                () -> client.search("$AAPL", "2014-10-26", "2014-11-04"));
+
+        assertThat(causeChain(ex)).anyMatch(IOException.class::isInstance);
+        List<LoggedRequest> searches = wm.findAll(getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
+        assertThat(searches).hasSize(2);
+        // A twitter4j retry would sign again with a new nonce and timestamp; the transport re-sends the same request.
+        assertThat(searches.get(1).getUrl()).isEqualTo(searches.get(0).getUrl());
+        assertThat(searches.get(1).getHeader("Authorization")).isEqualTo(searches.get(0).getHeader("Authorization"));
+        assertThat(wm.getAllServeEvents()).hasSize(2);
     }
 
     @Test

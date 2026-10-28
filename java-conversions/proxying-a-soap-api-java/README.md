@@ -56,7 +56,7 @@ The original README's "How it works" also says the proxy verifies the request's 
 | Path | Methods | Host | Port | Answered by | Implemented by | Source |
 |---|---|---|---|---|---|---|
 | `/` only (Mule `path="/"` matches the root alone) | every method: the listener declares no `allowedMethods` (AAP 0.4.9), so `GET`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, CORS pre-flights, `TRACE` and extension methods are forwarded too | `0.0.0.0` | `http.port`, default `8081` | one `POST` to `${proxy.upstream-url}` (default `http://www.predic8.com:8080/shop/ShopService`), the fixed URL with no inbound path or query appended | `controller/SoapProxyController` → `service/SoapProxyService` → `client/ShopServiceClient` | `soap-api-proxy.xml:3,4,6-11` |
-| `GET /?wsdl` (query `wsdl` in any case) and `GET /?xsd=<location>` | `GET` | `0.0.0.0` | `http.port` | the upstream WSDL read from `proxy.wsdl-location` at start-up, and each schema it reaches; no upstream call | SC-11 `config/WsdlQueryPublisher`, registered on `/*` by `ProxyingASoapApiApplication.wsdlQueryPublisher` | `soap-api-proxy.xml:7` |
+| `GET /?wsdl` (a `wsdl` parameter in any case or position, with or without a value) and `GET /?xsd=<location>` | `GET` | `0.0.0.0` | `http.port` | the upstream WSDL read from `proxy.wsdl-location` at start-up, and each schema it reaches; no upstream call | SC-11 `config/WsdlQueryPublisher`, registered on `/*` by `ProxyingASoapApiApplication.wsdlQueryPublisher` | `soap-api-proxy.xml:7` |
 | any other path (`/other`, `/x/`, `/shop/ShopService`, …) | every method | `0.0.0.0` | `http.port` | `404`, `text/plain`, `No listener for endpoint: <path>`; nothing forwarded | SC-1 `exception/GlobalExceptionHandler` | `soap-api-proxy.xml:6` |
 
 The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
@@ -307,9 +307,9 @@ No scenario of this project is `unreachable`. `get-root-wsdl` is its one `nondet
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 306 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 306 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 54 of 54 lines (`service/SoapProxyService` 30, `mapper/ProxyHeaderMapper` 24). Total project LINE coverage: 92.8% (823 of 887 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 326 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 326 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 54 of 54 lines (`service/SoapProxyService` 30, `mapper/ProxyHeaderMapper` 24). Total project LINE coverage: 92.8% (837 of 902 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

@@ -71,10 +71,10 @@ Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client
 - Per-record errors in the `create` save results (a rejected field value or a duplicate rule, for example) are not raised or logged, as in the original flow: the service returns the save results unchanged and the trigger discards them.
 - The ERROR lines name the upstream, the category and exception classes only, never vendor messages, credentials or record data.
 
-Measured on this build without credentials, with `sfdc.auth-endpoint` pointed at a closed local port (timestamps and thread prefixes removed):
+Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, and `sfdc.auth-endpoint` pointed at a closed local port (timestamps and thread prefixes removed):
 
 ```console
-$ java -jar target/import-contacts-into-salesforce-java-1.0.0-SNAPSHOT.jar --contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out --contacts.polling-frequency=2000 --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0
+$ java -jar target/import-contacts-into-salesforce-java-1.0.0-SNAPSHOT.jar --contacts.input-dir=target/run/in --contacts.move-to-dir=target/run/out --contacts.polling-frequency=2000 --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0 --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
 $ cp src/main/resources/contacts.csv target/run/in/
 ERROR c.m.e.i.client.UpstreamCallExecutor      : Upstream Salesforce call failed [UNAVAILABLE]: com.sforce.ws.ConnectionException at com.sforce.ws.transport.SoapConnection.send(SoapConnection.java:128) <- java.net.ConnectException
 ERROR c.m.e.i.trigger.FileInboundPoller        : Exception processing file contacts.csv: com.mulesoft.examples.import_contacts_into_salesforce.exception.UpstreamUnavailableException at com.mulesoft.examples.import_contacts_into_salesforce.client.UpstreamCallExecutor.translate(UpstreamCallExecutor.java:276)
@@ -94,7 +94,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `spring.main.web-application-type` | `WebApplicationType` | `none` | none | fixed | the original has no HTTP listener, so no web server starts and no port is bound |
 | `contacts.input-dir` | `String` (a path) | `src/main/resources/input` | none; the original hard-coded `path` on the file endpoint (xml:9) | default | directory polled for CSV files |
 | `contacts.move-to-dir` | `String` (a path) | `src/main/resources/output` | none; the original hard-coded `moveToDirectory` (xml:9) | default | directory each polled file is moved to under its own name |
-| `contacts.polling-frequency` | `long` (ms) | `10000` | none; the original hard-coded `pollingFrequency` (xml:9) | default | fixed delay between the end of one poll and the start of the next |
+| `contacts.polling-frequency` | `long` (ms) | `10000` | none; the original hard-coded `pollingFrequency` (xml:9) | default | fixed delay between the end of one poll and the start of the next; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
 | `sfdc.username` | `String` | none, `${SFDC_USERNAME:}` | **`sfdc.user`** (xml:4) | TODO | the Salesforce user the `login` call authenticates; renamed because the request's key names govern (AAP 0.4.6) |
 | `sfdc.password` | `String` | none, `${SFDC_PASSWORD:}` | `sfdc.password` (unchanged, xml:4) | TODO (secret) | that user's password, without the security token |
 | `sfdc.securityToken` | `String` | none, `${SFDC_SECURITYTOKEN:}` | `sfdc.securityToken` (unchanged, xml:4) | TODO (secret) | appended to the password at login; `sfdc.security-token` binds as well |
@@ -155,7 +155,7 @@ cp src/main/resources/contacts.csv src/main/resources/input/
 Within one polling interval the file moves to `src/main/resources/output/contacts.csv`, and Salesforce lists John Doe and Jane Doe under **Contacts**. Delete both Contacts afterwards. For a large file, copy it next to the input directory first and then move it in, so a poll never reads a half-written file.
 
 - `mvn test` needs no licence, credential or network: Salesforce is a Mockito-mocked `SalesforcePartnerClient` or a WireMock Partner SOAP stub.
-- Without the three `sfdc.*` values the application still starts, but every import fails at the lazy `login`. A rejected login (`INVALID_LOGIN`) is none of the three failure modes, so it is logged by `FileInboundPoller` at ERROR and the file is moved.
+- Without the three `sfdc.*` values the application still starts, but every import fails before any Salesforce request: the lazy `login` first checks that `sfdc.username`, `sfdc.password` and `sfdc.securityToken` are non-blank and throws an `IllegalStateException` naming each missing key, never a value. That, like a rejected login (`INVALID_LOGIN`), is none of the three failure modes, so it is logged by `FileInboundPoller` at ERROR and the file is moved.
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
@@ -173,6 +173,8 @@ The IT writes data, so use a sandbox org, never production:
 - It queries each Contact by e-mail with the original test flow's SOQL `SELECT FirstName,Id,LastName FROM Contact WHERE Email = '<email>'`, waiting up to 60 s, and asserts `FirstName` `John` for `john.doe@texasComp.com` and `LastName` `Doe` for `jane.doe@texasComp.com`, as the original asserted (`ImportContactsToSfdcIT.java:101,105`).
 - Contacts with those two e-mails that an earlier run left behind are recorded first, so only a Contact this import created satisfies the assertions.
 - `@AfterEach` deletes every Contact read back for the two e-mails, the earlier ones included. A failed delete is logged, never thrown, as the original only printed it.
+- The wait polls on the test thread, so a query still running at the timeout has recorded the IDs it returned before the wait returns and `@AfterEach` reads them.
+- A failed cleanup query or delete is logged at WARN with the fixture e-mail or the record IDs and the class names of the exception and its causes only, and a failed delete result with its status codes only: no vendor message, cause or suppressed message, error field or stack trace.
 
 While `application-it.yml` or one of the three keys is missing, blank or still `TODO`, the class is skipped by its `LiveCredentialsGate` and a `@BeforeAll` assumption: reported skipped, never failed, and no application starts. A skipped run is not Tier 2B evidence.
 
@@ -182,6 +184,7 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 |---|---|
 | `ImportContactsToSfdcTest` | the ported `ImportContactsToSfdcIT` (`import-contacts-into-salesforce/src/test/java/org/mule/examples/ImportContactsToSfdcIT.java:86-105`) with the whole application context against a mocked `SalesforcePartnerClient`: `contacts.csv` dropped into a temporary input directory and `pollOnce()` lead to exactly one `create` of type `Contact` with two records, `FirstName` `John` for `john.doe@texasComp.com` and `LastName` `Doe` for `jane.doe@texasComp.com`; also every field of both records (phones keep their leading zero), the file moved unchanged to the output directory, and no other Salesforce call |
 | `ImportContactsToSfdcIT` | the same two assertions against a live org (failsafe, previous section) |
+| `ImportContactsToSfdcITCleanupTest` | the wait and `@AfterEach` of `ImportContactsToSfdcIT` without credentials or a Spring context, against a mocked `SalesforcePartnerClient`: a query that answers after the wait's timeout runs on the test thread, its Contact ID is recorded before the wait returns and is then deleted; cleanup queries and deletes failing with exception, cause and suppressed messages that carry personal fields and secrets are logged at WARN by class names only (circular chains marked, chains cut after five names), failed delete results by status codes only, no throwable attached, every delete still attempted |
 | `trigger/ContactsFileTriggerTest` | `contacts.csv` handed byte for byte to the import once and moved to the output directory; a Salesforce read timeout and any other import failure logged at ERROR, not retried, file still moved; an empty input directory hands nothing over; `poll()` scheduled with the original 10000 ms fixed delay |
 | `trigger/FileInboundPollerTest` | SC-5: move after success and after a handled failure, delete without a move directory, the interrupt flag kept, the in-process mark against re-entrant and concurrent polls, an unopenable file left in place and retried, a file too large to read (over the read limit, or one whose allocation fails with `OutOfMemoryError`) left in place while the other files are consumed, missing directories created, subdirectories ignored, a same-named file in the move directory replaced |
 | `service/ContactImportServiceTest` | every record of `contacts.csv` sent in one `create` call; a header-only file still calls `create` once with no records; every client failure propagated unchanged |
@@ -211,10 +214,10 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 The root `SUMMARY.md` carries the same row for this project (AAP 0.8.7). Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 659 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`ImportContactsToSfdcIT`: `src/test/resources/application-it.yml not supplied`).
-- `mvn -B clean package`: `BUILD SUCCESS`; 659 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
-- `mvn -B test`: `BUILD SUCCESS`; 659 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 92 of 92 lines (100.0%) of `service/ContactImportService`, `mapper/ContactMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 91.5% (634 of 693 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 692 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`ImportContactsToSfdcIT`: `src/test/resources/application-it.yml not supplied`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 692 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
+- `mvn -B test`: `BUILD SUCCESS`; 692 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 92 of 92 lines (100.0%) of `service/ContactImportService`, `mapper/ContactMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 91.8% (659 of 718 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=1`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `ImportContactsToSfdcIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

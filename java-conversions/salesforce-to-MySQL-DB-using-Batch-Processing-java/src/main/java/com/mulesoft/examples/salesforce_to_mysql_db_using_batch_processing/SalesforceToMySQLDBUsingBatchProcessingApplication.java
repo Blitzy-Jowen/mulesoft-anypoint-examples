@@ -22,7 +22,8 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * as a standalone process without a web server, as {@code application.yml} sets
  * ({@code spring.main.web-application-type: none}), because the flow has no HTTP listener. Salesforce is contacted
  * only when a poll runs, so the application starts with the {@code sfdc.*} credentials unset; the MySQL
- * {@code contact} table is reached through Boot's auto-configured {@code DataSource} and {@code JdbcTemplate}.
+ * {@code contact} table is reached through Boot's auto-configured {@code DataSource} and {@code JdbcTemplate}, and
+ * the application also starts with the {@code mysql.*} settings unset, through {@code config.DataSourceConfig}.
  *
  * <p>{@code @EnableScheduling} drives {@code trigger.ContactPollScheduler.poll()}, the replacement of the flow's
  * {@code poll} with its {@code fixed-frequency-scheduler}, every {@code poll.frequency} milliseconds (default 60000,

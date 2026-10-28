@@ -56,10 +56,19 @@ smtp:
   user: ${SMTP_USER:}
   # TODO: supply the SMTP password
   password: ${SMTP_PASSWORD:}
-# The subject "Scatter gather example - aggregation" is a literal of the flow, so it stays a constant of
-# client/AggregationReportMailer rather than a key here.
+# smtp:outbound-endpoint from, to and subject (scatter-gather.xml:64), read by client/AggregationReportMailer
 mail:
   # TODO: supply the sender address
   from: ${MAIL_FROM:}
   # TODO: supply the recipient address(es), comma-separated allowed
   to: ${MAIL_TO:}
+  # subject literal of smtp:outbound-endpoint (scatter-gather.xml:64), the default; an empty value is sent as given
+  subject: ${MAIL_SUBJECT:Scatter gather example - aggregation}
+# scatter-gather.xml has no logger, so neither the aggregated contacts nor the report mail is logged at any level: a
+# root DEBUG/TRACE override, or --debug/--trace, must not reach this category, which below INFO writes them. A
+# logger's own level outranks logging.level.root and the --debug/--trace groups; Angus Mail logs through
+# java.util.logging, which Spring Boot bridges and holds at the same level. The /scatterGather response needs no cap:
+# it is the constant "Please find attached your Aggregation Report", written past the Spring MVC body writers.
+logging:
+  level:
+    org.eclipse.angus.mail: INFO   # .smtp DEBUG writes the SMTP account and the recipient addresses; .smtp.protocol TRACE the whole SMTP dialogue: MAIL FROM, RCPT TO, the headers and the CSV report of contact names and e-mail addresses

@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
@@ -35,6 +36,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -102,7 +105,7 @@ class LeadsFileTriggerTest {
     void createTriggerOverTempDirectories() throws IOException {
         input = Files.createDirectories(root.resolve("input"));
         output = Files.createDirectories(root.resolve("output"));
-        trigger = new LeadsFileTrigger(leadImportBatchService, input.toString(), output.toString());
+        trigger = new LeadsFileTrigger(leadImportBatchService, input.toString(), output.toString(), "10000");
 
         packageLogger = (Logger) LoggerFactory.getLogger(PACKAGE_ROOT_LOGGER);
         logged = new ListAppender<>();
@@ -180,6 +183,29 @@ class LeadsFileTriggerTest {
         assertArrayEquals(leadsCsv(), captor.getValue());
         verifyNoMoreInteractions(leadImportBatchService);
         assertMovedToOutput();
+    }
+
+    @ParameterizedTest(name = "leads.polling-frequency \"{0}\" -> start-up fails naming the key and the value")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void nonPositiveOrUnreadablePollingFrequencyFailsNamingKeyAndValue(String frequency) {
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new LeadsFileTrigger(leadImportBatchService, input.toString(), output.toString(), frequency));
+
+        String message = failure.getMessage();
+        assertNotNull(message, "the failure carries no message");
+        assertTrue(message.contains("leads.polling-frequency"), () -> "key not named: " + message);
+        assertTrue(message.contains("\"" + frequency + "\""), () -> "value not named: " + message);
+        verifyNoInteractions(leadImportBatchService);
+    }
+
+    @ParameterizedTest(name = "leads.polling-frequency \"{0}\" -> accepted, as Spring schedules it")
+    @ValueSource(strings = {"1", "10000", "PT10S", "pt0.5s"})
+    void positivePollingFrequencyIsAccepted(String frequency) {
+        LeadsFileTrigger accepted = assertDoesNotThrow(
+                () -> new LeadsFileTrigger(leadImportBatchService, input.toString(), output.toString(), frequency));
+
+        assertEquals(input, accepted.inputDirectory());
+        assertEquals(output, accepted.moveToDirectory());
     }
 
     /**

@@ -38,10 +38,11 @@ The `?xsd=` value is the `schemaLocation` the referring file writes. `AdmissionS
 
 | Case | Response | Enforced by |
 |---|---|---|
-| A path no listener serves, with any method. A sub-path (`/AdmissionService/x`) and a trailing slash (`/AdmissionService/`) are other paths. | `404 Not Found`, `Content-Type: text/plain;charset=UTF-8`, body `No listener for endpoint: <path>` | `config/WebServiceConfig` `ListenerPathFilter` |
-| A body that cannot be read as a SOAP 1.1 envelope: malformed XML, an empty body, a root other than `soap:Envelope`, or a body declaring a DOCTYPE. A non-POST request without a metadata query is read as a message, so a plain `GET /AdmissionService` lands here with its empty body. | HTTP 500, SOAP 1.1 fault, `faultcode` `soap:Client`, `faultstring` the parser's message, for example `Premature end of file.` for an empty body | SC-11 `config/SoapListenerBoundaryAdapter` |
+| A path no listener serves, with any method. A sub-path (`/AdmissionService/x`) and a trailing slash (`/AdmissionService/`) are other paths. | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` | `config/WebServiceConfig` `ListenerPathFilter` |
+| A body that cannot be read as a SOAP 1.1 envelope: malformed XML, an empty body, a body nested deeper than 100 elements (CXF's default `maxElementDepth`), a root other than `soap:Envelope`, or a body declaring a DOCTYPE. A non-POST request without a metadata query is read as a message, so a plain `GET /AdmissionService` lands here with its empty body. | HTTP 500, SOAP 1.1 fault, `faultcode` `soap:Client`, `faultstring` the parser's message, for example `Premature end of file.` for an empty body | SC-11 `config/SoapListenerBoundaryAdapter` |
 | A request whose `Content-Type` SAAJ rejects for SOAP 1.1 (anything other than `text/xml`) | HTTP 500, `soap:Client`, for example `Invalid Content-Type:application/json. Is this an error message instead of a SOAP response?` | SC-11 `config/SoapListenerBoundaryAdapter` |
-| An exception during processing, for example a mock that cannot be reached or answers with a fault, or an upstream episode date that cannot be read as a date | HTTP 500, `soap:Server`, `faultstring` the exception message, for example `I/O error: Connection refused`; CXF's `Fault occurred while processing.` when the exception carries none | SC-11 `config/SoapFaultConfig` |
+| An exception during processing, for example a mock that cannot be reached or answers with a fault, or an upstream episode date that cannot be read as a date | HTTP 500, `soap:Server`, `faultstring` the exception message, for example `I/O error: Connection refused`; CXF's `Fault occurred while processing.` when the exception carries none, as a `NullPointerException` the JVM raised counts | SC-11 `config/SoapFaultConfig` |
+| A `mustUnderstand="1"` header block that nothing on the listener understands, for example `<x:Sec xmlns:x="urn:x" soapenv:mustUnderstand="1"/>` | Not checked: the request is processed and answered as it would be without the block, never with a `soap:MustUnderstand` fault. Every listener was a `cxf:proxy-service`, and Mule 3.8's `ProxyServiceMessageProcessorBuilder.configureServer` removes CXF's `MustUnderstandInterceptor` from every proxy service it builds | SC-11 `config/SoapFaultConfig` (`CxfStyleSoapMessageDispatcher` in its unchecked mode, the `messageReceiver` bean of `config/WebServiceConfig`) |
 
 - No listener restricts methods, so the method 405 of AAP 0.4.7 cannot occur. `SoapListenerBoundaryAdapter` receives an empty POST-only path list.
 - Each fault uses the CXF envelope form of the success responses.
@@ -53,7 +54,6 @@ The `?xsd=` value is the `schemaLocation` the referring file writes. `AdmissionS
 ```console
 $ curl -i -X POST -H 'Content-Type: text/xml;charset=UTF-8' --data-binary @src/test/resources/message.xml http://localhost:8081/AdmissionService
 HTTP/1.1 200 OK
-Accept: text/xml, text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2
 Connection: keep-alive
 Content-Type: text/xml;charset=utf-8
 Content-Length: 760
@@ -79,7 +79,7 @@ Date: <current date>
 $ curl -i http://localhost:8081/unknown
 HTTP/1.1 404 Not Found
 Connection: keep-alive
-Content-Type: text/plain;charset=UTF-8
+Content-Type: text/plain
 Content-Length: 34
 Date: <current date>
 
@@ -87,7 +87,6 @@ No listener for endpoint: /unknown
 
 $ curl -i http://localhost:8081/AdmissionService
 HTTP/1.1 500 Internal Server Error
-Accept: text/xml, text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2
 Connection: keep-alive
 Content-Type: text/xml;charset=utf-8
 Content-Length: 217
@@ -114,8 +113,11 @@ Every key of `src/main/resources/application.yml`. The original reads one placeh
 | `spring.web.resources.add-mappings` | `false` | none | no static-resource handler answers any path |
 | `spring.webservices.servlet.init` | `dispatchOptionsRequest: "true"`, `dispatchTraceRequest: "true"` (servlet init-params, so strings) | no listener declares `allowedMethods` (`Hospital_Admissions_SOA.xml:20`, `mocks.xml:5,46`) | `OPTIONS` and `TRACE` reach `SoapListenerBoundaryAdapter` like every other method |
 | `spring.autoconfigure.exclude` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | no Boot `/error` endpoint; `WebServiceConfig.ListenerPathFilter` alone owns the no-listener 404, `/error` included |
+| `logging.level.org.springframework.ws.client.MessageTracing` | `INFO` | none: `Hospital_Admissions_SOA.xml` and `mocks.xml` declare no logger | its `.sent`/`.received` `TRACE` write every SOAP envelope the `PatientService` and `EHRService` clients exchange: `upsertPatient` carries the `Subject` |
+| `logging.level.org.springframework.ws.server.MessageTracing` | `INFO` | none | the same envelopes as `AdmissionService` and the two mocks receive and answer them |
 
 - `spring.webservices.path` is not set and stays at Boot's default: `WebServicesProperties` rejects `/` ("Path must have length greater than 1"), so the application would not start. `WebServiceConfig` maps `messageDispatcherServlet` to exactly `/AdmissionService`, `/PatientService` and `/EHRService`, whatever its initial mapping.
+- The two `logging.level` keys keep the patient's `Subject` (`nationalId`, names, address, `dateOfBirth`) out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`. The original had no logger, so it logged none of it. The nested `UnderRootTrace` run of `controller/AdmissionServiceEndpointTest` asserts this.
 - There are no secrets, credentials, hosts of external systems or tenant identifiers, so the configuration has no TODO placeholder. The project has no `src/test/resources/application-test.yml` and no `application-it.yml`.
 - Original-to-new key map: `config.dev.properties` `http.port` → `application.yml` `http.port`, the same name. The original loaded `config.dev.properties` through a Spring `PropertyPlaceholderConfigurer` (`Hospital_Admissions_SOA.xml:4-8`); its one key is folded into `application.yml`, so the file is not carried. `mule-app.properties` holds comments only. `mule-deploy.properties` decided which flow files were converted: both.
 - Override the port on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port`). The internal calls follow the bound port.
@@ -163,7 +165,7 @@ The points below keep the original's behaviour; none changes it. Each point that
 - The original README says the AdmissionService proxy works on the SOAP body. Its flow actually declares `payload="envelope"` and selects `payload.Envelope.Body.admitSubject` (`Hospital_Admissions_SOA.xml:21,59`), which is the node `AdmissionServiceEndpoint` receives as its payload.
 - `?wsdl` serves the carried files with addresses and schema locations rewritten, re-serialized with an XML declaration. CXF re-serialized them in its own form: the soapUI project's definition cache records it, with the keys `?xsd=xsd/SOA-Message-1.0.xsd` and `?xsd=SOA-Model-1.0.xsd` on `/AdmissionService`, where this project publishes `?xsd=service/xsd/SOA-Message-1.0.xsd`, the location the carried `AdmissionService.wsdl` writes. Byte equality with the original's `?wsdl` is unverified.
 - Requests must carry an XML content type (`text/xml`) for SAAJ; any other is answered with the `soap:Client` fault above. Whether the original CXF proxy accepted other content types is unverified (`DECISIONS.md` section 9, verification points).
-- SAAJ adds an `Accept` header to every SOAP response and fault, which CXF did not send (`DECISIONS.md` section 9, verification points).
+- SOAP responses and faults carry neither the `Accept` nor the `SOAPAction` request header SAAJ keeps on every message, as CXF sent neither: SC-11 `SoapListenerBoundaryAdapter` drops both. Characters outside the Basic Multilingual Plane are written as raw UTF-8, as CXF wrote them, in the responses and in the internal `upsertPatient` and `createEpisode` calls (SC-11 `SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory`), where SAAJ alone writes numeric character references such as `&#128512;` (`DECISIONS.md` section 9, verification points).
 - The internal calls carry no `SOAPAction` beyond the `WebServiceTemplate` default and no extra header, as the original sent none; the WSDLs' malformed `http://http://...` actions are never sent.
 - Externalized or stubbed: nothing. The original reaches no external system and holds no credential. `PatientService` and `EHRService` are the original's own mock services, carried in the same process.
 - Not carried (AAP 0.2.2): `config.dev.properties` (folded into `application.yml`), `mule-project.xml`, `catalog/**`, `src/test/resources/log4j2-test.xml` and `src/test/resources/sample_data/**`. Carried byte for byte: `src/main/resources/service/**` (the three WSDLs and two schemas), `Hospital-Admission-Example-soapui-project.xml`, and the test inputs `message.xml` and `reply.xml`.
@@ -190,7 +192,7 @@ java -jar target/xml-only-soap-webservice-java-1.0.0-SNAPSHOT.jar
 | Test class | What it asserts |
 |---|---|
 | `XMLWithSoapTest` | the ported `XMLWithSoapIT` (`xml-only-soap-webservice/src/test/java/org/mule/examples/XMLWithSoapIT.java:54-65`), end to end through the in-process mocks with nothing mocked: `POST /AdmissionService` with `message.xml` returns a non-empty reply containing `<runningTotal>500</runningTotal>` and `<status>ADMITTED</status>` |
-| `controller/AdmissionServiceEndpointTest` | on the wire through ST-1, the whole application on a random port with only the clock fixed: the exact `admitSubjectResponse` with its Episode and Bill in order, the `soap:Client` fault for unreadable requests, the no-listener 404 for unserved paths, and `?wsdl` with its rewritten address and schema closure; `beanNameIsTheExplicitComponentName`: the bean name `WebServiceConfig.ADMISSION_ENDPOINT` from an explicit `@Component`, with an empty `@Endpoint` value |
+| `controller/AdmissionServiceEndpointTest` | on the wire through ST-1, the whole application on a random port with only the clock fixed: the exact `admitSubjectResponse` with its Episode and Bill in order, the same reply for a request carrying an unchecked `mustUnderstand="1"` header block, the `soap:Client` fault for unreadable requests, the no-listener 404 for unserved paths, and `?wsdl` with its rewritten address and schema closure; `beanNameIsTheExplicitComponentName`: the bean name `WebServiceConfig.ADMISSION_ENDPOINT` from an explicit `@Component`, with an empty `@Endpoint` value; nested `UnderRootTrace`, under `logging.level.root=TRACE` with the real clock: the original `message.xml` admission, through both mocks over HTTP, answers `admitSubjectResponse` while none of its `Subject` values reaches the console |
 | `controller/PatientServiceMockEndpointTest` | on the wire: `upsertPatientResponse` with `PatientId` = now, the Donald Duck `getPatientResponse` for every other root and for an empty Body, the `soap:Client` fault for unreadable bodies and for a plain `GET`, the 404 for sub-paths, and `?wsdl`; `beanNameIsTheExplicitComponentName`: the bean name `WebServiceConfig.PATIENT_ENDPOINT` from an explicit `@Component`, with an empty `@Endpoint` value |
 | `controller/EhrServiceMockEndpointTest` | on the wire: `createEpisodeResponse` echoing `PatientId` with the now dates, `findEpisodesResponse` for every other root, the `soap:Client` fault for requests that are not SOAP envelopes, the 404 for sub-paths, and `?wsdl` with its schema closure; `beanNameIsTheExplicitComponentName`: the bean name `WebServiceConfig.EHR_ENDPOINT` from an explicit `@Component`, with an empty `@Endpoint` value |
 | `service/AdmissionOrchestrationServiceTest` | the flow's sequence with every collaborator mocked: the `upsertPatient` script, the PatientService call, the `createEpisode` script, the EHRService call and the response script, in that order and each once; empty and null payloads passed through; every failure propagated unchanged after one attempt, stopping the chain |
@@ -200,7 +202,7 @@ java -jar target/xml-only-soap-webservice-java-1.0.0-SNAPSHOT.jar
 | `mapper/PatientMockResponseMapperTest`, `mapper/EhrMockResponseMapperTest` | the four mock scripts on a fixed clock, compared as exact documents, including the `now` format and the echoed `PatientId` |
 | `mapper/DwXmlWriterTest` | SC-4: the DataWeave 1.0 XML writer's bytes (declaration, tab layout, LF line ends, nothing after the root end tag) |
 | `client/PatientServiceClientTest`, `client/EhrServiceClientTest` | WireMock in place of the mock listener: the Body root returned, `null` for an empty Body, a SOAP fault, an HTTP error, a refused connection and a reset each reaching the caller as its Spring WS exception after exactly one request |
-| `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server` and `soap:Client` faults inside dispatch, the boundary faults and 405, and `?wsdl`/`?xsd=` publication with rewritten addresses, the last also over this project's own three registrations |
+| `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server` and `soap:Client` faults inside dispatch, the component's checked `soap:MustUnderstand` fault and the unchecked proxy-service receiver this project registers, which lets a `mustUnderstand` block through to the endpoint, the boundary faults and 405, and `?wsdl`/`?xsd=` publication with rewritten addresses, the last also over this project's own three registrations |
 | `FixtureParityTest` | ST-2 fixture replay (section below); skipped while no fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
@@ -247,9 +249,9 @@ No scenario of this project is `unreachable`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 362 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 362 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 644 of 657 lines. `service` 44 of 44: `AdmissionOrchestrationService` 14 of 14, `PatientMockService` 15 of 15, `EhrMockService` 15 of 15. `mapper` 600 of 613: `AdmitSubjectResponseMapper` 123 of 123, `DwXmlWriter` 170 of 170, `EhrMockResponseMapper` 102 of 104, `CreateEpisodeRequestMapper` 90 of 95, `UpsertPatientRequestMapper` 77 of 79, `PatientMockResponseMapper` 38 of 42 (nested and anonymous classes counted with their outer class). Total project LINE coverage: 92.2% (1290 of 1399 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 419 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 419 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 644 of 657 lines. `service` 44 of 44: `AdmissionOrchestrationService` 14 of 14, `PatientMockService` 15 of 15, `EhrMockService` 15 of 15. `mapper` 600 of 613: `AdmitSubjectResponseMapper` 123 of 123, `DwXmlWriter` 170 of 170, `EhrMockResponseMapper` 102 of 104, `CreateEpisodeRequestMapper` 90 of 95, `UpsertPatientRequestMapper` 77 of 79, `PatientMockResponseMapper` 38 of 42 (nested and anonymous classes counted with their outer class). Total project LINE coverage: 91.6% (1457 of 1591 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=10`, `failed=0`, every scenario `UNVERIFIED-uncaptured`.
 
 ## Fallback evidence (AAP 0.8.4)

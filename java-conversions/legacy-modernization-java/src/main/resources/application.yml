@@ -30,3 +30,10 @@ fulfillment:
   # file:outbound-endpoint path (:35), relative to the working directory as in Mule. File names follow
   # outputPattern (:35) as ShippingOrder-<dd-MM-yy_HH-mm-ss.SSS>.txt; they are produced in code, not configured.
   output-dir: src/main/resources/Output
+
+logging:
+  level:
+    # FufillmentWebService.xml declares no logger, so the order's addresses are not logged at any level. A logger's
+    # own level outranks logging.level.root and the --debug and --trace logger groups, so neither reaches this one.
+    # The application sends no SOAP request, so no client MessageTracing logger is written.
+    org.springframework.ws.server.MessageTracing: INFO   # .received/.sent TRACE write every putShippingOrder envelope and its reply: the billing and shipping addresses

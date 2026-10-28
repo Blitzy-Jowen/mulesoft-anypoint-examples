@@ -18,11 +18,14 @@ import java.net.SocketTimeoutException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -93,7 +96,11 @@ import com.sforce.soap.partner.SaveResult;
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of {@code sfdc.username},
  * {@code sfdc.password}, {@code sfdc.securityToken} is missing, blank, still {@code TODO} or an unresolvable
  * placeholder ({@link #missingCredential()}); then no Spring context starts and Salesforce is never called. A skipped
- * run is not Tier 2B evidence. Logs name test data only, never a credential.
+ * run is not Tier 2B evidence. Logs name the generated test Contact, its {@code Id} and counts only, never a
+ * credential. A cleanup failure is logged at WARN by the type identifiers of the exception and its causes, a failed
+ * Salesforce delete by its {@code StatusCode} names; no exception message, cause or suppressed exception, Salesforce
+ * error message or field, and no throwable reaches the log, because JDBC and vendor text can repeat SQL values,
+ * contact fields or tokens.
  */
 @ExtendWith(SalesforceToMySQLDBUsingBatchProcessingIT.LiveCredentialsGate.class)
 @SpringBootTest(classes = SalesforceToMySQLDBUsingBatchProcessingApplication.class,
@@ -129,6 +136,17 @@ class SalesforceToMySQLDBUsingBatchProcessingIT {
     private static final List<String> REQUIRED_KEYS = List.of("sfdc.username", "sfdc.password", "sfdc.securityToken");
 
     private static final String TODO = "TODO";
+
+    /** Most classes {@link #failureTypes(Throwable)} names: the failure and its first four causes. */
+    private static final int FAILURE_TYPE_LIMIT = 5;
+
+    private static final String CAUSE_SEPARATOR = " <- ";
+
+    private static final String MORE_CAUSES = "...";
+
+    private static final String CIRCULAR_CAUSE = "[circular]";
+
+    private static final String NULL_LOG_TOKEN = "(null)";
 
     /** The original {@code selectContactFromDB} query, its value bound instead of concatenated. */
     private static final String SELECT_BY_LAST_NAME =
@@ -310,7 +328,8 @@ class SalesforceToMySQLDBUsingBatchProcessingIT {
             int deleted = jdbcTemplate.update(DELETE_BY_LAST_NAME, contact.get(LAST_NAME));
             LOG.info("deleteContactFromDB result: {}", deleted);
         } catch (RuntimeException e) {
-            LOG.warn("Could not delete the contact row with last_name {}", contact.get(LAST_NAME), e);
+            LOG.warn("Could not delete the contact row with last_name {}: {}", contact.get(LAST_NAME),
+                    failureTypes(e));
         }
     }
 
@@ -325,7 +344,7 @@ class SalesforceToMySQLDBUsingBatchProcessingIT {
                         result == null ? "no delete result" : errors(result.getErrors()));
             }
         } catch (Exception e) {
-            LOG.warn("Could not delete Salesforce Contact {}", contactId, e);
+            LOG.warn("Could not delete Salesforce Contact {}: {}", contactId, failureTypes(e));
         }
     }
 
@@ -338,7 +357,8 @@ class SalesforceToMySQLDBUsingBatchProcessingIT {
             Object id = rows.isEmpty() ? null : rows.get(0).get(ID);
             return id == null ? null : id.toString();
         } catch (Exception e) {
-            LOG.warn("Could not look up the Salesforce Contact with LastName {} for deletion", lastName, e);
+            LOG.warn("Could not look up the Salesforce Contact with LastName {} for deletion: {}", lastName,
+                    failureTypes(e));
             return null;
         }
     }
@@ -357,12 +377,46 @@ class SalesforceToMySQLDBUsingBatchProcessingIT {
         return false;
     }
 
+    /**
+     * Names the type identifiers of {@code failure} without any of its text: its class name, then the class name of
+     * each cause, separated by {@code " <- "}. At most {@value #FAILURE_TYPE_LIMIT} classes are named, a longer chain
+     * ending in {@code ...}, and a cause already named ends the walk as {@code [circular]}. Messages, causes' messages
+     * and suppressed exceptions are never read: vendor and JDBC text can repeat SQL values, contact fields or tokens.
+     */
+    private static String failureTypes(Throwable failure) {
+        if (failure == null) {
+            return NULL_LOG_TOKEN;
+        }
+        StringBuilder out = new StringBuilder(failure.getClass().getName());
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(failure);
+        for (Throwable cause = failure.getCause(); cause != null; cause = cause.getCause()) {
+            out.append(CAUSE_SEPARATOR);
+            if (named.size() == FAILURE_TYPE_LIMIT) {
+                out.append(MORE_CAUSES);
+                break;
+            }
+            if (!named.add(cause)) {
+                out.append(CIRCULAR_CAUSE);
+                break;
+            }
+            out.append(cause.getClass().getName());
+        }
+        return out.toString();
+    }
+
+    /**
+     * Names the {@code StatusCode} of each Salesforce error, separated by {@code "; "}, or {@code no error detail}
+     * when there is none. An error's message and fields are never read, because Salesforce repeats submitted values
+     * in them.
+     */
     private static String errors(com.sforce.soap.partner.Error[] errors) {
         if (errors == null || errors.length == 0) {
             return "no error detail";
         }
         return Arrays.stream(errors)
-                .map(error -> error.getStatusCode() + " " + error.getMessage())
+                .map(error -> error == null || error.getStatusCode() == null ? NULL_LOG_TOKEN
+                        : error.getStatusCode().name())
                 .collect(Collectors.joining("; "));
     }
 

@@ -10,10 +10,14 @@ package com.mulesoft.examples.importing_an_email_attachment_using_the_imap_conne
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
+import java.time.Duration;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -65,6 +69,12 @@ import com.mulesoft.examples.importing_an_email_attachment_using_the_imap_connec
  * LOGIN, SELECT or a FETCH ends that step with a timeout, handled as any other failure of it, instead of holding the
  * synchronized poll and every later one; no operation is retried.
  *
+ * <p>A null or blank {@code imap.host}, {@code imap.user} or {@code imap.password} leaves the mailbox unconfigured:
+ * every poll is skipped before a {@link Session} is opened, so no connection is attempted. The first skipped poll
+ * logs one WARN naming each missing key with its environment variable, for example
+ * {@code imap.host (IMAP_HOST) is not configured; IMAPS polling is skipped}, and every skipped poll logs a DEBUG
+ * line; neither carries a configured value.
+ *
  * <p>The poller's own diagnostics carry a fixed description of the failed operation, the folder name, host, port or
  * message number, and the class names along the failure's cause chain; never an exception message, a cause's
  * message, a stack trace, the user, the password or message content, because mail authentication, MIME parsing and
@@ -77,6 +87,12 @@ public class ImapMailPoller {
     private static final Logger log = LoggerFactory.getLogger(ImapMailPoller.class);
 
     private static final String PROTOCOL = "imaps";
+
+    /** The key of the poll frequency, the original connector's {@code checkFrequency}. */
+    static final String FREQUENCY_KEY = "imap.check-frequency";
+
+    /** The poll frequency in ms (default 100), as both the schedule of {@link #poll()} and the constructor read it. */
+    static final String FREQUENCY = "${" + FREQUENCY_KEY + ":100}";
 
     /** The most exception types one diagnostic names; a longer cause chain is cut off. */
     private static final int MAX_EXCEPTION_TYPES = 10;
@@ -101,15 +117,30 @@ public class ImapMailPoller {
     private final Map<String, String> sessionProperties;
 
     /**
+     * The keys of the mailbox settings that are null or blank, in the order host, user, password; empty when all three
+     * are set. Fixed at construction, as the settings are.
+     */
+    private final List<String> missingSettings;
+
+    /**
+     * Whether the one-time WARN about missing mailbox settings has been logged. Read and written only inside
+     * {@link #pollOnce()}, so this poller's monitor guards it.
+     */
+    private boolean missingSettingsWarned;
+
+    /**
      * @param attachmentImportService the rest of the original flow, run once per received message
      * @param environment             source of {@code imap.properties}, extra jakarta.mail session properties such as
      *                                trust settings; an entry for {@code mail.imaps.connectiontimeout},
      *                                {@code mail.imaps.timeout} or {@code mail.imaps.writetimeout} replaces the
      *                                matching deadline below
-     * @param host                    the original endpoint's {@code host}, from {@code imap.host}
+     * @param host                    the original endpoint's {@code host}, from {@code imap.host}; null or blank skips
+     *                                every poll
      * @param port                    the original endpoint's {@code port} (993, implicit TLS), from {@code imap.port}
-     * @param user                    the original endpoint's {@code user}, from {@code imap.user}
-     * @param password                the original endpoint's {@code password}, from {@code imap.password}
+     * @param user                    the original endpoint's {@code user}, from {@code imap.user}; null or blank skips
+     *                                every poll
+     * @param password                the original endpoint's {@code password}, from {@code imap.password}; null or
+     *                                blank skips every poll; never logged
      * @param folderName              the polled folder, from {@code imap.folder}; Mule's default {@code mailboxFolder}
      * @param connectTimeout          ms allowed for opening the TCP connection, from {@code imap.connect-timeout};
      *                                10000 by default, the original endpoint's {@code responseTimeout}
@@ -117,10 +148,14 @@ public class ImapMailPoller {
      *                                reply), from {@code imap.read-timeout}; 10000 by default
      * @param writeTimeout            ms allowed for each socket write, from {@code imap.write-timeout}; 10000 by
      *                                default
+     * @param checkFrequency          the poll frequency the schedule of {@link #poll()} reads, from
+     *                                {@code imap.check-frequency}; checked here only, never stored
      * @throws IllegalArgumentException naming the offending key, when one of the three deadlines or an
      *                                  {@code imap.properties} entry replacing one is not a positive decimal whole
-     *                                  number within int range (0 or a negative value would mean no deadline);
-     *                                  the poller is then never created, so it never polls
+     *                                  number within int range (0 or a negative value would mean no deadline), and
+     *                                  naming the key and the value when {@code imap.check-frequency} is not a
+     *                                  positive frequency ({@link #requirePositiveFrequency(String, String)}); the
+     *                                  poller is then never created, so it never polls
      */
     public ImapMailPoller(AttachmentImportService attachmentImportService, Environment environment,
             @Value("${imap.host:}") String host, @Value("${imap.port:993}") int port,
@@ -128,12 +163,15 @@ public class ImapMailPoller {
             @Value("${imap.folder:INBOX}") String folderName,
             @Value("${imap.connect-timeout:10000}") String connectTimeout,
             @Value("${imap.read-timeout:10000}") String readTimeout,
-            @Value("${imap.write-timeout:10000}") String writeTimeout) {
+            @Value("${imap.write-timeout:10000}") String writeTimeout,
+            @Value(FREQUENCY) String checkFrequency) {
+        requirePositiveFrequency(FREQUENCY_KEY, checkFrequency);
         this.attachmentImportService = attachmentImportService;
         this.host = host;
         this.port = port;
         this.user = user;
         this.password = password;
+        this.missingSettings = missingSettings(host, user, password);
         this.folderName = folderName;
         this.connectTimeout = positiveMillis("imap.connect-timeout", connectTimeout);
         this.readTimeout = positiveMillis("imap.read-timeout", readTimeout);
@@ -154,7 +192,7 @@ public class ImapMailPoller {
      * The scheduled poll: a fixed delay between the end of one poll and the start of the next, as the original
      * connector's {@code checkFrequency} gave its polling receiver.
      */
-    @Scheduled(fixedDelayString = "${imap.check-frequency:100}", initialDelayString = "${imap.initial-delay:0}")
+    @Scheduled(fixedDelayString = FREQUENCY, initialDelayString = "${imap.initial-delay:0}")
     public void poll() {
         pollOnce();
     }
@@ -163,10 +201,27 @@ public class ImapMailPoller {
      * Runs one poll of the mailbox. Synchronized so the scheduled poll and a direct call never overlap. Never
      * throws: connection, folder and message failures are logged.
      *
+     * <p>A null or blank {@code imap.host}, {@code imap.user} or {@code imap.password} skips the poll without opening
+     * a session. The first skipped poll of this poller logs one WARN naming every missing key with its environment
+     * variable, so the misconfiguration shows at the default level; every skipped poll, the first included, also logs
+     * a DEBUG line.
+     *
      * @return the number of messages handed to {@link AttachmentImportService#importAttachments(Map)}, whether or
-     *         not the import succeeded
+     *         not the import succeeded; {@code 0} when {@code imap.host}, {@code imap.user} or {@code imap.password}
+     *         is null or blank, or the folder cannot be opened or listed
      */
     public synchronized int pollOnce() {
+        if (!missingSettings.isEmpty()) {
+            if (!missingSettingsWarned) {
+                missingSettingsWarned = true;
+                log.warn("{}; IMAPS polling is skipped", notConfigured(missingSettings, true));
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("{}; IMAPS poll skipped", notConfigured(missingSettings, false));
+            }
+            return 0;
+        }
+
         Store store = null;
         Folder folder = null;
         try {
@@ -221,6 +276,42 @@ public class ImapMailPoller {
     }
 
     /**
+     * The keys of the mailbox settings a poll cannot do without that are null or blank, in the order host, user,
+     * password. Angus Mail would otherwise connect to the loopback host for a blank host, and log in with a blank
+     * user or password, or with a Jakarta Mail default name such as the JVM user's for a null user, only to be
+     * refused.
+     */
+    private static List<String> missingSettings(String host, String user, String password) {
+        List<String> missing = new ArrayList<>();
+        if (host == null || host.isBlank()) {
+            missing.add("imap.host");
+        }
+        if (user == null || user.isBlank()) {
+            missing.add("imap.user");
+        }
+        if (password == null || password.isBlank()) {
+            missing.add("imap.password");
+        }
+        return List.copyOf(missing);
+    }
+
+    /**
+     * States which settings are missing without any of their values, for example
+     * {@code imap.user (IMAP_USER), imap.password (IMAP_PASSWORD) are not configured}: every key, followed by its
+     * environment variable when {@code withVariables}, joined with {@code ", "}. The variable is the key upper-cased
+     * with dots and hyphens as underscores, the name its {@code application.yml} placeholder reads.
+     */
+    private static String notConfigured(List<String> keys, boolean withVariables) {
+        StringJoiner names = new StringJoiner(", ");
+        for (String key : keys) {
+            names.add(withVariables
+                    ? key + " (" + key.toUpperCase(Locale.ROOT).replace('.', '_').replace('-', '_') + ")"
+                    : key);
+        }
+        return names + (keys.size() == 1 ? " is not configured" : " are not configured");
+    }
+
+    /**
      * Reads a socket deadline the way Angus Mail will apply it, refusing every value it would apply as no deadline
      * (0, a negative value, or text it cannot parse, which it silently reads as -1) or read in another notation.
      *
@@ -247,6 +338,46 @@ public class ImapMailPoller {
             throw new IllegalArgumentException(refusal);
         }
         return millis;
+    }
+
+    /**
+     * Refuses a poll frequency the schedule of {@link #poll()} cannot run, so that start-up fails with a message
+     * naming the key and the value rather than with the message-less {@link IllegalArgumentException} that
+     * {@link java.util.concurrent.ScheduledThreadPoolExecutor} throws for a period that is not positive. The value is
+     * read as Spring 6.1's {@code @Scheduled} reads {@code fixedDelayString}: an ISO-8601 duration when its first or
+     * second character is {@code P} or {@code p}, otherwise a whole number of milliseconds, without trimming. On
+     * Spring 6.1.15 {@code PT0.0001S}, {@code 1}, {@code P1D} and {@code pt1s} are scheduled, while {@code 0},
+     * {@code -5}, {@code PT0S} and {@code PT-1S} are refused by the executor with that message-less exception.
+     *
+     * @param key   the configuration key the value came from, named in the refusal
+     * @param value the configured frequency
+     * @throws IllegalArgumentException naming the key and the value, when the value is neither a positive number of
+     *                                  milliseconds nor a positive ISO-8601 duration
+     */
+    static void requirePositiveFrequency(String key, String value) {
+        Duration period;
+        try {
+            period = isDurationString(value) ? Duration.parse(value) : Duration.ofMillis(Long.parseLong(value));
+        } catch (NumberFormatException | DateTimeParseException e) {
+            throw invalidFrequency(key, value);
+        }
+        if (period.isZero() || period.isNegative()) {
+            throw invalidFrequency(key, value);
+        }
+    }
+
+    /** Whether Spring 6.1's {@code @Scheduled} reads the value as an ISO-8601 duration rather than as milliseconds. */
+    private static boolean isDurationString(String value) {
+        return value != null && value.length() > 1 && (isP(value.charAt(0)) || isP(value.charAt(1)));
+    }
+
+    private static boolean isP(char c) {
+        return c == 'P' || c == 'p';
+    }
+
+    private static IllegalArgumentException invalidFrequency(String key, String value) {
+        return new IllegalArgumentException("Invalid " + key + " value \"" + value + "\": the polling frequency must "
+                + "be a positive number of milliseconds or a positive ISO-8601 duration");
     }
 
     /**

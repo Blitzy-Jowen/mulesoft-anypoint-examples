@@ -2,6 +2,7 @@ package com.mulesoft.examples.xml_only_soap_webservice.controller;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -9,12 +10,14 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.URLDecoder;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -26,16 +29,29 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.transform.Source;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.AnnotatedGenericBeanDefinition;
 import org.springframework.beans.factory.support.SimpleBeanDefinitionRegistry;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.AnnotationBeanNameGenerator;
 import org.springframework.context.annotation.Bean;
@@ -43,6 +59,10 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.core.annotation.AnnotationUtils;
 import org.springframework.stereotype.Component;
 import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.NestedTestConfiguration;
+import org.springframework.test.context.TestPropertySource;
+import org.springframework.ws.client.core.WebServiceTemplate;
+import org.springframework.ws.server.endpoint.adapter.DefaultMethodEndpointAdapter;
 import org.springframework.ws.server.endpoint.annotation.Endpoint;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -68,6 +88,7 @@ import com.mulesoft.examples.xml_only_soap_webservice.support.HttpTestClient.Res
  * The admission chain calls the PatientService and EHRService mocks of the same process over HTTP, exactly as the
  * original's {@code http:request}s targeted its own listener; nothing is mocked. The only substitution is the clock:
  * {@link FixedClockConfig} makes every mock {@code now} equal {@link #NOW}, so the {@code Episode} values are exact.
+ * The nested {@link UnderRootTrace} run covers the logger levels {@code application.yml} pins, in a context of its own.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -154,6 +175,26 @@ class AdmissionServiceEndpointTest {
         assertLeaf(billFields.get(1), null, null, "initialStateEstimate", "5");
         assertLeaf(billFields.get(2), null, null, "runningTotal", "500");
         assertLeaf(billFields.get(3), null, null, "status", "ADMITTED");
+    }
+
+    /**
+     * The listener was a {@code cxf:proxy-service}, from which Mule 3.8 removed CXF's
+     * {@code MustUnderstandInterceptor}, so a {@code mustUnderstand="1"} header block nothing understands is not
+     * checked: the request is processed and answered exactly as it is without the block, never with a
+     * {@code soap:MustUnderstand} fault.
+     */
+    @Test
+    void mustUnderstandHeaderBlockIsNotCheckedAndRequestIsProcessed() {
+        String plain = new String(message(), UTF_8);
+        String withBlock = plain.replace("<soapenv:Header/>",
+                "<soapenv:Header><x:Sec xmlns:x=\"urn:x\" soapenv:mustUnderstand=\"1\"/></soapenv:Header>");
+        assertThat(withBlock).as("message.xml with the header block").isNotEqualTo(plain);
+
+        Response response = postXml(P, withBlock.getBytes(UTF_8));
+
+        assertQName(assertSoapResponse(response), NS0, "ns0", "admitSubjectResponse");
+        assertThat(response.bodyAsString()).as("body of %s", response).doesNotContain("Fault")
+                .isEqualTo(postXml(P, message()).bodyAsString());
     }
 
     /**
@@ -247,6 +288,135 @@ class AdmissionServiceEndpointTest {
         assertThat(targetNamespaces).as("schema target namespaces").contains(NS0, NS1);
     }
 
+    /** The admission of {@link LoggedAdmission} under {@code logging.level.root=TRACE}. */
+    @Nested
+    @TestPropertySource(properties = "logging.level.root=TRACE")
+    class UnderRootTrace extends LoggedAdmission {
+    }
+
+    /**
+     * Tests the logger levels {@code application.yml} pins, which keep the patient out of the log under a root
+     * {@code TRACE} level: {@code Hospital_Admissions_SOA.xml} and {@code mocks.xml} declare no logger.
+     *
+     * <p>The whole application runs on a random port in a context of its own, with the real clock. The original
+     * test's {@code admitSubject} is posted to {@link WebServiceConfig#ADMISSION_PATH}, which upserts the patient at
+     * the PatientService mock and creates the episode at the EHRService mock over HTTP, so every client and server
+     * {@code MessageTracing} logger of the chain is reached. The exchange is asserted on the wire, then its own log
+     * events are asserted to hold the unpinned {@code DefaultMethodEndpointAdapter} {@code TRACE} invocation line and
+     * the unpinned {@code WebServiceTemplate} {@code DEBUG} connection line to each mock, which prove the capture sees
+     * those levels, and the console output is asserted to hold none of the {@code Subject}'s values. The run restores
+     * the logger levels it found and closes its context, so later test classes do not run at {@code TRACE}.
+     */
+    @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    @NestedTestConfiguration(NestedTestConfiguration.EnclosingConfiguration.OVERRIDE)
+    @DirtiesContext
+    @ExtendWith(OutputCaptureExtension.class)
+    abstract static class LoggedAdmission {
+
+        /** The {@code Subject} values of {@code message.xml}, which must stay out of the log. */
+        static final List<String> PATIENT_DATA =
+                List.of("<nationalId>1234", "Nial", "Darbey", "Buenos Aires", "1970-08-07");
+
+        /** How long lines written after the reply get to arrive before the output is scanned for patient data. */
+        private static final Duration SETTLE = Duration.ofMillis(300);
+
+        /** Most offending lines a failure reports; the capture holds the whole run, so it is never dumped. */
+        private static final int REPORTED_LINES = 20;
+
+        /** The logger levels set before this run's context started, by logger name. */
+        private static final Map<String, Level> LEVELS_BEFORE = new HashMap<>();
+
+        @LocalServerPort
+        int port;
+
+        @BeforeAll
+        static void recordLevels() {
+            LEVELS_BEFORE.clear();
+            for (Logger logger : loggerContext().getLoggerList()) {
+                if (logger.getLevel() != null) {
+                    LEVELS_BEFORE.put(logger.getName(), logger.getLevel());
+                }
+            }
+        }
+
+        @AfterAll
+        static void restoreLevels() {
+            for (Logger logger : loggerContext().getLoggerList()) {
+                Level before = LEVELS_BEFORE.get(logger.getName());
+                // The root logger always has a level and cannot be given none.
+                if (before != null || !org.slf4j.Logger.ROOT_LOGGER_NAME.equals(logger.getName())) {
+                    logger.setLevel(before);
+                }
+            }
+        }
+
+        @Test
+        void admissionAnswersWhileTheLogHoldsNoPatientData(CapturedOutput output) {
+            byte[] message = message();
+            assertThat(new String(message, UTF_8)).contains(PATIENT_DATA);
+            Logger root = loggerContext().getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.setContext(loggerContext());
+            events.start();
+            root.addAppender(events);
+            Response response;
+            try {
+                response = HttpTestClient.localhost(port).send("POST", P,
+                        Map.of("Content-Type", XML_CONTENT_TYPE), message);
+            } finally {
+                root.detachAppender(events);
+                events.stop();
+            }
+            // The appender appends under its own lock, so reading under it sees every event the request wrote.
+            List<ILoggingEvent> logged;
+            synchronized (events) {
+                logged = List.copyOf(events.list);
+            }
+
+            assertQName(assertSoapResponse(response), NS0, "ns0", "admitSubjectResponse");
+
+            ILoggingEvent invocation = logged.stream()
+                    .filter(event -> event.getLevel() == Level.TRACE
+                            && DefaultMethodEndpointAdapter.class.getName().equals(event.getLoggerName())
+                            && event.getFormattedMessage().startsWith("Invoking [")
+                            && event.getFormattedMessage().contains(AdmissionServiceEndpoint.class.getName()))
+                    .findFirst()
+                    .orElse(null);
+            assertThat(invocation).as("the unpinned DefaultMethodEndpointAdapter TRACE line of the admission")
+                    .isNotNull();
+            for (String mockPath : List.of(WebServiceConfig.PATIENT_PATH, WebServiceConfig.EHR_PATH)) {
+                assertThat(logged).as("the unpinned WebServiceTemplate DEBUG connection line to %s", mockPath)
+                        .anyMatch(event -> event.getLevel() == Level.DEBUG
+                                && WebServiceTemplate.class.getName().equals(event.getLoggerName())
+                                && event.getFormattedMessage().startsWith("Opening [")
+                                && event.getFormattedMessage().endsWith(mockPath + "]"));
+            }
+            assertThat(output.getAll()).as("the console capture holds the TRACE line of the admission")
+                    .contains(invocation.getFormattedMessage());
+            // Lines written after the reply get SETTLE to arrive; the capture only grows, so one scan covers the wait.
+            await().pollDelay(SETTLE).until(() -> true);
+            assertThat(linesHoldingPatientData(output.getAll())).as("console lines holding the patient's Subject")
+                    .isEmpty();
+        }
+
+        /** The distinct lines of {@code output} holding a {@code Subject} value, at most {@link #REPORTED_LINES}. */
+        private static List<String> linesHoldingPatientData(String output) {
+            // The capture of a TRACE run is large, so it is split into lines only when it holds a value at all.
+            if (PATIENT_DATA.stream().noneMatch(output::contains)) {
+                return List.of();
+            }
+            return output.lines()
+                    .filter(line -> PATIENT_DATA.stream().anyMatch(line::contains))
+                    .distinct()
+                    .limit(REPORTED_LINES)
+                    .toList();
+        }
+
+        private static LoggerContext loggerContext() {
+            return (LoggerContext) LoggerFactory.getILoggerFactory();
+        }
+    }
+
     /**
      * {@link WebServiceConfig}'s listener-path mapping looks this endpoint up by the bean name
      * {@value WebServiceConfig#ADMISSION_ENDPOINT}. Spring WS does not alias {@code @Endpoint}'s value to
@@ -320,7 +490,7 @@ class AdmissionServiceEndpointTest {
     private static void assertNoListener(Response response, String path) {
         assertThat(response.status()).as("%s", response).isEqualTo(404);
         assertThat(response.reason()).as("%s", response).isEqualTo("Not Found");
-        assertThat(contentType(response)).startsWith("text/plain");
+        assertThat(contentType(response)).isEqualTo("text/plain");
         assertThat(response.body()).as("body bytes of %s", response)
                 .isEqualTo(("No listener for endpoint: " + path).getBytes(UTF_8));
     }

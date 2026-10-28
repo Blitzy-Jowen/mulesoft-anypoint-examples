@@ -11,10 +11,10 @@ Order data in JSON is posted to an HTTP endpoint. A Ruby transformer applies the
 | Path | Methods | Host | Port | Response | Source |
 |---|---|---|---|---|---|
 | `/customBusinessEvents` | any, `HEAD`, `OPTIONS` and `TRACE` included: the listener declares no `allowedMethods` | `0.0.0.0` | `http.port`, default `8081` | `200 OK`, body the discounted unit price as text (`8.5` for `message.json`), with its `Content-Length`; `Content-Type` as described below; a `HEAD` reply carries the headers without the body | `custom-business-events.xml:3-5` |
-| any other path (`/`, `/customBusinessEvents/x` and `/error` included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
+| any other path (`/`, `/customBusinessEvents/x`, `/error` and `/customBusinessEvents` with `;` segment parameters, such as `/customBusinessEvents;x=1`, included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
 | `/customBusinessEvents`, when the flow fails | any | `0.0.0.0` | `http.port` | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }`, logged at ERROR on one line (SC-1, AAP 0.4.7) | platform default for an unhandled exception |
 
-- Only the exact path `/customBusinessEvents` is served. SC-1's 405 (`Method not allowed for endpoint: <path>`) cannot occur, because the listener accepts every method: a `GET` or `PUT` carrying the JSON body is processed exactly as a `POST`.
+- Only the exact path `/customBusinessEvents` is served. A path carrying `;` segment parameters (`/customBusinessEvents;x=1`, `/customBusinessEvents;jsessionid=ABC`) is not that path: it gets the no-listener 404 naming it with its parameters, and the flow does not run, so no business event is tracked. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). SC-1's 405 (`Method not allowed for endpoint: <path>`) cannot occur, because the listener accepts every method: a `GET` or `PUT` carrying the JSON body is processed exactly as a `POST`.
 - The request's `Content-Type` decides the encoding and the reply's `Content-Type`, as the Mule message carried the inbound media type and encoding through transformers that declare none of their own (`controller/BusinessEventController` Javadoc). The body is decoded with the request's `charset`, or UTF-8 when it declares none, and the result is encoded with it. The reply's `Content-Type` is the request's type and subtype in lower case followed by `; charset=<canonical charset name>`: `application/json; charset=UTF-8` for `Content-Type: application/json`, `application/json; charset=ISO-8859-1` for `charset=latin1`. A request without `Content-Type`, or with `*/*`, is answered without one. `Accept` is never consulted, so the endpoint never answers 406 or 415.
 - A CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) runs the flow like any other `OPTIONS` request and gets no `Access-Control-*` or `Vary` header. The original listener applied no CORS policy (`config/PreflightDispatchConfig`).
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
@@ -85,7 +85,7 @@ When a captured fixture shows different bytes for any of these, the fixture gove
 - the `Content-Type` of the 200 reply, echoed from the request with its charset, and absent for a request without one;
 - the string-price result, `200` with an empty body;
 - the unknown-item result. The original JRuby `$discount` is a Ruby global that only a matching `when` assigns. The conversion treats it as not surviving between requests (JRuby JSR-223 global-variable behaviour), so an unknown item always fails, whatever was requested before (`PriceDiscountServiceTest.eachRequestStartsWithoutADiscountWhateverWasRequestedBefore`). `post-unknown-item` is therefore captured first on a freshly deployed original. If a captured fixture shows the previous request's discount reused, the fixture governs and `service/PriceDiscountService` changes;
-- the `404` text, the reply to a form-encoded body and to an `OPTIONS` request without a body.
+- the `404` text, the `404` for a path carrying `;` segment parameters, the reply to a form-encoded body and to an `OPTIONS` request without a body.
 
 ## Configuration keys
 
@@ -127,7 +127,7 @@ Every key of `src/main/resources/application.yml`, with the Java type its value 
 | `object-to-string-transformer` (line 23) | `String.valueOf` |
 | `tracking:transaction id="custom-business-event-example-transaction"` (line 24) | `BusinessEventTracker.setTransactionId` with `PriceDiscountService.TRANSACTION_ID` |
 | default exception strategy | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| listener semantics (no CORS policy, request charset from `Content-Type` alone) | `config/PreflightDispatchConfig`, `config/RequestCharsetFilter` |
+| listener semantics (no CORS policy, request charset from `Content-Type` alone, the raw path, query removed, matched literally with its `;` segment parameters) | `config/PreflightDispatchConfig`, `config/RequestCharsetFilter`, `config/ListenerPathConfig` |
 | `mule-deploy.properties` (loads `custom-business-events.xml`) | `TrackACustomBusinessEventApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` (empty) | `src/main/resources/application.yml` |
 | `TrackACustomBusinessEventIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`) | `TrackACustomBusinessEventTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)` with ST-1 `support/HttpTestClient`) |
@@ -138,6 +138,7 @@ Shared components (AAP 0.4.4), each copied with only the `package` line changed:
 - ST-1 `support/HttpTestClient`, from `rest-api-with-apikit-java`.
 - ST-2 `FixtureParityTest`, from `hello-world-java`; `src/test/resources/fixtures/SCENARIOS.md` copies that project's format with this project's rows.
 - `config/PreflightDispatchConfig` and `config/PreflightDispatchConfigTest` are the classes `hello-world-java` carries.
+- `config/ListenerPathConfig` is the class `hello-world-java` carries.
 
 ## Behaviours stubbed or externalized
 
@@ -180,12 +181,12 @@ Date: <current date>
 | Test class | What it asserts |
 |---|---|
 | `TrackACustomBusinessEventTest` | the ported `TrackACustomBusinessEventIT` (`track-a-custom-business-event/src/test/java/org/mule/examples/TrackACustomBusinessEventIT.java:52-62`): `POST /customBusinessEvents` with `message.json` returns a non-empty body equal to `8.5` |
-| `controller/BusinessEventControllerTest` | on the wire through ST-1: jeans → `8.0` and jackets → `7.0` (shoes → `8.5` in every other happy path), each `HTTP/1.1 200 OK` with its `Content-Length`; the reply's `Content-Type` for each request media type and charset (`latin1` answered as `ISO-8859-1`), and none for an absent or `*/*` `Content-Type`; the same reply for `PUT`, `GET`, `DELETE`, `PATCH` and `OPTIONS`, with no `Allow` header; `HEAD` with headers only; 500 `application/json` for an unknown item, a price nested 20000 deep, malformed JSON and five unparseable charsets; 404 `text/plain` `No listener for endpoint: <path>` for `/`, `/customBusinessEvents/x`, `/customBusinessEventsX` and `/unknown`, whatever charset the request declares |
+| `controller/BusinessEventControllerTest` | on the wire through ST-1: jeans → `8.0` and jackets → `7.0` (shoes → `8.5` in every other happy path), each `HTTP/1.1 200 OK` with its `Content-Length`; the reply's `Content-Type` for each request media type and charset (`latin1` answered as `ISO-8859-1`), and none for an absent or `*/*` `Content-Type`; the same reply for `PUT`, `GET`, `DELETE`, `PATCH` and `OPTIONS`, with no `Allow` header; `HEAD` with headers only; 500 `application/json` for an unknown item, a price nested 20000 deep, malformed JSON and five unparseable charsets; 404 `text/plain` `No listener for endpoint: <path>` for `/`, `/customBusinessEvents/x`, `/customBusinessEventsX`, `/unknown`, `/customBusinessEvents;x=1` and `/customBusinessEvents;jsessionid=ABC`, whatever charset the request declares; no business event or transaction id logged, in the captured console output, for a path with `;` segment parameters, while the same request to `/customBusinessEvents` logs its `Price` event |
 | `service/PriceDiscountServiceTest` | Mockito with a mocked tracker: every discount (`8.5`, `8.0`, `7.0`, decimal, long and big-integer prices, the string price → empty text), charset decoding, deep nesting and long values; every script failure with its JRuby text and the event metadata logged before it; every unreadable body (`Payload is not valid JSON`, `JSON payload is not an object`) raised before the event, with messages that quote no request bytes; the order and count of tracker calls; no discount carried from one request to the next |
 | `service/BusinessEventTrackerTest` | the MDC keys `transactionId` and `businessEvent`; a random UUID per transaction; the `Price` INFO line `Business event Price {item name=shoes, item units=2, item price per unit=10}` in its transaction context; `setTransactionId` replacing and logging the id; `endTransaction` clearing it; line terminators escaped in every logged value |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
-| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight carrying `message.json` gets exactly the plain `OPTIONS` reply (`200 8.5`, no `Access-Control-*` or `Vary`); a pre-flight to `/unknown` gets the no-listener 404 |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight carrying `message.json` gets exactly the plain `OPTIONS` reply (`200 8.5`, no `Access-Control-*` or `Vary`); a pre-flight to `/unknown` or `/customBusinessEvents;x=1` gets the no-listener 404 |
 | `config/RequestCharsetFilterTest` | a request whose charset is illegal, unsupported or unreadable continues as a view that declares none, its `Content-Type` untouched; every other request continues unchanged |
 | `config/RequestLoggingLevelsTest` | under `logging.level.root=TRACE`, no header, credential, query string, `Content-Type` or body a caller sends reaches the log, while the `Price` event is still logged at INFO with its tracking MDC |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped until Tier 2A fixtures exist |
@@ -221,9 +222,9 @@ This project's scenarios, exactly as `SCENARIOS.md` names them, all `http`:
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 231 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 231 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 129 of 129 lines of `service/PriceDiscountService` (with its nested `OpenContainer`) and `service/BusinessEventTracker` (the project has no `mapper` package). Total project LINE coverage: 98.3% (345 of 351 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 237 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 237 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 129 of 129 lines of `service/PriceDiscountService` (with its nested `OpenContainer`) and `service/BusinessEventTracker` (the project has no `mapper` package). Total project LINE coverage: 98.3% (354 of 360 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=9`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

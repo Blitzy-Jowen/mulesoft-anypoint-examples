@@ -23,6 +23,7 @@ import java.util.stream.Stream;
 import jakarta.servlet.AsyncEvent;
 import jakarta.servlet.AsyncListener;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -504,6 +505,33 @@ class BayeuxLongPollingControllerTest {
         assertThat(response.getContentAsString(UTF_8)).isEqualTo("[]");
     }
 
+    @ParameterizedTest(name = "batch followed by \"{0}\"")
+    @ValueSource(strings = {" {\"ignored\":true}", " []", " garbage", " ]", " }"})
+    void batchFollowedByFurtherInputIsRefusedWholeWithoutSideEffects(String suffix) throws Exception {
+        HandshakeCountingBroker counting = replaceBroker(new HandshakeCountingBroker(brokerEnvironment()));
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        assertThat(mapper.isEnabled(DeserializationFeature.FAIL_ON_TRAILING_TOKENS))
+                .as("the injected mapper is left unchanged").isFalse();
+        String clientId = handshake(mvc);
+        exchange(mvc, batch(subscribe(clientId, OUT)));
+        String valid = batch(publish(clientId, OUT, mapper.getNodeFactory().textNode("published")),
+                envelope(HANDSHAKE_CHANNEL, null));
+
+        MockHttpServletResponse response = finish(mvc, start(mvc, valid + suffix));
+
+        assertThat(response.getStatus()).isEqualTo(400);
+        assertContentType(response, JSON_TYPE);
+        assertThat(response.getContentAsString(UTF_8)).isEqualTo("[]");
+        assertThat(broker.drain(clientId)).as("the refused publication reached no subscriber").isEmpty();
+        assertThat(counting.handshakes).as("only the setup's handshake reached the broker").hasValue(1);
+
+        // The batch alone is valid, so the suffix alone made the request malformed.
+        ArrayNode accepted = exchange(mvc, valid);
+        assertThat(find(accepted, OUT).path("successful").asBoolean()).as(accepted.toString()).isTrue();
+        assertThat(broker.drain(clientId)).extracting(AjaxChannelBroker.Delivery::data).containsExactly("published");
+        assertThat(counting.handshakes).hasValue(2);
+    }
+
     @Test
     void singleMessageObjectIsABatchOfOneAndItsIdIsEchoedUnchanged() throws Exception {
         JsonNode reply = single(exchange(mvc(SHORT_TIMEOUT_MS), "{\"channel\":\"/meta/handshake\",\"id\":7}"));
@@ -859,6 +887,22 @@ class BayeuxLongPollingControllerTest {
         public boolean awaitDeliveries(String clientId, long timeoutMs) throws InterruptedException {
             release.await(LONG_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             return super.awaitDeliveries(clientId, timeoutMs);
+        }
+    }
+
+    /** A broker that counts the clients registered through {@link AjaxChannelBroker#handshake()}. */
+    static final class HandshakeCountingBroker extends AjaxChannelBroker {
+
+        final AtomicInteger handshakes = new AtomicInteger();
+
+        HandshakeCountingBroker(MockEnvironment environment) {
+            super(environment);
+        }
+
+        @Override
+        public String handshake() {
+            handshakes.incrementAndGet();
+            return super.handshake();
         }
     }
 }

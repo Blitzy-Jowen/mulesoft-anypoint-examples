@@ -87,6 +87,27 @@ public record OAuthProviderProperties(
         owner = owner == null ? new Owner("", "", List.of()) : owner;
     }
 
+    /** Renders every setting in record form with the client secret left out, so the settings can be logged. */
+    @Override
+    public String toString() {
+        return "OAuthProviderProperties[providerName=" + providerName + ", clientId=" + clientId
+                + ", clientSecret=" + mask(clientSecret) + ", clientName=" + clientName
+                + ", clientDescription=" + clientDescription + ", clientType=" + clientType
+                + ", redirectUris=" + redirectUris + ", authorizedGrantTypes=" + authorizedGrantTypes
+                + ", scopes=" + scopes + ", resourceScope=" + resourceScope + ", tokenTtlSeconds=" + tokenTtlSeconds
+                + ", authorizationCodeTtlSeconds=" + authorizationCodeTtlSeconds + ", owner=" + owner + "]";
+    }
+
+    /**
+     * The mask a rendering shows for a secret, so neither the value nor its length is ever written.
+     *
+     * @param secret a normalised secret, never {@code null}
+     * @return empty while the secret is unset, {@code ****} otherwise
+     */
+    private static String mask(String secret) {
+        return secret.isEmpty() ? "" : "****";
+    }
+
     /**
      * The resource owner of the original's {@code ss:user-service} (xml line 16), bound from
      * {@code oauth.provider.owner.*}.
@@ -105,6 +126,12 @@ public record OAuthProviderProperties(
             username = username == null ? "" : username;
             password = password == null ? "" : password;
             authorities = authorities == null ? List.of() : List.copyOf(authorities);
+        }
+
+        /** Renders the owner in record form with the password left out, so the settings can be logged. */
+        @Override
+        public String toString() {
+            return "Owner[username=" + username + ", password=" + mask(password) + ", authorities=" + authorities + "]";
         }
     }
 }

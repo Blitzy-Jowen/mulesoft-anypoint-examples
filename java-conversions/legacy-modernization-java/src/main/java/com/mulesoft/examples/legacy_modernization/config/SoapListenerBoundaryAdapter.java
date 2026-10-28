@@ -37,6 +37,7 @@ import org.springframework.ws.soap.SoapMessage;
 import org.springframework.ws.soap.SoapMessageCreationException;
 import org.springframework.ws.soap.SoapMessageFactory;
 import org.springframework.ws.soap.SoapVersion;
+import org.springframework.ws.transport.TransportConstants;
 import org.springframework.ws.transport.WebServiceMessageReceiver;
 import org.springframework.ws.transport.http.HttpServletConnection;
 import org.springframework.ws.transport.http.WebServiceMessageReceiverHandlerAdapter;
@@ -51,13 +52,16 @@ import org.xml.sax.SAXParseException;
  * status codes.
  *
  * <ul>
- *   <li>A non-POST request to a path matching one of the POST-only patterns: status 405, Content-Type
- *       {@code text/plain;charset=UTF-8}, body {@code Method not allowed for endpoint: <path>} in UTF-8, and no
- *       {@code Allow} header.</li>
+ *   <li>A non-POST request to a path matching one of the POST-only patterns (the method {@code POST} in any letter
+ *       case is a POST, as Mule 3.8's {@code MethodRequestMatcher} compared methods): status 405, Content-Type
+ *       {@code text/plain} with no charset parameter, body {@code Method not allowed for endpoint: <path>} in UTF-8,
+ *       and no {@code Allow} header, the same bytes as every other listener's method 405. The body is written
+ *       through the output stream, never the writer, so the container appends no charset.</li>
  *   <li>Any other request, whatever its method, is read as a SOAP message. A listener that accepts every method
  *       therefore reads a {@code GET} without a metadata query as a message; metadata queries are answered before
  *       the request reaches this adapter.</li>
- *   <li>A body that cannot be read as a SOAP 1.1 envelope (malformed XML, an empty body, or a root other than
+ *   <li>A body that cannot be read as a SOAP 1.1 envelope (malformed XML, an empty body, a body nested deeper than 100
+ *       elements as CXF's default {@code maxElementDepth} allowed, or a root other than
  *       {@code {http://schemas.xmlsoap.org/soap/envelope/}Envelope}) is answered with HTTP 500 and a SOAP 1.1 fault,
  *       {@code faultcode} {@code soap:Client} and {@code faultstring} the parser's message, written through the same
  *       connection type and envelope style as every dispatched fault. The same fault answers an
@@ -65,6 +69,10 @@ import org.xml.sax.SAXParseException;
  *       created, for example for a Content-Type the message factory rejects.</li>
  *   <li>Every other envelope is handed to the message receiver unchanged; the response it leaves, fault or not, is
  *       restyled by {@link SoapEnvelopeStyleInterceptor#restyle(SoapMessage)} before it is written.</li>
+ *   <li>No response or fault this adapter sends carries {@code Accept} or {@code SOAPAction}, which CXF never wrote
+ *       on a response: SAAJ keeps those request headers in the MIME headers of every message it creates or writes,
+ *       and Spring WS copies every MIME header onto the response. Every other header, {@code Content-Type} and
+ *       {@code Content-Length} among them, passes unchanged.</li>
  * </ul>
  *
  * <p>The path a pattern is matched against is the request URI without the context path ({@code /} when nothing is
@@ -83,11 +91,21 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
     private static final Logger log = LoggerFactory.getLogger(SoapListenerBoundaryAdapter.class);
 
     private static final String METHOD_NOT_ALLOWED_PREFIX = "Method not allowed for endpoint: ";
-    private static final String TEXT_CONTENT_TYPE = "text/plain;charset=UTF-8";
+    private static final String TEXT_CONTENT_TYPE = "text/plain";
     private static final String ROOT_PATH = "/";
 
     private static final String ENVELOPE = "Envelope";
     private static final String ENVELOPE_QNAME = "{" + SoapEnvelopeStyleInterceptor.SOAP11_NS + "}" + ENVELOPE;
+
+    /**
+     * The deepest element nesting a request body may reach, the root element counting as depth 1: CXF's default
+     * {@code org.apache.cxf.stax.maxElementDepth}, which the original CXF listeners applied to every request. A deeper
+     * body fails the parse here, so no endpoint code ever recurses over it.
+     */
+    private static final int MAX_ELEMENT_DEPTH = 100;
+
+    /** The JDK parser's element-depth limit, set on the factory so that it outranks the same-named system property. */
+    private static final String MAX_ELEMENT_DEPTH_PROPERTY = "jdk.xml.maxElementDepth";
 
     private final List<String> postOnlyPatterns;
     private final SoapEnvelopeStyleInterceptor styler;
@@ -123,10 +141,14 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
                 "The SOAP listener boundary needs a SoapMessageFactory");
     }
 
+    /**
+     * Reads a request whose method is {@code POST} in any letter case, as Mule 3.8's {@code MethodRequestMatcher}
+     * compared methods, as a SOAP message, and hands every other method to {@link #handleNonPostMethod}.
+     */
     @Override
     public ModelAndView handle(HttpServletRequest request, HttpServletResponse response, Object handler)
             throws Exception {
-        if (HttpMethod.POST.matches(request.getMethod())) {
+        if (HttpMethod.POST.name().equalsIgnoreCase(request.getMethod())) {
             processAsMessage(request, response, handler);
         }
         else {
@@ -208,7 +230,10 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
         }
     }
 
-    /** Writes the listener's 405 for a method it does not accept, and completes the response body. */
+    /**
+     * Writes the listener's 405 for a method it does not accept, and completes the response body. The UTF-8 bytes go
+     * through the output stream, never the writer, so the Content-Type stays {@code text/plain} without a charset.
+     */
     private static void writeMethodNotAllowed(HttpServletResponse response, String path) throws IOException {
         byte[] body = (METHOD_NOT_ALLOWED_PREFIX + path).getBytes(StandardCharsets.UTF_8);
         response.setStatus(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
@@ -231,7 +256,8 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
 
     /**
      * Why {@code body} cannot be read as a SOAP 1.1 envelope, or {@code null} when it can: the parser's message for
-     * a body that is not well-formed XML, otherwise a fixed text naming the root element.
+     * a body that is not well-formed XML or nests elements deeper than {@link #MAX_ELEMENT_DEPTH}, otherwise a fixed
+     * text naming the root element.
      */
     private static String envelopeProblem(byte[] body) {
         Document document;
@@ -250,9 +276,10 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
     }
 
     /**
-     * A namespace-aware parser with DOCTYPE declarations, external entities, external DTDs and XInclude disabled.
-     * The JDK's built-in implementation is used, so the parser messages a caller receives do not depend on which XML
-     * library the classpath carries; a fresh factory per request keeps concurrent requests apart.
+     * A namespace-aware parser with DOCTYPE declarations, external entities, external DTDs and XInclude disabled, and
+     * element nesting limited to {@link #MAX_ELEMENT_DEPTH}. The JDK's built-in implementation is used, so the parser
+     * messages a caller receives do not depend on which XML library the classpath carries; a fresh factory per request
+     * keeps concurrent requests apart.
      */
     private static DocumentBuilder newSecureBuilder() {
         try {
@@ -265,6 +292,7 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
             factory.setXIncludeAware(false);
             factory.setExpandEntityReferences(false);
             factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            factory.setAttribute(MAX_ELEMENT_DEPTH_PROPERTY, String.valueOf(MAX_ELEMENT_DEPTH));
             DocumentBuilder builder = factory.newDocumentBuilder();
             builder.setErrorHandler(ThrowingErrorHandler.INSTANCE);
             return builder;
@@ -334,11 +362,29 @@ public class SoapListenerBoundaryAdapter extends WebServiceMessageReceiverHandle
         }
     }
 
-    /** {@link HttpServletConnection}'s constructor is protected; this subclass makes it available here. */
+    /**
+     * {@link HttpServletConnection}'s constructor is protected; this subclass makes it available here. It also keeps
+     * the request headers SAAJ holds in every message's MIME headers off the response: {@code Accept}, which SAAJ
+     * sets on every message it creates, and {@code SOAPAction}, which it sets after every write. CXF wrote neither on
+     * a response.
+     */
     private static final class BoundaryConnection extends HttpServletConnection {
+
+        private static final List<String> REQUEST_ONLY_HEADERS =
+                List.of(TransportConstants.HEADER_ACCEPT, TransportConstants.HEADER_SOAP_ACTION);
 
         BoundaryConnection(HttpServletRequest request, HttpServletResponse response) {
             super(request, response);
+        }
+
+        @Override
+        public void addResponseHeader(String name, String value) throws IOException {
+            for (String requestOnly : REQUEST_ONLY_HEADERS) {
+                if (requestOnly.equalsIgnoreCase(name)) {
+                    return;
+                }
+            }
+            super.addResponseHeader(name, value);
         }
     }
 

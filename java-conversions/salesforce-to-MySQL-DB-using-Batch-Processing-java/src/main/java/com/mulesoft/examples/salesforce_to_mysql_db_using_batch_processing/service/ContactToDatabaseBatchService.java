@@ -23,13 +23,15 @@ import org.springframework.stereotype.Service;
  * One run of the original flow {@code triggerFlow} and its batch job {@code salesforce-to-database-Batch}
  * ({@code salesforce-to-database.xml}): read the {@code timestamp} watermark, query the Contacts Salesforce modified
  * after it, log the watermark, run every Contact through the job's two steps, which insert or update its row in the
- * {@code contact} table, then move the watermark to the latest {@code LastModifiedDate} the query returned.
+ * {@code contact} table, then, only after a successful job, move the watermark to the latest {@code LastModifiedDate}
+ * the query returned.
  *
  * <p>The 60 s poll schedule belongs to {@code trigger/ContactPollScheduler}; this class performs one poll per
  * {@link #synchronize()} call. The original declares no exception strategy, so nothing is caught here: every
  * Salesforce call runs through the SC-9 executor inside {@link SalesforcePartnerClient}, which classifies and logs a
  * failure, and the failure propagates to the trigger with the watermark unchanged. A database failure of one record
- * fails only that record, as {@link BatchJobRunner} records it.
+ * fails only that record, as {@link BatchJobRunner} records it, and stops the job; the watermark then stays as it was,
+ * so the next scheduled poll selects the failed and unprocessed Contacts again. Nothing is retried within a poll.
  *
  * <p>The original {@code batch:threading-profile} is not carried: records are processed in order on the calling
  * thread, as {@link BatchJobRunner} documents.
@@ -147,13 +149,15 @@ public class ContactToDatabaseBatchService {
     }
 
     /**
-     * Performs one poll: watermark, query, watermark logger, batch job, then the {@code MAX} watermark update.
+     * Performs one poll: watermark, query, watermark logger, batch job, then, after a successful job, the
+     * {@code MAX} watermark update.
      *
      * <p>Calls are serialized: the original scheduler never overlapped two runs of its poll, and a poll requested on
      * demand while a scheduled one runs must neither read the watermark before the running poll has moved it nor
      * move it back afterwards.
      *
-     * @return the result of the batch job run
+     * @return the result of the batch job run; unless it is {@code SUCCESSFUL} without a failed record, the watermark
+     *         was left as it was
      * @throws Exception the SC-9 upstream exception or the original Salesforce exception of the query, unchanged,
      *                   with the watermark left as it was
      */
@@ -164,10 +168,13 @@ public class ContactToDatabaseBatchService {
 
         BatchJobResult result = batchJobRunner.run(job, () -> records);
 
-        // Whatever the job's status: the poll, and with it the watermark update, completed once the records were
-        // loaded, independent of record outcomes. The candidates come from the polled records, because step 1
-        // replaces each record's payload. An empty query selects nothing and leaves the watermark untouched.
-        watermarkStore.updateMax(WATERMARK_KEY, selectorValues(records));
+        // The watermark moves only after successful processing: a job that stopped or failed a record keeps the
+        // stored value, so the next scheduled poll selects this poll's records again instead of skipping those it
+        // did not write. The candidates come from the polled records, because step 1 replaces each record's payload.
+        // An empty query selects nothing and leaves the watermark untouched.
+        if (result.isSuccessful() && result.failedRecords() == 0) {
+            watermarkStore.updateMax(WATERMARK_KEY, selectorValues(records));
+        }
         return result;
     }
 

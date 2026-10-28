@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
@@ -35,6 +36,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -69,6 +72,9 @@ class CsvFileTriggerTest {
      */
     private static final byte[] INPUT = classpath("/" + INPUT_CSV);
 
+    /** The {@code csv-import.polling-frequency} {@code application.yml} sets: Mule's default of 1000 ms. */
+    private static final String POLLING_FREQUENCY = "1000";
+
     @TempDir
     Path inputDir;
 
@@ -84,7 +90,7 @@ class CsvFileTriggerTest {
     @BeforeEach
     void createTrigger() {
         customerImportService = mock(CustomerImportService.class);
-        trigger = new CsvFileTrigger(customerImportService, inputDir.toString());
+        trigger = new CsvFileTrigger(customerImportService, inputDir.toString(), POLLING_FREQUENCY);
     }
 
     @Test
@@ -159,6 +165,25 @@ class CsvFileTriggerTest {
         assertNotNull(scheduled);
         // A fixed delay over application.yml's csv-import.polling-frequency, defaulting to Mule's 1000 ms.
         assertEquals("${csv-import.polling-frequency:1000}", scheduled.fixedDelayString());
+    }
+
+    @ParameterizedTest(name = "csv-import.polling-frequency \"{0}\" -> start-up fails naming the key and the value")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void unschedulableFrequencyFailsNamingKeyAndValue(String frequency) {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> new CsvFileTrigger(customerImportService, inputDir.toString(), frequency));
+
+        assertTrue(e.getMessage().contains("csv-import.polling-frequency"), e.getMessage());
+        assertTrue(e.getMessage().contains("\"" + frequency + "\""), e.getMessage());
+    }
+
+    @ParameterizedTest(name = "csv-import.polling-frequency \"{0}\" -> the trigger is created")
+    @ValueSource(strings = {"1", "1000", "PT10S", "pt0.5s"})
+    void schedulableFrequencyCreatesTheTrigger(String frequency) {
+        CsvFileTrigger created = assertDoesNotThrow(
+                () -> new CsvFileTrigger(customerImportService, inputDir.toString(), frequency));
+
+        assertEquals(inputDir, created.inputDirectory());
     }
 
     /** Places a copy of the original {@code input.csv} in the input directory, as the original IT dispatched it. */

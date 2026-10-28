@@ -37,3 +37,14 @@ dynamics:
     token-uri: https://login.microsoftonline.com/${dynamics.oauth.tenant-id}/oauth2/v2.0/token
     # Client-credentials scope: the environment URL's .default
     scope: ${dynamics.service-url}/.default
+
+# import-contacts-into-ms-dynamics.xml has no logger, so no token or contact data is logged at any level: a root
+# DEBUG/TRACE override must not reach these categories, which below INFO write the Entra access token, the contact
+# records and the e-mail address of a contact query. The application's own categories are not capped.
+logging:
+  level:
+    org.springframework.core.codec: INFO                                      # CharSequenceEncoder, StringDecoder: the contact create and query bodies
+    org.springframework.http.codec: INFO                                      # Jackson2JsonDecoder: the Entra token response with its access_token
+    org.springframework.web.HttpLogging: INFO                                 # the codec loggers above fall back to it when their own is held at INFO
+    org.springframework.web.reactive.function.client.ExchangeFunctions: INFO  # the request URL, whose contact query $filter carries the e-mail address
+    reactor.netty.http.client.HttpClientConnect: INFO                         # the request URI, with the same $filter

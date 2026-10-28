@@ -12,8 +12,8 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
-  # No JMS connection settings here: config/IbmMqConfig builds the IBM MQ factory from wmq.*, and without a wmq.host
-  # the tests' embedded broker comes from Boot's auto-configuration.
+  # No JMS connection settings here: config/IbmMqConfig builds the IBM MQ factory from wmq.*, and only with
+  # wmq.enabled false (the test profile) does the tests' embedded broker come from Boot's auto-configuration.
 
 server:
   port: 8086                       # ajax:connector serverUrl http://0.0.0.0:8086/services/wmqExample (websphere-mq.xml:7), the only listener
@@ -22,7 +22,7 @@ server:
 # IBM MQ client connection of wmq:connector (websphere-mq.xml:4), under the original key names, read by
 # config/IbmMqConfig. Its transportType CLIENT_MQ_TCPIP is fixed in IbmMqConfig.
 wmq:
-  enabled: true                    # the MQ connection factory is created only when true and wmq.host has text
+  enabled: true                    # the MQ connection factory and its start-up connection check (validateConnections="true") exist unless false; then wmq.host is required
   # TODO: supply the IBM MQ queue manager host name
   host: ${WMQ_HOST:}
   port: ${WMQ_PORT:1414}           # the port the original WebsphereMQIT sets, IBM MQ's default listener port
@@ -48,6 +48,13 @@ wmq:
     connect-timeout-seconds: 10      # TCP connect to the queue manager's listener (com.ibm.mq.cfg.TCP.Connect_Timeout)
     negotiation-timeout-seconds: 10  # each reply of the negotiation that opens a connection (com.ibm.mq.cfg.TCP.QmgrNegotiationFlowTimeout)
     receive-timeout-seconds: 10      # each read once connected; a silent peer is declared broken after about twice this unless a write is blocked (com.ibm.mq.cfg.MQRCVBLKTO)
+  # Directory of the IBM MQ client's own error log (mqjms.log.0 to .2) and, when they run, its trace file and FFDC
+  # directory, which the client otherwise writes to the working directory. config/IbmMqConfig points the JVM-wide IBM
+  # client properties com.ibm.msg.client.commonservices.log.outputName and com.ibm.msg.client.commonservices.trace.outputName
+  # into it before the first MQ factory is built, unless either is already set as a system property or in the client's
+  # jms.config. The directory is created; a blank value means target/mqclient.
+  client:
+    diagnostics-dir: target/mqclient   # under the build directory; a relative path resolves against the working directory
 
 # SC-12: Mule Ajax transport, read by AjaxResourceConfig, BayeuxLongPollingController and AjaxChannelBroker, and by
 # client/MqQueueSender and trigger/OutQueueListener for the channels <server-path>/enqueue and <server-path>/dequeue.

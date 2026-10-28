@@ -22,7 +22,9 @@ logging:
     # Below INFO these loggers write credentials the original never logged. A logger's own level outranks
     # logging.level.root and the --debug and --trace logger groups, so neither reaches them.
     twitter4j: INFO   # consumer key and access token: in the OAuth base string, and the config dump of twitter4j.debug
-    sun.net.www.protocol.http.HttpURLConnection: INFO   # JDK client header dumps (JUL): OAuth Authorization, api_key, appid
+    sun.net.www.protocol.http.HttpURLConnection: INFO   # JDK client header dumps (JUL) of Twitter and Sentiment140: OAuth Authorization, appid
+    org.apache.hc.client5.http.headers: INFO   # Stocklytics transport (httpclient5) header dumps: api_key
+    org.apache.hc.client5.http.wire: INFO      # Stocklytics transport (httpclient5) byte dumps: api_key
 
 ports:
   twitter-search: 8081             # mule-component-bindings.xml:31

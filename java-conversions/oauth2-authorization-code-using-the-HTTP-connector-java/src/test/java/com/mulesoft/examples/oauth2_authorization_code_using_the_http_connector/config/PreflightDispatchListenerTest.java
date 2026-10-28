@@ -90,7 +90,7 @@ class PreflightDispatchListenerTest {
     private static final String STORE_TYPE = "JKS";
 
     /** Content type of SC-10's no-listener 404, written by {@link PortRoutingFilter}. */
-    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain;charset=UTF-8";
+    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
 
     /** The {@code Location} the mocked {@code boxUserLoginFlow} answers with. */
     private static final String LOGIN_LOCATION =

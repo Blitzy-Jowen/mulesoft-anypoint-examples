@@ -17,8 +17,10 @@ import java.util.Objects;
  * @param jobInstanceId       a random UUID string per run, produced by the runner
  * @param status              the final state of the run
  * @param loadedRecords       the records the input phase produced
- * @param processedRecords    the records that went through the process phase
- * @param successfulRecords   the processed records minus the failed records
+ * @param processedRecords    the records that failed or finished their handling in the job's last step; every loaded
+ *                            record when the job ran to the end
+ * @param successfulRecords   the processed records minus the failed records; a record a stopped job left unfinished
+ *                            is neither successful nor failed
  * @param failedRecords       the records with at least one step failure
  * @param elapsedTimeInMillis the wall-clock duration of the run, in milliseconds
  */
@@ -45,8 +47,10 @@ public record BatchJobResult(String jobName, String jobInstanceId, Status status
      * @param jobInstanceId       a random UUID string per run, produced by the runner
      * @param status              the final state of the run
      * @param loadedRecords       the records the input phase produced
-     * @param processedRecords    the records that went through the process phase
-     * @param successfulRecords   the processed records minus the failed records
+     * @param processedRecords    the records that failed or finished their handling in the job's last step; every
+     *                            loaded record when the job ran to the end
+     * @param successfulRecords   the processed records minus the failed records; a record a stopped job left
+     *                            unfinished is neither successful nor failed
      * @param failedRecords       the records with at least one step failure
      * @param elapsedTimeInMillis the wall-clock duration of the run, in milliseconds
      * @throws NullPointerException     if {@code jobName}, {@code jobInstanceId} or {@code status} is {@code null}

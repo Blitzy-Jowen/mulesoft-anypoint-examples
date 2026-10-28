@@ -16,15 +16,11 @@ import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.times;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.ServerSocket;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -36,8 +32,10 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -45,6 +43,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforcePartnerClient;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.SalesforceOAuthProperties;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.ContactQueryService;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.HttpTestClient;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.HttpTestClient.Response;
@@ -64,11 +63,17 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.Http
  * README's log lines. Everything between the HTTP requests and those two stand-ins (the controller, the authorize
  * decision, the token client, the stored token and the contact count) is the production code.
  *
+ * <p>The listener binds a random port. The production code reads the {@code redirect_uri} from
+ * {@link SalesforceOAuthProperties} at each authorize redirect and code exchange, so once the listener is bound each
+ * test points the callback's {@code sfdc.oauth.callback.local-port} at that port and registers the WireMock authorize
+ * stub against the same callback. No port is chosen before the bind, so no other process can take it in between.
+ *
  * <p>The same login and assertion run against a live org in the failsafe {@code SalesforceOauthIT}.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
-// The context binds PORT and holds the authorized token slot; closing it after this class keeps both out of the
-// context cache, so no other test class inherits the port or an already-authorized application.
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+// The context's SalesforceOAuthProperties carry the callback port this class sets, and its token slot is left
+// authorized; closing the context after this class keeps both out of the context cache, so no other test class
+// inherits a redirect_uri aimed at this listener or an already-authorized application.
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class SalesforceOauthTest {
 
@@ -85,29 +90,15 @@ class SalesforceOauthTest {
     private static final String CODE = "test-code";
 
     /**
-     * The listener port, fixed before the context starts rather than {@code RANDOM_PORT}: the callback's
-     * {@code redirect_uri} is built from {@code sfdc.oauth.callback.local-port}, not from the bound port, and the
-     * WireMock authorize stub must redirect to that same callback, so both need the port in advance.
+     * Stand-in for {@code login.salesforce.com}: the authorize and token endpoints of the authorization-code flow.
+     * Started before the context so that {@link #properties} can point both URLs at it; the token stub is registered
+     * here, the authorize stub once the listener port is known ({@link #bindCallbackToListener()}).
      */
-    private static final int PORT;
-
-    /** Stand-in for {@code login.salesforce.com}: the authorize and token endpoints of the authorization-code flow. */
     private static final WireMockServer WIREMOCK;
 
     static {
-        try (ServerSocket socket = new ServerSocket(0)) {
-            socket.setReuseAddress(true);
-            PORT = socket.getLocalPort();
-        } catch (IOException e) {
-            throw new UncheckedIOException("Could not reserve a port for the listener", e);
-        }
-
         WIREMOCK = new WireMockServer(WireMockConfiguration.options().dynamicPort());
         WIREMOCK.start();
-        WIREMOCK.stubFor(get(urlPathEqualTo(AUTHORIZE_PATH))
-                .willReturn(aResponse()
-                        .withStatus(302)
-                        .withHeader("Location", callbackUri() + "?code=" + CODE)));
         WIREMOCK.stubFor(post(urlPathEqualTo(TOKEN_PATH))
                 .willReturn(aResponse()
                         .withStatus(200)
@@ -128,11 +119,16 @@ class SalesforceOauthTest {
     @MockBean
     private SalesforcePartnerClient partnerClient;
 
+    /** The port the listener bound, which the callback and the authorize stub are aimed at. */
+    @LocalServerPort
+    private int port;
+
+    /** The application's OAuth settings, whose callback supplies the {@code redirect_uri} at each use. */
+    @Autowired
+    private SalesforceOAuthProperties oauthProperties;
+
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        // server.port resolves ${http.port}, so DEFINED_PORT binds PORT.
-        registry.add("http.port", () -> PORT);
-        registry.add("sfdc.oauth.callback.local-port", () -> PORT);
         registry.add("sfdc.key", () -> CONSUMER_KEY);
         registry.add("sfdc.secret", () -> CONSUMER_SECRET);
         registry.add("sfdc.oauth.authorization-url", () -> WIREMOCK.baseUrl() + AUTHORIZE_PATH);
@@ -142,6 +138,20 @@ class SalesforceOauthTest {
     @AfterAll
     static void stopWireMock() {
         WIREMOCK.stop();
+    }
+
+    /**
+     * Aims the callback at the bound listener, then has the authorize stub approve by redirecting the browser there
+     * with a code. The production code reads the callback's port each time it builds the {@code redirect_uri}, so the
+     * authorize redirect and the code exchange of this test both carry the listener port.
+     */
+    @BeforeEach
+    void bindCallbackToListener() {
+        oauthProperties.getOauth().getCallback().setLocalPort(port);
+        WIREMOCK.stubFor(get(urlPathEqualTo(AUTHORIZE_PATH))
+                .willReturn(aResponse()
+                        .withStatus(302)
+                        .withHeader("Location", callbackUri() + "?code=" + CODE)));
     }
 
     @BeforeEach
@@ -154,7 +164,7 @@ class SalesforceOauthTest {
 
     @Test
     void testAuthentication() throws Exception {
-        HttpTestClient app = HttpTestClient.localhost(PORT);
+        HttpTestClient app = HttpTestClient.localhost(port);
 
         // No token yet: / redirects the browser to the Salesforce authorization page.
         Response first = app.get("/");
@@ -178,9 +188,7 @@ class SalesforceOauthTest {
         URI callback = URI.create(login.header("Location"));
         Response done = app.get(callback.getRawPath() + "?" + callback.getRawQuery());
         assertEquals(200, done.status(), () -> "unexpected response: " + done);
-        String contentType = done.header("Content-Type");
-        assertNotNull(contentType, () -> "missing Content-Type: " + done);
-        assertTrue(contentType.startsWith("text/plain"), () -> "unexpected Content-Type: " + contentType);
+        assertUntypedText(done);
         assertTrue(done.bodyAsString().contains(MESSAGE), () -> "unexpected body: " + done);
         assertEquals("Salesforce query returned 3 contacts.", done.bodyAsString());
 
@@ -196,6 +204,7 @@ class SalesforceOauthTest {
         Response again = app.get("/");
         assertEquals(200, again.status(), () -> "unexpected response: " + again);
         assertNull(again.header("Location"), () -> "unexpected redirect: " + again);
+        assertUntypedText(again);
         assertTrue(again.bodyAsString().contains(MESSAGE), () -> "unexpected body: " + again);
         assertEquals("Salesforce query returned 3 contacts.", again.bodyAsString());
 
@@ -203,9 +212,19 @@ class SalesforceOauthTest {
         Mockito.verify(partnerClient, times(2)).query(ContactQueryService.CONTACT_QUERY);
     }
 
+    /**
+     * The flow's text as the Mule listener sent its untyped {@code set-payload}: no {@code Content-Type}, and the
+     * {@code Content-Length} of the body bytes.
+     */
+    private static void assertUntypedText(Response response) {
+        assertNull(response.header("Content-Type"), () -> "unexpected Content-Type: " + response);
+        assertEquals(String.valueOf(response.body().length), response.header("Content-Length"),
+                () -> "unexpected Content-Length: " + response);
+    }
+
     /** The {@code redirect_uri} the application registers: the callback on this test's listener port. */
-    private static String callbackUri() {
-        return "http://localhost:" + PORT + "/oauth2callback";
+    private String callbackUri() {
+        return "http://localhost:" + port + "/oauth2callback";
     }
 
     /** A Contact record as the Partner client returns it: a {@code HashMap} carrying the sObject {@code type}. */

@@ -4,6 +4,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -12,6 +13,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -70,9 +72,15 @@ import org.xml.sax.SAXParseException;
  *       classpath root. The key under which a schema is served is the location exactly as written; within one
  *       registration a key must always denote the same resource, otherwise {@link #register} throws
  *       {@link IllegalStateException}. Keys of different registrations are independent.</li>
- *   <li>Only {@code GET} is handled. A request whose path matches no registration, whose query is neither
- *       {@code wsdl} (any case) nor {@code xsd=<registered key>}, or that uses another method continues down the
- *       filter chain untouched.</li>
+ *   <li>Only {@code GET} is handled, and its query is read as CXF's {@code WSDLGetInterceptor} read it: split at
+ *       {@code &}, empty parameters skipped, each name lower-cased and taken raw, a repeated name keeping its last
+ *       value. A {@code wsdl} parameter, in any case or position and with or without a value, selects the
+ *       registration's WSDL and takes precedence over {@code xsd}; its value is not consulted, because each
+ *       registration publishes exactly one WSDL (CXF's {@code ""} key). Otherwise an {@code xsd} parameter selects the
+ *       schema whose registered key equals its value after URL-decoding as UTF-8. A request whose path matches no
+ *       registration, whose query selects nothing (an unknown key or a malformed escape included), or that uses
+ *       another method continues down the filter chain untouched. The servlet parameter API is never called,
+ *       because it can consume a form-encoded body the chain must still read.</li>
  *   <li>A served request is logged at DEBUG with registration-owned identity only (the document kind, its registered
  *       WSDL or schema key and resource, and the registration's patterns), never the request's query, parameters,
  *       path or URL, which carry caller-supplied data. A location that cannot be resolved relative to its referring
@@ -101,7 +109,7 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
     private static final String LOCATION = "location";
     private static final String SCHEMA_LOCATION = "schemaLocation";
 
-    private static final String WSDL_QUERY = "wsdl";
+    private static final String WSDL_PARAMETER = "wsdl";
     private static final String XSD_PARAMETER = "xsd";
     private static final String XSD_QUERY_PREFIX = XSD_PARAMETER + "=";
     private static final String CONTENT_TYPE = "text/xml;charset=UTF-8";
@@ -252,7 +260,7 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
      */
     private Selection select(HttpServletRequest request) {
         String query = request.getQueryString();
-        if (query == null) {
+        if (query == null || query.isEmpty()) {
             return null;
         }
         Published target = matchingRegistration(pathWithinApplication(request));
@@ -260,11 +268,12 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
             return null;
         }
         Registration registration = target.registration();
-        if (WSDL_QUERY.equalsIgnoreCase(query)) {
+        Map<String, String> parameters = queryParameters(query);
+        if (parameters.containsKey(WSDL_PARAMETER)) {
             return new Selection(target, target.wsdl(), "WSDL " + safeResource(registration.wsdl()));
         }
-        if (query.startsWith(XSD_QUERY_PREFIX)) {
-            String key = request.getParameter(XSD_PARAMETER);
+        String key = decodedQueryValue(parameters.get(XSD_PARAMETER));
+        if (key != null) {
             for (Map.Entry<String, Resource> schema : registration.schemas().entrySet()) {
                 if (schema.getKey().equals(key)) {
                     return new Selection(target, target.schemas().get(schema.getKey()),
@@ -273,6 +282,42 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
             }
         }
         return null;
+    }
+
+    /**
+     * {@code query} as CXF's {@code UrlUtils.parseQueryString} read it for {@code WSDLGetInterceptor}: split at every
+     * {@code &} with empty parameters skipped; a parameter's name is the text before its first {@code =}, or all of
+     * it, lower-cased; its value is the raw text after that {@code =}, or empty without one. Neither is
+     * percent-decoded here, and a repeated name keeps its last value.
+     */
+    private static Map<String, String> queryParameters(String query) {
+        Map<String, String> parameters = new HashMap<>();
+        for (String parameter : query.split("&")) {
+            if (parameter.isEmpty()) {
+                continue;
+            }
+            int separator = parameter.indexOf('=');
+            String name = separator < 0 ? parameter : parameter.substring(0, separator);
+            String value = separator < 0 ? "" : parameter.substring(separator + 1);
+            parameters.put(name.toLowerCase(Locale.ROOT), value);
+        }
+        return parameters;
+    }
+
+    /**
+     * {@code value} URL-decoded as UTF-8, as CXF's {@code WSDLGetUtils} decoded the {@code xsd} value before looking
+     * its schema up, or {@code null} when there is no value or it holds a malformed escape such as {@code %zz}, which
+     * therefore selects no schema.
+     */
+    private static String decodedQueryValue(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return URLDecoder.decode(value, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException malformedEscape) {
+            return null;
+        }
     }
 
     private Published matchingRegistration(String path) {
@@ -503,9 +548,9 @@ public class WsdlQueryPublisher extends OncePerRequestFilter {
     }
 
     /**
-     * Percent-encodes the UTF-8 bytes of {@code value} that cannot stand literally in a query value, so the
-     * container's parameter decoding returns the location exactly as written; ordinary locations (letters, digits,
-     * {@code / . - _}) pass through unchanged.
+     * Percent-encodes the UTF-8 bytes of {@code value} that cannot stand literally in a query value, so the URL
+     * decoding {@link #select} applies to an {@code xsd} value returns the location exactly as written; ordinary
+     * locations (letters, digits, {@code / . - _}) pass through unchanged.
      */
     private static String encodeQueryValue(String value) {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8);

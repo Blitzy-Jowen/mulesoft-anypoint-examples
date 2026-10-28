@@ -74,8 +74,10 @@ public class AttachmentImportService {
     /**
      * Imports the first attachment of one received mail as the {@code orders} XML file.
      *
-     * @param attachments the mail's attachments in Mule's attachment-list order, which must be the map's iteration
-     *                    order (an insertion-ordered map); only the first one is read
+     * @param attachments the mail's attachments by name; only the first value in this map's iteration order is read,
+     *                    as the original read {@code payload[0]}. {@code ImapMailPoller} supplies a
+     *                    {@link java.util.HashMap}, as Mule's inbound-attachment map was, so that iteration order is
+     *                    Mule's attachment-list order, which is neither the MIME part order nor the insertion order
      * @return the written file
      * @throws IllegalStateException when there is no attachment, the first one's content is neither text, a
      *                               stream nor bytes, or a CSV value holds a character XML 1.0 does not allow,

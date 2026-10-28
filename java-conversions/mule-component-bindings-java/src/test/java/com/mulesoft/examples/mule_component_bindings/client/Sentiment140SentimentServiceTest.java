@@ -9,6 +9,8 @@
 package com.mulesoft.examples.mule_component_bindings.client;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.binaryEqualTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
@@ -35,6 +37,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -48,12 +51,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.mule_component_bindings.config.StockStatsProperties;
 import com.mulesoft.examples.mule_component_bindings.model.Sentiment;
@@ -65,9 +70,12 @@ import com.mulesoft.examples.mule_component_bindings.model.Tweet;
  * {@code http://www.sentiment140.com/api/}: the bulk classification is posted with the original headers and the
  * tweets' JSON as UTF-8 bytes, each returned polarity sets the sentiment of the tweet with its id and tweets without
  * a result keep none, a status other than 200 fails with the original message, an unreadable body or an unknown id
- * fails with a plain {@link RuntimeException}, and through the timed transport an upstream that never answers, or
+ * fails with a plain {@link RuntimeException}, an application id without text fails naming
+ * {@code stockstats.sentiment140ApiKey} before any request is sent, even for no tweets, and through the timed
+ * transport an upstream that never answers, or
  * that sends its headers and stalls its body, fails once with a {@link SocketTimeoutException} cause within the
- * timeout; the constructor accepts only a timeout the transport can enforce.
+ * timeout; a connection reset or closed before any response fails the call after one POST; the constructor accepts
+ * only a timeout the transport can enforce.
  */
 class Sentiment140SentimentServiceTest {
 
@@ -147,6 +155,43 @@ class Sentiment140SentimentServiceTest {
         assertThat(wm.getAllServeEvents()).hasSize(1);
     }
 
+    /**
+     * An application id that is {@code null}, empty or whitespace only, each with no tweets, which would still be
+     * posted, and with one tweet.
+     */
+    static Stream<Arguments> applicationIdsWithoutText() {
+        List<Arguments> cases = new ArrayList<>();
+        for (String blank : Arrays.asList(null, "", "   ")) {
+            Named<String> applicationId = Named.of(blank == null ? "null" : '"' + blank + '"', blank);
+            cases.add(Arguments.of(applicationId, Named.of("no tweets", 0)));
+            cases.add(Arguments.of(applicationId, Named.of("one tweet", 1)));
+        }
+        return cases.stream();
+    }
+
+    @ParameterizedTest(name = "[{index}] appid {0}, {1}")
+    @MethodSource("applicationIdsWithoutText")
+    void applicationIdWithoutTextFailsNamingTheKeyBeforeAnyRequest(String applicationId, int tweetCount) {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson"))
+                .willReturn(okJson("{\"data\":[{\"id\":\"1\",\"polarity\":4}]}")));
+        List<Tweet> tweets = new ArrayList<>();
+        for (int id = 1; id <= tweetCount; id++) {
+            tweets.add(tweet(String.valueOf(id), "$AAPL"));
+        }
+        Sentiment140SentimentService service = new Sentiment140SentimentService(RestClient.builder(),
+                new StockStatsProperties("test-access-key", "test-access-secret", "test-api-key", "test-api-secret",
+                        wm.baseUrl() + "/1.1/", "test-stocklytics-key", wm.baseUrl() + "/", applicationId,
+                        wm.baseUrl() + "/"));
+
+        assertThatThrownBy(() -> service.classify(tweets))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("Sentiment140 application ID (stockstats.sentiment140ApiKey) is not configured")
+                .hasNoCause();
+        assertThat(tweets).hasSize(tweetCount).allSatisfy(tweet -> assertThat(tweet.getSentiment()).isNull());
+        wm.verify(0, anyRequestedFor(anyUrl()));
+        assertThat(wm.getAllServeEvents()).isEmpty();
+    }
+
     // 201 is included because the original accepts exactly 200, not any 2xx.
     @ParameterizedTest
     @ValueSource(ints = {201, 403, 404, 500})
@@ -158,6 +203,27 @@ class Sentiment140SentimentServiceTest {
         assertThatThrownBy(() -> service.classify(tweets))
                 .isExactlyInstanceOf(RuntimeException.class)
                 .hasMessage("Sentiment140 returned status " + status);
+        assertThat(wm.getAllServeEvents()).hasSize(1);
+        assertThat(tweets.get(0).getSentiment()).isNull();
+    }
+
+    /**
+     * A bulk classification whose connection is reset, or closed before any response, fails with a
+     * {@link ResourceAccessException} and is posted exactly once: the JDK {@code HttpURLConnection} re-sends a
+     * request once after such a failure only when it has no streamed body, and this POST streams its body.
+     */
+    @ParameterizedTest
+    @EnumSource(value = Fault.class, names = {"CONNECTION_RESET_BY_PEER", "EMPTY_RESPONSE"})
+    void connectionFaultFailsAndIsPostedOnce(Fault fault) {
+        wm.stubFor(post(urlEqualTo("/bulkClassifyJson")).willReturn(aResponse().withFault(fault)));
+        List<Tweet> tweets = List.of(tweet("1", "$AAPL"));
+        Sentiment140SentimentService service = newService();
+
+        Throwable thrown = catchThrowable(() -> service.classify(tweets));
+
+        assertThat(thrown).isInstanceOf(ResourceAccessException.class);
+        assertThat(causeChain(thrown)).anyMatch(IOException.class::isInstance);
+        wm.verify(1, postRequestedFor(urlEqualTo("/bulkClassifyJson")));
         assertThat(wm.getAllServeEvents()).hasSize(1);
         assertThat(tweets.get(0).getSentiment()).isNull();
     }

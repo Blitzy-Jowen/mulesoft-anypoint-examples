@@ -11,6 +11,7 @@ package com.mulesoft.examples.processing_orders_with_dataweave_and_apikit.trigge
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -23,12 +24,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.client.ResourceAccessException;
 
@@ -69,6 +73,9 @@ class OrderFileTriggerTest {
 
     private static final String REPORT_CSV = "report.csv";
 
+    /** The {@code orders.polling-frequency} {@code application.yml} sets: Mule's default of 1000 ms. */
+    private static final String POLLING_FREQUENCY = "1000";
+
     /** The original's committed {@code report.csv}, spelled out to pin its bytes independently of the fixture. */
     private static final String ORIGINAL_REPORT =
             "totalNumberOfItems,totalAmount,averageSellingPrice\n4,149.93,37.4825\n";
@@ -103,7 +110,7 @@ class OrderFileTriggerTest {
         OrderFlowService flow = new OrderFlowService(currencyClient,
                 new OrderMapper(new DwJsonWriter()), new OrderReportMapper(new DwCsvWriter()),
                 new FileOutboundWriter(), outDir.toString());
-        trigger = new OrderFileTrigger(flow, inDir.toString());
+        trigger = new OrderFileTrigger(flow, inDir.toString(), POLLING_FREQUENCY);
     }
 
     @Test
@@ -173,6 +180,30 @@ class OrderFileTriggerTest {
         assertOriginalOutputs();
         assertThat(input).doesNotExist();
         verify(currencyClient, times(1)).getCurrencies();
+    }
+
+    @ParameterizedTest(name = "orders.polling-frequency \"{0}\" -> start-up fails naming the key and the value")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void unschedulableFrequencyFailsNamingKeyAndValue(String frequency) {
+        OrderFlowService flow = mock(OrderFlowService.class);
+
+        assertThatThrownBy(() -> new OrderFileTrigger(flow, inDir.toString(), frequency))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("orders.polling-frequency")
+                .hasMessageContaining("\"" + frequency + "\"");
+    }
+
+    @ParameterizedTest(name = "orders.polling-frequency \"{0}\" -> the trigger is created")
+    @ValueSource(strings = {"1", "1000", "PT10S", "pt0.5s"})
+    void schedulableFrequencyCreatesTheTrigger(String frequency) {
+        OrderFlowService flow = mock(OrderFlowService.class);
+        AtomicReference<OrderFileTrigger> created = new AtomicReference<>();
+
+        assertThatCode(() -> created.set(new OrderFileTrigger(flow, inDir.toString(), frequency)))
+                .doesNotThrowAnyException();
+
+        assertThat(created.get().inputDirectory()).isEqualTo(inDir);
+        verifyNoInteractions(flow);
     }
 
     /** Places the original's {@code orders.xml} in the input directory, as the original IT dispatched it there. */

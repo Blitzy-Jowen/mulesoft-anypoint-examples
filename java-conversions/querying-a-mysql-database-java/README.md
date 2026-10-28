@@ -56,7 +56,14 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
 | `spring.datasource.url` | `String` | `${jdbc.url}` | none | fixed | the `db:generic-config url` (`database-to-json.xml:3`); set `jdbc.url` rather than this key |
 | `spring.sql.init.mode` | `DatabaseInitializationMode` | `never` | none | fixed | the application never runs `import.sql` or any other schema or data script against the configured database |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `WARN` | none | fixed | its `DEBUG` and `TRACE` write the request line with its `?lastname=<last name>` query string. `WARN`, not `INFO`: its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
+| `logging.level.org.springframework.jdbc.core.StatementCreatorUtils` | `LogLevel` | `INFO` | none | fixed | its `TRACE` writes every bound parameter value: the queried last name |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor` | `LogLevel` | `INFO` | none | fixed | its `DEBUG` and `TRACE` write the response body: the matching first names as JSON |
+| `logging.level.org.springframework.web.method.HandlerMethod` | `LogLevel` | `INFO` | none | fixed | its `TRACE` writes handler arguments, a handled exception and its message included |
+| `logging.level.org.springframework.web.HttpLogging` | `LogLevel` | `INFO` | none | fixed | the HTTP message converters write through this category wherever their own is held at `INFO` |
+| `logging.level.io.undertow.request.io` | `LogLevel` | `INFO` | none | fixed | its `DEBUG` writes request-parse failures quoting a query value that does not decode: the queried last name |
 
+- The six `logging.level` keys keep the queried last name and the employees' first names out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`: a logger's own level outranks them. The original has no logger, so it logged neither. `config/SensitiveLogLevelsTest` asserts this.
 - Driver: `com.mysql:mysql-connector-j` 8.3.0 (`com.mysql.cj.jdbc.Driver`, detected from the `jdbc:mysql:` URL) replaces `mysql:mysql-connector-java` 5.1.31 (`com.mysql.jdbc.Driver`). With a URL set, Boot builds its HikariCP pool from it.
 - Supplying the URL, run from `java-conversions/querying-a-mysql-database-java/`:
 
@@ -129,6 +136,7 @@ JDBC_URL='jdbc:mysql://localhost:3306/company?user=<user>&password=<password>' m
 | `config/UnconfiguredDataSourceListenerTest` | the application started with `jdbc.url` empty: `GET /?lastname=Puckett` → 500 `application/json` `{ "message": "MySQL JDBC URL (jdbc.url, environment variable JDBC_URL) is not configured" }` and one ERROR line carrying SQL state `08001` |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
 | `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/?lastname=Puckett` runs the flow and gets the plain `OPTIONS` reply (200 JSON, no `Access-Control-*` or `Vary`); a pre-flight to an unserved path gets the no-listener 404 |
+| `config/SensitiveLogLevelsTest` | the six `logging.level` keys bound from `application.yml` as Spring Boot binds them; with the root at `TRACE` and those levels applied through Spring Boot's logging system, querying a sentinel employee by last name over H2 answers as usual and writes neither name, as text or as logged body bytes, through any logger outside `com.mulesoft.examples`; a control with the levels cleared shows exactly `DispatcherServlet`, `StatementCreatorUtils` and `HttpEntityMethodProcessor` writing them. A sentinel last name with an undecodable `%ZZ` escape, sent raw, is answered `400 Bad Request` with an empty body and is written by no such logger, in a message or a throwable's message; the control shows exactly `io.undertow.request.io` writing it |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
@@ -162,8 +170,8 @@ No scenario of this project is `unreachable` or `nondeterministic`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 135 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 135 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 145 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 145 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 9 of 9 lines of `service/EmployeeQueryService` (the project has no `mapper` package). Total project LINE coverage: 96.4% (214 of 222 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 

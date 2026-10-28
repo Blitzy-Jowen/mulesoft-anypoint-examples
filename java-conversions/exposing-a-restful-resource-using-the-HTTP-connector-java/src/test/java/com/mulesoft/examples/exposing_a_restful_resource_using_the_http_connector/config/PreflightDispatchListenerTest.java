@@ -146,7 +146,8 @@ class PreflightDispatchListenerTest {
 
         assertEquals("HTTP/1.1 201 Created", stored.statusLine(), stored::toString);
         assertEquals("http://0.0.0.0:8081/person/1", stored.header("Location"), stored::toString);
-        assertEquals("text/plain;charset=UTF-8", stored.header("Content-Type"), stored::toString);
+        assertEquals(List.of(), stored.headers("Content-Type"), stored::toString);
+        assertEquals(List.of("74"), stored.headers("Content-Length"), stored::toString);
         assertArrayEquals(PersonService.STORE_SUCCESS_RESPONSE.getBytes(StandardCharsets.UTF_8), stored.body(),
                 stored::toString);
         assertNoCorsHeaders(stored);
@@ -154,7 +155,8 @@ class PreflightDispatchListenerTest {
         HttpTestClient.Response item = client.send("GET", "/person/1", Map.of("Origin", ORIGIN), null);
 
         assertEquals("HTTP/1.1 200 OK", item.statusLine(), item::toString);
-        assertEquals("application/json", item.header("Content-Type"), item::toString);
+        assertEquals(List.of(), item.headers("Content-Type"), item::toString);
+        assertEquals(List.of(String.valueOf(person.length)), item.headers("Content-Length"), item::toString);
         assertArrayEquals(person, item.body(), item::toString);
         assertNoCorsHeaders(item);
 

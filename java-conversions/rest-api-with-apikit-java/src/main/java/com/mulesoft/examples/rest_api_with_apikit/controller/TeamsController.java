@@ -12,6 +12,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
+import com.mulesoft.examples.rest_api_with_apikit.config.ApiKitAcceptNegotiator;
 import com.mulesoft.examples.rest_api_with_apikit.config.JsonSchemaValidator;
 import com.mulesoft.examples.rest_api_with_apikit.mapper.LeagueJsonMapper;
 import com.mulesoft.examples.rest_api_with_apikit.model.response.Teams;
@@ -25,6 +26,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -43,7 +45,8 @@ import org.springframework.web.bind.annotation.RestController;
  * <ul>
  *   <li>{@code get:/teams} → {@link #getTeams(HttpServletRequest)}: 200 {@code application/json};</li>
  *   <li>{@code post:/teams} → {@link #addTeam(String)}: 201 with {@code Location} and an empty body;</li>
- *   <li>{@code get:/teams/{teamId}} → {@link #getTeam(String)}: 200 {@code application/json};</li>
+ *   <li>{@code get:/teams/{teamId}} → {@link #getTeam(String, HttpServletRequest)}: 200
+ *       {@code application/json};</li>
  *   <li>{@code put:/teams/{teamId}} → {@link #updateTeam(String, String)}: 204 with an empty body;</li>
  *   <li>{@code delete:/teams/{teamId}} → {@link #deleteTeam(String)}: 204 with an empty body.</li>
  * </ul>
@@ -59,7 +62,9 @@ import org.springframework.web.bind.annotation.RestController;
  * <ul>
  *   <li>an unknown team ({@code ApiKitNotFoundException}) → APIkit's 404 mapping in {@code ApiKitExceptionHandler};</li>
  *   <li>an invalid {@code teamId}, a missing body or one its schema rejects → APIkit's 400 mapping;</li>
- *   <li>an undeclared method, body media type or {@code Accept} type → APIkit's 405, 415 or 406 mapping. HEAD
+ *   <li>an undeclared method, body media type or {@code Accept} type → APIkit's 405, 415 or 406 mapping. Each GET
+ *       negotiates its {@code Accept} header with {@link ApiKitAcceptNegotiator} after its URI parameter
+ *       validation and before it calls {@link LeagueAPI}, where APIkit negotiated it. HEAD
  *       and OPTIONS, which Spring would otherwise answer itself, are claimed on both resources by
  *       {@link #rejectUndeclaredTeamsMethod(HttpServletRequest)} and
  *       {@link #rejectUndeclaredTeamMethod(HttpServletRequest)}, which raise the same 405;</li>
@@ -112,11 +117,15 @@ public class TeamsController {
      * {@code null} when absent or written without {@code =} ({@code ?city}), {@code ""} for {@code ?city=}, the
      * last value when repeated. A form body cannot supply or change it, as it could not in the original.
      *
-     * @param request the current request, whose raw query string is read
+     * @param request the current request, whose raw query string is read and whose {@code Accept} header is
+     *                negotiated
      * @return 200 {@code application/json} with the team list
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
      */
     @GetMapping(value = TEAMS_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> getTeams(HttpServletRequest request) {
+    public ResponseEntity<String> getTeams(HttpServletRequest request) throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         Teams teams = leagueAPI.getTeams(queryParameter(request.getQueryString(), CITY_PARAMETER));
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
@@ -148,11 +157,16 @@ public class TeamsController {
     /**
      * GET {@code /api/teams/{teamId}}: one team with its number of matches played.
      *
-     * @param teamId the three-letter team code
+     * @param teamId  the three-letter team code
+     * @param request the current request, whose {@code Accept} header is negotiated
      * @return 200 {@code application/json} with the team, null properties omitted
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
      */
     @GetMapping(value = TEAM_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> getTeam(@PathVariable("teamId") @Size(min = 3, max = 3) String teamId) {
+    public ResponseEntity<String> getTeam(@PathVariable("teamId") @Size(min = 3, max = 3) String teamId,
+                                          HttpServletRequest request) throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(leagueJsonMapper.toJson(leagueAPI.getTeam(teamId)));

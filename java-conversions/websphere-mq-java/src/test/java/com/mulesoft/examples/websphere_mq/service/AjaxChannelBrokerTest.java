@@ -360,6 +360,7 @@ class AjaxChannelBrokerTest {
         await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> loggedMessages(Level.INFO).contains(timeoutLine));
         assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
         assertThat(loggedMessages(Level.INFO)).containsExactly(timeoutLine);
+        assertThat(loggedMessages(Level.ERROR)).isEmpty();
     }
 
     @Test
@@ -462,9 +463,10 @@ class AjaxChannelBrokerTest {
         assertThat(broker.awaitMessages(client, QUIET_MS)).isEmpty();
         String throwSite = Pattern.quote(AjaxChannelBrokerTest.class.getName()
                 + ".sensitiveFailure(AjaxChannelBrokerTest.java:") + "\\d+\\)";
-        assertThat(loggedMessages(Level.INFO)).singleElement().asString().matches(
+        assertThat(loggedMessages(Level.ERROR)).singleElement().asString().matches(
                 Pattern.quote("Ajax handler for channel " + INBOUND + " failed: java.lang.IllegalStateException at ")
                         + throwSite + Pattern.quote(" <- java.io.IOException"));
+        assertThat(loggedMessages(Level.INFO)).isEmpty();
         assertThat(loggedMessages(Level.DEBUG)).filteredOn(message -> message.startsWith("Ajax handler failure"))
                 .singleElement().asString().matches(
                         Pattern.quote("Ajax handler failure on channel " + INBOUND
@@ -476,7 +478,7 @@ class AjaxChannelBrokerTest {
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("handlerFailureDescriptions")
-    void handlerFailureIsDescribedByTypeIdentifiersOnly(String description, Exception failure, String infoDescription,
+    void handlerFailureIsDescribedByTypeIdentifiersOnly(String description, Exception failure, String errorDescription,
             String debugDescription) {
         AjaxChannelBroker broker = broker(handlerEnvironment());
         broker.registerInbound(INBOUND, data -> {
@@ -487,8 +489,9 @@ class AjaxChannelBrokerTest {
 
         String debugLine = "Ajax handler failure on channel " + INBOUND + ": " + debugDescription;
         await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> loggedMessages(Level.DEBUG).contains(debugLine));
-        assertThat(loggedMessages(Level.INFO))
-                .containsExactly("Ajax handler for channel " + INBOUND + " failed: " + infoDescription);
+        assertThat(loggedMessages(Level.ERROR))
+                .containsExactly("Ajax handler for channel " + INBOUND + " failed: " + errorDescription);
+        assertThat(loggedMessages(Level.INFO)).isEmpty();
         assertThat(loggedEvents()).allSatisfy(event -> assertThat(event.getFormattedMessage()).doesNotContain(SECRET));
     }
 
@@ -587,7 +590,7 @@ class AjaxChannelBrokerTest {
                 Arguments.of("failure", Map.of(timeout, HANDLER_TIMEOUT_MS), (BrokerScenario) broker -> {
                     broker.registerInbound(FORGED_CHANNEL, failing);
                     broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);
-                }, Level.INFO, "Ajax handler for channel " + FORGED_CHANNEL_RENDERING
+                }, Level.ERROR, "Ajax handler for channel " + FORGED_CHANNEL_RENDERING
                         + " failed: java.lang.IllegalStateException"),
                 Arguments.of("failure detail", Map.of(timeout, HANDLER_TIMEOUT_MS), (BrokerScenario) broker -> {
                     broker.registerInbound(FORGED_CHANNEL, failing);

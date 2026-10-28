@@ -12,6 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -30,6 +31,7 @@ import java.util.stream.Stream;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mulesoft.examples.websphere_mq.config.AjaxResourceConfig;
 import com.mulesoft.examples.websphere_mq.service.AjaxChannelBroker;
 import jakarta.jms.JMSException;
 import jakarta.jms.Message;
@@ -45,6 +47,9 @@ import org.springframework.jms.JmsException;
 import org.springframework.jms.UncategorizedJmsException;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.jms.core.MessageCreator;
+import org.springframework.mock.web.MockServletContext;
+import org.springframework.web.context.support.GenericWebApplicationContext;
+import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
 
 /**
  * Unit test of {@link MqQueueSender}, the outbound WMQ adapter replacing the two {@code wmq:outbound-endpoint}s of
@@ -58,6 +63,11 @@ import org.springframework.jms.core.MessageCreator;
  * {@code MULE_REPLYTO} before the send (lines 10-12) and its Ajax connector set {@code disableReplyTo="true"}
  * (line 7), so a converted message carries no reply destination. Transactions belong to the template and are not
  * exercised here.
+ *
+ * <p>The server-path tests hold {@link MqQueueSender#normalizeServerPath(String)} to {@link AjaxResourceConfig},
+ * whose normalization it mirrors: every accepted form yields the prefix the docroot and script handlers are
+ * registered under, and every rejected form the same {@link IllegalStateException}. The unrefreshed web application
+ * context and mock servlet context only satisfy the {@link ResourceHandlerRegistry} constructor.
  */
 class MqQueueSenderTest {
 
@@ -100,6 +110,79 @@ class MqQueueSenderTest {
         verify(broker, times(1)).registerInbound(eq(ENQUEUE_CHANNEL), handler.capture());
         verifyNoMoreInteractions(broker);
         verifyNoInteractions(jmsTemplate);
+    }
+
+    /** Configured forms that {@link AjaxResourceConfig} serves the page {@code /services/wmqExample/} for. */
+    static Stream<String> equivalentServerPaths() {
+        return Stream.of("/services/wmqExample", "/services/wmqExample/", "services/wmqExample",
+                " /services/wmqExample// ");
+    }
+
+    /**
+     * Each form must register the channel the page publishes on (index.html:55, websphere-mq.xml:9), never one
+     * with a doubled or missing slash.
+     */
+    @ParameterizedTest(name = "[{0}]")
+    @MethodSource("equivalentServerPaths")
+    void register_equivalentServerPath_registersOriginalEnqueueChannel(String serverPath) {
+        new MqQueueSender(jmsTemplate, broker, new ObjectMapper(), serverPath, IN_QUEUE, OUT_QUEUE).register();
+
+        verify(broker, times(1)).registerInbound(eq(ENQUEUE_CHANNEL), any(AjaxChannelBroker.InboundHandler.class));
+        verifyNoMoreInteractions(broker);
+        verifyNoInteractions(jmsTemplate);
+    }
+
+    @ParameterizedTest(name = "[{0}]")
+    @MethodSource("equivalentServerPaths")
+    void normalizeServerPath_equivalentServerPath_matchesAjaxResourceConfigRegistration(String serverPath) {
+        ResourceHandlerRegistry registry =
+                new ResourceHandlerRegistry(new GenericWebApplicationContext(), new MockServletContext());
+        new AjaxResourceConfig(serverPath).addResourceHandlers(registry);
+
+        assertEquals(SERVER_PATH, MqQueueSender.normalizeServerPath(serverPath));
+        assertTrue(registry.hasMappingForPattern(SERVER_PATH + "/**"));
+        assertTrue(registry.hasMappingForPattern(SERVER_PATH + "/mule-resource/js/**"));
+    }
+
+    static Stream<Arguments> rejectedServerPaths() {
+        String belowRoot = "ajax.server-path must name a path below the root, but is '%s'";
+        String literal = "ajax.server-path must be a literal path, but is '%s'";
+        return Stream.of(
+                Arguments.of(null, belowRoot.formatted("null")),
+                Arguments.of("", belowRoot.formatted("")),
+                Arguments.of("/", belowRoot.formatted("/")),
+                Arguments.of(" // ", belowRoot.formatted(" // ")),
+                Arguments.of("/a//b", literal.formatted("/a//b")),
+                Arguments.of("/a/./b", literal.formatted("/a/./b")),
+                Arguments.of("/a/../b", literal.formatted("/a/../b")),
+                Arguments.of("/services/*", literal.formatted("/services/*")),
+                Arguments.of("/services/{id}", literal.formatted("/services/{id}")),
+                Arguments.of("/a?b", literal.formatted("/a?b")),
+                Arguments.of("/a\\b", literal.formatted("/a\\b")));
+    }
+
+    @ParameterizedTest(name = "[{0}]")
+    @MethodSource("rejectedServerPaths")
+    void normalizeServerPath_rejectsWhatAjaxResourceConfigRejects(String serverPath, String expectedMessage) {
+        IllegalStateException thrown =
+                assertThrows(IllegalStateException.class, () -> MqQueueSender.normalizeServerPath(serverPath));
+        IllegalStateException resourceConfigThrown =
+                assertThrows(IllegalStateException.class, () -> new AjaxResourceConfig(serverPath));
+
+        assertEquals(expectedMessage, thrown.getMessage());
+        assertEquals(expectedMessage, resourceConfigThrown.getMessage());
+    }
+
+    @Test
+    void constructor_rejectsNullAndNonLiteralServerPath() {
+        NullPointerException nullPath = assertThrows(NullPointerException.class,
+                () -> new MqQueueSender(jmsTemplate, broker, new ObjectMapper(), null, IN_QUEUE, OUT_QUEUE));
+        IllegalStateException rootPath = assertThrows(IllegalStateException.class,
+                () -> new MqQueueSender(jmsTemplate, broker, new ObjectMapper(), "/", IN_QUEUE, OUT_QUEUE));
+
+        assertEquals("serverPath", nullPath.getMessage());
+        assertEquals("ajax.server-path must name a path below the root, but is '/'", rootPath.getMessage());
+        verifyNoInteractions(broker, jmsTemplate);
     }
 
     @Test

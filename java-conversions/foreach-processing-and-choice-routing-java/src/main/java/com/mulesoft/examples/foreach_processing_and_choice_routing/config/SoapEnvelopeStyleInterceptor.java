@@ -1,19 +1,48 @@
 package com.mulesoft.examples.foreach_processing_and_choice_routing.config;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.StringWriter;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
+import javax.xml.XMLConstants;
+import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerConfigurationException;
+import javax.xml.transform.TransformerException;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
+
+import jakarta.xml.soap.MessageFactory;
+import jakarta.xml.soap.MimeHeader;
+import jakarta.xml.soap.MimeHeaders;
 import jakarta.xml.soap.SOAPException;
 import jakarta.xml.soap.SOAPMessage;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
+import org.springframework.util.ObjectUtils;
 import org.springframework.ws.context.MessageContext;
 import org.springframework.ws.server.EndpointInterceptor;
 import org.springframework.ws.soap.SoapMessage;
+import org.springframework.ws.soap.SoapVersion;
 import org.springframework.ws.soap.saaj.SaajSoapEnvelopeException;
 import org.springframework.ws.soap.saaj.SaajSoapMessage;
+import org.springframework.ws.soap.saaj.SaajSoapMessageException;
+import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
+import org.springframework.ws.transport.TransportConstants;
+import org.springframework.ws.transport.TransportOutputStream;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NamedNodeMap;
@@ -31,7 +60,9 @@ import org.w3c.dom.Node;
  * between structural elements is removed. The body payload, its prefixes and its namespace declarations are never
  * touched, so a JAXB {@code ns2:} payload passes through byte for byte. No XML declaration is written for messages
  * the message factory creates, which every response is; SAAJ re-emits the declaration a message parsed from bytes
- * carried, and only its internal envelope class could clear it, so such a message keeps it.
+ * carried, and only its internal envelope class could clear it, so such a message keeps it. Characters outside the
+ * Basic Multilingual Plane are written as raw UTF-8, as CXF wrote them, by the messages of
+ * {@link CxfStyleMessageFactory}, the message factory each consumer's web-service configuration declares.
  * <p>
  * Spring WS does not auto-detect a plain {@link EndpointInterceptor} bean: the web-service configuration registers
  * this bean on its endpoint mappings, and the listener boundary applies {@link #restyle(SoapMessage)} to every message
@@ -40,6 +71,8 @@ import org.w3c.dom.Node;
  */
 @Component
 public class SoapEnvelopeStyleInterceptor implements EndpointInterceptor {
+
+    private static final Logger log = LoggerFactory.getLogger(SoapEnvelopeStyleInterceptor.class);
 
     /** Namespace of the SOAP 1.1 envelope. */
     public static final String SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -337,5 +370,267 @@ public class SoapEnvelopeStyleInterceptor implements EndpointInterceptor {
         String name = node.getNodeName();
         int colon = name.indexOf(':');
         return colon < 0 ? name : name.substring(colon + 1);
+    }
+
+    /**
+     * Spring WS's {@link SaajSoapMessageFactory}, except that every message it creates (response, fault or outbound
+     * request) writes characters outside the Basic Multilingual Plane as raw UTF-8, as CXF 2.7 wrote them through
+     * Woodstox, where SAAJ writes a numeric character reference such as {@code &#128512;}. Messages read from a stream
+     * are created as Spring WS creates them, because they are read, not written. Configured once at startup, one
+     * instance then serves all requests concurrently, as Spring's does.
+     */
+    public static class CxfStyleMessageFactory extends SaajSoapMessageFactory {
+
+        /** Spring's default, which it keeps in a private field. */
+        private boolean langAttributeOnSoap11FaultString = true;
+
+        /** Creates the factory without a SAAJ factory, which {@link #afterPropertiesSet()} creates as Spring's does. */
+        public CxfStyleMessageFactory() {
+        }
+
+        /**
+         * Creates the factory over a SAAJ factory.
+         *
+         * @param messageFactory the SAAJ message factory every message is created with
+         */
+        public CxfStyleMessageFactory(MessageFactory messageFactory) {
+            super(messageFactory);
+        }
+
+        @Override
+        public void setLangAttributeOnSoap11FaultString(boolean langAttributeOnSoap11FaultString) {
+            super.setLangAttributeOnSoap11FaultString(langAttributeOnSoap11FaultString);
+            this.langAttributeOnSoap11FaultString = langAttributeOnSoap11FaultString;
+        }
+
+        /** Spring's empty message, with its message properties, written as {@link CxfStyleSaajSoapMessage} writes. */
+        @Override
+        public SaajSoapMessage createWebServiceMessage() {
+            SaajSoapMessage created = super.createWebServiceMessage();
+            return new CxfStyleSaajSoapMessage(created.getSaajMessage(), langAttributeOnSoap11FaultString,
+                    getMessageFactory());
+        }
+    }
+
+    /**
+     * A SAAJ message whose characters outside the Basic Multilingual Plane are written as their four UTF-8 bytes. CXF
+     * 2.7 serialized through Woodstox, which wrote them so; SAAJ serializes through the JDK's identity transformer,
+     * which writes each one in text and attribute values as a numeric character reference. When the SOAP part holds
+     * such a character, the document SAAJ transforms is transformed by a transformer built as SAAJ builds its own, but
+     * with the output encoding UTF-16, under which the JDK writes those characters as characters and every other one
+     * exactly as for UTF-8; the result is encoded as UTF-8, behind the declaration SAAJ writes when
+     * {@link SOAPMessage#WRITE_XML_DECLARATION} is {@code "true"}. Every other byte, and every header but a
+     * {@code Content-Length} that counts these bytes, is the one Spring WS and SAAJ write. SAAJ's own write is used
+     * unchanged for a message with attachments or an XOP package, one whose
+     * {@link SOAPMessage#CHARACTER_SET_ENCODING} is not UTF-8, one without such a character, and one holding an
+     * unpaired surrogate, which UTF-8 cannot encode.
+     */
+    private static final class CxfStyleSaajSoapMessage extends SaajSoapMessage {
+
+        /** The charset SAAJ's envelope serializes in when {@link SOAPMessage#CHARACTER_SET_ENCODING} is not set. */
+        private static final String SAAJ_DEFAULT_CHARSET = "utf-8";
+
+        /** The system property under which SAAJ uses the JDK's built-in transformer factory. */
+        private static final String SAAJ_DEFAULT_TRANSFORMER_FACTORY = "saaj.use.default.transformer.factory";
+
+        CxfStyleSaajSoapMessage(SOAPMessage soapMessage, boolean langAttributeOnSoap11FaultString,
+                MessageFactory messageFactory) {
+            super(soapMessage, langAttributeOnSoap11FaultString, messageFactory);
+        }
+
+        /**
+         * Writes the message as {@link SaajSoapMessage#writeTo(OutputStream)} does, with the bytes of
+         * {@link #rawUtf8Envelope()}: the same MIME header steps, {@code Content-Length} counting the bytes written,
+         * and afterwards the message left as SAAJ leaves a written one.
+         */
+        @Override
+        public void writeTo(OutputStream outputStream) throws IOException {
+            byte[] envelope = rawUtf8Envelope();
+            if (envelope == null) {
+                super.writeTo(outputStream);
+                return;
+            }
+            SOAPMessage message = getSaajMessage();
+            MimeHeaders mimeHeaders = message.getMimeHeaders();
+            if (ObjectUtils.isEmpty(mimeHeaders.getHeader(TransportConstants.HEADER_ACCEPT))) {
+                mimeHeaders.setHeader(TransportConstants.HEADER_ACCEPT, getVersion().getContentType());
+            }
+            try {
+                message.saveChanges();
+                TransportOutputStream transport = outputStream instanceof TransportOutputStream transportOutputStream
+                        ? transportOutputStream
+                        : null;
+                if (transport != null
+                        && ObjectUtils.isEmpty(mimeHeaders.getHeader(TransportConstants.HEADER_CONTENT_TYPE))) {
+                    mimeHeaders.addHeader(TransportConstants.HEADER_CONTENT_TYPE, envelopeContentType(message));
+                    message.saveChanges();
+                }
+                // SAAJ counted its own bytes, in which each such character took a whole character reference.
+                if (!ObjectUtils.isEmpty(mimeHeaders.getHeader(TransportConstants.HEADER_CONTENT_LENGTH))) {
+                    mimeHeaders.setHeader(TransportConstants.HEADER_CONTENT_LENGTH, Integer.toString(envelope.length));
+                }
+                if (transport != null) {
+                    for (Iterator<MimeHeader> headers = mimeHeaders.getAllHeaders(); headers.hasNext();) {
+                        MimeHeader header = headers.next();
+                        transport.addHeader(header.getName(), header.getValue());
+                    }
+                }
+                outputStream.write(envelope);
+                outputStream.flush();
+                // SAAJ's own write of the bytes it saved, discarded, leaves the message as SAAJ leaves every written
+                // one: a SOAP 1.1 message without SOAPAction gets SOAPAction "", and the next write saves again.
+                message.writeTo(OutputStream.nullOutputStream());
+            }
+            catch (SOAPException ex) {
+                throw new SaajSoapMessageException("Could not write message to OutputStream: " + ex.getMessage(), ex);
+            }
+        }
+
+        /**
+         * The SOAP part as SAAJ writes it, with every character outside the Basic Multilingual Plane as raw UTF-8, or
+         * {@code null} when SAAJ's own write is to be used.
+         */
+        private byte[] rawUtf8Envelope() {
+            SOAPMessage message = getSaajMessage();
+            String charset;
+            Object writeXmlDeclaration;
+            Document document;
+            try {
+                charset = serializationCharset(message);
+                if (message.countAttachments() > 0 || isXopPackage()
+                        || !StandardCharsets.UTF_8.name().equalsIgnoreCase(charset)) {
+                    return null;
+                }
+                writeXmlDeclaration = message.getProperty(SOAPMessage.WRITE_XML_DECLARATION);
+                document = message.getSOAPPart().getEnvelope().getOwnerDocument();
+            }
+            catch (SOAPException ex) {
+                log.debug("SOAP envelope unavailable for the UTF-8 write; SAAJ writes the message and reports it");
+                return null;
+            }
+            if (document == null || !containsSurrogate(document)) {
+                return null;
+            }
+            StringWriter text = new StringWriter();
+            if (writeXmlDeclaration != null && "true".equalsIgnoreCase(writeXmlDeclaration.toString())) {
+                text.append("<?xml version=\"").append(document.getXmlVersion()).append("\" encoding=\"")
+                        .append(charset).append("\" ?>");
+            }
+            try {
+                newUtf16Transformer().transform(new DOMSource(document), new StreamResult(text));
+                ByteBuffer encoded = StandardCharsets.UTF_8.newEncoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .encode(CharBuffer.wrap(text.getBuffer()));
+                byte[] bytes = new byte[encoded.remaining()];
+                encoded.get(bytes);
+                return bytes;
+            }
+            catch (TransformerException | CharacterCodingException ex) {
+                log.debug("SOAP message not writable as raw UTF-8 ({}); SAAJ writes it unchanged",
+                        ex.getClass().getSimpleName());
+                return null;
+            }
+        }
+
+        /** The charset SAAJ's envelope serializes in: {@link SOAPMessage#CHARACTER_SET_ENCODING}, else its default. */
+        private static String serializationCharset(SOAPMessage message) throws SOAPException {
+            Object charset = message.getProperty(SOAPMessage.CHARACTER_SET_ENCODING);
+            return charset == null ? SAAJ_DEFAULT_CHARSET : charset.toString();
+        }
+
+        /** The Content-Type Spring WS adds for the envelope's SOAP version when SAAJ set none. */
+        private static String envelopeContentType(SOAPMessage message) throws SOAPException {
+            String namespace = message.getSOAPPart().getEnvelope().getElementQName().getNamespaceURI();
+            return SoapVersion.SOAP_11.getEnvelopeNamespaceUri().equals(namespace)
+                    ? SoapVersion.SOAP_11.getContentType()
+                    : SoapVersion.SOAP_12.getContentType();
+        }
+
+        /**
+         * Whether any node name or value under {@code document}, attributes included, holds a UTF-16 surrogate,
+         * paired or not. The walk is iterative, so nesting depth costs no stack. Attributes are read on elements only,
+         * because SAAJ's text nodes fail on {@code getAttributes()} instead of answering {@code null}.
+         */
+        private static boolean containsSurrogate(Document document) {
+            Node node = document;
+            while (node != null) {
+                if (hasSurrogate(node.getNodeName()) || hasSurrogate(node.getNodeValue())) {
+                    return true;
+                }
+                NamedNodeMap attributes = node.getNodeType() == Node.ELEMENT_NODE ? node.getAttributes() : null;
+                if (attributes != null) {
+                    for (int i = 0; i < attributes.getLength(); i++) {
+                        Node attribute = attributes.item(i);
+                        if (hasSurrogate(attribute.getNodeName()) || hasSurrogate(attribute.getNodeValue())) {
+                            return true;
+                        }
+                    }
+                }
+                node = nextInDocumentOrder(node, document);
+            }
+            return false;
+        }
+
+        /** The node after {@code node} in document order within {@code root}, or {@code null} after the last. */
+        private static Node nextInDocumentOrder(Node node, Node root) {
+            Node firstChild = node.getFirstChild();
+            if (firstChild != null) {
+                return firstChild;
+            }
+            for (Node current = node; current != null && current != root; current = current.getParentNode()) {
+                Node sibling = current.getNextSibling();
+                if (sibling != null) {
+                    return sibling;
+                }
+            }
+            return null;
+        }
+
+        private static boolean hasSurrogate(String text) {
+            if (text == null) {
+                return false;
+            }
+            for (int i = 0; i < text.length(); i++) {
+                if (Character.isSurrogate(text.charAt(i))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * An identity transformer from a factory configured as SAAJ's {@code EfficientStreamingTransformer} configures
+         * its own, writing no declaration, in UTF-16. The factory is created per write, because factories are not
+         * safe for concurrent use.
+         */
+        private static Transformer newUtf16Transformer() throws TransformerConfigurationException {
+            TransformerFactory factory = Boolean.getBoolean(SAAJ_DEFAULT_TRANSFORMER_FACTORY)
+                    ? TransformerFactory.newDefaultInstance()
+                    : TransformerFactory.newInstance();
+            try {
+                factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            }
+            catch (TransformerConfigurationException ex) {
+                log.debug("Transformer factory {} does not support secure processing; SAAJ continues without it",
+                        factory.getClass().getName());
+            }
+            setEmptyAttributeIfSupported(factory, XMLConstants.ACCESS_EXTERNAL_DTD);
+            setEmptyAttributeIfSupported(factory, XMLConstants.ACCESS_EXTERNAL_STYLESHEET);
+            Transformer transformer = factory.newTransformer();
+            transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
+            transformer.setOutputProperty(OutputKeys.ENCODING, StandardCharsets.UTF_16.name());
+            return transformer;
+        }
+
+        private static void setEmptyAttributeIfSupported(TransformerFactory factory, String attribute) {
+            try {
+                factory.setAttribute(attribute, "");
+            }
+            catch (IllegalArgumentException ex) {
+                log.debug("Transformer factory {} does not support {}; SAAJ continues without it",
+                        factory.getClass().getName(), attribute);
+            }
+        }
     }
 }

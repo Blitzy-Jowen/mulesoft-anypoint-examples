@@ -10,6 +10,7 @@ package com.mulesoft.examples.import_contacts_into_ms_dynamics.trigger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -25,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
@@ -36,6 +38,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -97,7 +100,7 @@ class ContactsFileTriggerTest {
     void createTriggerOverTempDirectories() throws IOException {
         in = Files.createDirectories(tempDir.resolve("input"));
         out = Files.createDirectories(tempDir.resolve("output"));
-        trigger = new ContactsFileTrigger(service, in.toString(), out.toString());
+        trigger = new ContactsFileTrigger(service, in.toString(), out.toString(), "10000");
 
         pollerLogger = (Logger) LoggerFactory.getLogger(FileInboundPoller.class);
         logged = new ListAppender<>();
@@ -199,6 +202,27 @@ class ContactsFileTriggerTest {
         verify(service, times(1)).importContacts(any());
         verifyNoMoreInteractions(service);
         assertMovedToOutput();
+    }
+
+    @ParameterizedTest(name = "contacts.polling-frequency \"{0}\" -> start-up fails naming the key and the value")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void nonPositiveOrUnreadablePollingFrequencyFailsNamingKeyAndValue(String frequency) {
+        assertThatThrownBy(() -> new ContactsFileTrigger(service, in.toString(), out.toString(), frequency))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("contacts.polling-frequency")
+                .hasMessageContaining("\"" + frequency + "\"");
+        verifyNoInteractions(service);
+    }
+
+    @ParameterizedTest(name = "contacts.polling-frequency \"{0}\" -> accepted, as Spring schedules it")
+    @ValueSource(strings = {"1", "10000", "PT10S", "pt0.5s"})
+    void positivePollingFrequencyIsAccepted(String frequency) {
+        AtomicReference<ContactsFileTrigger> accepted = new AtomicReference<>();
+        assertThatCode(() -> accepted.set(new ContactsFileTrigger(service, in.toString(), out.toString(), frequency)))
+                .doesNotThrowAnyException();
+
+        assertThat(accepted.get().inputDirectory()).isEqualTo(in);
+        assertThat(accepted.get().moveToDirectory()).isEqualTo(out);
     }
 
     /** Places the original {@code contacts.csv} in the input directory, as the original IT dispatched it there. */

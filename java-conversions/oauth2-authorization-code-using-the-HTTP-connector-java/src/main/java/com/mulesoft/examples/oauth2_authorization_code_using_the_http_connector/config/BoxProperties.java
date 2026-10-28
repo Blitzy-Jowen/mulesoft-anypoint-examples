@@ -15,6 +15,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.Optional;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -27,6 +28,7 @@ import org.springframework.core.io.FileSystemResource;
 import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Component;
 import org.springframework.util.ResourceUtils;
+import org.springframework.util.StringUtils;
 
 /**
  * Box OAuth 2.0 and TLS configuration of {@code http-authorization-code-web.xml}, the single holder of every
@@ -48,6 +50,10 @@ import org.springframework.util.ResourceUtils;
  * <p>Every key keeps its original placeholder name. The client identity and the three store passwords have no
  * value in the repository and default to empty; they come only from configuration, so the class has no setter.
  * Passwords have no getter, appear in no exception message, and {@link Object#toString()} is not overridden.
+ *
+ * <p>The client identity is not checked at construction either, so the application starts without it. Each
+ * operation that sends it first asks {@link #firstMissing(ClientCredential...)} for the credentials it needs and
+ * fails locally, naming the missing key, rather than sending Box an empty value.
  *
  * <p>The {@link SSLContext} of {@code TLS_Context} is built on the first {@link #sslContext()} call, never at
  * construction: loading a JKS store with an empty or wrong password fails, and the application context must
@@ -138,6 +144,59 @@ public final class BoxProperties {
     /** @return {@code box.secret}, the Box OAuth client secret ({@code clientSecret}) */
     public String getSecret() {
         return secret;
+    }
+
+    /**
+     * The Box client credentials of {@code oauth2:authorization-code-grant-type} (line 6), in the order an operation
+     * checks them. Each names its key and the message an operation fails with when the key has no value; neither
+     * ever carries the value.
+     */
+    public enum ClientCredential {
+
+        /** {@code box.id}, the client ID ({@code clientId="${box.id}"}). */
+        ID("box.id", "Box client ID"),
+
+        /** {@code box.secret}, the client secret ({@code clientSecret="${box.secret}"}). */
+        SECRET("box.secret", "Box client secret");
+
+        private final String key;
+        private final String description;
+
+        ClientCredential(String key, String description) {
+            this.key = key;
+            this.description = description;
+        }
+
+        /** @return the configuration key, {@code box.id} or {@code box.secret} */
+        public String key() {
+            return key;
+        }
+
+        /**
+         * @return the failure message naming this key, {@code Box client ID (box.id) is not configured} or
+         *         {@code Box client secret (box.secret) is not configured}
+         */
+        public String notConfiguredMessage() {
+            return description + " (" + key + ") is not configured";
+        }
+    }
+
+    /**
+     * The first of {@code needed}, in the order given, whose key has no value: unset, empty or whitespace only, as
+     * the empty defaults of {@code application.yml} leave both keys. Only the credential is returned, never its
+     * value.
+     *
+     * @param needed the credentials an operation is about to send, in the order it reports them
+     * @return the first missing credential, or empty when every one has a value
+     */
+    public Optional<ClientCredential> firstMissing(ClientCredential... needed) {
+        for (ClientCredential credential : needed) {
+            String value = credential == ClientCredential.ID ? id : secret;
+            if (!StringUtils.hasText(value)) {
+                return Optional.of(credential);
+            }
+        }
+        return Optional.empty();
     }
 
     /** @return {@code box.authorization-url}, the Box authorization endpoint ({@code authorizationUrl}) */

@@ -8,7 +8,10 @@
 
 package com.mulesoft.examples.soap_webservice_security.client;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Duration;
@@ -34,13 +37,17 @@ import org.springframework.core.io.DefaultResourceLoader;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.oxm.jaxb.Jaxb2Marshaller;
 import org.springframework.stereotype.Component;
+import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
+import org.springframework.ws.WebServiceMessage;
 import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.client.support.interceptor.ClientInterceptor;
 import org.springframework.ws.soap.SoapMessage;
 import org.springframework.ws.soap.SoapVersion;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.springframework.ws.soap.security.wss4j2.Wss4jSecurityInterceptor;
+import org.springframework.ws.transport.WebServiceConnection;
+import org.springframework.ws.transport.http.HttpUrlConnection;
 import org.springframework.ws.transport.http.HttpUrlConnectionMessageSender;
 
 import com.mulesoft.examples.soap_webservice_security.config.PasswordCallback;
@@ -75,9 +82,10 @@ import com.mulesoft.examples.soap_webservice_security.model.soap.GreetResponse;
  * {@code PasswordDigest}, Timestamp TTL, key identifiers, algorithms, {@code mustUnderstand}, body-content
  * encryption). Responses are not validated: the original clients had out-interceptors only.
  *
- * <p>Nothing here catches: a SOAP fault raises {@code SoapFaultClientException} carrying the server's
- * {@code faultstring}, a transport failure {@code WebServiceIOException}, and missing configuration
- * {@link IllegalStateException}; the original catch branch is {@code GreeterClientExceptionHandler}.
+ * <p>Every call sends its request exactly once ({@link SingleAttemptMessageSender}). Nothing here catches: a SOAP
+ * fault raises {@code SoapFaultClientException} carrying the server's {@code faultstring}, a transport failure
+ * {@code WebServiceIOException}, and missing configuration {@link IllegalStateException}; the original catch branch
+ * is {@code GreeterClientExceptionHandler}.
  *
  * <p>Every user name and password comes from {@code soap-security.*} through the injected beans. Nothing that needs a
  * secret is touched before a client type is first called, so the application starts with every credential
@@ -127,17 +135,23 @@ public class SecureGreeterClient {
     /** Written by Spring WS as the quoted empty string {@code ""}. */
     private static final String EMPTY_SOAP_ACTION = "";
 
+    /**
+     * The WSS4J action token {@code Encrypt} of the original action set {@code UsernameToken Timestamp Encrypt}.
+     * WSS4J 4 still accepts it but deprecates its {@code ConfigurationConstants} field in favour of
+     * {@link ConfigurationConstants#ENCRYPTION} ({@code Encryption}), a different token that is accepted as well.
+     */
+    private static final String ENCRYPT = "Encrypt";
+
     /** Actions for which WSS4J asks for the user's password: the token password or the private-key password. */
     private static final Set<String> PASSWORD_ACTIONS = Set.of(ConfigurationConstants.USERNAME_TOKEN,
             ConfigurationConstants.SIGNATURE, ConfigurationConstants.SAML_TOKEN_SIGNED);
 
     /** Actions for which WSS4J loads a crypto. */
     private static final Set<String> CRYPTO_ACTIONS = Set.of(ConfigurationConstants.SIGNATURE,
-            ConfigurationConstants.ENCRYPT, ConfigurationConstants.ENCRYPTION,
+            ENCRYPT, ConfigurationConstants.ENCRYPTION,
             ConfigurationConstants.SAML_TOKEN_SIGNED);
 
-    private static final Set<String> ENCRYPT_ACTIONS =
-            Set.of(ConfigurationConstants.ENCRYPT, ConfigurationConstants.ENCRYPTION);
+    private static final Set<String> ENCRYPT_ACTIONS = Set.of(ENCRYPT, ConfigurationConstants.ENCRYPTION);
 
     private final SoapSecurityProperties properties;
     private final Supplier<Crypto> crypto;
@@ -380,8 +394,13 @@ public class SecureGreeterClient {
         template.setMarshaller(resolved.marshaller());
         template.setUnmarshaller(resolved.marshaller());
 
-        HttpUrlConnectionMessageSender sender = new HttpUrlConnectionMessageSender();
-        Duration timeout = Duration.ofMillis(properties.getClient().getResponseTimeout());
+        // HttpURLConnection waits indefinitely on a zero timeout, so only a positive one is applied.
+        int timeoutMillis = properties.getClient().getResponseTimeout();
+        Assert.isTrue(timeoutMillis > 0,
+                () -> "soap-security.client.response-timeout must be a positive number of milliseconds: "
+                        + timeoutMillis);
+        HttpUrlConnectionMessageSender sender = new SingleAttemptMessageSender();
+        Duration timeout = Duration.ofMillis(timeoutMillis);
         sender.setConnectionTimeout(timeout);
         sender.setReadTimeout(timeout);
         template.setMessageSender(sender);
@@ -527,6 +546,55 @@ public class SecureGreeterClient {
 
     /** The message factory and marshaller every template of this client shares. */
     private record Transport(SaajSoapMessageFactory messageFactory, Jaxb2Marshaller marshaller) {
+    }
+
+    /**
+     * {@link HttpUrlConnectionMessageSender} whose connections send every request exactly once.
+     *
+     * <p>A default {@link HttpURLConnection} buffers the POST body and, when the connection fails while the response
+     * is read (a reset, an end of stream before any response byte), silently sends the whole request a second time
+     * ({@code sun.net.http.retryPost}, on by default), so the Greeter service would receive one {@code greet} twice,
+     * a secured one with the same security header. The original client sub-flows make one request per call and a
+     * timeout or connectivity failure is never retried. In fixed-length streaming mode the JDK never re-sends, so
+     * each connection buffers the envelope Spring WS writes, after any {@link Wss4jSecurityInterceptor} has secured
+     * it, and then streams it with its exact length: {@code Content-Length} and the bytes on the wire are unchanged.
+     * Timeouts and every other connection setting stay the inherited ones. A JVM-wide system property is not used,
+     * because it would change every other HTTP client in the process. Stateless, so one instance per template serves
+     * concurrent callers.
+     */
+    private static final class SingleAttemptMessageSender extends HttpUrlConnectionMessageSender {
+
+        @Override
+        public WebServiceConnection createConnection(URI uri) throws IOException {
+            // The parent opens and prepares the HttpURLConnection (method, timeouts) without connecting it.
+            HttpUrlConnection prepared = (HttpUrlConnection) super.createConnection(uri);
+            return new FixedLengthHttpUrlConnection(prepared.getConnection());
+        }
+    }
+
+    /** Collects the request body, then sends it in fixed-length streaming mode ({@link SingleAttemptMessageSender}). */
+    private static final class FixedLengthHttpUrlConnection extends HttpUrlConnection {
+
+        private final ByteArrayOutputStream requestBody = new ByteArrayOutputStream();
+
+        private FixedLengthHttpUrlConnection(HttpURLConnection connection) {
+            super(connection);
+        }
+
+        @Override
+        protected OutputStream getRequestOutputStream() {
+            return requestBody;
+        }
+
+        @Override
+        protected void onSendAfterWrite(WebServiceMessage message) throws IOException {
+            HttpURLConnection connection = getConnection();
+            connection.setFixedLengthStreamingMode(requestBody.size());
+            try (OutputStream out = connection.getOutputStream()) {
+                requestBody.writeTo(out);
+            }
+            super.onSendAfterWrite(message);
+        }
     }
 
     /**

@@ -77,7 +77,7 @@ Status values:
 | `csvImportFolder` | `String` | none (`${CSVIMPORTFOLDER:}`) | `csvImportFolder` (unchanged) | TODO | folder created under *Shared Documents*, for example `my_folder`. The original README told users to replace `${csvImportFolder}` in the flow (step 7) |
 | `csv-import.input-dir` | `String` (a `Path`) | `src/main/resources/input` | none: `file:inbound-endpoint path` (l.7) | default | directory polled for files |
 | `csv-import.move-to-dir` | `String` (a `Path`) | `src/main/resources/output` | none: `moveToDirectory` (l.7) | default | directory each processed file is moved to |
-| `csv-import.polling-frequency` | `long` (ms) | `10000` | none: `pollingFrequency` (l.7) | default | delay between polls |
+| `csv-import.polling-frequency` | `long` (ms) | `10000` | none: `pollingFrequency` (l.7) | default | delay between polls; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
 | `sharepoint-online.sts-url` | `String` | `https://login.microsoftonline.com/extSTS.srf` | none: fixed inside the connector | default | Microsoft security token service of the claims sign-in, a public service URL; tests point it at WireMock |
 | `spring.main.web-application-type` | `WebApplicationType` | `none` | none | fixed | no HTTP listener, as in the original |
 
@@ -194,9 +194,9 @@ No scenario of this project is `unreachable` or `nondeterministic`: the flow has
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 77 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 77 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 69 of 69 lines of `service/SharepointImportService` (the project has no `mapper` package). Total project LINE coverage: 78.1% (422 of 540 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 87 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 87 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 69 of 69 lines of `service/SharepointImportService` (the project has no `mapper` package). Total project LINE coverage: 78.6% (433 of 551 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=1`, `failed=0`.
 
 Tier 1 evidence shows that the project builds and passes its own tests. It is not parity evidence.

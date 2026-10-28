@@ -122,3 +122,17 @@ narayana:
   # Seconds; JBossTS com.arjuna.ats.arjuna.coordinator.defaultTimeout (fulfillment.xml:13). Its txReaperTimeout
   # 1000000 (fulfillment.xml:14) has no Narayana starter key.
   default-timeout: 600
+
+logging:
+  level:
+    # fulfillment.xml logs only defaultErrorHandler's "Error occurred: <payload>": below INFO these loggers write
+    # the order's customer (names, address). A logger's own level outranks logging.level.root and the --debug and
+    # --trace logger groups, so neither reaches them.
+    org.springframework.ws.server.MessageTracing: INFO   # .received/.sent TRACE write every processOrder envelope and its OrderSummary reply, customer included
+    org.springframework.ws.client.MessageTracing: INFO   # the same for every envelope SamsungServiceClient sends and receives
+    org.springframework.web.servlet.DispatcherServlet: WARN   # request line with the query: a GET to /ajax/cometd carries the published order in its message parameter. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments: the Bayeux message holding the published order
+    org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter: INFO   # TRACE writes the async result a held /meta/connect resumes with: the order summary reply
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # TRACE writes the response body: the same Bayeux reply
+    # The embedded broker's audit loggers write at INFO, so they need their own level: fulfillment.xml declares none.
+    org.apache.activemq.audit: WARN   # .base/.resource/.message INFO lines: every connection and session the listener opens and closes, and each in-house message sent and consumed, its totalValue property included

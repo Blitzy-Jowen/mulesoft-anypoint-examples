@@ -26,6 +26,7 @@ All six listeners share `HTTP_Listener_Configuration` (`greeting.xml:4`): host `
 - File writes: each successful call to `/greet3` … `/greet6` creates exactly one new file in `greeting.output-dir`, creating the directory first when needed. The file is named `<uuid>.dat`, Mule's default name (`#[function:uuid].dat`) when a `file:outbound-endpoint` sets no `outputPattern`. Content is UTF-8. The file content is computed in full before the write, so a failed call writes no file.
 - Request bodies: `/greet5` and `/greet6` read the body as bytes whatever its `Content-Type`, the header absent included; the XML encoding is detected from the document. An empty body, or a body sent as `application/x-www-form-urlencoded` (which the Mule listener turned into a form-parameter map the flows cannot read), fails the flow with a 500 and writes no file. `curl --data` sends `application/x-www-form-urlencoded` unless told otherwise, so pass `-H 'Content-Type: …'` as in the examples below. The other four flows never read the body.
 - Unknown path: any path other than the six (`/greet1/`, `/greet7`, `/` and `/error` included) gets `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7). SC-1's 405 cannot occur, because every listener accepts every method.
+- A listener path carrying `;` segment parameters (`/greet3;x=1?username=Mule&age=1`, `/greet3;jsessionid=ABC`) is not that listener's path: it gets the no-listener 404 naming the path with its parameters and without the query, `No listener for endpoint: /greet3;x=1`, no flow runs and no file is written. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). A `;` in the query string stays part of the value: `/greet1?username=a;b` returns `Hello a;b`.
 - Unhandled failure: `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }` (SC-1, AAP 0.4.7), and no file is written. The failures are:
 
   | Request | Body of the 500 |
@@ -98,7 +99,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `fixed
 | MEL `xpath('/user/…').text` (`greeting.xml:67-68`) | JDK DOM parser and `javax.xml.xpath` in `GreetingService.greet5` |
 | `json:json-to-object-transformer returnClass="java.lang.Object"` (`greeting.xml:78`) | Jackson `ObjectMapper.readValue(bytes, Object.class)` in `GreetingService.greet6`, an object becoming a `LinkedHashMap` |
 | default exception strategy (platform 404/500) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| listener semantics (no CORS policy; `TRACE` and form bodies passed to the flow) | `config/PreflightDispatchConfig`; `spring.mvc.dispatch-trace-request`, `spring.mvc.formcontent.filter.enabled` |
+| listener semantics (no CORS policy; `TRACE` and form bodies passed to the flow; the raw path, query removed, matched literally with its `;` segment parameters) | `config/PreflightDispatchConfig`; `spring.mvc.dispatch-trace-request`, `spring.mvc.formcontent.filter.enabled`; `config/ListenerPathConfig` |
 | `mule-deploy.properties` (loads `greeting.xml`) | `MuleExpressionLanguageBasicsApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` (empty) | `src/main/resources/application.yml` |
 | `MuleExpressionLanguageBasicsIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`) | `MuleExpressionLanguageBasicsTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)` with ST-1 `support/HttpTestClient`) |
@@ -113,6 +114,7 @@ Shared components are copies, identical apart from the `package` line, of their 
 | SC-6 `service/FileOutboundWriter` (`service/FileOutboundWriterTest`) | `processing-orders-with-dataweave-and-APIkit-java` |
 | ST-2 `FixtureParityTest` (test) | `hello-world-java` |
 | `config/PreflightDispatchConfig` (`config/PreflightDispatchConfigTest`) | `hello-world-java` |
+| `config/ListenerPathConfig` (no unit test of its own; asserted on the wire by `controller/GreetingControllerTest` and `config/PreflightDispatchListenerTest`) | `hello-world-java` |
 
 ## Preserved MEL and DataWeave semantics
 
@@ -131,7 +133,7 @@ These follow the AAP's reading of the original where its source does not settle 
 1. `/greet4`'s DataWeave comparison of a string `age` with 18, implemented with DataWeave 1.0's coercion of the right operand to the left one's type (text against `"18"`): `age=5` writes `true` and `age=100` writes `false`, where `/greet3`'s MEL comparison gives `false` and `true` (scenarios `get-greet4-age-5`, `get-greet4-age-100`, `get-greet3-age-5`). `mapper/GreetingCsvMapper` owns the rule.
 2. `/greet4` without `age` writes `false` as `age_of` (no `SCENARIOS.md` row; asserted by `GreetingCsvMapperTest` and `GreetingServiceTest`).
 3. The absent `Content-Type` of every `200` reply, including whether `/greet4`'s DataWeave step left `application/csv` on the message. Only `GreetingController.ok` changes if a capture shows a value.
-4. The exact text of each 500 body: Mule's expression and transformer failures carried their own messages, which differ from the Java exception messages above (`get-greet3-non-numeric-age`, `post-greet5-malformed-xml`, `post-greet6-malformed-json`), as does the Mule failure for a form-urlencoded body to `/greet5` or `/greet6`. The 404 text of `get-unknown-path` is a platform default as well.
+4. The exact text of each 500 body: Mule's expression and transformer failures carried their own messages, which differ from the Java exception messages above (`get-greet3-non-numeric-age`, `post-greet5-malformed-xml`, `post-greet6-malformed-json`), as does the Mule failure for a form-urlencoded body to `/greet5` or `/greet6`. The 404 text of `get-unknown-path` is a platform default as well, as is the 404 for a listener path carrying `;` segment parameters.
 5. `Hello null` for a missing `username` (`get-greet1-no-username`).
 
 ## Behaviours stubbed or externalized
@@ -184,6 +186,7 @@ No listener for endpoint: /greet7
 | Test class | What it asserts |
 |---|---|
 | `MuleExpressionLanguageBasicsTest` | the ported `MuleExpressionLanguageBasicsIT` (`mule-expression-language-basics/src/test/java/org/mule/examples/MuleExpressionLanguageBasicsIT.java:67-118`), every request a `POST` with `Content-Type: text/plain` as the original's `MuleClient` sent it: `greet1` and `greet2` with `username=Mule&age=1` return exactly `Hello Mule`, `greet2` without a query `No username provided`; `greet3` to `greet6` (query `username=Mule&age=1`, the copied `message.xml` and `message.json`) return `Hello Mule` and leave exactly one entry in the output directory whose trimmed content equals `Mule, 1, false` (`Mule,1,false` for `greet4`). The directory lives under a JUnit `@TempDir` |
+| `controller/GreetingControllerTest` | on the wire through ST-1: each listener's happy path for `GET`, `POST` and `OPTIONS` with the original test's inputs, `200 Hello Mule` and, for `greet3` … `greet6`, exactly one file with the expected line; the `greet2` empty-username branch; the `http.query.params` semantics (last pair wins, UTF-8 and `+` decoding, `/greet1?username=a;b` → `Hello a;b`, a pair without `=` → `Hello null`); the no-listener 404 and no file for the paths next to every listener, for `/greet1;x=1` … `/greet6;x=1` and `/greet3;jsessionid=ABC`, and for `/greet7`; Undertow's empty 400 for a malformed query escape; the JSON 500 and no file for a non-numeric or empty `greet3` age and for bodies `greet5` and `greet6` cannot read or parse |
 | `controller/GreetingListenerBoundaryTest` | on the wire through ST-1: `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `TRACE` on each listener run the flow and get `200` with its `Content-Length` and no `Content-Type`, and a `TRACE` carrying `Authorization` is never echoed; `HEAD` gets the headers without the body and still writes the file; `greet5` and `greet6` accept their documents as `text/plain`, as their own media type and under an unparseable `Content-Type`; a form-urlencoded body never fails the query-driven flows and makes `greet5` and `greet6` answer every method with the same JSON 500 and no file; the file count of every call |
 | `service/GreetingServiceTest` | every branch of the six flows with real collaborators and exact, untrimmed file bytes: the `greet2` choice, each operand type of the MEL `> 18` comparison and its failures, the XPath selections and encodings of `greet5`, the payload shapes of `greet6`, external references never loaded, one new file per call, and failures that write no file |
 | `mapper/GreetingCsvMapperTest` | the `docs-greetingFlow4` script: `Mule,1,false` + LF for the original input, column order `username`, `age`, `age_of`, no header, `null` values as empty fields, and the DataWeave `age > 18` coercion |
@@ -191,10 +194,10 @@ No listener for endpoint: /greet7
 | `service/FileOutboundWriterTest` | SC-6: directory creation, whole-file replacement, permissions, locking, symbolic links, failures, and the `<uuid>.dat` default name |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes; `ErrorResponse` JSON escaping; escaped, length-bounded ERROR log lines |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
-| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to each of `/greet1` … `/greet6` runs the flow exactly as a plain `OPTIONS` request does (`200 Hello Mule`, no `Content-Type`, no `Access-Control-*` or `Vary`, one file for `greet3` … `greet6`); a pre-flight to an unserved path gets the no-listener 404 |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to each of `/greet1` … `/greet6` runs the flow exactly as a plain `OPTIONS` request does (`200 Hello Mule`, no `Content-Type`, no `Access-Control-*` or `Vary`, one file for `greet3` … `greet6`); a pre-flight to an unserved path, `/greet7` or `/greet3;x=1?username=Mule&age=1`, gets the no-listener 404 and writes no file |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
-`support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes. The AAP (0.5.6) also lists `controller/GreetingControllerTest` for this project; it is delivered separately and is not part of the run measured under Tier status.
+`support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
 
 ## Fixture parity (ST-2)
 
@@ -237,9 +240,9 @@ The twelve `nondeterministic` rows are the requests that write a file: each prod
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 600 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 600 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 266 of 291 lines of `service/GreetingService`, `service/FileOutboundWriter`, `mapper/GreetingCsvMapper` and `mapper/DwCsvWriter`. Total project LINE coverage: 94.1% (495 of 526 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 609 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 609 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 266 of 291 lines of `service/GreetingService`, `service/FileOutboundWriter`, `mapper/GreetingCsvMapper` and `mapper/DwCsvWriter`. Total project LINE coverage: 94.2% (504 of 535 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=22`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

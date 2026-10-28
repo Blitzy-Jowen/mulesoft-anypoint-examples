@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 import javax.xml.namespace.QName;
@@ -96,7 +97,9 @@ import com.sforce.ws.parser.XmlOutputStream;
  *
  * <p>Both connection modes are covered: login mode (no {@link SessionSource} bean, credentials from
  * {@link SalesforceProperties}) and session mode (a {@link SessionSource} bean, as in
- * {@code authenticating-salesforce-using-oauth2}). The test uses no project controller, service, mapper or handler,
+ * {@code authenticating-salesforce-using-oauth2}). In login mode a missing or blank {@code sfdc.username},
+ * {@code sfdc.password} or {@code sfdc.securityToken} fails the call locally, naming the key, with no request sent;
+ * session mode needs none of them. The test uses no project controller, service, mapper or handler,
  * no Spring context and no mocks, so it runs unchanged in every Salesforce project.
  *
  * <p>Small responses are literal XML. The describe responses are produced by WSC itself from populated result
@@ -146,6 +149,15 @@ class SalesforcePartnerClientTest {
 
     /** The {@code application.yml} key of the read timeout. */
     private static final String READ_TIMEOUT_KEY = "sfdc.read-timeout";
+
+    /** The {@code application.yml} key of the login username. */
+    private static final String USERNAME_KEY = "sfdc.username";
+
+    /** The {@code application.yml} key of the login password. */
+    private static final String PASSWORD_KEY = "sfdc.password";
+
+    /** The {@code application.yml} key of the login security token. */
+    private static final String SECURITY_TOKEN_KEY = "sfdc.securityToken";
 
     /** The query of the original flow's POST {@code /} for {@code object=user}, {@code field=email}. */
     private static final String SOQL = "SELECT id, name, email from user where name like '%mule%'";
@@ -498,6 +510,69 @@ class SalesforcePartnerClientTest {
         assertThat(wm.findAll(postRequestedFor(urlEqualTo(API_PATH)))).isEmpty();
     }
 
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("missingLoginKeys")
+    void missingLoginKeyFailsLocallyNamingItWithoutAnyRequest(Consumer<SalesforceProperties> unset, String message)
+            throws Exception {
+        // Both stubs would succeed, so any failure below is the client's own check, not a Salesforce answer.
+        stubLogin();
+        stubApi("describeGlobal", soap(describeGlobalResponse()));
+        unset.accept(props);
+        SalesforcePartnerClient client = loginModeClient();
+
+        Throwable call = catchThrowable(client::describeGlobal);
+        Throwable relogin = catchThrowable(client::reauthenticate);
+        Throwable nextCall = catchThrowable(client::describeGlobal);
+
+        assertThat(List.of(call, relogin, nextCall)).allSatisfy(thrown -> assertThat(thrown)
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage(message)
+                .hasNoCause());
+        assertThat(call.getMessage()).doesNotContain(USERNAME, PASSWORD, SECURITY_TOKEN);
+        // No login request and no API request reached Salesforce.
+        assertThat(wm.getAllServeEvents()).isEmpty();
+
+        // Nothing was cached by the failures: once the configuration is complete, the next call logs in once.
+        props.setUsername(USERNAME);
+        props.setPassword(PASSWORD);
+        props.setSecurityToken(SECURITY_TOKEN);
+        client.describeGlobal();
+
+        assertThat(loginRequests()).hasSize(1);
+        assertThat(apiRequests("describeGlobal")).hasSize(1);
+    }
+
+    /**
+     * Each login key left {@code null}, empty or blank while the other two are configured, with the message that
+     * names it; then several keys at once, named in the order username, password, security token.
+     */
+    static Stream<Arguments> missingLoginKeys() {
+        Map<String, BiConsumer<SalesforceProperties, String>> setters = new LinkedHashMap<>();
+        setters.put(USERNAME_KEY, SalesforceProperties::setUsername);
+        setters.put(PASSWORD_KEY, SalesforceProperties::setPassword);
+        setters.put(SECURITY_TOKEN_KEY, SalesforceProperties::setSecurityToken);
+        Stream<Arguments> oneKey = setters.entrySet().stream().flatMap(setter -> Stream.<String>of(null, "", "  ")
+                .map(value -> Arguments.of(
+                        Named.<Consumer<SalesforceProperties>>of(setter.getKey() + " = " + quoted(value),
+                                properties -> setter.getValue().accept(properties, value)),
+                        setter.getKey() + " is not configured")));
+        Stream<Arguments> severalKeys = Stream.of(
+                Arguments.of(Named.<Consumer<SalesforceProperties>>of(USERNAME_KEY + " and " + SECURITY_TOKEN_KEY,
+                                properties -> {
+                                    properties.setUsername(null);
+                                    properties.setSecurityToken(" ");
+                                }),
+                        USERNAME_KEY + " and " + SECURITY_TOKEN_KEY + " are not configured"),
+                Arguments.of(Named.<Consumer<SalesforceProperties>>of("every login key",
+                                properties -> {
+                                    properties.setUsername(null);
+                                    properties.setPassword("");
+                                    properties.setSecurityToken(null);
+                                }),
+                        USERNAME_KEY + ", " + PASSWORD_KEY + " and " + SECURITY_TOKEN_KEY + " are not configured"));
+        return Stream.concat(oneKey, severalKeys);
+    }
+
     @Test
     void propertiesDefaultToTheProductionLoginEndpointAndTenSecondTimeouts() {
         SalesforceProperties defaults = new SalesforceProperties();
@@ -526,6 +601,28 @@ class SalesforcePartnerClientTest {
         assertThat(source.refreshCalls).hasValue(0);
         assertThat(records).hasSize(1);
         assertUserRecord(records.get(0), USER_A);
+    }
+
+    @Test
+    void sessionModeNeedsNoLoginKey() throws Exception {
+        props.setUsername(null);
+        props.setPassword(null);
+        props.setSecurityToken(null);
+        stubLogin();
+        stubApi("describeGlobal", soap(describeGlobalResponse()));
+        TestSessionSource source = new TestSessionSource(apiUrl());
+        SalesforcePartnerClient client = sessionModeClient(source);
+
+        client.describeGlobal();
+        client.reauthenticate();
+        client.describeGlobal();
+
+        assertThat(loginRequests()).isEmpty();
+        assertThat(source.refreshCalls).hasValue(1);
+        List<LoggedRequest> describeGlobal = apiRequests("describeGlobal");
+        assertThat(describeGlobal).hasSize(2);
+        assertThat(requestsCarrying(describeGlobal, SESSION_1)).hasSize(1);
+        assertThat(requestsCarrying(describeGlobal, SESSION_2)).hasSize(1);
     }
 
     @Test
@@ -801,6 +898,11 @@ class SalesforcePartnerClientTest {
         return requests.stream()
                 .filter(request -> request.getBodyAsString().contains(">" + sessionId + "<"))
                 .toList();
+    }
+
+    /** A configuration value as a test name shows it: {@code null}, or the value in double quotes. */
+    private static String quoted(String value) {
+        return value == null ? "null" : "\"" + value + "\"";
     }
 
     private static List<Throwable> causes(Throwable failure) {

@@ -34,3 +34,11 @@ imap:
 orders:
   output-dir: src/test/resources/output   # original file:outbound-endpoint path, relative to the working directory (imap-to-xml.xml:32)
   output-file-name: orders.xml            # original outputPattern (imap-to-xml.xml:32)
+
+# The original logs only the orders XML it builds from the attachment ("Received: <xml>", AttachmentImportService):
+# a root DEBUG/TRACE override, or --debug/--trace, must not reach this category, which below INFO writes the mailbox
+# account and every polled mail. A logger's own level outranks logging.level.root and the --debug/--trace groups;
+# Angus Mail logs through java.util.logging, which Spring Boot bridges and holds at the same level.
+logging:
+  level:
+    org.eclipse.angus.mail: INFO   # .imap DEBUG writes the mailbox user; .imap.protocol TRACE the whole IMAP dialogue: the envelope, every header (Return-Path, From, To, Subject) and the attachment's content

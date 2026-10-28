@@ -10,9 +10,11 @@ package com.mulesoft.examples.document_integration_using_the_cmis_connector.clie
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URLEncoder;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -32,12 +34,38 @@ import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
 
+import org.apache.hc.client5.http.DnsResolver;
+import org.apache.hc.client5.http.SystemDefaultDnsResolver;
+import org.apache.hc.client5.http.classic.ExecChain;
+import org.apache.hc.client5.http.config.ConnectionConfig;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.ChainElement;
+import org.apache.hc.client5.http.impl.DefaultRedirectStrategy;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.routing.SystemDefaultRoutePlanner;
+import org.apache.hc.client5.http.protocol.HttpClientContext;
+import org.apache.hc.client5.http.protocol.RedirectLocations;
+import org.apache.hc.core5.http.ClassicHttpRequest;
+import org.apache.hc.core5.http.ClassicHttpResponse;
+import org.apache.hc.core5.http.Header;
+import org.apache.hc.core5.http.HttpException;
+import org.apache.hc.core5.http.HttpRequest;
+import org.apache.hc.core5.http.HttpResponse;
+import org.apache.hc.core5.http.Method;
+import org.apache.hc.core5.http.ProtocolException;
+import org.apache.hc.core5.http.protocol.HttpContext;
+import org.apache.hc.core5.io.CloseMode;
+import org.apache.hc.core5.net.URIAuthority;
+import org.apache.hc.core5.util.TimeValue;
+import org.apache.hc.core5.util.Timeout;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.InvalidMediaTypeException;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.ClientHttpResponse;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 import org.springframework.web.client.HttpClientErrorException;
@@ -82,11 +110,19 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.confi
  * transport or body-read failure raises {@code ResourceAccessException} with {@code CMIS <step> request timed out}
  * or {@code CMIS <step> request failed with an I/O error}; missing protocol elements, an unparseable Content-Type
  * and unreadable XML raise {@link IllegalStateException}. Upstream bodies, reason phrases and header text, request
- * URLs and Java type names are never copied into a message. No call is retried. The class holds no mutable state
- * and is safe to share.
+ * URLs and Java type names are never copied into a message.
+ *
+ * <p>No call is retried, neither here nor by the transport, so each request is sent once, whether it fails with a
+ * timeout, a refused, reset or early-closed connection or an error status. RestClient sends through Apache
+ * httpclient5 with its automatic retries switched off, because the JDK {@code HttpURLConnection} under Spring's
+ * default request factory re-sends a bodiless request, as each GET here is, once when its connection is reset or
+ * closes before a response arrives, and has no setting to stop it. Apart from that re-send, {@link #buildHttpClient}
+ * keeps every behaviour of the {@code HttpURLConnection} transport: its timeouts, redirects, proxy selection, TLS
+ * defaults and absent compression, cookies and authentication handling. The client owns a connection pool, which
+ * {@link #close()} releases when the application context shuts down; it holds no other state and is safe to share.
  */
 @Component
-public class CmisAtomPubClient {
+public class CmisAtomPubClient implements AutoCloseable {
 
     private static final String ATOM = "http://www.w3.org/2005/Atom";
     private static final String APP = "http://www.w3.org/2007/app";
@@ -103,6 +139,25 @@ public class CmisAtomPubClient {
 
     /** Mule's default response timeout, used where a timeout property is unset. */
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+
+    /**
+     * The most redirects one GET follows. {@code HttpURLConnection} sends at most {@code http.maxRedirects}, by JDK
+     * default 20, requests per exchange and fails with an I/O error when the last is answered with a redirect too;
+     * httpclient5 sends one request more than its limit before failing the same way.
+     */
+    private static final int MAX_REDIRECTS_FOLLOWED = 19;
+
+    /**
+     * How long an idle pooled connection stays reusable when the server's {@code Keep-Alive} header names no
+     * timeout: the 5 s the JDK keep-alive cache kept one, so no request is written to a connection idle for longer.
+     */
+    private static final TimeValue IDLE_CONNECTION_LIFETIME = TimeValue.ofSeconds(5);
+
+    /** The request headers {@code HttpURLConnection} removes from a redirect hop to another host or port. */
+    private static final List<String> NEW_DESTINATION_DROPPED_HEADERS = List.of("Authorization", "Cookie", "Cookie2");
+
+    /** Exchange attribute set once a redirect hop has left the original request's host and port. */
+    private static final String LEFT_DESTINATION_ATTRIBUTE = CmisAtomPubClient.class.getName() + ".leftDestination";
 
     /**
      * Fails the parse on errors and fatal errors instead of the JDK default handler, which also prints each one
@@ -133,23 +188,27 @@ public class CmisAtomPubClient {
 
     private final CmisProperties properties;
 
+    private final CloseableHttpClient httpClient;
+
     private final RestClient restClient;
 
     /** First unset service-account key, {@code cmis.username} before {@code cmis.password}; null if both are set. */
     private final String missingCredentialKey;
 
     /**
-     * Builds the HTTP client from the connection settings; makes no request. An unset service account is accepted
-     * here, so the application starts without it, and is rejected by {@link #createDocumentByPath} instead.
+     * Builds the HTTP client and its connection pool from the connection settings; makes no request. An unset
+     * service account is accepted here, so the application starts without it, and is rejected by
+     * {@link #createDocumentByPath} instead.
      *
      * @param properties repository URL, repository ID, service account and timeouts
      */
     public CmisAtomPubClient(CmisProperties properties) {
         this.properties = Objects.requireNonNull(properties, "properties");
-        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
-        requestFactory.setConnectTimeout(orDefault(properties.getConnectTimeout()));
-        requestFactory.setReadTimeout(orDefault(properties.getReadTimeout()));
-        RestClient.Builder builder = RestClient.builder().requestFactory(requestFactory);
+        this.httpClient = buildHttpClient(timeout(properties.getConnectTimeout()),
+                timeout(properties.getReadTimeout()));
+        // No factory timeout is set, so the client's own configuration governs every exchange.
+        RestClient.Builder builder = RestClient.builder()
+                .requestFactory(new HttpComponentsClientHttpRequestFactory(httpClient));
         String username = properties.getUsername();
         String password = properties.getPassword();
         if (!StringUtils.hasText(username)) {
@@ -203,8 +262,122 @@ public class CmisAtomPubClient {
         return objectId(parse(created, "create-document"));
     }
 
-    private static Duration orDefault(Duration timeout) {
-        return timeout == null ? DEFAULT_TIMEOUT : timeout;
+    /** Closes the connection pool and its connections; Spring calls it when the application context shuts down. */
+    @Override
+    public void close() {
+        httpClient.close(CloseMode.GRACEFUL);
+    }
+
+    /**
+     * A configured timeout as {@code SimpleClientHttpRequestFactory} applied it to {@code HttpURLConnection}: unset
+     * is {@link #DEFAULT_TIMEOUT}, the value counts in whole milliseconds, and zero or a negative value means no
+     * timeout.
+     */
+    private static Timeout timeout(Duration configured) {
+        int millis = (int) (configured == null ? DEFAULT_TIMEOUT : configured).toMillis();
+        return millis > 0 ? Timeout.ofMilliseconds(millis) : Timeout.DISABLED;
+    }
+
+    /**
+     * Builds the transport, configured so that no request is ever sent twice:
+     * <ul>
+     *   <li>automatic retries are off, so a request whose connection is refused, reset or closed before or while
+     *       the response arrives fails instead of being sent again;</li>
+     *   <li>a host name resolves to its first address only, as {@code HttpURLConnection} connected, so a refused or
+     *       timed-out connect is not repeated against the host's other addresses;</li>
+     *   <li>a pooled connection is checked before every reuse and kept idle no longer than the server's
+     *       {@code Keep-Alive} timeout, or {@link #IDLE_CONNECTION_LIFETIME} without one, so one the server closed
+     *       is replaced before the request is written rather than failing it, which {@code HttpURLConnection} hid
+     *       by re-sending the request.</li>
+     * </ul>
+     *
+     * <p>Everything else is as {@code HttpURLConnection} did it. {@code connectTimeout} bounds the TCP connect and
+     * {@code readTimeout} every wait for response bytes, the TLS handshake included, each wait on its own rather
+     * than the response as a whole. Only a GET follows redirects, as {@link HttpUrlConnectionRedirectStrategy}
+     * describes, and a hop to another host or port carries no {@code Authorization}, {@code Cookie} or
+     * {@code Cookie2} header ({@link #dropCredentialsOnNewDestination}). An HTTP proxy is used where the JVM's
+     * default {@link java.net.ProxySelector}, read for every route, names one, and {@code https} connects with the
+     * JSSE default context, protocols and cipher suites ({@code https.protocols}, {@code https.cipherSuites}).
+     * Content compression is off, so no {@code Accept-Encoding} is sent and bodies are read as sent; there is no
+     * cookie store, auth cache or connection state, and authentication challenges are not answered, so a
+     * {@code 401} is returned as received. The pool has no size limit, as {@code HttpURLConnection} had none, so
+     * no exchange waits for another's connection.
+     */
+    private static CloseableHttpClient buildHttpClient(Timeout connectTimeout, Timeout readTimeout) {
+        return HttpClients.custom()
+                .setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()
+                        .useSystemProperties()
+                        .setDnsResolver(new FirstAddressDnsResolver(SystemDefaultDnsResolver.INSTANCE))
+                        .setDefaultConnectionConfig(ConnectionConfig.custom()
+                                .setConnectTimeout(connectTimeout)
+                                .setSocketTimeout(readTimeout)
+                                .setValidateAfterInactivity(TimeValue.ZERO_MILLISECONDS)
+                                .build())
+                        .setMaxConnTotal(Integer.MAX_VALUE)
+                        .setMaxConnPerRoute(Integer.MAX_VALUE)
+                        .build())
+                // A null selector reads ProxySelector.getDefault() for every route.
+                .setRoutePlanner(new SystemDefaultRoutePlanner(null))
+                .setDefaultRequestConfig(RequestConfig.custom()
+                        .setResponseTimeout(readTimeout)
+                        .setConnectionKeepAlive(IDLE_CONNECTION_LIFETIME)
+                        .setRedirectsEnabled(true)
+                        .setMaxRedirects(MAX_REDIRECTS_FOLLOWED)
+                        // A redirect loop ends at the redirect limit, as it did for HttpURLConnection, where
+                        // httpclient5's loop check would end it at the first repeated location.
+                        .setCircularRedirectsAllowed(true)
+                        .setAuthenticationEnabled(false)
+                        .build())
+                .disableAutomaticRetries()
+                .disableContentCompression()
+                .disableCookieManagement()
+                .disableAuthCaching()
+                .disableConnectionState()
+                .setRedirectStrategy(new HttpUrlConnectionRedirectStrategy())
+                .addExecInterceptorAfter(ChainElement.REDIRECT.name(), "new-destination-redirect-headers",
+                        CmisAtomPubClient::dropCredentialsOnNewDestination)
+                .build();
+    }
+
+    /**
+     * Removes {@link #NEW_DESTINATION_DROPPED_HEADERS} from every redirect hop, starting with the first whose host
+     * or port differs from the original request's, as {@code HttpURLConnection} removed them for the rest of the
+     * exchange; the service account's Basic credentials therefore never reach another host. The first hop is the
+     * original request itself and passes unchanged.
+     */
+    private static ClassicHttpResponse dropCredentialsOnNewDestination(ClassicHttpRequest request,
+            ExecChain.Scope scope, ExecChain chain) throws IOException, HttpException {
+        HttpClientContext context = scope.clientContext;
+        if (context.getAttribute(LEFT_DESTINATION_ATTRIBUTE) != null
+                || !sameDestination(request, scope.originalRequest)) {
+            context.setAttribute(LEFT_DESTINATION_ATTRIBUTE, Boolean.TRUE);
+            NEW_DESTINATION_DROPPED_HEADERS.forEach(request::removeHeaders);
+        }
+        return chain.proceed(request, scope);
+    }
+
+    /**
+     * Whether both requests go to the same scheme, host (case-insensitively) and port, an absent port counting as
+     * the scheme's default, as {@code HttpURLConnection} compared destinations.
+     */
+    private static boolean sameDestination(ClassicHttpRequest a, ClassicHttpRequest b) {
+        URIAuthority authorityA = a.getAuthority();
+        URIAuthority authorityB = b.getAuthority();
+        String schemeA = a.getScheme();
+        String schemeB = b.getScheme();
+        if (authorityA == null || authorityB == null || schemeA == null || schemeB == null) {
+            return false;
+        }
+        return schemeA.equalsIgnoreCase(schemeB)
+                && authorityA.getHostName().equalsIgnoreCase(authorityB.getHostName())
+                && effectivePort(schemeA, authorityA.getPort()) == effectivePort(schemeB, authorityB.getPort());
+    }
+
+    private static int effectivePort(String scheme, int port) {
+        if (port >= 0) {
+            return port;
+        }
+        return "https".equalsIgnoreCase(scheme) ? 443 : 80;
     }
 
     /** Fails the operation, naming the first unset service-account key, before any repository request. */
@@ -489,5 +662,66 @@ public class CmisAtomPubClient {
     private static String childText(Element parent, String namespace, String localName) {
         List<Element> matches = children(parent, namespace, localName);
         return matches.isEmpty() ? null : matches.get(0).getTextContent().trim();
+    }
+
+    /**
+     * Follows a redirect only where {@code HttpURLConnection}, as {@code SimpleClientHttpRequestFactory} set it up,
+     * followed one: the request is a GET, the status is 300, 301, 302, 303 or 307 with a {@code Location}, and that
+     * location keeps the scheme of the URL that answered, which a relative one always does. Any other redirect, a
+     * 308 or a {@code 305 Use Proxy} among them, and every redirect answering the create-document POST, is returned
+     * as received, and nothing is sent to its location.
+     */
+    private static final class HttpUrlConnectionRedirectStrategy extends DefaultRedirectStrategy {
+
+        private static final Set<Integer> FOLLOWED_STATUSES = Set.of(300, 301, 302, 303, 307);
+
+        @Override
+        public boolean isRedirected(HttpRequest request, HttpResponse response, HttpContext context)
+                throws ProtocolException {
+            Header location = response.getFirstHeader(HttpHeaders.LOCATION);
+            if (location == null || !Method.GET.isSame(request.getMethod())
+                    || !FOLLOWED_STATUSES.contains(response.getCode())) {
+                return false;
+            }
+            String targetScheme = createLocationURI(location.getValue()).getScheme();
+            return targetScheme == null || targetScheme.equalsIgnoreCase(answeredScheme(request, context));
+        }
+
+        /**
+         * The scheme of the URL that answered with the redirect. httpclient5 passes the original request on every
+         * hop, so that URL is the last redirect location followed, or the original request's before any has been.
+         */
+        private static String answeredScheme(HttpRequest original, HttpContext context) {
+            RedirectLocations followed = HttpClientContext.adapt(context).getRedirectLocations();
+            return followed == null || followed.size() == 0
+                    ? original.getScheme()
+                    : followed.get(followed.size() - 1).getScheme();
+        }
+    }
+
+    /**
+     * The first address {@code delegate} resolves a host to, alone; with the system resolver that is the one address
+     * {@code HttpURLConnection} connected to. httpclient5 would otherwise move on to each further address of the host
+     * after a refused or timed-out connect: a second connection attempt after a connectivity failure, which could
+     * also stretch the connect past its timeout.
+     */
+    private static final class FirstAddressDnsResolver implements DnsResolver {
+
+        private final DnsResolver delegate;
+
+        FirstAddressDnsResolver(DnsResolver delegate) {
+            this.delegate = Objects.requireNonNull(delegate, "delegate");
+        }
+
+        @Override
+        public InetAddress[] resolve(String host) throws UnknownHostException {
+            InetAddress[] addresses = delegate.resolve(host);
+            return addresses.length <= 1 ? addresses : new InetAddress[] {addresses[0]};
+        }
+
+        @Override
+        public String resolveCanonicalHostname(String host) throws UnknownHostException {
+            return delegate.resolveCanonicalHostname(host);
+        }
     }
 }

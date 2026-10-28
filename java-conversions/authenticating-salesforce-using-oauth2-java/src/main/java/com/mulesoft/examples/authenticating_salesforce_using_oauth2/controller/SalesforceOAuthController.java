@@ -17,8 +17,6 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.Sale
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.SalesforceOAuthService.AuthorizeOutcome;
 
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -42,12 +40,19 @@ import org.springframework.web.bind.annotation.RestController;
  *
  * <p>Neither listener declares {@code allowedMethods}, so every method is accepted and answered alike: each path has a
  * method-less mapping plus an explicit {@code OPTIONS} mapping, and no mapping declares a media-type condition, so no
- * {@code Accept} or {@code Content-Type} a caller sends turns into a 406 or 415.
+ * {@code Accept} or {@code Content-Type} a caller sends turns into a 406 or 415. The listener applied no CORS policy,
+ * so {@code config.PreflightDispatchConfig} dispatches a CORS pre-flight to the {@code OPTIONS} mapping as the plain
+ * {@code OPTIONS} request it is, and it runs the flow too.
  *
  * <p>No exception is handled here, as the flow declares no exception strategy: the SC-9
  * {@code UpstreamExceptionHandler} answers the approved Salesforce failure modes (502, 429, 503) and the SC-1
  * {@code GlobalExceptionHandler} every other failure with its 500, an unknown path with its no-listener 404. The
  * service is always called before the response is touched, so a failure finds an uncommitted response.
+ *
+ * <p>The 200 text goes out with its {@code Content-Length} and no {@code Content-Type}, written to the servlet
+ * response directly so that no message converter adds one: the flow's {@code set-payload} (line 17) declares no MIME
+ * type, and the Mule listener sent no Content-Type for such a payload. The absent Content-Type is a Tier 2A
+ * verification point, where a captured fixture of the original governs.
  */
 @RestController
 public class SalesforceOAuthController {
@@ -59,9 +64,6 @@ public class SalesforceOAuthController {
      * {@code "/${...}"} would map {@code //oauth2callback} for the slash form, a path no request matches.
      */
     static final String CALLBACK_PATH = "${sfdc.oauth.callback.path:oauth2callback}";
-
-    /** Content-Type of the flow's text answer; renders as {@code text/plain;charset=UTF-8}. */
-    private static final MediaType TEXT_PLAIN_UTF8 = new MediaType("text", "plain", StandardCharsets.UTF_8);
 
     private final SalesforceOAuthService service;
 
@@ -76,13 +78,12 @@ public class SalesforceOAuthController {
      * Answers {@code /} for every method except {@code OPTIONS}: 302 to the Salesforce authorization page while no
      * token is held, otherwise 200 with {@code Salesforce query returned <n> contacts.}.
      *
-     * @param response the response the redirect is committed to
-     * @return the 200 text answer, or {@code null} once the redirect has been committed
+     * @param response the response the redirect or the text is committed to
      * @throws Exception every failure of the authorize step or the query, unchanged, for the advices
      */
     @RequestMapping("/")
-    public ResponseEntity<String> root(HttpServletResponse response) throws Exception {
-        return render(service.authorize(), response);
+    public void root(HttpServletResponse response) throws Exception {
+        render(service.authorize(), response);
     }
 
     /**
@@ -90,13 +91,12 @@ public class SalesforceOAuthController {
      * {@code OPTIONS}, which Spring MVC would otherwise answer itself with an {@code Allow} header and no body; the
      * Mule listener ran the flow for {@code OPTIONS} too.
      *
-     * @param response the response the redirect is committed to
-     * @return the answer of {@link #root(HttpServletResponse)}
+     * @param response the response the redirect or the text is committed to
      * @throws Exception every failure of the authorize step or the query, unchanged
      */
     @RequestMapping(path = "/", method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> rootOptions(HttpServletResponse response) throws Exception {
-        return root(response);
+    public void rootOptions(HttpServletResponse response) throws Exception {
+        root(response);
     }
 
     /**
@@ -106,16 +106,16 @@ public class SalesforceOAuthController {
      * @param code             the {@code code} parameter Salesforce issues, or {@code null}
      * @param error            the {@code error} parameter of a refused authorization, or {@code null}
      * @param errorDescription the {@code error_description} parameter of a refused authorization, or {@code null}
-     * @return the 200 text answer
+     * @param response         the response the text is committed to
      * @throws Exception a refused authorization ({@code IllegalStateException}), a failed exchange or a failed query,
      *                   unchanged, for the advices
      */
     @RequestMapping(CALLBACK_PATH)
-    public ResponseEntity<String> callback(@RequestParam(name = "code", required = false) String code,
-                                           @RequestParam(name = "error", required = false) String error,
-                                           @RequestParam(name = "error_description", required = false)
-                                           String errorDescription) throws Exception {
-        return text(service.completeAuthorization(code, error, errorDescription));
+    public void callback(@RequestParam(name = "code", required = false) String code,
+                         @RequestParam(name = "error", required = false) String error,
+                         @RequestParam(name = "error_description", required = false) String errorDescription,
+                         HttpServletResponse response) throws Exception {
+        text(service.completeAuthorization(code, error, errorDescription), response);
     }
 
     /**
@@ -125,46 +125,58 @@ public class SalesforceOAuthController {
      * @param code             the {@code code} parameter Salesforce issues, or {@code null}
      * @param error            the {@code error} parameter of a refused authorization, or {@code null}
      * @param errorDescription the {@code error_description} parameter of a refused authorization, or {@code null}
-     * @return the answer of {@link #callback(String, String, String)}
+     * @param response         the response the text is committed to
      * @throws Exception every failure of the callback, unchanged
      */
     @RequestMapping(path = CALLBACK_PATH, method = RequestMethod.OPTIONS)
-    public ResponseEntity<String> callbackOptions(@RequestParam(name = "code", required = false) String code,
-                                                  @RequestParam(name = "error", required = false) String error,
-                                                  @RequestParam(name = "error_description", required = false)
-                                                  String errorDescription) throws Exception {
-        return callback(code, error, errorDescription);
+    public void callbackOptions(@RequestParam(name = "code", required = false) String code,
+                                @RequestParam(name = "error", required = false) String error,
+                                @RequestParam(name = "error_description", required = false) String errorDescription,
+                                HttpServletResponse response) throws Exception {
+        callback(code, error, errorDescription, response);
     }
 
     /**
-     * Renders the outcome of the authorize step. A redirect is 302 with {@code Location} and an empty body, no
-     * Content-Type.
+     * Renders the outcome of the authorize step: a redirect as 302 with {@code Location} and an empty body, no
+     * Content-Type; a completed query as the text of {@link #text(String, HttpServletResponse)}.
      *
-     * <p>The redirect is committed here with {@code Content-Length: 0} rather than returned as a bodiless
-     * {@link ResponseEntity}: Spring MVC leaves such an entity uncommitted, and {@code FrameworkServlet} then
-     * completes it with an {@code Allow} header for {@code OPTIONS} and, because
+     * <p>Every reply is committed here with its {@code Content-Length} rather than returned as a
+     * {@code ResponseEntity}: Spring MVC leaves a bodiless entity uncommitted, and {@code FrameworkServlet} then
+     * completes an uncommitted reply with an {@code Allow} header for {@code OPTIONS} and, because
      * {@code spring.mvc.dispatch-trace-request} routes {@code TRACE} here, with the servlet's {@code message/http} echo
-     * for {@code TRACE}, so those methods would not get the 302 every other method gets. {@code Location} is set as a
-     * plain header, not through {@code sendRedirect}, which may rewrite the value.
+     * for {@code TRACE}, so those methods would not get the answer every other method gets. {@code Location} is set as
+     * a plain header, not through {@code sendRedirect}, which may rewrite the value.
+     *
+     * @param outcome  the authorize step's outcome: the redirect location, or the completed query's text
+     * @param response the response the reply is committed to
+     * @throws IOException when committing the reply fails
      */
-    private static ResponseEntity<String> render(AuthorizeOutcome outcome, HttpServletResponse response)
-            throws IOException {
+    private static void render(AuthorizeOutcome outcome, HttpServletResponse response) throws IOException {
         if (outcome.isRedirect()) {
             response.setStatus(HttpServletResponse.SC_FOUND);
             response.setHeader(HttpHeaders.LOCATION, outcome.redirectLocation().toASCIIString());
             response.setContentLength(0);
             response.flushBuffer();
-            return null;
+            return;
         }
-        return text(outcome.body());
+        text(outcome.body(), response);
     }
 
     /**
-     * 200 with {@code body} as {@code text/plain;charset=UTF-8}. The preset Content-Type makes Spring write the body
-     * without consulting {@code Accept}, and the string converter flushes it with its {@code Content-Length}, which
-     * commits the reply.
+     * Commits 200 with the UTF-8 bytes of {@code body}, their {@code Content-Length} and no {@code Content-Type}, the
+     * reply the Mule listener sent for the flow's untyped {@code set-payload}. Writing to the servlet response keeps
+     * every message converter, and so every Content-Type and {@code Accept} negotiation, out of the reply; a
+     * {@code HEAD} reply carries the same headers without the body.
+     *
+     * @param body     the flow's {@code set-payload} text
+     * @param response the response the text is committed to
+     * @throws IOException when writing or committing the reply fails
      */
-    private static ResponseEntity<String> text(String body) {
-        return ResponseEntity.ok().contentType(TEXT_PLAIN_UTF8).body(body);
+    private static void text(String body, HttpServletResponse response) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        response.setContentLength(bytes.length);
+        response.getOutputStream().write(bytes);
+        response.flushBuffer();
     }
 }

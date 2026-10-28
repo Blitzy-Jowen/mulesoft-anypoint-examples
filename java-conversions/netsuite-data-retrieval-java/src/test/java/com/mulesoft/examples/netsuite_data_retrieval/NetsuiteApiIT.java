@@ -56,10 +56,14 @@ import com.mulesoft.examples.netsuite_data_retrieval.support.NetsuiteTestRecords
  * (template {@code application-it.yml.example}). The surefire {@code NetsuiteApiTest} runs the same assertions
  * against a mocked {@link NetsuiteRestClient}.
  *
- * <p>The customers test is bracketed as the original's was: {@link NetsuiteTestRecords#createCustomerInNetsuite}
- * creates the test customer before the request and {@link NetsuiteTestRecords#deleteCustomerInNetsuite} deletes it in
- * {@code finally}, so it never stays in the account. The create is never retried: {@link NetsuiteRestClient} repeats a
- * request only after a 401, which NetSuite answers before processing it. The request is repeated until the new
+ * <p>The customers test is bracketed as the original's was, by {@link NetsuiteTestRecords#withTestCustomer}:
+ * {@link NetsuiteTestRecords#createCustomerInNetsuite} creates the test customer, marked with an external ID generated
+ * for the run ({@link NetsuiteTestRecords#newExternalId()}), inside the protected block, and
+ * {@link NetsuiteTestRecords#deleteCustomerInNetsuite} deletes it in {@code finally}. When the create's answer is lost
+ * or carries no record ID, the cleanup finds the customer by that external ID and deletes it, so neither a failed
+ * assertion nor an unknown create outcome leaves this run's customer in the account, and no other customer is
+ * touched. The create is never retried: {@link NetsuiteRestClient} repeats a request only after a 401, which NetSuite
+ * answers before processing it, and the cleanup only looks up and deletes. The request is repeated until the new
  * customer appears, because SuiteQL may list a record shortly after it is created. The opportunities and items
  * searches are read-only.
  *
@@ -71,7 +75,8 @@ import com.mulesoft.examples.netsuite_data_retrieval.support.NetsuiteTestRecords
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of its eight keys is missing, blank,
  * {@code TODO} or an unresolvable placeholder ({@link #missingCredential()}); the Spring context then never starts and
  * NetSuite is never called. A skipped run is not Tier 2B evidence. Failure messages carry the status line and a
- * truncated body only, and nothing here logs or reports a credential value.
+ * truncated body only, and nothing here logs or reports a credential value; the test customer's logs name its record
+ * ID and generated external ID only.
  */
 @ExtendWith(NetsuiteApiIT.LiveCredentialsGate.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -160,31 +165,23 @@ class NetsuiteApiIT {
         String companyName = env.getRequiredProperty(NetsuiteTestRecords.COMPANY_NAME_KEY);
         String path = API + "/customers?name=" + queryValue(companyName);
         String companyNamePair = "\"companyName\": \"" + companyName + "\"";
+        String externalId = NetsuiteTestRecords.newExternalId();
 
-        // Created before the try: when the create fails there is no customer to delete.
-        String id = NetsuiteTestRecords.createCustomerInNetsuite(client, env);
-        Throwable failure = null;
-        try {
-            await("GET " + API + "/customers lists the test customer")
-                    .atMost(LISTING_TIMEOUT)
-                    .pollDelay(Duration.ZERO)
-                    .pollInterval(LISTING_POLL_INTERVAL)
-                    .ignoreExceptions()
-                    .untilAsserted(() -> {
-                        HttpTestClient.Response response = http(CUSTOMERS_READ_TIMEOUT_MILLIS).get(path);
-                        assertOk(response);
-                        assertThat(response.bodyAsString().contains(companyNamePair))
-                                .as(() -> "The testing company name should be included in the response! "
-                                        + describe(response))
-                                .isTrue();
-                        assertResolvedTypeIds(response);
-                    });
-        } catch (RuntimeException | Error e) {
-            failure = e;
-            throw e;
-        } finally {
-            deleteTestCustomer(id, failure);
-        }
+        NetsuiteTestRecords.withTestCustomer(client, env, externalId, () ->
+                await("GET " + API + "/customers lists the test customer")
+                        .atMost(LISTING_TIMEOUT)
+                        .pollDelay(Duration.ZERO)
+                        .pollInterval(LISTING_POLL_INTERVAL)
+                        .ignoreExceptions()
+                        .untilAsserted(() -> {
+                            HttpTestClient.Response response = http(CUSTOMERS_READ_TIMEOUT_MILLIS).get(path);
+                            assertOk(response);
+                            assertThat(response.bodyAsString().contains(companyNamePair))
+                                    .as(() -> "The testing company name should be included in the response! "
+                                            + describe(response))
+                                    .isTrue();
+                            assertResolvedTypeIds(response);
+                        }));
     }
 
     @Test
@@ -292,21 +289,6 @@ class NetsuiteApiIT {
             violations.add(field + ": typeId absent");
         } else if (!typeId.isTextual() || !INTERNAL_ID.matcher(typeId.textValue()).matches()) {
             violations.add(field + ": typeId " + typeId + " is not a textual NetSuite internal ID");
-        }
-    }
-
-    /**
-     * Deletes the test customer. A cleanup failure fails the test, because the customer may be left in the account;
-     * when the test already failed, it is added to that failure as suppressed rather than replacing it.
-     */
-    private void deleteTestCustomer(String id, Throwable failure) {
-        try {
-            NetsuiteTestRecords.deleteCustomerInNetsuite(client, id);
-        } catch (RuntimeException cleanupFailure) {
-            if (failure == null) {
-                throw cleanupFailure;
-            }
-            failure.addSuppressed(cleanupFailure);
         }
     }
 

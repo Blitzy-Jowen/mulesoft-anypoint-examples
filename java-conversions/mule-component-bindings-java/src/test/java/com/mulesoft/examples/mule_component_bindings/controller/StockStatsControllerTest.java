@@ -550,7 +550,7 @@ class StockStatsControllerTest {
         // an unserved path under the listener's /api/* reaches the dispatcher's no-listener answer
         "/api/unknown | text/plain",
         // a path outside /api/* on this port is answered by the port routing itself
-        "/            | text/plain;charset=UTF-8",
+        "/            | text/plain",
     })
     void pathsTheResourceDoesNotServeAreAnsweredWithTheNoListener404(String path, String contentType) {
         Response response = stockStats.get(path, Map.of("Accept", "text/html"));

@@ -21,7 +21,10 @@ import org.springframework.stereotype.Repository;
  * {@code salesforce-to-database.xml}: the {@code db:select} of the enricher in step {@code queryExistingContactInDbStep}
  * (line 28) and the {@code db:insert} and {@code db:update} of step {@code upsertContactInDbStep} (lines 40 and 46).
  * The {@code db:mysql-config} of line 7 is Boot's auto-configured {@code DataSource} and {@link JdbcTemplate} over
- * {@code spring.datasource.*}; this class reads no configuration itself.
+ * {@code spring.datasource.*}; this class reads no configuration itself. While {@code mysql.host},
+ * {@code mysql.user} or {@code mysql.password} is missing, {@code config.DataSourceConfig} supplies
+ * {@code config.UnconfiguredDataSource} instead, so every call fails with a
+ * {@code CannotGetJdbcConnectionException} naming the missing keys.
  *
  * <p>Each statement is the original parameterized query with every MEL expression replaced by a bind parameter, so
  * no record value is ever concatenated into SQL. A {@code null} value is bound as SQL {@code NULL}.

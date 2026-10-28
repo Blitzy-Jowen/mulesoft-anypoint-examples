@@ -8,6 +8,8 @@
 
 package com.mulesoft.examples.mule_component_bindings;
 
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
@@ -15,6 +17,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -25,14 +28,18 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Collections;
 
+import org.apache.commons.lang3.SerializationUtils;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.Mockito;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -61,10 +68,10 @@ import twitter4j.QueryResult;
  * the Spring profile {@code test} supplies fake credentials, {@code @MockBean} puts the mocks into the context and
  * the raw-socket {@link HttpTestClient} returns once the complete response has arrived, so no wait is needed.
  *
- * <p>The two scenarios need different mock sets, so each sits in its own {@link Nested} class and therefore its own
- * application context. Both bind the stock-statistics listener to {@link #STOCK_STATS_PORT}, reserved once for
- * the class; each nested class discards its context after its test, so the first context releases the port before
- * the second binds it.
+ * <p>The scenarios need different mock sets or properties, so each sits in its own {@link Nested} class and
+ * therefore its own application context. All bind the stock-statistics listener to {@link #STOCK_STATS_PORT},
+ * reserved once for the class; each nested class discards its context after its tests, so one context releases
+ * the port before the next binds it.
  *
  * <p>{@code @SpringBootTest} and {@code @ActiveProfiles} sit on the nested classes, not on this class: JUnit
  * post-processes the enclosing instance of every nested test, so an annotated enclosing class makes the Spring
@@ -86,7 +93,7 @@ class MuleComponentBindingsTest {
 
     private static final String STOCK_STATS_PATH = "/api/stockStats";
 
-    /** Stands in for Stocklytics and Sentiment140; only the added end-to-end scenario stubs it. */
+    /** Stands in for Stocklytics, Sentiment140 and Twitter; only the added scenarios stub it. */
     @RegisterExtension
     static WireMockExtension wm = WireMockExtension.newInstance()
             .options(wireMockConfig().dynamicPort())
@@ -98,6 +105,8 @@ class MuleComponentBindingsTest {
         // The clients append their resource paths (historicalPrices/1.0, bulkClassifyJson) to these base URLs.
         registry.add("stockstats.stocklytics-base-url", () -> wm.baseUrl() + "/");
         registry.add("stockstats.sentiment140-base-url", () -> wm.baseUrl() + "/");
+        // Reached only where the Twitter client is not mocked; twitter4j appends search/tweets.json.
+        registry.add("twitter.rest-base-url", () -> wm.baseUrl() + "/1.1/");
     }
 
     /**
@@ -195,6 +204,106 @@ class MuleComponentBindingsTest {
             wm.verify(getRequestedFor(urlPathEqualTo("/historicalPrices/1.0")));
             wm.verify(postRequestedFor(urlPathEqualTo("/bulkClassifyJson")));
             Mockito.verify(twitterSearchClient).search("$" + STOCK, DATE, "2012-11-05");
+        }
+    }
+
+    /**
+     * ADDED scenario, not ported: both stock-statistics keys blank, the Twitter keys of profile {@code test}, and
+     * no mock. The application starts, the Twitter-only {@code "/"} flow answers through the real Twitter client,
+     * and the stock-statistics request fails with the {@code 500} naming {@code stockstats.stocklyticsApiKey}, the
+     * key of its first call, before any upstream is contacted.
+     */
+    @Nested
+    @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+            properties = {"stockstats.stocklyticsApiKey=", "stockstats.sentiment140ApiKey="})
+    @ActiveProfiles("test")
+    @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+    class WithoutStockStatsKeys {
+
+        /** A v1.1 search answer without tweets; twitter4j requires its {@code search_metadata}. */
+        private static final String NO_TWEETS = "{\"statuses\":[],\"search_metadata\":{\"completed_in\":0.001,"
+                + "\"max_id\":0,\"max_id_str\":\"0\",\"query\":\"AAPL\",\"refresh_url\":\"?since_id=0&q=AAPL\","
+                + "\"count\":15,\"since_id\":0,\"since_id_str\":\"0\"}}";
+
+        @LocalServerPort
+        private int mainPort;
+
+        @BeforeEach
+        void noStubsAndNoRequests() {
+            wm.resetAll();
+        }
+
+        @Test
+        void twitterOnlyListenerStillAnswers() {
+            wm.stubFor(get(urlPathEqualTo("/1.1/search/tweets.json")).willReturn(okJson(NO_TWEETS)));
+
+            HttpTestClient.Response result = HttpTestClient.localhost(mainPort).get("/");
+
+            assertEquals("HTTP/1.1 200 OK", result.statusLine(), () -> "unexpected response: " + result);
+            assertArrayEquals(SerializationUtils.serialize(new ArrayList<Tweet>()), result.body());
+            wm.verify(1, getRequestedFor(urlPathEqualTo("/1.1/search/tweets.json")));
+            assertEquals(1, wm.getAllServeEvents().size());
+        }
+
+        @Test
+        void stockStatsFailsNamingTheMissingKeyBeforeAnyUpstreamCall() {
+            HttpTestClient.Response result = HttpTestClient.localhost(STOCK_STATS_PORT).get(STOCK_STATS_PATH + MESSAGE);
+
+            assertEquals("HTTP/1.1 500 Internal Server Error", result.statusLine(),
+                    () -> "unexpected response: " + result);
+            assertEquals("Stocklytics API key (stockstats.stocklyticsApiKey) is not configured",
+                    result.bodyAsString());
+            wm.verify(0, anyRequestedFor(anyUrl()));
+        }
+    }
+
+    /**
+     * ADDED scenario, not ported: {@code twitter.apiKey} blank, every other key of profile {@code test}, and no
+     * mock. The {@code "/"} flow answers SC-1's {@code 500} naming the key without contacting Twitter, and the
+     * stock-statistics request calls Stocklytics first, as the original order has it, then fails with the
+     * {@code 500} naming the same key, before Twitter or Sentiment140 is contacted.
+     */
+    @Nested
+    @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "twitter.apiKey=")
+    @ActiveProfiles("test")
+    @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+    class WithoutTwitterApiKey {
+
+        private static final String MISSING_KEY = "Twitter API key (twitter.apiKey) is not configured";
+
+        @LocalServerPort
+        private int mainPort;
+
+        @BeforeEach
+        void noStubsAndNoRequests() {
+            wm.resetAll();
+        }
+
+        @Test
+        void twitterListenerFailsNamingTheMissingKeyBeforeAnyUpstreamCall() {
+            HttpTestClient.Response result = HttpTestClient.localhost(mainPort).get("/");
+
+            assertEquals("HTTP/1.1 500 Internal Server Error", result.statusLine(),
+                    () -> "unexpected response: " + result);
+            assertTrue(String.valueOf(result.header("Content-Type")).startsWith("application/json"),
+                    result::toString);
+            assertEquals("{ \"message\": \"" + MISSING_KEY + "\" }", result.bodyAsString());
+            wm.verify(0, anyRequestedFor(anyUrl()));
+        }
+
+        @Test
+        void stockStatsFailsNamingTheMissingKeyAfterStocklyticsOnly() {
+            String prices = "{\"2012-10-26\":{\"open\":0,\"close\":1,\"high\":0,\"low\":2,\"volume\":0}}";
+            wm.stubFor(get(urlPathEqualTo("/historicalPrices/1.0")).willReturn(okJson(prices)));
+            wm.stubFor(post(urlPathEqualTo("/bulkClassifyJson")).willReturn(okJson("{\"data\":[]}")));
+
+            HttpTestClient.Response result = HttpTestClient.localhost(STOCK_STATS_PORT).get(STOCK_STATS_PATH + MESSAGE);
+
+            assertEquals("HTTP/1.1 500 Internal Server Error", result.statusLine(),
+                    () -> "unexpected response: " + result);
+            assertEquals(MISSING_KEY, result.bodyAsString());
+            wm.verify(1, getRequestedFor(urlPathEqualTo("/historicalPrices/1.0")));
+            assertEquals(1, wm.getAllServeEvents().size());
         }
     }
 }

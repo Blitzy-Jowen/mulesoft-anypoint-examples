@@ -9,6 +9,7 @@
 package com.mulesoft.examples.document_integration_using_the_cmis_connector.client;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.any;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
@@ -29,18 +30,25 @@ import static org.junit.jupiter.api.Assertions.fail;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.ConnectException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Locale;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -62,6 +70,7 @@ import com.github.tomakehurst.wiremock.http.QueryParameter;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.document_integration_using_the_cmis_connector.config.CmisProperties;
+import com.mulesoft.examples.document_integration_using_the_cmis_connector.support.TestProfileValues;
 
 /**
  * Unit test of {@link CmisAtomPubClient}, the CMIS 1.1 AtomPub adapter that replaces the original flow's
@@ -81,6 +90,20 @@ class CmisAtomPubClientTest {
     private static final String DESCENDANTS = BASE_PATH + "/default/descendants";
     private static final String QUERY = BASE_PATH + "/default/query";
 
+    /** Where the redirect cases move the service document. */
+    private static final String MOVED = "/moved/cmis/atom";
+
+    /** A redirect hop on another destination, between {@link #BASE_PATH} and {@link #MOVED}. */
+    private static final String MOVED_ELSEWHERE = "/elsewhere/cmis/atom";
+
+    /** The page a web server sends with a redirect, carrying the DOCTYPE such pages declare. */
+    private static final String REDIRECT_PAGE = "<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n"
+            + "<html><head><title>301 Moved Permanently</title></head><body><h1>Moved Permanently</h1>"
+            + "<p>The document has moved <a href=\"" + MOVED + "\">here</a>.</p></body></html>";
+
+    /** The most requests one redirected GET makes: the JDK default of {@code http.maxRedirects}. */
+    private static final int MAX_REDIRECT_REQUESTS = 20;
+
     private static final String FOLDER = "/okm:root/";
     private static final String NAME = "pic123.jpg";
     private static final String OBJECT_ID = "/okm:root/pic123.jpg";
@@ -88,8 +111,13 @@ class CmisAtomPubClientTest {
     private static final String OBJECT_TYPE = "cmis:document";
     private static final String VERSIONING_STATE = "NONE";
 
-    /** HTTP Basic credentials of the public OpenKM demo account {@code user3}/{@code pass3} the original used. */
-    private static final String EXPECTED_AUTH = "Basic dXNlcjM6cGFzczM=";
+    /** The public OpenKM demo account: {@code cmis.username} and {@code cmis.password} of application-test.yml. */
+    private static final String USERNAME = TestProfileValues.required("cmis.username");
+    private static final String PASSWORD = TestProfileValues.required("cmis.password");
+
+    /** HTTP Basic credentials of that account, encoded with the JDK's Base64 rather than the client's encoder. */
+    private static final String EXPECTED_AUTH = "Basic "
+            + Base64.getEncoder().encodeToString((USERNAME + ":" + PASSWORD).getBytes(StandardCharsets.ISO_8859_1));
 
     /** JPEG magic bytes, a NUL and a high byte; seven bytes, so the Base64 form ends in padding. */
     private static final byte[] CONTENT = {(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0, 0x00, 0x01, 0x7F};
@@ -136,8 +164,8 @@ class CmisAtomPubClientTest {
         props = new CmisProperties();
         props.setBaseUrl(wm.baseUrl() + BASE_PATH);
         props.setRepositoryId("default");
-        props.setUsername("user3");
-        props.setPassword("pass3");
+        props.setUsername(USERNAME);
+        props.setPassword(PASSWORD);
         props.setConnectTimeout(Duration.ofSeconds(2));
         props.setReadTimeout(Duration.ofSeconds(2));
         client = new CmisAtomPubClient(props);
@@ -263,8 +291,7 @@ class CmisAtomPubClientTest {
      * never re-sent, so no second document is created.
      */
     @ParameterizedTest
-    @EnumSource(value = Fault.class,
-            names = {"CONNECTION_RESET_BY_PEER", "EMPTY_RESPONSE", "MALFORMED_RESPONSE_CHUNK"})
+    @EnumSource(Fault.class)
     void createDocumentConnectionFaultRaisesFixedMessageAndIsSentOnce(Fault fault) {
         stubFailingStep(CREATE_DOCUMENT, aResponse().withFault(fault));
 
@@ -273,6 +300,194 @@ class CmisAtomPubClientTest {
         assertEquals("CMIS create-document request failed with an I/O error", e.getMessage());
         assertInstanceOf(IOException.class, e.getCause());
         verifyRequestsThrough(CREATE_DOCUMENT);
+    }
+
+    static Stream<Arguments> getStepFaults() {
+        return Stream.of(SERVICE_DOCUMENT, FOLDER_ENTRY)
+                .flatMap(step -> Arrays.stream(Fault.values()).map(fault -> Arguments.of(step, fault)));
+    }
+
+    /**
+     * A GET whose connection is reset, closed before any response, answered with garbage or broken inside the body
+     * fails with a fixed message and is sent exactly once: the transport never re-sends a bodiless request after a
+     * connectivity failure, as the JDK {@code HttpURLConnection} did once, and no later step runs.
+     */
+    @ParameterizedTest
+    @MethodSource("getStepFaults")
+    void getConnectionFaultRaisesFixedMessageAndIsSentOnce(String step, Fault fault) {
+        stubFailingStep(step, aResponse().withFault(fault));
+
+        ResourceAccessException e = assertThrows(ResourceAccessException.class, () -> createDocument(client));
+
+        assertEquals("CMIS " + step + " request failed with an I/O error", e.getMessage());
+        assertInstanceOf(IOException.class, e.getCause());
+        verifyRequestsThrough(step);
+    }
+
+    /**
+     * A connect that does not complete within the connect timeout fails with the same fixed timeout message as a
+     * read timeout, and is not attempted again. The upstream is a listening socket that never accepts, whose
+     * backlog the test fills first, so the kernel leaves every further connection attempt unanswered.
+     */
+    @Test
+    void connectTimeoutRaisesFixedMessageWithoutRetry() throws IOException {
+        try (ServerSocket unaccepting = new ServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            List<Socket> backlog = new ArrayList<>();
+            try {
+                InetSocketAddress address = new InetSocketAddress(unaccepting.getInetAddress(),
+                        unaccepting.getLocalPort());
+                fillBacklog(address, backlog);
+                props.setBaseUrl("http://" + address.getAddress().getHostAddress() + ":" + address.getPort()
+                        + BASE_PATH);
+                Duration connectTimeout = Duration.ofSeconds(1);
+                props.setConnectTimeout(connectTimeout);
+                CmisAtomPubClient unanswered = new CmisAtomPubClient(props);
+
+                long start = System.nanoTime();
+                ResourceAccessException e = assertThrows(ResourceAccessException.class,
+                        () -> createDocument(unanswered));
+                Duration elapsed = Duration.ofNanos(System.nanoTime() - start);
+
+                assertEquals("CMIS service document request timed out", e.getMessage());
+                assertInstanceOf(SocketTimeoutException.class, e.getCause());
+                // One connect attempt: a second one would wait out the connect timeout again.
+                assertTrue(elapsed.compareTo(connectTimeout.minusMillis(50)) >= 0
+                        && elapsed.compareTo(connectTimeout.multipliedBy(2)) < 0, elapsed::toString);
+            } finally {
+                for (Socket socket : backlog) {
+                    socket.close();
+                }
+            }
+        }
+    }
+
+    /** Every status HttpURLConnection followed for a GET, each with an absolute and with a relative Location. */
+    static Stream<Arguments> followedRedirects() {
+        return IntStream.of(300, 301, 302, 303, 307).boxed()
+                .flatMap(status -> Stream.of(Arguments.of(status, true), Arguments.of(status, false)));
+    }
+
+    /**
+     * A GET redirect that keeps the scheme is followed, and a hop to the same host and port keeps the service
+     * account and the {@code Accept} header.
+     */
+    @ParameterizedTest
+    @MethodSource("followedRedirects")
+    void sameSchemeGetRedirectIsFollowedWithTheServiceAccount(int status, boolean absoluteLocation) {
+        wm.stubFor(get(urlPathEqualTo(BASE_PATH)).willReturn(aResponse()
+                .withStatus(status)
+                .withHeader("Location", absoluteLocation ? wm.baseUrl() + MOVED : MOVED)));
+        stubMovedServiceDocument();
+        stubFolderEntry(true);
+        stubCreate(true);
+
+        assertEquals(OBJECT_ID, createDocument(client));
+
+        wm.verify(1, getRequestedFor(urlPathEqualTo(BASE_PATH)));
+        wm.verify(1, getRequestedFor(urlPathEqualTo(MOVED))
+                .withHeader("Authorization", equalTo(expectedAuthorization()))
+                .withHeader("Accept", equalTo(SERVICE_DOCUMENT_TYPE)));
+        wm.verify(4, anyRequestedFor(anyUrl()));
+    }
+
+    /**
+     * A redirect hop to another destination (host or port) carries no {@code Authorization} header, nor does any
+     * hop after it, even one back to the original host, as HttpURLConnection removed it for the rest of the
+     * exchange; the next request is a new exchange and authenticates again. {@code 127.0.0.1} and
+     * {@code localhost} reach the same WireMock but are different destinations.
+     */
+    @Test
+    void redirectToAnotherDestinationDropsTheServiceAccountForTheRestOfTheExchange() {
+        wm.stubFor(get(urlPathEqualTo(BASE_PATH)).willReturn(aResponse()
+                .withStatus(302)
+                .withHeader("Location", "http://127.0.0.1:" + wm.getPort() + MOVED_ELSEWHERE)));
+        wm.stubFor(get(urlPathEqualTo(MOVED_ELSEWHERE)).willReturn(aResponse()
+                .withStatus(302)
+                .withHeader("Location", wm.baseUrl() + MOVED)));
+        stubMovedServiceDocument();
+        stubFolderEntry(true);
+        stubCreate(true);
+
+        assertEquals(OBJECT_ID, createDocument(client));
+
+        wm.verify(1, getRequestedFor(urlPathEqualTo(BASE_PATH))
+                .withHeader("Authorization", equalTo(expectedAuthorization())));
+        wm.verify(1, getRequestedFor(urlPathEqualTo(MOVED_ELSEWHERE)).withoutHeader("Authorization"));
+        wm.verify(1, getRequestedFor(urlPathEqualTo(MOVED)).withoutHeader("Authorization")
+                .withHeader("Accept", equalTo(SERVICE_DOCUMENT_TYPE)));
+        wm.verify(1, getRequestedFor(urlPathEqualTo(OBJECT_BY_PATH))
+                .withHeader("Authorization", equalTo(expectedAuthorization())));
+        wm.verify(1, postRequestedFor(urlPathEqualTo(CHILDREN))
+                .withHeader("Authorization", equalTo(expectedAuthorization())));
+        wm.verify(5, anyRequestedFor(anyUrl()));
+    }
+
+    static Stream<Arguments> unfollowedGetRedirects() {
+        return Stream.of(
+                Arguments.of(Named.of("301 from http to https, as the public OpenKM demo answers", 301), "https"),
+                Arguments.of(Named.of("308, which HttpURLConnection does not follow", 308), "http"));
+    }
+
+    /**
+     * A GET redirect HttpURLConnection did not follow is returned as received and nothing is sent to its
+     * Location, so its HTML page is read as the service document; a page with a DOCTYPE, as such pages carry,
+     * is rejected as not well-formed XML.
+     */
+    @ParameterizedTest
+    @MethodSource("unfollowedGetRedirects")
+    void unfollowedGetRedirectIsReadAsTheResponse(int status, String scheme) {
+        wm.stubFor(get(urlPathEqualTo(BASE_PATH)).willReturn(aResponse()
+                .withStatus(status)
+                .withHeader("Location", scheme + "://localhost:" + wm.getPort() + MOVED)
+                .withHeader("Content-Type", "text/html; charset=iso-8859-1")
+                .withBody(REDIRECT_PAGE)));
+        stubMovedServiceDocument();
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> createDocument(client));
+
+        assertEquals("CMIS service document response is not well-formed XML", e.getMessage());
+        wm.verify(1, anyRequestedFor(anyUrl()));
+    }
+
+    /**
+     * A redirect answering the create-document POST is never followed, whatever its status, so the entry is posted
+     * once; the redirect has no body, which fails the step.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {301, 302, 303, 307, 308})
+    void createDocumentRedirectIsNotFollowed(int status) {
+        stubServiceDocument(true);
+        stubFolderEntry(true);
+        wm.stubFor(post(urlPathEqualTo(CHILDREN)).willReturn(aResponse()
+                .withStatus(status)
+                .withHeader("Location", wm.baseUrl() + MOVED)));
+        wm.stubFor(any(urlPathEqualTo(MOVED)).willReturn(aResponse()
+                .withStatus(201)
+                .withHeader("Content-Type", ENTRY_TYPE + ";charset=UTF-8")
+                .withBody(createdEntry(true))));
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> createDocument(client));
+
+        assertEquals("CMIS create-document response has no body", e.getMessage());
+        verifyRequestsThrough(CREATE_DOCUMENT);
+    }
+
+    /**
+     * A GET that keeps redirecting is sent at most {@value #MAX_REDIRECT_REQUESTS} times, the JDK default of
+     * {@code http.maxRedirects} that HttpURLConnection applied, and then fails as an I/O error.
+     */
+    @Test
+    void redirectLoopFailsAfterTheRedirectLimit() {
+        wm.stubFor(get(urlPathEqualTo(BASE_PATH)).willReturn(aResponse()
+                .withStatus(302)
+                .withHeader("Location", wm.baseUrl() + BASE_PATH)));
+
+        ResourceAccessException e = assertThrows(ResourceAccessException.class, () -> createDocument(client));
+
+        assertEquals("CMIS service document request failed with an I/O error", e.getMessage());
+        assertInstanceOf(IOException.class, e.getCause());
+        wm.verify(MAX_REDIRECT_REQUESTS, getRequestedFor(urlPathEqualTo(BASE_PATH)));
+        wm.verify(MAX_REDIRECT_REQUESTS, anyRequestedFor(anyUrl()));
     }
 
     @Test
@@ -365,13 +580,14 @@ class CmisAtomPubClientTest {
         wm.verify(1, postRequestedFor(urlPathEqualTo(CHILDREN)));
     }
 
+    /** Each synthetic unset value, paired with the test profile's value of the other key, and the key it lacks. */
     static Stream<Arguments> unsetServiceAccount() {
         return Stream.of(
-                Arguments.of(null, "pass3", "cmis.username"),
-                Arguments.of("", "pass3", "cmis.username"),
-                Arguments.of("   ", "pass3", "cmis.username"),
-                Arguments.of("user3", null, "cmis.password"),
-                Arguments.of("user3", "", "cmis.password"));
+                Arguments.of(null, PASSWORD, "cmis.username"),
+                Arguments.of("", PASSWORD, "cmis.username"),
+                Arguments.of("   ", PASSWORD, "cmis.username"),
+                Arguments.of(USERNAME, null, "cmis.password"),
+                Arguments.of(USERNAME, "", "cmis.password"));
     }
 
     /**
@@ -472,6 +688,45 @@ class CmisAtomPubClientTest {
                         .withStatus(201)
                         .withHeader("Content-Type", ENTRY_TYPE + ";charset=UTF-8")
                         .withBody(createdEntry(withObjectId))));
+    }
+
+    /** The service document of {@link #stubServiceDocument}, served at the redirect target {@link #MOVED}. */
+    private static void stubMovedServiceDocument() {
+        wm.stubFor(get(urlPathEqualTo(MOVED))
+                .willReturn(okForContentType(SERVICE_DOCUMENT_TYPE + ";charset=UTF-8", serviceDocument(true))));
+    }
+
+    /**
+     * The HTTP Basic {@code Authorization} value of the service account {@link #createClient} configures, encoded
+     * as Spring's {@code HttpHeaders.setBasicAuth} encodes it.
+     */
+    private String expectedAuthorization() {
+        return "Basic " + Base64.getEncoder().encodeToString(
+                (props.getUsername() + ":" + props.getPassword()).getBytes(StandardCharsets.ISO_8859_1));
+    }
+
+    /**
+     * Connects to {@code address}, which listens but never accepts, until its accept queue is full and a connection
+     * attempt goes unanswered; each socket that connected is added to {@code backlog}, which the caller closes.
+     */
+    private static void fillBacklog(InetSocketAddress address, List<Socket> backlog) throws IOException {
+        for (int attempt = 0; attempt < 64; attempt++) {
+            Socket socket = new Socket();
+            boolean connected = false;
+            try {
+                socket.connect(address, 200);
+                connected = true;
+            } catch (SocketTimeoutException queueFull) {
+                return;
+            } finally {
+                if (connected) {
+                    backlog.add(socket);
+                } else {
+                    socket.close();
+                }
+            }
+        }
+        fail("the accept queue of " + address + " never filled");
     }
 
     /**

@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -28,8 +29,11 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Properties;
@@ -37,6 +41,7 @@ import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -44,12 +49,14 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.BeanCreationException;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.mock.env.MockEnvironment;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -87,9 +94,11 @@ import jakarta.mail.util.ByteArrayDataSource;
  *
  * <p>GreenMail runs per test method on dynamic ports, so every poller is built inside its test. POP3S presents
  * GreenMail's self-signed certificate, which the poller accepts through its {@code sslTrust} argument {@code *}
- * everywhere except in the test of the untrusted certificate. Plain JUnit 5 without a Spring context;
- * {@link OutputCaptureExtension} only captures the console log lines, and the blank-host test reads the poller's
- * DEBUG and WARN events through a Logback {@link ListAppender}.
+ * everywhere except in the test of the untrusted certificate. Plain JUnit 5 without a Spring context, except the
+ * {@code pop3.check-frequency} wiring test, which builds the poller in a plain context without scheduling;
+ * {@link OutputCaptureExtension} only captures the console log lines, and the test of a blank mailbox setting reads
+ * the poller's DEBUG and WARN events through a Logback {@link ListAppender}; that test points the poller at a local
+ * listener instead of GreenMail and asserts that no poll connects to it.
  *
  * <p>Expected attachment orders are fixed literals worked out once from Mule 3.8's naming rules and the bucket order
  * of a default-capacity {@link java.util.HashMap}; when the poller hands over another order, the poller is wrong, not
@@ -104,7 +113,14 @@ class Pop3MailPollerTest {
     private static final String MAILBOX_PASSWORD = "secret";
     private static final String SUBJECT = "This is the POP Subject Line!";
     private static final int RESPONSE_TIMEOUT = 10000;
+    /** The original {@code checkFrequency}, passed as {@code pop3.check-frequency} to every directly built poller. */
+    private static final String CHECK_FREQUENCY = "100";
+    /** The response timeout of a poller pointed at a listener that never answers: it bounds a poll that connects. */
+    private static final int STALL_TIMEOUT = 500;
     private static final long DELIVERY_WAIT_MS = 5000;
+    // Test-only sentinel values of configured settings: no log line may contain either of them.
+    private static final String SENTINEL_USER = "sentinel-user-5c2d@test.invalid";
+    private static final String SENTINEL_PASSWORD = "sentinel-pw-e17b";
 
     @RegisterExtension
     static GreenMailExtension greenMail = new GreenMailExtension(
@@ -177,7 +193,7 @@ class Pop3MailPollerTest {
     }
 
     @Test
-    @DisplayName("a rejected login is logged at WARN and leaves the mailbox untouched for the next poll")
+    @DisplayName("a rejected login is logged at ERROR and leaves the mailbox untouched for the next poll")
     void leavesTheMailboxUntouchedWhenTheLoginIsRejected(CapturedOutput output) throws Exception {
         send(attachmentMail(inputCsv(), "report"), 1);
 
@@ -186,7 +202,7 @@ class Pop3MailPollerTest {
         assertEquals(0, consumed);
         verifyNoInteractions(service);
         assertEquals(1, pop3MessageCount());
-        assertTrue(output.getAll().lines().anyMatch(line -> line.contains("WARN")
+        assertTrue(output.getAll().lines().anyMatch(line -> line.contains("ERROR")
                 && line.contains("Cannot poll POP3S mailbox")
                 && line.contains("jakarta.mail.AuthenticationFailedException")));
         // GreenMail's rejection text is server-controlled, so only its exception type is logged.
@@ -201,7 +217,7 @@ class Pop3MailPollerTest {
 
     @Test
     @Timeout(30)
-    @DisplayName("an unreachable server is logged at WARN and the poll returns 0 without throwing")
+    @DisplayName("an unreachable server is logged at ERROR and the poll returns 0 without throwing")
     void returnsZeroWhenTheServerIsUnreachable(CapturedOutput output) throws Exception {
         // The reservation stays open until every assertion has run, so no other process can take the port meanwhile.
         try (Socket reserved = reserveRefusingPort()) {
@@ -211,21 +227,46 @@ class Pop3MailPollerTest {
 
             assertEquals(0, consumed);
             verifyNoInteractions(service);
-            assertTrue(output.getAll().lines().anyMatch(line -> line.contains("WARN")
+            assertTrue(output.getAll().lines().anyMatch(line -> line.contains("ERROR")
                     && line.contains("Cannot poll POP3S mailbox " + pop3Host() + ":" + refusingPort)
                     && line.contains("java.net.ConnectException")));
             assertFalse(output.getAll().contains("Couldn't connect"), "the exception message is not logged");
         }
     }
 
-    @ParameterizedTest
-    @NullAndEmptySource
-    @ValueSource(strings = { "   " })
-    @DisplayName("a blank pop3.host disables polling: nothing is read, the mailbox is kept, one WARN names the key")
-    void skipsThePollWhenTheHostIsBlank(String host) throws Exception {
-        send(attachmentMail(inputCsv(), "report"), 1);
-        Pop3MailPoller poller = poller(host, pop3Port(), MAILBOX_PASSWORD);
+    /**
+     * Each mailbox setting null, empty or blank while the other two hold a loopback host or sentinels, and all three
+     * empty at once, with the WARN and the DEBUG line each case must log.
+     */
+    static Stream<Arguments> unconfiguredMailboxes() {
+        String loopback = "127.0.0.1";
+        List<Arguments> cases = new ArrayList<>();
+        for (String blank : Arrays.asList(null, "", "   ")) {
+            String shown = blank == null ? "null" : "\"" + blank + "\"";
+            cases.add(Arguments.of(Named.of("pop3.host " + shown, blank), SENTINEL_USER, SENTINEL_PASSWORD,
+                    "pop3.host (POP3_HOST) is not configured; POP3S polling is skipped",
+                    "pop3.host is not configured; POP3S poll skipped"));
+            cases.add(Arguments.of(Named.of("pop3.user " + shown, loopback), blank, SENTINEL_PASSWORD,
+                    "pop3.user (POP3_USER) is not configured; POP3S polling is skipped",
+                    "pop3.user is not configured; POP3S poll skipped"));
+            cases.add(Arguments.of(Named.of("pop3.password " + shown, loopback), SENTINEL_USER, blank,
+                    "pop3.password (POP3_PASSWORD) is not configured; POP3S polling is skipped",
+                    "pop3.password is not configured; POP3S poll skipped"));
+        }
+        cases.add(Arguments.of(Named.of("all three empty, as application.yml ships them", ""), "", "",
+                "pop3.host (POP3_HOST), pop3.user (POP3_USER), pop3.password (POP3_PASSWORD) are not configured; "
+                        + "POP3S polling is skipped",
+                "pop3.host, pop3.user, pop3.password are not configured; POP3S poll skipped"));
+        return cases.stream();
+    }
 
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unconfiguredMailboxes")
+    @Timeout(60)
+    @DisplayName("a null or blank pop3.host, pop3.user or pop3.password disables polling without connecting; "
+            + "one WARN names the missing keys")
+    void skipsThePollWhenAMailboxSettingIsBlank(String host, String user, String password, String warning,
+            String debug, CapturedOutput output) throws Exception {
         // application.yml pins the package logger to INFO, so the poller's logger is opened to DEBUG for this test
         // only; events are counted from this thread alone, which runs every poll here.
         String testThread = Thread.currentThread().getName();
@@ -235,7 +276,12 @@ class Pop3MailPollerTest {
         appender.start();
         pollerLogger.addAppender(appender);
         pollerLogger.setLevel(Level.DEBUG);
-        try {
+        // Listens on every local address and never accepts: a connection from any poll, a blank host resolving to
+        // the loopback address included, would complete in its backlog. The short timeout bounds a poll that did
+        // connect, which would then stall in the TLS handshake.
+        try (ServerSocket listener = new ServerSocket(0)) {
+            Pop3MailPoller poller = new Pop3MailPoller(service, host, listener.getLocalPort(), user, password,
+                    "INBOX", STALL_TIMEOUT, "*", CHECK_FREQUENCY);
             assertEquals(0, poller.pollOnce());
             assertEquals(1, appender.list.stream()
                             .filter(event -> event.getThreadName().equals(testThread))
@@ -244,6 +290,9 @@ class Pop3MailPollerTest {
                     "the first skipped poll already logs the WARN");
             assertEquals(0, poller.pollOnce());
             assertEquals(0, poller.pollOnce());
+
+            listener.setSoTimeout(200);
+            assertThrows(SocketTimeoutException.class, listener::accept, "no poll connected to the listener");
         } finally {
             pollerLogger.setLevel(previousLevel);
             pollerLogger.detachAppender(appender);
@@ -254,23 +303,15 @@ class Pop3MailPollerTest {
                 .toList();
 
         verifyNoInteractions(service);
-        assertEquals(1, pop3MessageCount());
-        List<String> warnings = events.stream()
-                .filter(event -> event.getLevel() == Level.WARN)
-                .map(ILoggingEvent::getFormattedMessage)
-                .toList();
-        assertEquals(1, warnings.size(), "the WARN is logged once, not on every skipped poll: " + warnings);
-        assertTrue(warnings.get(0).contains("pop3.host (POP3_HOST)"), "the WARN names the key and its variable");
-        assertEquals(3, events.stream()
-                        .filter(event -> event.getLevel() == Level.DEBUG)
-                        .filter(event -> event.getFormattedMessage()
-                                .equals("pop3.host is not configured; POP3S poll skipped"))
-                        .count(),
-                "every skipped poll, the first included, logs the DEBUG line");
-        assertEquals(4, events.size(), "the skipped polls log nothing else: " + events);
-        assertTrue(events.stream().map(ILoggingEvent::getFormattedMessage)
-                        .noneMatch(message -> message.contains(MAILBOX_PASSWORD) || message.contains(RECEIVER)),
-                "no credential is logged");
+        assertEquals(List.of(Level.WARN, Level.DEBUG, Level.DEBUG, Level.DEBUG),
+                events.stream().map(ILoggingEvent::getLevel).toList(),
+                "the WARN once, at the first skipped poll, and a DEBUG line at every skipped poll, nothing else: "
+                        + events);
+        assertEquals(List.of(warning, debug, debug, debug),
+                events.stream().map(ILoggingEvent::getFormattedMessage).toList(),
+                "the WARN names every missing key with its variable; the DEBUG line names the keys");
+        assertFalse(output.getAll().contains(SENTINEL_USER), "no configured user is logged");
+        assertFalse(output.getAll().contains(SENTINEL_PASSWORD), "no configured password is logged");
     }
 
     @ParameterizedTest(name = "{0}")
@@ -460,28 +501,75 @@ class Pop3MailPollerTest {
     }
 
     @Test
-    @DisplayName("an untrusted server certificate is logged at WARN with the exception chain's types")
+    @DisplayName("an untrusted server certificate is logged at ERROR with the exception chain's types")
     void logsTheExceptionChainOfAnUntrustedCertificate(CapturedOutput output) throws Exception {
         send(attachmentMail(inputCsv(), "report"), 1);
 
         // No sslTrust: GreenMail's self-signed certificate fails default certificate path validation. GreenMail's own
         // connection thread then prints the aborted handshake to stderr; that trace is the server's, not the poller's.
         Pop3MailPoller untrusting = new Pop3MailPoller(service, pop3Host(), pop3Port(), RECEIVER, MAILBOX_PASSWORD,
-                "INBOX", RESPONSE_TIMEOUT, "");
+                "INBOX", RESPONSE_TIMEOUT, "", CHECK_FREQUENCY);
         assertEquals(0, assertDoesNotThrow(untrusting::pollOnce));
 
         verifyNoInteractions(service);
         assertEquals(1, pop3MessageCount());
         String chain = "jakarta.mail.MessagingException caused by javax.net.ssl.SSLHandshakeException";
-        assertTrue(output.getAll().lines().anyMatch(line -> line.contains("WARN")
+        assertTrue(output.getAll().lines().anyMatch(line -> line.contains("ERROR")
                         && line.contains("Cannot poll POP3S mailbox " + pop3Host() + ":" + pop3Port() + ": " + chain)),
-                "the TLS failure is logged at WARN with the cause chain's types");
+                "the TLS failure is logged at ERROR with the cause chain's types");
         assertFalse(output.getAll().contains("Connect failed"), "the exception message is not logged");
         assertFalse(output.getAll().contains("PKIX path building failed"), "the cause's message is not logged");
     }
 
+    @ParameterizedTest(name = "pop3.check-frequency = \"{0}\"")
+    @ValueSource(strings = { "0", "-1", "PT0S", "PT-1S", "abc", "" })
+    @DisplayName("a zero, negative or unreadable pop3.check-frequency is refused at construction, naming key and value")
+    void refusesAFrequencyThatIsNotPositive(String frequency) {
+        IllegalArgumentException refusal = assertThrows(IllegalArgumentException.class,
+                () -> pollerWithFrequency(frequency));
+
+        assertEquals(frequencyRefusal(frequency), refusal.getMessage());
+    }
+
+    @ParameterizedTest(name = "pop3.check-frequency = \"{0}\"")
+    @ValueSource(strings = { "1", "100", "PT10S", "pt0.5s" })
+    @DisplayName("a positive pop3.check-frequency in milliseconds or as an ISO-8601 duration is accepted")
+    void acceptsAPositiveFrequency(String frequency) {
+        assertDoesNotThrow(() -> pollerWithFrequency(frequency));
+    }
+
+    @Test
+    @DisplayName("a non-positive pop3.check-frequency in the environment stops Spring from creating the poller")
+    void refusesANonPositiveFrequencyFromTheEnvironment() {
+        // A plain context without scheduling, so the constructor's check is the only one that can refuse the value.
+        try (AnnotationConfigApplicationContext context = new AnnotationConfigApplicationContext()) {
+            context.setEnvironment(new MockEnvironment().withProperty("pop3.check-frequency", "-5"));
+            context.registerBean(AttachmentImportService.class, () -> service);
+            context.register(Pop3MailPoller.class);
+
+            BeanCreationException failure = assertThrows(BeanCreationException.class, context::refresh);
+
+            Throwable rootCause = failure.getMostSpecificCause();
+            assertInstanceOf(IllegalArgumentException.class, rootCause);
+            assertEquals(frequencyRefusal("-5"), rootCause.getMessage());
+        }
+    }
+
     private Pop3MailPoller poller(String host, int port, String password) {
-        return new Pop3MailPoller(service, host, port, RECEIVER, password, "INBOX", RESPONSE_TIMEOUT, "*");
+        return new Pop3MailPoller(service, host, port, RECEIVER, password, "INBOX", RESPONSE_TIMEOUT, "*",
+                CHECK_FREQUENCY);
+    }
+
+    /** A poller for the test mailbox with {@code frequency} as its {@code pop3.check-frequency}. */
+    private Pop3MailPoller pollerWithFrequency(String frequency) {
+        return new Pop3MailPoller(service, pop3Host(), pop3Port(), RECEIVER, MAILBOX_PASSWORD, "INBOX",
+                RESPONSE_TIMEOUT, "*", frequency);
+    }
+
+    /** The refusal of {@code frequency} as {@code pop3.check-frequency}, naming the key and the quoted value. */
+    private static String frequencyRefusal(String frequency) {
+        return "Invalid pop3.check-frequency value \"" + frequency + "\": the polling frequency must be a positive "
+                + "number of milliseconds or a positive ISO-8601 duration";
     }
 
     private static String pop3Host() {

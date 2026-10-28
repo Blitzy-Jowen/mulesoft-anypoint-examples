@@ -35,6 +35,12 @@ import com.mulesoft.examples.soap_webservice_security.client.SecureGreeterClient
  *
  * <p>The listener is opened by {@code config/ListenerPorts} as the additional listener {@code client}, and
  * {@code config/PortRoutingFilter} keeps {@code /client} off the SOAP listener, where it answers the no-listener 404.
+ *
+ * <p>The listener declares no {@code allowedMethods}, so the mapping without methods and its {@code OPTIONS}
+ * counterpart run the flow for every method token. A CORS pre-flight, an {@code OPTIONS} request carrying
+ * {@code Origin} and {@code Access-Control-Request-Method}, reaches the {@code OPTIONS} mapping exactly as a plain
+ * {@code OPTIONS} request does, because {@code config.PreflightDispatchConfig} dispatches it without Spring's CORS
+ * processing: it runs the flow, and its response carries no {@code Access-Control-*} or {@code Vary} header.
  */
 @RestController
 public class GreeterClientController {
@@ -54,23 +60,45 @@ public class GreeterClientController {
     }
 
     /**
-     * Runs the {@code SecurityClients} flow for any request on {@code /client} and answers 200 {@code text/plain}
-     * with the greeting, or with {@code Client type is not supported} for an unknown or missing {@code clientType}.
+     * Runs the {@code SecurityClients} flow for every method except {@code OPTIONS} on {@code /client} and answers
+     * 200 {@code text/plain} with the greeting, or with {@code Client type is not supported} for an unknown or
+     * missing {@code clientType}.
      *
-     * <p>All eight methods are listed because the listener declares no {@code allowedMethods}, and a mapping without
-     * methods does not match {@code OPTIONS}, which Spring MVC would then answer itself with an {@code Allow} header
-     * instead of running the flow. {@code TRACE} reaches this method because {@code application.yml} sets
-     * {@code spring.mvc.dispatch-trace-request}. No {@code consumes} or {@code produces} condition is declared, and
-     * the preset Content-Type makes Spring write the body without consulting {@code Accept}, so no request is
-     * rejected with 406 or 415: the original listener read neither the body nor the negotiation headers.
+     * <p>The listener declares no {@code allowedMethods}, so the mapping declares no method and every method token
+     * runs the flow, an extension method such as {@code PROPFIND} included. {@code TRACE} reaches this method
+     * because {@code application.yml} sets {@code spring.mvc.dispatch-trace-request}; a {@code HEAD} reply carries
+     * the headers without the body. No {@code consumes} or {@code produces} condition is declared, and the preset
+     * Content-Type makes Spring write the body without consulting {@code Accept}, so no request is rejected with 406
+     * or 415: the original listener read neither the body nor the negotiation headers.
      *
      * @param request the request, read for its raw query string only
      * @return 200 {@code text/plain} carrying the result of the selected client
      */
-    @RequestMapping(path = "/client", method = {RequestMethod.GET, RequestMethod.HEAD, RequestMethod.POST,
-            RequestMethod.PUT, RequestMethod.PATCH, RequestMethod.DELETE, RequestMethod.OPTIONS,
-            RequestMethod.TRACE})
+    @RequestMapping("/client")
     public ResponseEntity<String> client(HttpServletRequest request) {
+        return clientResponse(request);
+    }
+
+    /**
+     * Runs the {@code SecurityClients} flow for {@code OPTIONS}, a CORS pre-flight included, like every other
+     * method. A mapping without methods deliberately does not match {@code OPTIONS}, which Spring MVC would otherwise
+     * answer itself with an {@code Allow} header and no body; the Mule listener ran the flow for {@code OPTIONS} too.
+     *
+     * @param request the request, read for its raw query string only
+     * @return the response of {@link #client(HttpServletRequest)}
+     */
+    @RequestMapping(path = "/client", method = RequestMethod.OPTIONS)
+    public ResponseEntity<String> clientOptions(HttpServletRequest request) {
+        return clientResponse(request);
+    }
+
+    /**
+     * Binds query {@code name} and {@code clientType}, runs the selected client and wraps its result.
+     *
+     * @param request the request, read for its raw query string only
+     * @return 200 {@code text/plain} carrying the result of the selected client
+     */
+    private ResponseEntity<String> clientResponse(HttpServletRequest request) {
         String rawQuery = request.getQueryString();
         String name = queryParam(rawQuery, NAME_PARAMETER);                    // service-clients.xml:10
         String clientType = queryParam(rawQuery, CLIENT_TYPE_PARAMETER);       // service-clients.xml:11

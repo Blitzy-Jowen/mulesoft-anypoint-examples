@@ -93,9 +93,11 @@ public class SalesforceProperties {
     }
 
     /**
-     * Returns the security token exactly as configured. The bean neither trims it nor turns {@code null} into an
-     * empty string: {@code SalesforcePartnerClient} treats {@code null} as empty and logs in with
-     * {@code password + securityToken}, the form the Partner API expects from a user outside a trusted IP range.
+     * Returns the security token exactly as configured; the bean neither trims it nor turns {@code null} into an
+     * empty string. In login mode {@code SalesforcePartnerClient} requires it, as it requires the username and the
+     * password, and logs in with {@code password + securityToken}, the form the Partner API expects from a user
+     * outside a trusted IP range. While it is {@code null} or blank, a login fails naming {@code sfdc.securityToken}
+     * before any request is sent.
      *
      * @return the raw security token, or {@code null} when not configured
      */

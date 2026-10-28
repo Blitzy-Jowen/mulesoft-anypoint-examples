@@ -20,12 +20,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -56,8 +61,10 @@ import com.mulesoft.examples.adding_a_new_customer_to_workday_revenue_management
  * reads the raw status line, so status code, reason phrase, headers and body bytes are asserted as they leave the
  * server.
  *
- * <p>Covered for {@code POST /}: the happy path with the outgoing SOAP request, the listener defaults (405 for the
- * methods {@code allowedMethods} excludes, 404 for an unserved path), the unhandled-failure 500 for an unparseable
+ * <p>Covered for {@code POST /}: the happy path with the outgoing SOAP request, for {@code POST} in any letter case,
+ * which the Mule listener compared ignoring case ({@code config/ListenerMethodFilter}), the listener defaults (405
+ * for every spelling of the methods {@code allowedMethods} excludes, 404 for an unserved path in any letter case of
+ * {@code POST}), the unhandled-failure 500 for an unparseable
  * body and for a Workday validation fault (classified {@code OTHER} and rethrown, as the flow declares no exception
  * strategy), and the three approved connector failure modes: one re-authentication and retry before the 502, a 429
  * with Workday's {@code Retry-After} and no retry, and a 503 with no retry after a read timeout. Standard reason
@@ -142,15 +149,20 @@ class WorkdayCustomerControllerTest {
 
     // ---------------------------------------------------------------- POST / (add-customer-flow)
 
-    @Test
-    void postRootAddsCustomer() throws IOException {
+    @ParameterizedTest(name = "{0} {1}")
+    @CsvSource({"POST, /", "post, /", "Post, /", "pOsT, /", "post, /?source=test"})
+    void postRootAddsCustomer(String method, String target) throws IOException {
         stubWorkday(soapResponse(200, PUT_CUSTOMER_RESPONSE));
 
-        Response response = send("POST", "/", customerXml());
+        Response response = send(method, target, customerXml());
 
         assertThat(response.status()).as("status of %s", response).isEqualTo(200);
         assertReasonPresent(response);
-        assertThat(contentType(response)).isEqualTo(new MediaType("text", "plain", UTF_8));
+        // The flow's template set-payload declares no MIME type, so the Mule listener sent no Content-Type.
+        assertThat(response.headers("Content-Type")).as("Content-Type of %s", response).isEmpty();
+        assertThat(response.headers("Content-Length")).as("Content-Length of %s", response)
+                .containsExactly(String.valueOf("Added customer: NAME".getBytes(UTF_8).length));
+        assertThat(response.headers("Transfer-Encoding")).as("Transfer-Encoding of %s", response).isEmpty();
         assertThat(new String(response.body(), UTF_8)).isEqualTo("Added customer: NAME");
         // One Put_Customer carrying the mapped customer.xml values and the PasswordText UsernameToken user@tenant;
         // local names and values only, because the namespace prefixes are the marshaller's choice.
@@ -167,21 +179,45 @@ class WorkdayCustomerControllerTest {
 
     // ---------------------------------------------------------------- listener defaults (SC-1)
 
-    @ParameterizedTest(name = "{0} /")
-    @ValueSource(strings = {"GET", "OPTIONS"})
-    void nonPostMethodsAreRejected(String method) {
-        Response response = send(method, "/", new byte[0]);
+    /**
+     * Spellings of methods other than {@code POST}, each with the headers it is sent with: a lower-case
+     * {@code options} also carries the headers that would make an {@code OPTIONS} request a CORS pre-flight.
+     */
+    private static Stream<Arguments> nonPostMethods() {
+        Map<String, String> preflightHeaders = new LinkedHashMap<>();
+        preflightHeaders.put("Origin", "https://example.invalid");
+        preflightHeaders.put("Access-Control-Request-Method", "POST");
+        return Stream.of(
+                Arguments.of("GET", Map.of()),
+                Arguments.of("OPTIONS", Map.of()),
+                Arguments.of("get", Map.of()),
+                Arguments.of("Get", Map.of()),
+                Arguments.of("options", Map.of()),
+                Arguments.of("options", preflightHeaders),
+                Arguments.of("put", Map.of()),
+                Arguments.of("postx", Map.of()),
+                Arguments.of("pos", Map.of()));
+    }
+
+    @ParameterizedTest(name = "{0} / with headers {1}")
+    @MethodSource("nonPostMethods")
+    void nonPostMethodsAreRejected(String method, Map<String, String> headers) {
+        Response response = http.send(method, "/", headers, new byte[0]);
 
         assertThat(response.status()).as("status of %s", response).isEqualTo(405);
         assertReasonPresent(response);
         assertMediaType(response, "text/plain");
         assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: /");
+        assertThat(response.headers()).as("headers of %s", response)
+                .noneMatch(header -> header.getKey()
+                        .regionMatches(true, 0, "Access-Control-", 0, "Access-Control-".length()));
         assertNoUpstreamCall();
     }
 
-    @Test
-    void unknownPathIsNotFound() throws IOException {
-        Response response = send("POST", "/other", customerXml());
+    @ParameterizedTest(name = "{0} /other")
+    @ValueSource(strings = {"POST", "post"})
+    void unknownPathIsNotFound(String method) throws IOException {
+        Response response = send(method, "/other", customerXml());
 
         assertThat(response.status()).as("status of %s", response).isEqualTo(404);
         assertReasonPresent(response);

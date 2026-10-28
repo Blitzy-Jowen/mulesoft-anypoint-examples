@@ -9,6 +9,7 @@
 package com.mulesoft.examples.websphere_mq.trigger;
 
 import org.springframework.jms.annotation.JmsListener;
+import org.springframework.messaging.Message;
 import org.springframework.stereotype.Component;
 
 import com.mulesoft.examples.websphere_mq.client.MqQueueSender;
@@ -23,7 +24,7 @@ import com.mulesoft.examples.websphere_mq.service.MqProcessingService;
  *   <li>{@code <wmq:transaction action="ALWAYS_BEGIN"/>} on the {@code in} inbound endpoint: the listener runs on
  *       the session-transacted container factory {@code transactedListenerContainerFactory} of
  *       {@code config/IbmMqConfig}, so every receive opens a local JMS transaction, committed when
- *       {@link #onMessage(String)} returns and rolled back when it throws.</li>
+ *       {@link #onMessage(Message)} returns and rolled back when it throws.</li>
  *   <li>{@code <wmq:transaction action="JOIN_IF_POSSIBLE"/>} on the {@code out} outbound endpoint:
  *       {@link MqQueueSender#sendToOut(String)} runs on this listener thread through the session-transacted
  *       template of {@code config/IbmMqConfig}, which reuses the container's listener session, so the send to
@@ -33,7 +34,7 @@ import com.mulesoft.examples.websphere_mq.service.MqProcessingService;
  * </ul>
  *
  * <p>The flow has no exception strategy, so nothing is caught: an exception from the processing step or the send
- * leaves {@link #onMessage(String)}, the container rolls back the receive and the send, and the broker redelivers
+ * leaves {@link #onMessage(Message)}, the container rolls back the receive and the send, and the broker redelivers
  * the message, as the original WMQ transaction did.
  *
  * <p>{@link #process(String)} is public and the class is not final, so tests can run the flow body directly or wrap
@@ -66,11 +67,19 @@ public class InQueueListener {
      * messages on {@code in} carry no {@code JMSReplyTo} (flow {@code Input} deletes {@code MULE_REPLYTO}), so every
      * delivery would fail, roll back and be redelivered without end.
      *
-     * @param text the text of the received message
+     * <p>The text arrives as the payload of a {@link Message} rather than as a plain {@code String} parameter. Spring
+     * binds a plain parameter through its payload resolver, which rejects a text without a non-whitespace character
+     * ({@code ""}, {@code "   "}) as an empty payload before this method runs; on this transacted listener that
+     * rejection rolls the receive back, so the message would be redelivered without end. The original flow processes
+     * such a text like any other ({@code ""} becomes {@code " - processed"}), and a {@code Message<String>} parameter
+     * hands it over unchanged, while a payload that is not a {@code String} is converted exactly as for a plain
+     * parameter.
+     *
+     * @param message the received message, whose payload is its text
      */
     @JmsListener(destination = "${wmq.queues.in:in}", containerFactory = "transactedListenerContainerFactory")
-    public void onMessage(String text) {
-        process(text);
+    public void onMessage(Message<String> message) {
+        process(message.getPayload());
     }
 
     /**

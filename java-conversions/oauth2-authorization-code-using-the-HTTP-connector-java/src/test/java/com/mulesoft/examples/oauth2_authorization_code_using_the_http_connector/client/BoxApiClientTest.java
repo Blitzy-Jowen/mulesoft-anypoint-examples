@@ -90,6 +90,7 @@ import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.client.BoxApiClient.RawResponse;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.TestProfileValues;
 
 /**
  * The contract of {@link BoxApiClient}, the Box requests of
@@ -110,7 +111,14 @@ class BoxApiClientTest {
     private static final String REDIRECT_URL = "https://localhost:8082/redirectUrl";
     /** {@link #REDIRECT_URL} form-encoded, written out so the expected forms do not reuse the client's encoder. */
     private static final String ENCODED_REDIRECT = "https%3A%2F%2Flocalhost%3A8082%2FredirectUrl";
-    private static final String STORE_PASSWORD = "mule123";
+    /**
+     * The demo passwords of {@code application-test.yml}: of the carried {@code keystore.jks} and its key, and of the
+     * trust store. The run-time key and trust stores below are made with the same passwords, so the configuration
+     * the client receives opens them all.
+     */
+    private static final String KEYSTORE_PASSWORD = TestProfileValues.required("keystore.password");
+    private static final String KEY_PASSWORD = TestProfileValues.required("keystore.keyPassword");
+    private static final String TRUSTSTORE_PASSWORD = TestProfileValues.required("truststore.password");
 
     private static final String CODE = "auth code/1";
     private static final String REFRESH = "refresh+token=1";
@@ -177,9 +185,9 @@ class BoxApiClientTest {
         generateLocalhostKey(trustedServerKeyStore);
         generateLocalhostKey(untrustedServerKeyStore);
         keytool("-exportcert", "-rfc", "-alias", "box", "-keystore", trustedServerKeyStore.toString(),
-                "-storepass", STORE_PASSWORD, "-file", certificate.toString());
+                "-storepass", KEYSTORE_PASSWORD, "-file", certificate.toString());
         keytool("-importcert", "-noprompt", "-alias", "box", "-file", certificate.toString(),
-                "-keystore", trustStore.toString(), "-storetype", "JKS", "-storepass", STORE_PASSWORD);
+                "-keystore", trustStore.toString(), "-storetype", "JKS", "-storepass", TRUSTSTORE_PASSWORD);
         trustedHttps = httpsStandIn(trustedServerKeyStore);
         untrustedHttps = httpsStandIn(untrustedServerKeyStore);
     }
@@ -636,6 +644,59 @@ class BoxApiClientTest {
         assertThat(clientLog.list).isEmpty();
     }
 
+    /**
+     * Both token exchanges with client credentials that have no value: unset, empty or whitespace only, with the
+     * message naming the first missing key, {@code box.id} before {@code box.secret}.
+     */
+    static Stream<Arguments> tokenExchangesWithAMissingClientCredential() {
+        String noClientId = "Box client ID (box.id) is not configured";
+        String noClientSecret = "Box client secret (box.secret) is not configured";
+        return Stream.of(Operation.REQUEST_TOKEN, Operation.REFRESH_TOKEN).flatMap(operation -> Stream.of(
+                Arguments.of(operation, null, CLIENT_SECRET, noClientId),
+                Arguments.of(operation, "", CLIENT_SECRET, noClientId),
+                Arguments.of(operation, " \t ", CLIENT_SECRET, noClientId),
+                Arguments.of(operation, CLIENT_ID, null, noClientSecret),
+                Arguments.of(operation, CLIENT_ID, "", noClientSecret),
+                Arguments.of(operation, CLIENT_ID, " \t ", noClientSecret),
+                Arguments.of(operation, "", "", noClientId)));
+    }
+
+    /**
+     * Both token forms carry {@code client_id} and {@code client_secret}, so without either value nothing is sent:
+     * the exchange fails before any request, and before the DEBUG request line, naming the key and no value.
+     */
+    @ParameterizedTest(name = "[{index}] {0}, box.id={1}, box.secret={2}")
+    @MethodSource("tokenExchangesWithAMissingClientCredential")
+    void tokenExchangeWithAMissingClientCredentialFailsNamingTheKeyBeforeAnyRequest(Operation operation,
+            String clientId, String clientSecret, String expectedMessage) {
+        wm.stubFor(any(anyUrl()).willReturn(ok()));
+
+        Throwable thrown;
+        try (BoxApiClient unconfigured = new BoxApiClient(properties(clientId, clientSecret,
+                wm.baseUrl() + TOKEN_PATH, wm.baseUrl() + "/2.0", "trust-store"))) {
+            thrown = catchThrowable(() -> operation.callOn(unconfigured));
+        }
+
+        assertThat(thrown).isExactlyInstanceOf(IllegalStateException.class).hasMessage(expectedMessage).hasNoCause();
+        assertThat(wm.getAllServeEvents()).isEmpty();
+        assertThat(clientLog.list).isEmpty();
+    }
+
+    /** The search sends the access token alone, so it needs neither client credential. */
+    @Test
+    void searchNeedsNoClientCredential() {
+        wm.stubFor(get(urlEqualTo(SEARCH_PATH)).willReturn(ok()));
+
+        try (BoxApiClient withoutCredentials = new BoxApiClient(properties("", "",
+                wm.baseUrl() + TOKEN_PATH, wm.baseUrl() + "/2.0", "trust-store"))) {
+            assertThat(withoutCredentials.search(ACCESS_TOKEN).status()).isEqualTo(200);
+        }
+
+        wm.verify(1, getRequestedFor(urlEqualTo(SEARCH_PATH))
+                .withHeader(HttpHeaders.AUTHORIZATION, equalTo("Bearer " + ACCESS_TOKEN)));
+        assertThat(wm.getAllServeEvents()).hasSize(1);
+    }
+
     // BoxApiClient has one constructor and a fixed 10 s READ_TIMEOUT, so each case waits out a real stall.
     @ParameterizedTest
     @CsvSource(delimiter = '|', value = {
@@ -989,9 +1050,15 @@ class BoxApiClientTest {
 
     /** As {@link #properties(String, String)}, with the trust store at {@code truststorePath}. */
     private static BoxProperties properties(String tokenUrl, String apiBaseUrl, String truststorePath) {
+        return properties(CLIENT_ID, CLIENT_SECRET, tokenUrl, apiBaseUrl, truststorePath);
+    }
+
+    /** As {@link #properties(String, String, String)}, with the given client ID and secret. */
+    private static BoxProperties properties(String clientId, String clientSecret, String tokenUrl, String apiBaseUrl,
+                                            String truststorePath) {
         return new BoxProperties(
-                CLIENT_ID,
-                CLIENT_SECRET,
+                clientId,
+                clientSecret,
                 "https://www.box.com/api/oauth2/authorize",
                 "https://localhost:8082/authorization",
                 REDIRECT_URL,
@@ -999,17 +1066,17 @@ class BoxApiClientTest {
                 apiBaseUrl,
                 "https://localhost:8082/authorization?onCompleteRedirectTo=http://localhost:8081/web/loginDone",
                 "keystore.jks",
-                STORE_PASSWORD,
-                STORE_PASSWORD,
+                KEYSTORE_PASSWORD,
+                KEY_PASSWORD,
                 truststorePath,
-                STORE_PASSWORD);
+                TRUSTSTORE_PASSWORD);
     }
 
     /** A JKS key store at {@code store} holding a new EC key whose certificate names {@code localhost} only. */
     private static void generateLocalhostKey(Path store) throws IOException, InterruptedException {
         keytool("-genkeypair", "-alias", "box", "-keyalg", "EC", "-groupname", "secp256r1", "-validity", "2",
                 "-dname", "CN=localhost", "-ext", "SAN=dns:localhost", "-keystore", store.toString(),
-                "-storetype", "JKS", "-storepass", STORE_PASSWORD, "-keypass", STORE_PASSWORD);
+                "-storetype", "JKS", "-storepass", KEYSTORE_PASSWORD, "-keypass", KEY_PASSWORD);
     }
 
     /** How long {@link #keytool} waits for keytool to finish. */
@@ -1077,8 +1144,8 @@ class BoxApiClientTest {
                 .dynamicHttpsPort()
                 .keystorePath(keyStore.toString())
                 .keystoreType("JKS")
-                .keystorePassword(STORE_PASSWORD)
-                .keyManagerPassword(STORE_PASSWORD));
+                .keystorePassword(KEYSTORE_PASSWORD)
+                .keyManagerPassword(KEY_PASSWORD));
         server.start();
         return server;
     }
@@ -1087,10 +1154,10 @@ class BoxApiClientTest {
     private static SSLContext serverContext(Path keyStore) throws IOException, GeneralSecurityException {
         KeyStore store = KeyStore.getInstance("JKS");
         try (InputStream in = Files.newInputStream(keyStore)) {
-            store.load(in, STORE_PASSWORD.toCharArray());
+            store.load(in, KEYSTORE_PASSWORD.toCharArray());
         }
         KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        keyManagers.init(store, STORE_PASSWORD.toCharArray());
+        keyManagers.init(store, KEY_PASSWORD.toCharArray());
         SSLContext context = SSLContext.getInstance("TLS");
         context.init(keyManagers.getKeyManagers(), null, null);
         return context;

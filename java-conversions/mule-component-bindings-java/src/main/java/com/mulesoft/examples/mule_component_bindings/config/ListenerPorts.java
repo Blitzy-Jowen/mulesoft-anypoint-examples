@@ -15,6 +15,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
@@ -23,12 +25,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.context.properties.source.ConfigurationProperty;
+import org.springframework.boot.context.properties.source.ConfigurationPropertyName;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySource;
+import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
 import org.springframework.boot.web.embedded.undertow.UndertowServletWebServerFactory;
 import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.Ordered;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.core.env.Environment;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
 import org.springframework.util.ResourceUtils;
@@ -72,7 +80,9 @@ import org.xnio.SslClientAuthMode;
  * <p>HTTPS: an entry with {@code ssl} opens a TLS listener over its key store. When the entry also names a trust
  * store, the listener requires a client certificate that the trust store accepts, because a Mule listener TLS
  * context requires one whenever it has a trust store ({@code needClientAuth = isTrustStoreConfigured()} in Mule
- * 3.8's {@code GrizzlyServerManager}); without a trust store no client certificate is requested.
+ * 3.8's {@code GrizzlyServerManager}); without a trust store no client certificate is requested. A store or key that
+ * cannot be opened stops the application at start-up; when the password it was opened with is empty, the message
+ * names the setting to supply rather than the JDK's reason (see {@link #additionalListenersCustomizer}).
  *
  * <p>Method restriction: Undertow 2.3's {@code DeploymentInfo} offers no disallowed-request-methods setting, and the
  * embedded server rejects no method by default, TRACE included. A Mule listener without {@code allowedMethods}
@@ -94,6 +104,16 @@ public class ListenerPorts {
 
     private static final int MIN_PORT = 1;
     private static final int MAX_PORT = 65535;
+
+    /** {@code ssl} settings holding the key password and the store password it falls back to. */
+    private static final String KEY_PASSWORD = "key-password";
+    private static final String KEY_STORE_PASSWORD = "key-store-password";
+
+    /**
+     * A configured value that is one placeholder and nothing else, {@code ${name}} or {@code ${name:default}}; group 1
+     * is the key it reads. Compound values and nested placeholders do not match.
+     */
+    private static final Pattern SINGLE_PLACEHOLDER = Pattern.compile("\\$\\{([^${}:\\s]+)(?::[^${}]*)?\\}");
 
     /**
      * The {@code listeners} configuration block. Every component is optional: an absent block means no additional
@@ -159,7 +179,8 @@ public class ListenerPorts {
     /**
      * TLS settings of an HTTPS listener. Store locations are Spring resource locations ({@code classpath:},
      * {@code file:}); a location without a prefix is read from the file system when such a file exists and from
-     * the classpath otherwise. Both stores use {@code keyStoreType}.
+     * the classpath otherwise. Both stores use {@code keyStoreType}. No password appears in {@link #toString()} or in
+     * a start-up failure message.
      *
      * @param keyStore           location of the store holding the server key; required
      * @param keyStorePassword   password of the key store
@@ -204,13 +225,21 @@ public class ListenerPorts {
      * empty, the handler that rejects those methods. Key and trust stores are read here, so a listener whose TLS
      * context cannot be built stops the application at start-up.
      *
+     * <p>The failure message gives the JDK's reason, except when the step that failed used an empty password: opening
+     * the key store with {@code key-store-password}, the key with {@code key-password} (or the
+     * {@code key-store-password} it falls back to, both then named) or the trust store with
+     * {@code trust-store-password}. The message then names each setting to supply as
+     * {@code listeners.additional[<index>].ssl.<setting>}, preceded by the key it reads when its configured value in
+     * {@code environment} is a single {@code ${key}} or {@code ${key:default}} placeholder. A store or key that opens
+     * with an empty password is used as before, and no password or configured value is put in the message.
+     *
      * @throws IllegalStateException naming the entry when a port is invalid or repeated, or a TLS context cannot be
      *                               built
      */
     @Bean
     public WebServerFactoryCustomizer<UndertowServletWebServerFactory> additionalListenersCustomizer(
-            Properties properties, ResourceLoader resourceLoader) {
-        List<ListenerSpec> specs = listenerSpecs(properties, resourceLoader);
+            Properties properties, ResourceLoader resourceLoader, Environment environment) {
+        List<ListenerSpec> specs = listenerSpecs(properties, resourceLoader, environment);
         HttpString[] disallowed = disallowedMethods(properties);
         return factory -> {
             if (!specs.isEmpty()) {
@@ -244,14 +273,16 @@ public class ListenerPorts {
         return registration;
     }
 
-    private static List<ListenerSpec> listenerSpecs(Properties properties, ResourceLoader resourceLoader) {
+    private static List<ListenerSpec> listenerSpecs(Properties properties, ResourceLoader resourceLoader,
+            Environment environment) {
         List<Additional> entries = validatedAdditional(properties);
         List<ListenerSpec> specs = new ArrayList<>(entries.size());
         for (int index = 0; index < entries.size(); index++) {
             Additional entry = entries.get(index);
             String label = describe(index, entry);
             Ssl ssl = entry.ssl();
-            SSLContext sslContext = ssl == null ? null : sslContext(label, ssl, resourceLoader);
+            SSLContext sslContext = ssl == null ? null
+                    : sslContext(label, position(index) + ".ssl.", ssl, resourceLoader, environment);
             // No client-auth setting exists: a trust store means a required client certificate, the Mule listener rule.
             boolean clientAuthRequired = ssl != null && StringUtils.hasText(ssl.trustStore());
             specs.add(new ListenerSpec(label, entry.port(), effectiveHost(entry, properties), sslContext,
@@ -280,8 +311,13 @@ public class ListenerPorts {
     }
 
     private static String describe(int index, Additional entry) {
-        String position = "listeners.additional[" + index + "]";
+        String position = position(index);
         return StringUtils.hasText(entry.name()) ? entry.name().trim() + " (" + position + ")" : position;
+    }
+
+    /** Property path of the entry at {@code index}. */
+    private static String position(int index) {
+        return "listeners.additional[" + index + "]";
     }
 
     private static HttpString[] disallowedMethods(Properties properties) {
@@ -311,23 +347,37 @@ public class ListenerPorts {
                 spec.sslContext() == null ? "http" : "https");
     }
 
-    private static SSLContext sslContext(String label, Ssl ssl, ResourceLoader resourceLoader) {
+    /**
+     * Builds the TLS context of one entry; {@code settingPrefix} is its {@code listeners.additional[<index>].ssl.}
+     * path, which a failure caused by an empty password names.
+     */
+    private static SSLContext sslContext(String label, String settingPrefix, Ssl ssl, ResourceLoader resourceLoader,
+            Environment environment) {
         if (!StringUtils.hasText(ssl.keyStore())) {
             throw new IllegalStateException(label + ": ssl.key-store is required for an HTTPS listener");
         }
         String type = StringUtils.hasText(ssl.keyStoreType()) ? ssl.keyStoreType().trim() : DEFAULT_KEY_STORE_TYPE;
         try {
-            KeyStore keyStore = loadStore(label, "key-store", ssl.keyStore(), type, ssl.keyStorePassword(),
-                    resourceLoader);
+            KeyStore keyStore = loadStore(label, settingPrefix, "key-store", ssl.keyStore(), type,
+                    ssl.keyStorePassword(), resourceLoader, environment);
             String keyPassword = StringUtils.hasLength(ssl.keyPassword()) ? ssl.keyPassword() : ssl.keyStorePassword();
             KeyManagerFactory keyManagerFactory =
                     KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-            keyManagerFactory.init(keyStore, toChars(keyPassword));
+            try {
+                keyManagerFactory.init(keyStore, toChars(keyPassword));
+            } catch (GeneralSecurityException e) {
+                if (StringUtils.hasLength(keyPassword)) {
+                    throw e;
+                }
+                // Empty only when key-password and the key-store-password it falls back to are both empty.
+                throw emptyPasswordFailure(label, "key", e, environment, settingPrefix + KEY_PASSWORD,
+                        settingPrefix + KEY_STORE_PASSWORD);
+            }
 
             TrustManager[] trustManagers = null;
             if (StringUtils.hasText(ssl.trustStore())) {
-                KeyStore trustStore = loadStore(label, "trust-store", ssl.trustStore(), type,
-                        ssl.trustStorePassword(), resourceLoader);
+                KeyStore trustStore = loadStore(label, settingPrefix, "trust-store", ssl.trustStore(), type,
+                        ssl.trustStorePassword(), resourceLoader, environment);
                 TrustManagerFactory trustManagerFactory =
                         TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
                 trustManagerFactory.init(trustStore);
@@ -342,17 +392,72 @@ public class ListenerPorts {
         }
     }
 
-    private static KeyStore loadStore(String label, String role, String location, String type, String password,
-            ResourceLoader resourceLoader) throws GeneralSecurityException, IOException {
+    /**
+     * Opens the store of {@code role} ({@code key-store} or {@code trust-store}) with its password, read from the
+     * setting {@code <role>-password}.
+     */
+    private static KeyStore loadStore(String label, String settingPrefix, String role, String location, String type,
+            String password, ResourceLoader resourceLoader, Environment environment)
+            throws GeneralSecurityException, IOException {
         Resource resource = resolve(location.trim(), resourceLoader);
         if (!resource.exists()) {
             throw new IllegalStateException(label + ": ssl." + role + " " + location + " does not exist");
         }
         KeyStore store = KeyStore.getInstance(type);
         try (InputStream in = resource.getInputStream()) {
-            store.load(in, toChars(password));
+            try {
+                store.load(in, toChars(password));
+            } catch (GeneralSecurityException | IOException e) {
+                if (StringUtils.hasLength(password)) {
+                    throw e;
+                }
+                throw emptyPasswordFailure(label, role.replace('-', ' '), e, environment,
+                        settingPrefix + role + "-password");
+            }
         }
         return store;
+    }
+
+    /**
+     * The start-up failure of a store or key that did not open while its password was empty. It names each setting
+     * the password may come from, preceded by the key that setting reads when it is a single placeholder, and never
+     * a password or a configured value.
+     *
+     * @param label       the entry, as the other start-up failures name it
+     * @param subject     what did not open: {@code key store}, {@code key} or {@code trust store}
+     * @param cause       the JDK failure, kept as the cause
+     * @param environment where the configured values of the settings are looked up
+     * @param settings    full property names of the settings, in the order the message offers them
+     */
+    private static IllegalStateException emptyPasswordFailure(String label, String subject, Exception cause,
+            Environment environment, String... settings) {
+        List<String> names = new ArrayList<>(settings.length);
+        for (String setting : settings) {
+            String key = placeholderKey(environment, setting);
+            names.add(key == null ? setting : key + " (" + setting + ")");
+        }
+        return new IllegalStateException(label + ": cannot build the TLS context: the " + subject
+                + " password is empty; supply " + String.join(" or ", names), cause);
+    }
+
+    /**
+     * The key that {@code property}'s configured value reads when that value is a single placeholder, unresolved
+     * from the first property source holding the property; {@code null} for any other value, an absent property or
+     * an environment whose property sources cannot be listed.
+     */
+    private static String placeholderKey(Environment environment, String property) {
+        if (!(environment instanceof ConfigurableEnvironment)) {
+            return null;
+        }
+        ConfigurationPropertyName name = ConfigurationPropertyName.of(property);
+        for (ConfigurationPropertySource source : ConfigurationPropertySources.get(environment)) {
+            ConfigurationProperty configured = source.getConfigurationProperty(name);
+            if (configured != null) {
+                Matcher placeholder = SINGLE_PLACEHOLDER.matcher(String.valueOf(configured.getValue()));
+                return placeholder.matches() ? placeholder.group(1) : null;
+            }
+        }
+        return null;
     }
 
     /**

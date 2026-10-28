@@ -19,11 +19,20 @@ import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Method;
 
+import jakarta.jms.JMSException;
+import jakarta.jms.Session;
+import jakarta.jms.TextMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 import org.springframework.jms.UncategorizedJmsException;
 import org.springframework.jms.annotation.JmsListener;
+import org.springframework.jms.listener.adapter.MessagingMessageListenerAdapter;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.handler.annotation.support.DefaultMessageHandlerMethodFactory;
+import org.springframework.messaging.support.MessageBuilder;
 
 import com.mulesoft.examples.websphere_mq.client.MqQueueSender;
 import com.mulesoft.examples.websphere_mq.service.MqProcessingService;
@@ -82,14 +91,24 @@ class InQueueListenerTest {
         verifyProcessedThenSentToOut();
     }
 
-    @Test
-    void onMessageFollowsTheSamePath() {
-        when(mqProcessingService.process(PAYLOAD)).thenReturn(PROCESSED);
-        when(mqQueueSender.sendToOut(PROCESSED)).thenReturn(PROCESSED);
+    /**
+     * A JMS text message reaches the flow body unchanged when Spring's {@code @JmsListener} argument resolution binds
+     * it, a text without a non-whitespace character included: the original flow processes {@code ""} to
+     * {@code " - processed"}, and Spring's payload resolver would reject such a text as empty, rolling the receive
+     * back without end. The adapter and handler method factory are the ones Spring builds for the annotation.
+     */
+    @ParameterizedTest(name = "[{0}]")
+    @ValueSource(strings = {PAYLOAD, "", "   "})
+    void onMessageHandsTheJmsTextToTheFlowUnchanged(String text) throws JMSException, NoSuchMethodException {
+        String processed = text + MqProcessingService.APPEND_STRING;
+        when(mqProcessingService.process(text)).thenReturn(processed);
+        when(mqQueueSender.sendToOut(processed)).thenReturn(processed);
+        TextMessage jmsMessage = mock(TextMessage.class);
+        when(jmsMessage.getText()).thenReturn(text);
 
-        listener.onMessage(PAYLOAD);
+        jmsListenerAdapter().onMessage(jmsMessage, mock(Session.class));
 
-        verifyProcessedThenSentToOut();
+        verifyProcessedThenSentToOut(text, processed);
     }
 
     /**
@@ -103,7 +122,7 @@ class InQueueListenerTest {
         when(mqProcessingService.process(PAYLOAD)).thenThrow(interrupted);
         when(mqProcessingService.process(null)).thenThrow(nullPayload);
 
-        assertThatThrownBy(() -> listener.onMessage(PAYLOAD)).isSameAs(interrupted);
+        assertThatThrownBy(() -> listener.onMessage(message(PAYLOAD))).isSameAs(interrupted);
         assertThatThrownBy(() -> listener.process(null)).isSameAs(nullPayload);
 
         verify(mqProcessingService).process(PAYLOAD);
@@ -119,7 +138,7 @@ class InQueueListenerTest {
         when(mqProcessingService.process(PAYLOAD)).thenReturn(PROCESSED);
         when(mqQueueSender.sendToOut(PROCESSED)).thenThrow(outUnavailable);
 
-        assertThatThrownBy(() -> listener.onMessage(PAYLOAD)).isSameAs(outUnavailable);
+        assertThatThrownBy(() -> listener.onMessage(message(PAYLOAD))).isSameAs(outUnavailable);
 
         verifyProcessedThenSentToOut();
     }
@@ -127,7 +146,7 @@ class InQueueListenerTest {
     /** {@code ALWAYS_BEGIN} on queue {@code in} maps to the session-transacted container factory. */
     @Test
     void onMessageIsATransactedListenerOnQueueIn() throws NoSuchMethodException {
-        Method onMessage = InQueueListener.class.getMethod("onMessage", String.class);
+        Method onMessage = InQueueListener.class.getMethod("onMessage", Message.class);
         JmsListener jmsListener = onMessage.getAnnotation(JmsListener.class);
 
         assertThat(jmsListener).isNotNull();
@@ -137,9 +156,33 @@ class InQueueListenerTest {
 
     /** Verifies the flow's processor order for {@link #PAYLOAD} and that nothing else was called. */
     private void verifyProcessedThenSentToOut() {
+        verifyProcessedThenSentToOut(PAYLOAD, PROCESSED);
+    }
+
+    /** Verifies that {@code payload} was processed, then {@code processed} sent to {@code out}, and nothing else. */
+    private void verifyProcessedThenSentToOut(String payload, String processed) {
         InOrder order = inOrder(mqProcessingService, mqQueueSender);
-        order.verify(mqProcessingService).process(PAYLOAD);
-        order.verify(mqQueueSender).sendToOut(PROCESSED);
+        order.verify(mqProcessingService).process(payload);
+        order.verify(mqQueueSender).sendToOut(processed);
         verifyNoMoreInteractions(mqProcessingService, mqQueueSender);
+    }
+
+    /** The messaging message the listener container hands {@link InQueueListener#onMessage(Message)}. */
+    private static Message<String> message(String text) {
+        return MessageBuilder.withPayload(text).build();
+    }
+
+    /**
+     * Wraps {@link #listener} as Spring wraps a {@code @JmsListener} method: a {@link MessagingMessageListenerAdapter}
+     * over a handler method of the default {@link DefaultMessageHandlerMethodFactory}, whose argument resolvers bind
+     * the JMS message to the method's parameter.
+     */
+    private MessagingMessageListenerAdapter jmsListenerAdapter() throws NoSuchMethodException {
+        DefaultMessageHandlerMethodFactory factory = new DefaultMessageHandlerMethodFactory();
+        factory.afterPropertiesSet();
+        MessagingMessageListenerAdapter adapter = new MessagingMessageListenerAdapter();
+        adapter.setHandlerMethod(factory.createInvocableHandlerMethod(listener,
+                InQueueListener.class.getMethod("onMessage", Message.class)));
+        return adapter;
     }
 }

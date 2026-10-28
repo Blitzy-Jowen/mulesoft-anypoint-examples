@@ -258,7 +258,7 @@ class AuthorizationControllerTest {
 
         assertThat(resp.status()).as("%s", resp).isEqualTo(404);
         assertThat(resp.reason()).isEqualTo("Not Found");
-        assertContentType(resp, "text/plain;charset=UTF-8");
+        assertContentType(resp, "text/plain");
         assertThat(resp.bodyAsString()).isEqualTo("No listener for endpoint: /authorize");
     }
 

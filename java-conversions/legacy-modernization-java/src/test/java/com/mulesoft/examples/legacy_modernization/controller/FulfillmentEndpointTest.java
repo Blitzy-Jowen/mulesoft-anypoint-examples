@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -34,25 +35,39 @@ import java.util.stream.Stream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.stubbing.Answer;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.mock.mockito.SpyBean;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.util.FileSystemUtils;
+import org.springframework.ws.server.endpoint.adapter.DefaultMethodEndpointAdapter;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -71,7 +86,8 @@ import com.mulesoft.examples.legacy_modernization.support.HttpTestClient;
  * asserted as Undertow sent them. The SOAP boundary, fault and envelope styling and the no-listener handler run
  * as configured; the only test doubles are a spy on {@link FileOutboundWriter}, which records the thread of each
  * export write, and, in {@link WhenFulfillmentFails}, a mock {@link IFulfillment}. Exports go to a {@link TempDir},
- * never into {@code src/main/resources/Output}.
+ * never into {@code src/main/resources/Output}. The nested {@link UnderRootTrace} run covers the logger level
+ * {@code application.yml} pins.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -165,6 +181,32 @@ class FulfillmentEndpointTest {
                 .allSatisfy(thread -> assertThat(thread).startsWith(ASYNC_THREAD_PREFIX));
     }
 
+    /**
+     * U+1F600 lies outside the Basic Multilingual Plane: CXF echoed it as its four UTF-8 bytes, where SAAJ alone
+     * writes {@code &#128512;}, and Content-Length counts the bytes sent.
+     */
+    @Test
+    void shippingIdOutsideTheBmpIsEchoedAsRawUtf8() throws IOException {
+        String shippingId = "A\uD83D\uDE00B";
+        String echoed = "<shippingId>" + shippingId + "</shippingId>";
+        byte[] request = new String(resource("message.xml"), UTF_8)
+                .replace("<shippingId>1234</shippingId>", echoed).getBytes(UTF_8);
+
+        HttpTestClient.Response response = postXml(HttpTestClient.localhost(port), LISTENER_PATH, request);
+
+        assertThat(response.status()).as("%s", response).isEqualTo(200);
+        assertThat(response.body()).isEqualTo(new String(resource("reply.xml"), UTF_8)
+                .replace("<shippingId>1234</shippingId>", echoed).getBytes(UTF_8));
+        assertThat(response.header("Content-Length")).isEqualTo(Integer.toString(response.body().length));
+        assertNoRequestHeaders(response);
+        // The export runs on its own thread; waiting for it keeps its file out of the next test's directory.
+        await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(50)).untilAsserted(() -> {
+            List<Path> files = shippingOrderFiles();
+            assertThat(files).hasSize(1);
+            assertThat(Files.readString(files.get(0), UTF_8)).contains("," + shippingId + "\n");
+        });
+    }
+
     // The original listener accepts POST only, so it never published ?wsdl: every GET gets the listener's 405.
     @ParameterizedTest
     @ValueSource(strings = {"/OrderFulfillment", "/OrderFulfillment?wsdl"})
@@ -172,7 +214,7 @@ class FulfillmentEndpointTest {
         HttpTestClient.Response response = HttpTestClient.localhost(port).get(target);
 
         assertThat(response.status()).as("%s", response).isEqualTo(405);
-        assertThat(contentType(response)).startsWith("text/plain");
+        assertThat(contentType(response)).isEqualTo("text/plain");
         assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: /OrderFulfillment");
     }
 
@@ -187,6 +229,7 @@ class FulfillmentEndpointTest {
         assertThat(text).contains("<soap:Envelope", "<faultcode>soap:Client</faultcode>")
                 .containsPattern("<soap:Fault[\\s>]");
         assertThat(fault(text).code()).isEqualTo("soap:Client");
+        assertNoRequestHeaders(response);
     }
 
     static Stream<Arguments> unreadableEnvelopes() throws IOException {
@@ -252,8 +295,127 @@ class FulfillmentEndpointTest {
             Fault fault = fault(text);
             assertThat(fault.code()).isEqualTo("soap:Server");
             assertThat(fault.string()).isEqualTo("boom");
+            assertNoRequestHeaders(response);
             verify(fulfillment).putShippingOrder(eq("1234"), any(), any(), any());
             assertThat(shippingOrderFiles()).isEmpty();
+        }
+    }
+
+    /** The shipping order of {@link LoggedShippingOrder} under {@code logging.level.root=TRACE}. */
+    @Nested
+    @TestPropertySource(properties = "logging.level.root=TRACE")
+    @DirtiesContext
+    class UnderRootTrace extends LoggedShippingOrder {
+    }
+
+    /**
+     * Tests the logger level {@code application.yml} pins, which keeps the order's addresses out of the log under a
+     * root {@code TRACE} level: {@code FufillmentWebService.xml} declares no logger.
+     *
+     * <p>The nested run keeps this class's configuration in a context of its own. The original test's
+     * {@code putShippingOrder} is posted and answered with {@code reply.xml}, its CSV export is awaited, then the
+     * exchange's own log events are asserted to hold the unpinned {@code DefaultMethodEndpointAdapter} {@code TRACE}
+     * invocation line, which proves the capture sees that level, and the console output is asserted to hold none of
+     * the billing or shipping address values. The run restores the logger levels it found and closes its context, so
+     * later test classes do not run at {@code TRACE}.
+     */
+    @ExtendWith(OutputCaptureExtension.class)
+    abstract static class LoggedShippingOrder {
+
+        /** The address values of {@code message.xml}, billing and shipping alike, which must stay out of the log. */
+        static final List<String> ADDRESS_DATA = List.of("77 Geary St", "Level 4", "San Francisco", "94108");
+
+        /** How long lines written after the export get to arrive before the output is scanned for address data. */
+        private static final Duration SETTLE = Duration.ofMillis(300);
+
+        /** Most offending lines a failure reports; the capture holds the whole run, so it is never dumped. */
+        private static final int REPORTED_LINES = 20;
+
+        /** The logger levels set before this run's context started, by logger name. */
+        private static final Map<String, Level> LEVELS_BEFORE = new HashMap<>();
+
+        @LocalServerPort
+        int port;
+
+        @BeforeAll
+        static void recordLevels() {
+            LEVELS_BEFORE.clear();
+            for (Logger logger : loggerContext().getLoggerList()) {
+                if (logger.getLevel() != null) {
+                    LEVELS_BEFORE.put(logger.getName(), logger.getLevel());
+                }
+            }
+        }
+
+        @AfterAll
+        static void restoreLevels() {
+            for (Logger logger : loggerContext().getLoggerList()) {
+                Level before = LEVELS_BEFORE.get(logger.getName());
+                // The root logger always has a level and cannot be given none.
+                if (before != null || !org.slf4j.Logger.ROOT_LOGGER_NAME.equals(logger.getName())) {
+                    logger.setLevel(before);
+                }
+            }
+        }
+
+        @Test
+        void shippingOrderAnswersAndExportsWhileTheLogHoldsNoAddress(CapturedOutput output) throws Exception {
+            byte[] message = resource("message.xml");
+            assertThat(new String(message, UTF_8)).contains(ADDRESS_DATA);
+            Logger root = loggerContext().getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.setContext(loggerContext());
+            events.start();
+            root.addAppender(events);
+            HttpTestClient.Response response;
+            try {
+                response = postXml(HttpTestClient.localhost(port), LISTENER_PATH, message);
+                await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(50))
+                        .untilAsserted(() -> assertThat(shippingOrderFiles()).hasSize(1));
+            } finally {
+                root.detachAppender(events);
+                events.stop();
+            }
+            // The appender appends under its own lock, so reading under it sees every event the exchange wrote.
+            List<ILoggingEvent> logged;
+            synchronized (events) {
+                logged = List.copyOf(events.list);
+            }
+
+            assertThat(response.status()).as("%s", response).isEqualTo(200);
+            assertThat(response.bodyAsString()).isEqualTo(new String(resource("reply.xml"), UTF_8));
+
+            ILoggingEvent invocation = logged.stream()
+                    .filter(event -> event.getLevel() == Level.TRACE
+                            && DefaultMethodEndpointAdapter.class.getName().equals(event.getLoggerName())
+                            && event.getFormattedMessage().startsWith("Invoking [")
+                            && event.getFormattedMessage().contains(FulfillmentEndpoint.class.getName()))
+                    .findFirst()
+                    .orElse(null);
+            assertThat(invocation).as("the unpinned DefaultMethodEndpointAdapter TRACE line of the order").isNotNull();
+            assertThat(output.getAll()).as("the console capture holds the TRACE line of the order")
+                    .contains(invocation.getFormattedMessage());
+            // Lines written after the export get SETTLE to arrive; the capture only grows, so one scan covers the wait.
+            await().pollDelay(SETTLE).until(() -> true);
+            assertThat(linesHoldingAddressData(output.getAll())).as("console lines holding the order's addresses")
+                    .isEmpty();
+        }
+
+        /** The distinct lines of {@code output} holding an address value, at most {@link #REPORTED_LINES}. */
+        private static List<String> linesHoldingAddressData(String output) {
+            // The capture of a TRACE run is large, so it is split into lines only when it holds a value at all.
+            if (ADDRESS_DATA.stream().noneMatch(output::contains)) {
+                return List.of();
+            }
+            return output.lines()
+                    .filter(line -> ADDRESS_DATA.stream().anyMatch(line::contains))
+                    .distinct()
+                    .limit(REPORTED_LINES)
+                    .toList();
+        }
+
+        private static LoggerContext loggerContext() {
+            return (LoggerContext) LoggerFactory.getILoggerFactory();
         }
     }
 
@@ -270,6 +432,12 @@ class FulfillmentEndpointTest {
         String contentType = response.header("Content-Type");
         assertThat(contentType).as("Content-Type of %s", response).isNotNull();
         return contentType;
+    }
+
+    /** SAAJ keeps {@code Accept} and {@code SOAPAction} in every message's MIME headers; CXF sent neither back. */
+    private static void assertNoRequestHeaders(HttpTestClient.Response response) {
+        assertThat(response.header("Accept")).as("Accept of %s", response).isNull();
+        assertThat(response.header("SOAPAction")).as("SOAPAction of %s", response).isNull();
     }
 
     /** The unqualified {@code faultcode} and {@code faultstring} of {@code soap:Envelope/soap:Body/soap:Fault}. */

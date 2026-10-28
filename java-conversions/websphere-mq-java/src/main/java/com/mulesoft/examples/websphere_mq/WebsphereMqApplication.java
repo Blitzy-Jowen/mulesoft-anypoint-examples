@@ -22,8 +22,10 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  * taken from {@code application.yml}.
  *
  * <p>JMS listener processing is switched on by {@code config.IbmMqConfig}, next to the listener container factories
- * it defines, so no JMS-enabling annotation is declared here. Without {@code wmq.host} that class defines no IBM MQ
- * {@code ConnectionFactory} and start-up fails for want of one; no other broker stands in for IBM MQ outside tests.
+ * it defines, so no JMS-enabling annotation is declared here. Without {@code wmq.host} start-up fails with a message
+ * naming {@code wmq.host} and {@code WMQ_HOST}, and while the configured queue manager cannot be reached or rejects the
+ * credentials it fails in that class's connection check, the counterpart of {@code validateConnections="true"}; no
+ * other broker stands in for IBM MQ outside tests.
  */
 @SpringBootApplication
 public class WebsphereMqApplication {

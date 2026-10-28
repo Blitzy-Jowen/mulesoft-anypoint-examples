@@ -152,7 +152,7 @@ class SamsungServiceEndpointTest {
         Response response = HttpTestClient.localhost(SAMSUNG_PORT).get(SAMSUNG_PATH);
 
         assertThat(response.status()).as(response.toString()).isEqualTo(405);
-        assertThat(response.header("Content-Type")).as(response.toString()).startsWith("text/plain");
+        assertThat(response.header("Content-Type")).as(response.toString()).isEqualTo("text/plain");
         assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: " + SAMSUNG_PATH);
     }
 

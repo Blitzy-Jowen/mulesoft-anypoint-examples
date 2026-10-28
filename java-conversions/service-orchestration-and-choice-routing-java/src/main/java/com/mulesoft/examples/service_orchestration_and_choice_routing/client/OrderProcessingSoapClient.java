@@ -71,11 +71,16 @@ public class OrderProcessingSoapClient {
      * @param proxyTimeoutMs   connect and read timeout in milliseconds of {@link #proxy(String)}, from
      *                         {@code orders.soap.proxy-timeout-ms}; the default 10000 is Mule's default response
      *                         timeout ({@code mule-config.xml:40} sets none)
+     * @throws IllegalArgumentException when {@code requestTimeoutMs} or {@code proxyTimeoutMs} is not between 1 and
+     *                                  {@link Integer#MAX_VALUE}, since such a value leaves the call without a time
+     *                                  limit; the message names the offending key, and no client is built
      */
     public OrderProcessingSoapClient(
             @Value("${orders.soap.url:http://localhost:1080/orders}") String url,
             @Value("${orders.soap.request-timeout-ms:10000000}") int requestTimeoutMs,
             @Value("${orders.soap.proxy-timeout-ms:10000}") int proxyTimeoutMs) {
+        requirePositiveTimeout("orders.soap.request-timeout-ms", requestTimeoutMs);
+        requirePositiveTimeout("orders.soap.proxy-timeout-ms", proxyTimeoutMs);
         this.url = url;
         this.requestClient = restClient(requestTimeoutMs);
         this.proxyClient = restClient(proxyTimeoutMs);
@@ -132,6 +137,21 @@ public class OrderProcessingSoapClient {
             return "";
         }
         return new String(body, charsetOf(response.getHeaders().getContentType()));
+    }
+
+    /**
+     * Rejects a timeout below 1 ms, which would leave the call waiting for ever: {@code HttpURLConnection} reads 0 as
+     * no limit, and {@code SimpleClientHttpRequestFactory} skips a negative value, keeping that same default.
+     *
+     * @param key       the configuration key the timeout comes from, which starts the message
+     * @param timeoutMs the configured timeout in milliseconds
+     * @throws IllegalArgumentException when {@code timeoutMs} is below 1
+     */
+    private static void requirePositiveTimeout(String key, int timeoutMs) {
+        if (timeoutMs < 1) {
+            throw new IllegalArgumentException(
+                    key + " must be between 1 and " + Integer.MAX_VALUE + ", was " + timeoutMs);
+        }
     }
 
     private static RestClient restClient(int timeoutMs) {

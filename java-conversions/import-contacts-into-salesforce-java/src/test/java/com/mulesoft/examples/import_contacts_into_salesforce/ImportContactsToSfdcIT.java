@@ -17,12 +17,15 @@ import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.StringJoiner;
 import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
@@ -77,7 +80,9 @@ import com.sforce.soap.partner.DeleteResult;
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of those three keys is missing,
  * blank, still {@code TODO} or an unresolvable placeholder ({@link #missingCredential()}); then no Spring context
  * starts and Salesforce is never called. A skipped run is not Tier 2B evidence. Logs name record IDs and e-mail
- * addresses of the test data only, never a credential.
+ * addresses of the test data only, never a credential: a failed cleanup step is named by the class names of its
+ * exception and causes, and a failed delete by its status codes, never by vendor message text, a cause or suppressed
+ * message, the fields of a delete error or a stack trace.
  */
 @ExtendWith(ImportContactsToSfdcIT.LiveCredentialsGate.class)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
@@ -108,6 +113,12 @@ class ImportContactsToSfdcIT {
     private static final Duration IMPORT_TIMEOUT = Duration.ofSeconds(60);
 
     private static final Duration QUERY_POLL_INTERVAL = Duration.ofSeconds(2);
+
+    /** Most class names {@link #failureTypes(Throwable)} gives before it cuts a cause chain short. */
+    private static final int FAILURE_TYPES_LIMIT = 5;
+
+    /** How a missing failure or delete status code is logged. */
+    private static final String NULL_RENDERING = "(null)";
 
     @TempDir
     static Path workDir;
@@ -172,8 +183,8 @@ class ImportContactsToSfdcIT {
         trigger.pollOnce();
 
         // Both are read back before either is asserted, so a failed assertion still leaves both IDs for tearDown.
-        Map<String, Object> john = awaitImportedContact(EMAIL1, existing1);
-        Map<String, Object> jane = awaitImportedContact(EMAIL2, existing2);
+        Map<String, Object> john = awaitImportedContact(EMAIL1, existing1, IMPORT_TIMEOUT);
+        Map<String, Object> jane = awaitImportedContact(EMAIL2, existing2, IMPORT_TIMEOUT);
 
         assertEquals("John", john.get("FirstName"));
         assertEquals("Doe", jane.get("LastName"));
@@ -192,7 +203,8 @@ class ImportContactsToSfdcIT {
                 try {
                     selectContacts(email);
                 } catch (Exception e) {
-                    LOG.warn("Could not query the Salesforce Contacts with e-mail {} for deletion", email, e);
+                    LOG.warn("Could not query the Salesforce Contacts with e-mail {} for deletion: {}", email,
+                            failureTypes(e));
                 }
             }
         }
@@ -213,18 +225,25 @@ class ImportContactsToSfdcIT {
                 }
             }
         } catch (Exception e) {
-            LOG.warn("Could not delete Salesforce Contacts {}", ids, e);
+            LOG.warn("Could not delete Salesforce Contacts {}: {}", ids, failureTypes(e));
         }
     }
 
     /**
      * Waits until the query for {@code email} returns a Contact whose ID is not in {@code existing}.
      *
+     * <p>Polled on the test thread: each query adds to {@link #contactIds}, which {@link #tearDown()} reads, copies
+     * and clears, and a query still running on Awaitility's own thread after a timeout could change that list during
+     * the cleanup or after its copy. Each query is bounded by the client's 10 s connect and read timeouts, so a query
+     * still running at the timeout ends, and records what it returned, before the wait returns.
+     *
+     * @param timeout how long the Contact may take to be returned: {@link #IMPORT_TIMEOUT} in the live test
      * @return the first such Contact, standing in for the original's {@code query-single}
      */
-    private Map<String, Object> awaitImportedContact(String email, Set<String> existing) {
+    Map<String, Object> awaitImportedContact(String email, Set<String> existing, Duration timeout) {
         List<Map<String, Object>> imported = await("Contact " + email + " imported into Salesforce")
-                .atMost(IMPORT_TIMEOUT)
+                .atMost(timeout)
+                .pollInSameThread()
                 .pollDelay(Duration.ZERO)
                 .pollInterval(QUERY_POLL_INTERVAL)
                 .until(() -> selectContacts(email).stream()
@@ -262,13 +281,46 @@ class ImportContactsToSfdcIT {
         return value.replace("\\", "\\\\").replace("'", "\\'");
     }
 
+    /**
+     * Names the errors of a failed delete by status code alone, separated by {@code "; "}, and {@code (null)} for an
+     * error without one. The message and the fields of each error are left out: Salesforce repeats record values in
+     * them.
+     */
     private static String errors(DeleteResult result) {
         if (result.getErrors() == null || result.getErrors().length == 0) {
             return "no error detail";
         }
         return Arrays.stream(result.getErrors())
-                .map(error -> error.getStatusCode() + " " + error.getMessage())
+                .map(error -> error == null || error.getStatusCode() == null ? NULL_RENDERING
+                        : error.getStatusCode().name())
                 .collect(Collectors.joining("; "));
+    }
+
+    /**
+     * Names {@code failure} by type alone: the class name of the failure and of each cause, separated by
+     * {@code " <- "}, or {@code (null)} for no failure. Messages, cause messages and suppressed exceptions are left
+     * out, because Salesforce and transport errors can repeat record values, SOQL and session tokens. The walk stops
+     * at a cause already named, marked {@code [circular]}, and after {@link #FAILURE_TYPES_LIMIT} names, marked
+     * {@code ...}.
+     */
+    private static String failureTypes(Throwable failure) {
+        if (failure == null) {
+            return NULL_RENDERING;
+        }
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        StringJoiner types = new StringJoiner(" <- ");
+        for (Throwable link = failure; link != null; link = link.getCause()) {
+            if (!named.add(link)) {
+                types.add("[circular]");
+                break;
+            }
+            if (named.size() > FAILURE_TYPES_LIMIT) {
+                types.add("...");
+                break;
+            }
+            types.add(link.getClass().getName());
+        }
+        return types.toString();
     }
 
     private static Path inputDir() {

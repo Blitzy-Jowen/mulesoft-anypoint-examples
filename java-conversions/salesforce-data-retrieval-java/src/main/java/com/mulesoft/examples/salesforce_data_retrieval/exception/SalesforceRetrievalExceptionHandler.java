@@ -64,9 +64,9 @@ public class SalesforceRetrievalExceptionHandler {
     static final String INVALID_QUERY_MESSAGE = "Invalid Salesforce query.";
 
     /**
-     * Content-Type of the catch branch's reply, the one the controller gives the POST flow's success reply. The
-     * original {@code set-payload} names no MIME type and left it to the platform, so this value is a Tier 2A
-     * verification point: a captured fixture of the original governs where it differs.
+     * Content-Type of the catch branch's reply. The original {@code set-payload} names no MIME type and left it to
+     * the platform, so this value is a Tier 2A verification point: a captured fixture of the original governs where
+     * it differs.
      */
     static final MediaType TEXT_PLAIN_UTF8 = new MediaType(MediaType.TEXT_PLAIN, StandardCharsets.UTF_8);
 

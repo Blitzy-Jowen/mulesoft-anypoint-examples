@@ -206,7 +206,7 @@ class ImportingAnEmailAttachmentUsingThePOP3ConnectorTest {
      * The original {@code @AfterClass tearDown}: empties the output directory, which JUnit also removes. The
      * original's IMAP deletion of the sent mail from the real mailbox has no counterpart: GreenMail keeps the mailbox
      * in memory and stops with the extension. This method runs before GreenMail stops and the context closes; a poll
-     * in between only logs a WARN for the unreachable server.
+     * in between only logs an ERROR for the unreachable server.
      */
     @AfterAll
     static void tearDown() throws IOException {

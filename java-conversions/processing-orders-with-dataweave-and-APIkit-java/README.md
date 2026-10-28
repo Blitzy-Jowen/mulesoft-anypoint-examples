@@ -12,7 +12,7 @@ This project holds the reference implementation of three shared components (four
 
 Every other shared class is a copy, identical apart from the package, together with its unit tests:
 
-- from `rest-api-with-apikit-java`: SC-1 (`exception/ErrorResponse`, `exception/GlobalExceptionHandler`), SC-3 (`exception/ApiKitExceptionHandler`, `exception/ApiKitNotFoundException`, `config/JsonSchemaValidator`), SC-17 (`controller/ApiKitConsoleController`, `src/main/resources/apikit-console/**`), ST-1 (`src/test/java/.../support/HttpTestClient`), and the RAML-project classes `config/ApiKitMethodCaseFilter` and `config/PreflightDispatchConfig`;
+- from `rest-api-with-apikit-java`: SC-1 (`exception/ErrorResponse`, `exception/GlobalExceptionHandler`), SC-3 (`exception/ApiKitExceptionHandler`, `exception/ApiKitNotFoundException`, `config/JsonSchemaValidator`), SC-17 (`controller/ApiKitConsoleController`, `src/main/resources/apikit-console/**`), ST-1 (`src/test/java/.../support/HttpTestClient`), and the RAML-project classes `config/ApiKitMethodCaseFilter`, `config/ApiKitAcceptNegotiator` and `config/PreflightDispatchConfig`;
 - from `login-form-using-the-http-connector-java`: SC-14 (`mapper/ParseTemplateRenderer`).
 
 ## Original example
@@ -36,6 +36,7 @@ Base URL `http://localhost:8081/api`, the RAML `baseUri`. The RAML contract is c
 
 - The RAML declares GET only. Every other method on `/api/currencies` gets the APIkit 405, HEAD and OPTIONS included (`CurrencyController.rejectUndeclaredMethod` maps them, so Spring does not answer them itself). A CORS pre-flight is answered like any other OPTIONS request, with the APIkit 405 and no `Access-Control-*` header (`config/PreflightDispatchConfig`), because the original listener applied no CORS policy.
 - Under `/api`, a method token in lower or mixed case (`get`, `Get`) is routed as its upper-case form (`config/ApiKitMethodCaseFilter`), as the APIkit router lower-cased the method before routing.
+- The `Accept` header of `GET /api/currencies` is negotiated as the APIkit router negotiated it (`config/ApiKitAcceptNegotiator`, a port of `RestContentTypeParser.bestMatch`). The negotiation runs in the RAML action after its URI and query parameter validation and before the flow, as APIkit did; `/currencies` declares no parameter, so it follows the HEAD rejection directly. A header that gives `application/json` quality 0, such as `application/json;q=0`, gets the APIkit 406. `*/*;q=0` is still accepted, because APIkit weighed a `*/*` range with the declared type's own quality.
 - The response is not validated against `currency-schema.json`, because APIkit validated requests only. The served document would not pass it: its `currency` values are strings, and the schema types them `number`.
 - The order flow below reads the currencies through this same endpoint, as the original flow called back on its own listener.
 
@@ -79,7 +80,7 @@ Both outputs are written through SC-4 in DataWeave 1.0's byte format. For the bu
 |---|---|---|---|---|
 | 404 | `application/json` | `{ "message": "Resource not found" }` | a path under `/api` that no resource names, or a miss under the console path | `ApiKitExceptionHandler` (SC-3) |
 | 405 | `application/json` | `{ "message": "Method not allowed" }` | any method on `/api/currencies` other than GET | `ApiKitExceptionHandler` |
-| 406 | `application/json` | `{ "message": "Not acceptable" }` | an `Accept` header that excludes `application/json` | `ApiKitExceptionHandler` |
+| 406 | `application/json` | `{ "message": "Not acceptable" }` | an `Accept` header that excludes `application/json`, or gives it quality 0 under APIkit's negotiation (`application/json;q=0`, raised by `config/ApiKitAcceptNegotiator`) | `ApiKitExceptionHandler` |
 | 415 | `application/json` | `{ "message": "Unsupported media type" }` | carried with SC-3; no request to this API raises it, because `/currencies` declares no request body | `ApiKitExceptionHandler` |
 | 400 | `application/json` | `{ "message": "Bad request" }` | carried with SC-3; no request to this API raises it, because `/currencies` declares no parameter or body | `ApiKitExceptionHandler` |
 | 404 | `text/plain` | `No listener for endpoint: <path>` | any path outside `/api` | `ApiKitExceptionHandler`, writing SC-1's listener default |
@@ -103,7 +104,7 @@ Every key of `src/main/resources/application.yml`, and the `http.port` placehold
 | `apikit.console-path` | `console` | `apikit:config consolePath="console"` | console path below the base path |
 | `orders.input-dir` | `src/main/resources/input` | `file:inbound-endpoint path` (`books.xml:8`) | directory the trigger polls; a relative path resolves against the working directory |
 | `orders.output-dir` | `src/main/resources/output` | `file:outbound-endpoint path` (`books.xml:39,42`) | directory `orders.json` and `report.csv` are written to |
-| `orders.polling-frequency` | `1000` | none declared, so the Mule file connector's default | milliseconds between the end of one poll and the start of the next |
+| `orders.polling-frequency` | `1000` | none declared, so the Mule file connector's default | milliseconds between the end of one poll and the start of the next; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
 | `spring.application.name` | `processing-orders-with-dataweave-and-APIkit-java` | — | application name in log lines |
 | `spring.web.resources.add-mappings` | `false` | — | no static resource handler, so unknown paths reach the APIkit 404 or the no-listener 404 |
 | `spring.mvc.dispatch-trace-request` | `true` | — | TRACE reaches the APIkit 405, as the listener declares no `allowedMethods` |
@@ -125,7 +126,7 @@ Every key of `src/main/resources/application.yml`, and the `http.port` placehold
 | `parse-template location="currency.json"` | SC-14 `mapper/ParseTemplateRenderer`; `currency.json` holds no `#[...]` expression, so it is returned unchanged |
 | `apikit:mapping-exception-strategy` (`currency.xml:5-31`) | SC-3 `exception/ApiKitExceptionHandler`, with `exception/ApiKitNotFoundException` and `config/JsonSchemaValidator` |
 | Console and RAML descriptor (`consoleEnabled="true"`) | SC-17 `controller/ApiKitConsoleController` and `src/main/resources/apikit-console/**` |
-| APIkit router method handling: case-insensitive tokens, no CORS processing | `config/ApiKitMethodCaseFilter`, `config/PreflightDispatchConfig` |
+| APIkit router method handling: case-insensitive tokens, output negotiation (`RestContentTypeParser.bestMatch`), no CORS processing | `config/ApiKitMethodCaseFilter`, `config/ApiKitAcceptNegotiator`, `config/PreflightDispatchConfig` |
 | listener defaults outside `/api`, unhandled exceptions | SC-1 `exception/GlobalExceptionHandler`, `exception/ErrorResponse` |
 | `file:inbound-endpoint path="src/main/resources/input"` (`books.xml:8`) | `trigger/OrderFileTrigger` (`@Scheduled`, single-run method `pollOnce()`) on SC-5 `trigger/FileInboundPoller` |
 | `enricher target="flowVars.currencies"` around `http:request GET /currencies` on `HTTP_Request_Configuration` (`books.xml:3-5,9-11`) | `client/CurrencyClient`; the nested `http:raml-api-configuration` was design-time metadata and has no counterpart |
@@ -204,6 +205,7 @@ Open the console at `http://localhost:8081/api/console/`.
 | `exception/ApiKitExceptionHandlerTest`, `exception/GlobalExceptionHandlerTest` | SC-3 mappings and precedence; SC-1 defaults and log safety |
 | `config/JsonSchemaValidatorTest` | SC-3 draft-03 validation: body faults give 400, schema faults give 500 |
 | `config/ApiKitMethodCaseFilterTest`, `config/ApiKitMethodCaseListenerTest` | lower and mixed-case method tokens under `/api` answered as their upper-case form, on `/api/currencies` and the RAML descriptor |
+| `config/ApiKitAcceptNegotiatorTest`, `config/ApiKitAcceptNegotiationListenerTest` | APIkit's `Accept` negotiation: the type `RestContentTypeParser.bestMatch` chose for each header, quirks included, and `negotiate` on the handler method Spring selected (method or class `produces`, negated types skipped, the rejection carrying the declared types, a request without a handler method refused); the APIkit 406 on `GET /api/currencies` for every form that gives JSON quality 0; `currency.json` byte for byte for the forms APIkit accepted (`*/*;q=0`, `application/json;q=0.5`); and unchanged answers with `application/json;q=0` for undeclared methods, unserved paths and the console |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | CORS pre-flights to `/api/currencies` answered as plain OPTIONS requests with the APIkit 405, never running the currency flow |
 
 `support/HttpTestClient` is ST-1, an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes, because `java.net.http.HttpClient` hides the reason phrase.
@@ -216,9 +218,9 @@ Open the console at `http://localhost:8081/api/console/`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 581 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 581 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 421 of 461 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 88.5% (1170 of 1322 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 704 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 704 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 421 of 461 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 89.6% (1305 of 1456 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project: it has no `FixtureParityTest` and no `SCENARIOS.md`. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported original assertions of `ProcessingOrdersWithDataweaveAndApikitTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 

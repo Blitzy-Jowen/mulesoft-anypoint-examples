@@ -46,12 +46,16 @@ import com.sforce.ws.bind.XmlObject;
  *   <li><b>login mode</b> (no {@link SessionSource} bean): the Partner API SOAP {@code login} with
  *       {@code sfdc.username} and {@code sfdc.password} immediately followed by {@code sfdc.securityToken}, the
  *       protocol of the original Mule {@code sfdc:config}; WSC then adopts the returned {@code serverUrl} and session
- *       ID. This is not an OAuth grant.</li>
+ *       ID. This is not an OAuth grant. All three keys are required: before each login the client checks that none is
+ *       missing or blank, and otherwise fails the call with an {@link IllegalStateException} naming every missing key
+ *       (never a value), without sending any request.</li>
  *   <li><b>session mode</b> (a {@link SessionSource} bean exists): the session ID and SOAP service endpoint the source
- *       supplies are used as they are and no {@code login} request is made.</li>
+ *       supplies are used as they are, no {@code login} request is made and none of the three login keys is
+ *       needed.</li>
  * </ul>
  * The connection is created lazily on the first call and cached, so the application starts with every
- * {@code sfdc.*} secret empty and nothing connects at startup. In session mode the source is consulted on every call,
+ * {@code sfdc.*} secret empty and nothing connects at startup; a login that fails, the credential check included,
+ * caches nothing, so the next call checks and logs in afresh. In session mode the source is consulted on every call,
  * and the cached connection is rebuilt, without a {@link SessionSource#refresh() refresh}, whenever the session it
  * returns differs from the one the connection was built from (for example after a new authorization).
  *
@@ -60,7 +64,9 @@ import com.sforce.ws.bind.XmlObject;
  * the re-authentication step. The executor alone decides retries: an {@code INVALID_SESSION_ID} rejection is
  * followed by one re-login and one retry, a rate limit and every timeout or connectivity failure are never retried,
  * and any other failure ({@code INVALID_LOGIN}, {@code INVALID_TYPE}, {@code MALFORMED_QUERY}, ...) reaches the
- * caller as the original WSC exception. This class therefore neither catches, wraps, retries nor waits.
+ * caller as the original WSC exception. The credential check runs inside the same callbacks, so its
+ * {@link IllegalStateException} is classified like any other failure and reaches the caller unchanged. This class
+ * therefore neither catches, wraps, retries nor waits.
  *
  * <p>Thread-safe: the cached connection is replaced under a lock, and {@link #toMap(XmlObject)} is stateless.
  *
@@ -91,6 +97,15 @@ public class SalesforcePartnerClient {
     /** Configuration key of the read timeout, named when its value is rejected. */
     private static final String READ_TIMEOUT_KEY = "sfdc.read-timeout";
 
+    /** Configuration key of the login-mode username, named when it is missing. */
+    private static final String USERNAME_KEY = "sfdc.username";
+
+    /** Configuration key of the login-mode password, named when it is missing. */
+    private static final String PASSWORD_KEY = "sfdc.password";
+
+    /** Configuration key of the login-mode security token, named when it is missing. */
+    private static final String SECURITY_TOKEN_KEY = "sfdc.securityToken";
+
     /** Map key of the sObject type, and local name of the Partner API element that carries it. */
     private static final String TYPE_KEY = "type";
 
@@ -111,8 +126,9 @@ public class SalesforcePartnerClient {
     private final Object lock = new Object();
 
     /**
-     * Creates the client; no connection is made until the first call. The timeouts are checked here, so an
-     * application configured with one that would leave Salesforce calls unbounded refuses to start.
+     * Creates the client; no connection is made, and no credential is checked, until the first call. The timeouts are
+     * checked here, so an application configured with one that would leave Salesforce calls unbounded refuses to
+     * start.
      *
      * @param properties    the {@code sfdc.*} settings: credentials, login endpoint and timeouts
      * @param executor      the SC-9 executor every vendor call runs through
@@ -281,7 +297,10 @@ public class SalesforcePartnerClient {
      * {@link UpstreamAction} the executor runs once after Salesforce rejects the session; if it fails, no connection
      * stays cached and the next call connects afresh.
      *
-     * @throws Exception the vendor's or the session source's exception, unwrapped
+     * @throws IllegalStateException in login mode, if {@code sfdc.username}, {@code sfdc.password} or
+     *                               {@code sfdc.securityToken} is missing or blank; in session mode, if the source
+     *                               returns no session, or one without a session ID or service endpoint
+     * @throws Exception             the vendor's or the session source's exception, unwrapped
      */
     public void reauthenticate() throws Exception {
         synchronized (lock) {
@@ -299,8 +318,10 @@ public class SalesforcePartnerClient {
      * inside the lambdas handed to the executor, so a failed lazy login is classified like any other vendor failure.
      *
      * @return the connection
-     * @throws IllegalStateException if the session source returns no session, or one without a session ID or service
-     *                               endpoint
+     * @throws IllegalStateException in login mode, if no connection is cached and {@code sfdc.username},
+     *                               {@code sfdc.password} or {@code sfdc.securityToken} is missing or blank; in
+     *                               session mode, if the session source returns no session, or one without a session
+     *                               ID or service endpoint
      * @throws Exception             the vendor's or the session source's exception, unwrapped
      */
     PartnerConnection connection() throws Exception {
@@ -357,9 +378,14 @@ public class SalesforcePartnerClient {
     }
 
     /**
-     * Builds a connection from a fresh {@link ConnectorConfig}.
+     * Builds a connection from a fresh {@link ConnectorConfig}. Login mode first checks the three login keys
+     * ({@link #requireLoginCredentials()}), so no credential is placed on the configuration, and no {@code login}
+     * request is sent, while one of them is missing.
      *
      * @param session in session mode, the validated session to connect with; {@code null} selects login mode
+     * @throws IllegalStateException in login mode, if {@code sfdc.username}, {@code sfdc.password} or
+     *                               {@code sfdc.securityToken} is missing or blank
+     * @throws Exception             the vendor's exception, unwrapped
      */
     private PartnerConnection createConnection(Session session) throws Exception {
         ConnectorConfig config = new ConnectorConfig();
@@ -380,16 +406,47 @@ public class SalesforcePartnerClient {
             config.setManualLogin(true);
             mode = "session";
         } else {
+            requireLoginCredentials();
             // WSC's login sends username and password; the Partner API expects the security token appended to
             // the password. The service endpoint stays unset, so WSC adopts the serverUrl the login returns.
             config.setUsername(properties.getUsername());
-            config.setPassword(Objects.toString(properties.getPassword(), "")
-                    + Objects.toString(properties.getSecurityToken(), ""));
+            config.setPassword(properties.getPassword() + properties.getSecurityToken());
             mode = "login";
         }
         PartnerConnection connection = Connector.newConnection(config);
         LOG.info("Salesforce connection established ({} mode) at {}", mode, config.getServiceEndpoint());
         return connection;
+    }
+
+    /**
+     * Checks that the login-mode credentials are configured, before anything is built or sent from them. Each of
+     * {@code sfdc.username}, {@code sfdc.password} and {@code sfdc.securityToken} must be non-blank; they are read
+     * afresh on every login, so a call after the configuration is completed logs in normally.
+     *
+     * @throws IllegalStateException if any of the three is {@code null} or blank. The message names every missing key
+     *                               in that order, for example {@code sfdc.password is not configured} or
+     *                               {@code sfdc.username, sfdc.password and sfdc.securityToken are not configured},
+     *                               and never a configured value
+     */
+    private void requireLoginCredentials() {
+        List<String> missing = new ArrayList<>(3);
+        if (isBlank(properties.getUsername())) {
+            missing.add(USERNAME_KEY);
+        }
+        if (isBlank(properties.getPassword())) {
+            missing.add(PASSWORD_KEY);
+        }
+        if (isBlank(properties.getSecurityToken())) {
+            missing.add(SECURITY_TOKEN_KEY);
+        }
+        if (missing.isEmpty()) {
+            return;
+        }
+        int last = missing.size() - 1;
+        String keys = last == 0
+                ? missing.get(0)
+                : String.join(", ", missing.subList(0, last)) + " and " + missing.get(last);
+        throw new IllegalStateException(keys + (last == 0 ? " is" : " are") + " not configured");
     }
 
     /**

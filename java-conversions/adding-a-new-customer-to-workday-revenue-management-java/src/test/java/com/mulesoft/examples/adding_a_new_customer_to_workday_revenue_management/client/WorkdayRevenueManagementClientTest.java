@@ -9,6 +9,8 @@
 package com.mulesoft.examples.adding_a_new_customer_to_workday_revenue_management.client;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
@@ -16,6 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.tuple;
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.params.provider.Arguments.arguments;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -33,6 +36,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import javax.xml.transform.Source;
 
@@ -40,6 +45,11 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.ws.client.WebServiceIOException;
 import org.springframework.ws.client.core.WebServiceTemplate;
@@ -86,6 +96,10 @@ import jakarta.xml.bind.JAXBElement;
  * connections the client's transport opened, one per send attempt. A refused connection never reaches WireMock, so
  * that transport count is its only attempt count.
  *
+ * <p>The configuration checks of {@link WorkdayProperties#requireConfigured()} are proved on both operations: each
+ * missing or invalid {@code wday.*} value fails the call with the message naming its key, before any connection is
+ * opened and without re-authentication, while an explicit {@code wday.endpoint} needs no {@code wday.hostname}.
+ *
  * <p>Each case builds a fresh client, wrapped in a Mockito spy so the number of {@code reauthenticate()} calls can be
  * verified; the executor's re-authentication step is the spy's own method reference. Every client connects and reads
  * with the 10 s production default timeouts, except that the read-timeout case reads with {@link #SHORT_READ_TIMEOUT}.
@@ -95,6 +109,15 @@ class WorkdayRevenueManagementClientTest {
 
     /** Revenue_Management v25.0 path of the fake tenant {@link #TENANT}. */
     static final String PATH = "/ccx/service/test_pt1/Revenue_Management/v25.0";
+
+    /** What the default {@code wday.endpoint} of {@code application.yml} derives to when only the host is empty. */
+    private static final String HOSTLESS_ENDPOINT = "https://" + PATH;
+
+    /** What the default {@code wday.endpoint} of {@code application.yml} derives to when every value is empty. */
+    private static final String UNCONFIGURED_ENDPOINT = "https:///ccx/service//Revenue_Management/v25.0";
+
+    private static final String INVALID_ENDPOINT_MESSAGE = "wday.endpoint is not a valid Workday service URL: it must"
+            + " be an absolute http or https URL with a host";
 
     private static final String SOAPENV_NS = "http://schemas.xmlsoap.org/soap/envelope/";
 
@@ -406,6 +429,89 @@ class WorkdayRevenueManagementClientTest {
         verify(client, never()).reauthenticate();
     }
 
+    /**
+     * A missing or invalid {@code wday.*} value fails either operation with the message naming the key, before the
+     * transport opens a connection and without re-authentication. WireMock answers every call successfully, so a call
+     * that got past the check would return instead of failing.
+     */
+    @ParameterizedTest(name = "{0}: {1}")
+    @MethodSource("misconfigurations")
+    void missingOrInvalidSettingFailsBeforeAnyRequest(Operation operation, String setting,
+            Consumer<WorkdayProperties> misconfiguration, String expectedMessage) {
+        wm.stubFor(post(urlEqualTo(PATH)).willReturn(soap(200, PUT_CUSTOMER_RESPONSE)));
+        WorkdayRevenueManagementClient misconfigured = newClient(wm.baseUrl() + PATH, DEFAULT_TIMEOUT,
+                misconfiguration);
+        CountingMessageSender transport = countTransportAttempts(misconfigured);
+
+        Throwable failure = catchThrowable(() -> operation.invoke(misconfigured));
+
+        assertThat(failure).isExactlyInstanceOf(IllegalStateException.class).hasMessage(expectedMessage);
+        assertThat(transport.connections()).isZero();
+        wm.verify(0, anyRequestedFor(anyUrl()));
+        verify(misconfigured, never()).reauthenticate();
+    }
+
+    /**
+     * Each operation crossed with every way a setting can be unusable: each required key {@code null}, empty or
+     * blank, every value empty as {@code application.yml} leaves them, and endpoints that are not absolute
+     * {@code http}/{@code https} URLs with a host. The host is reported missing only while the endpoint names none.
+     */
+    static Stream<Arguments> misconfigurations() {
+        List<Arguments> cases = new ArrayList<>();
+        for (Operation operation : Operation.values()) {
+            for (String missing : new String[] {null, "", "   "}) {
+                String shown = missing == null ? "null" : "'" + missing + "'";
+                cases.add(arguments(operation, "wday.hostname " + shown + " with a host-less endpoint",
+                        settings(properties -> {
+                            properties.setHostname(missing);
+                            properties.setEndpoint(HOSTLESS_ENDPOINT);
+                        }), "wday.hostname is not configured"));
+                cases.add(arguments(operation, "wday.endpoint " + shown,
+                        settings(properties -> properties.setEndpoint(missing)), "wday.endpoint is not configured"));
+                cases.add(arguments(operation, "wday.tenant " + shown,
+                        settings(properties -> properties.setTenant(missing)), "wday.tenant is not configured"));
+                cases.add(arguments(operation, "wday.user " + shown,
+                        settings(properties -> properties.setUser(missing)), "wday.user is not configured"));
+                cases.add(arguments(operation, "wday.password " + shown,
+                        settings(properties -> properties.setPassword(missing)), "wday.password is not configured"));
+            }
+            cases.add(arguments(operation, "every value empty", settings(properties -> {
+                properties.setHostname("");
+                properties.setTenant("");
+                properties.setUser("");
+                properties.setPassword("");
+                properties.setEndpoint(UNCONFIGURED_ENDPOINT);
+            }), "wday.hostname is not configured"));
+            for (String invalid : new String[] {"ftp://localhost" + PATH, "http://local host" + PATH, PATH,
+                    " https://localhost" + PATH}) {
+                cases.add(arguments(operation, "wday.endpoint '" + invalid + "'",
+                        settings(properties -> properties.setEndpoint(invalid)), INVALID_ENDPOINT_MESSAGE));
+            }
+        }
+        return cases.stream();
+    }
+
+    /**
+     * An explicit {@code wday.endpoint} with a host is used as it is, so the call is sent without
+     * {@code wday.hostname}, as for a tenant whose service URL is not the derived one.
+     */
+    @ParameterizedTest(name = "wday.hostname [{0}]")
+    @NullAndEmptySource
+    @ValueSource(strings = "   ")
+    void explicitEndpointIsSentWithoutHostname(String hostname) throws Exception {
+        wm.stubFor(post(urlEqualTo(PATH)).willReturn(soap(200, PUT_CUSTOMER_RESPONSE)));
+        WorkdayRevenueManagementClient overridden = newClient(wm.baseUrl() + PATH, DEFAULT_TIMEOUT,
+                properties -> properties.setHostname(hostname));
+
+        PutCustomerResponseType response = overridden.putCustomer(putCustomerRequest(CUSTOMER_NAME));
+
+        assertThat(response.getCustomerReference().getDescriptor()).isEqualTo(CUSTOMER_NAME);
+        List<LoggedRequest> requests = wm.findAll(postRequestedFor(urlEqualTo(PATH)));
+        assertThat(requests).hasSize(1);
+        assertCarriesPasswordTextUsernameToken(requests.get(0).getBodyAsString());
+        verify(overridden, never()).reauthenticate();
+    }
+
     /** {@link #newClient(String, Duration)} reading with {@link #DEFAULT_TIMEOUT}: every case awaiting an answer. */
     private static WorkdayRevenueManagementClient newClient(String endpoint) {
         return newClient(endpoint, DEFAULT_TIMEOUT);
@@ -416,6 +522,14 @@ class WorkdayRevenueManagementClientTest {
      * and the given read timeout, behind a real executor and the real Workday classifier.
      */
     private static WorkdayRevenueManagementClient newClient(String endpoint, Duration readTimeout) {
+        return newClient(endpoint, readTimeout, properties -> { });
+    }
+
+    /**
+     * {@link #newClient(String, Duration)} with {@code adjustment} applied to its settings before the client is built.
+     */
+    private static WorkdayRevenueManagementClient newClient(String endpoint, Duration readTimeout,
+            Consumer<WorkdayProperties> adjustment) {
         WorkdayProperties properties = new WorkdayProperties();
         properties.setHostname("localhost");
         properties.setTenant(TENANT);
@@ -424,8 +538,14 @@ class WorkdayRevenueManagementClientTest {
         properties.setEndpoint(endpoint);
         properties.setConnectTimeout(DEFAULT_TIMEOUT);
         properties.setReadTimeout(readTimeout);
+        adjustment.accept(properties);
         return spy(new WorkdayRevenueManagementClient(properties,
                 new UpstreamCallExecutor(List.of(new WorkdayFailureClassifier()))));
+    }
+
+    /** Types a settings change for {@link Arguments}, whose varargs would otherwise leave a lambda untyped. */
+    private static Consumer<WorkdayProperties> settings(Consumer<WorkdayProperties> change) {
+        return change;
     }
 
     /**
@@ -511,6 +631,27 @@ class WorkdayRevenueManagementClientTest {
             chain.add(current);
         }
         return chain;
+    }
+
+    /** The two client operations, each of which checks the {@code wday.*} values before it sends anything. */
+    enum Operation {
+
+        PUT_CUSTOMER {
+            @Override
+            Object invoke(WorkdayRevenueManagementClient client) throws Exception {
+                return client.putCustomer(putCustomerRequest(CUSTOMER_NAME));
+            }
+        },
+
+        SEND_RAW {
+            @Override
+            Object invoke(WorkdayRevenueManagementClient client) throws Exception {
+                return client.sendRaw(WorkdayTestRequests.getCustomersRequest(CUSTOMER_NAME));
+            }
+        };
+
+        /** Calls the operation on {@code client} with the request this test class sends for it. */
+        abstract Object invoke(WorkdayRevenueManagementClient client) throws Exception;
     }
 
     /**

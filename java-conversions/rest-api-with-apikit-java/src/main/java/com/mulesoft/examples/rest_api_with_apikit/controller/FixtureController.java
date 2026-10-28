@@ -10,6 +10,7 @@ package com.mulesoft.examples.rest_api_with_apikit.controller;
 
 import java.util.List;
 
+import com.mulesoft.examples.rest_api_with_apikit.config.ApiKitAcceptNegotiator;
 import com.mulesoft.examples.rest_api_with_apikit.config.JsonSchemaValidator;
 import com.mulesoft.examples.rest_api_with_apikit.mapper.LeagueJsonMapper;
 import com.mulesoft.examples.rest_api_with_apikit.service.LeagueAPI;
@@ -19,6 +20,7 @@ import jakarta.validation.constraints.Size;
 
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -56,8 +58,9 @@ import org.springframework.web.bind.annotation.RestController;
  *       message>" }} from {@code LeagueExceptionHandler}. The original flow mapped no 409; the RAML declares it
  *       ("Cannot update match before the match is actually played") and the RAML contract governs;</li>
  *   <li>a URI parameter of the wrong length, a missing body, or a body the schema rejects → APIkit's 400; a PUT
- *       body that is not {@code application/json} → 415; an {@code Accept} header excluding JSON on GET → 406;
- *       a method the RAML does not declare → 405, all from {@code ApiKitExceptionHandler}.</li>
+ *       body that is not {@code application/json} → 415; an {@code Accept} header excluding JSON on GET, or one
+ *       under which {@link ApiKitAcceptNegotiator} chooses no declared type after the URI parameters are
+ *       validated → 406; a method the RAML does not declare → 405, all from {@code ApiKitExceptionHandler}.</li>
  * </ul>
  */
 @RestController
@@ -97,11 +100,16 @@ public class FixtureController {
     /**
      * Flow {@code get:/fixture}: every match of the season.
      *
+     * @param request the current request, whose {@code Accept} header is negotiated
      * @return 200 {@code application/json}, the collection rendering: null scores written as {@code null} and
      *         dates as epoch milliseconds
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
      */
     @GetMapping(value = FIXTURE_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> getFixture() {
+    public ResponseEntity<String> getFixture(HttpServletRequest request)
+            throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(leagueJsonMapper.toJson(leagueAPI.getFixture()));
@@ -112,13 +120,18 @@ public class FixtureController {
      *
      * @param homeTeamId three-letter ID of the home team
      * @param awayTeamId three-letter ID of the away team
+     * @param request    the current request, whose {@code Accept} header is negotiated
      * @return 200 {@code application/json}, the single-resource rendering: null scores omitted and the date
      *         formatted {@code yyyy-MM-dd'T'HH:mm:ssZ}
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
      */
     @GetMapping(value = MATCH_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<String> getMatch(
             @PathVariable("homeTeamId") @Size(min = 3, max = 3) String homeTeamId,
-            @PathVariable("awayTeamId") @Size(min = 3, max = 3) String awayTeamId) {
+            @PathVariable("awayTeamId") @Size(min = 3, max = 3) String awayTeamId,
+            HttpServletRequest request) throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(leagueJsonMapper.toJson(leagueAPI.getMatch(homeTeamId, awayTeamId)));
@@ -145,7 +158,7 @@ public class FixtureController {
     /**
      * Rejects HEAD and OPTIONS on {@code /fixture}, which the RAML does not declare, so they reach APIkit's 405
      * as every undeclared method did in the original router. Without this mapping Spring would answer HEAD
-     * through {@link #getFixture()} and OPTIONS with its own 200 and {@code Allow} header. Spring ranks an
+     * through {@link #getFixture(HttpServletRequest)} and OPTIONS with its own 200 and {@code Allow} header. Spring ranks an
      * explicit HEAD mapping above the implicit HEAD of a GET mapping, and this one declares no {@code produces},
      * so it also claims a HEAD whose {@code Accept} header excludes JSON.
      *

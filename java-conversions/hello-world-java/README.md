@@ -11,14 +11,15 @@ The example answers an HTTP request to `/helloWorld` with the text `Hello World`
 | Path | Methods | Host | Port | Response | Source |
 |---|---|---|---|---|---|
 | `/helloWorld` | any, `HEAD`, `OPTIONS` and `TRACE` included: the listener declares no `allowedMethods` | `0.0.0.0` | `http.port`, default `8081` | `200 OK`, body `Hello World` (11 bytes, UTF-8, no trailing newline), `Content-Length: 11`, no `Content-Type` header; a `HEAD` reply carries the headers without the body | `hello-world/src/main/app/HelloWorld.xml:3-6` |
-| any other path (`/helloWorld/`, `/helloWorld/extra` and `/error` included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
+| any other path (`/helloWorld/`, `/helloWorld/extra`, `/error` and `/helloWorld` with `;` segment parameters, such as `/helloWorld;x=1`, included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
 | `/helloWorld`, when processing throws | any | `0.0.0.0` | `http.port` | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }`, logged at ERROR on one line (SC-1, AAP 0.4.7) | platform default for an unhandled exception |
 
 - No input can fail this flow: the request's query, headers and body are never read, so any `Accept`, `Content-Type` or body is ignored and never answered with 406, 415 or 400. The 500 row is reached only by `HelloWorldControllerTest`, through a mocked failing service. SC-1's 405 (`Method not allowed for endpoint: <path>`) cannot occur, because the listener accepts every method.
 - The reply carries no `Content-Type`, because the flow's `set-payload` declares no MIME type and the Mule listener sent none for such a payload (`HelloWorldController` Javadoc). `HelloWorldController` writes the bytes straight to the servlet response, so no message converter adds one.
 - A CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered like any other `OPTIONS` request, with `200 Hello World` and no `Access-Control-*` or `Vary` header. The original listener applied no CORS policy (`config/PreflightDispatchConfig`).
 - A request body the flow leaves unread is drained after the response, so requests pipelined on one HTTP/1.1 connection are all answered. The Mule listener (Grizzly) read the whole request before the flow ran (`config/RequestBodyDrainFilter`).
-- Tier 2A verification points (AAP 0.4.7): the absent `Content-Type` of the `200` reply and the bytes of the `404` and `500` defaults. When a captured fixture shows different bytes, the fixture governs and the code is changed to match.
+- A path carrying `;` segment parameters (`/helloWorld;x=1`, `/helloWorld;jsessionid=ABC`, `/helloWorld;`) is not `/helloWorld`: every method gets the no-listener 404 naming the path with its parameters, `No listener for endpoint: /helloWorld;x=1`, and the flow does not run. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). A `;` in the query string is not part of the path.
+- Tier 2A verification points (AAP 0.4.7): the absent `Content-Type` of the `200` reply, the bytes of the `404` and `500` defaults, and the `404` for a path carrying `;` segment parameters. When a captured fixture shows different bytes, the fixture governs and the code is changed to match.
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
 ## Configuration keys
@@ -54,7 +55,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `http:listener path="helloWorld"` without `allowedMethods` (`HelloWorld.xml:5`) | `controller/HelloWorldController`, `@RequestMapping("/helloWorld")`: `helloWorld` (every method but `OPTIONS`) and `helloWorldOptions` (`OPTIONS`), both writing the same reply |
 | `set-payload value="Hello World"` (`HelloWorld.xml:6`) | `service/HelloWorldService.hello()`, returning the constant `HELLO_WORLD` |
 | Platform default responses (no listener, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| Grizzly listener semantics (whole request read before the flow, no CORS policy) | `config/RequestBodyDrainFilter`, `config/PreflightDispatchConfig` |
+| Listener semantics (Grizzly read the whole request before the flow; no CORS policy; the raw path, query removed, matched literally, `;` segment parameters included) | `config/RequestBodyDrainFilter`, `config/PreflightDispatchConfig`, `config/ListenerPathConfig` |
 | `mule-deploy.properties` (loads `HelloWorld.xml`) | `HelloWorldApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` | `src/main/resources/application.yml` |
 | `HelloWorldIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`) | `HelloWorldTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)` with ST-1 `support/HttpTestClient`) |
@@ -96,11 +97,11 @@ Hello World
 | Test class | What it asserts |
 |---|---|
 | `HelloWorldTest` | the ported `HelloWorldIT` (`hello-world/src/test/java/org/mule/examples/HelloWorldIT.java:44-46`): `GET /helloWorld` with an empty body returns a response with a non-empty body equal to `Hello World` |
-| `controller/HelloWorldControllerTest` | on the wire through ST-1: `GET /helloWorld` → `HTTP/1.1 200 OK`, no `Content-Type`, `Content-Length: 11`, body `Hello World`; the same reply for `POST`, `PUT`, `DELETE` and `PATCH` with a `text/plain` body, for a malformed form body, for `OPTIONS` and for `Accept: application/json`; `/unknown` and `/helloWorld/extra` → 404 `text/plain` `No listener for endpoint: <path>`; a failing service → 500 `application/json` `{ "message": "boom" }` |
+| `controller/HelloWorldControllerTest` | on the wire through ST-1: `GET /helloWorld` → `HTTP/1.1 200 OK`, no `Content-Type`, `Content-Length: 11`, body `Hello World`; the same reply for `POST`, `PUT`, `DELETE` and `PATCH` with a `text/plain` body, for a malformed form body, for `OPTIONS` and for `Accept: application/json`; `/unknown` and `/helloWorld/extra` → 404 `text/plain` `No listener for endpoint: <path>`, and so do `/helloWorld;x=1`, `/helloWorld;jsessionid=ABC` and `/helloWorld;` for `GET`, `POST` with a body and `OPTIONS`; a failing service → 500 `application/json` `{ "message": "boom" }` |
 | `service/HelloWorldServiceTest` | `hello()` returns `Hello World`, non-null and non-empty, on every call; `HELLO_WORLD` equals the original payload |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path, carries no exception message except a JDBC driver's escaped, bounded diagnostic, and no stack trace; an `Error` reported with its own message |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
-| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/helloWorld` gets exactly the plain `OPTIONS` reply (`200 Hello World`, no `Content-Type`, no `Access-Control-*` or `Vary`); a pre-flight to `/unknown` gets the no-listener 404 |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/helloWorld` gets exactly the plain `OPTIONS` reply (`200 Hello World`, no `Content-Type`, no `Access-Control-*` or `Vary`); a pre-flight to `/unknown` or `/helloWorld;x=1` gets the no-listener 404 |
 | `config/RequestBodyDrainFilterTest` | pipelined requests behind a body-less request are all answered, on `/helloWorld` and on an unserved path; draining never changes the chain's outcome and leaves reader-read and asynchronous bodies alone |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 | `FixtureParityBoundaryTest` | the replay's isolation: scheduled triggers suppressed, configured targets outside the replay refused before the context starts, table and collection state only in replay-owned stores, credentials masked in diagnostics |
@@ -150,9 +151,9 @@ No scenario of this project is `unreachable` or `nondeterministic`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 442 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 442 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/HelloWorldService` (the project has no `mapper` package). Total project LINE coverage: 96.8% (212 of 219 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 452 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 452 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/HelloWorldService` (the project has no `mapper` package). Total project LINE coverage: 96.9% (221 of 228 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=3`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

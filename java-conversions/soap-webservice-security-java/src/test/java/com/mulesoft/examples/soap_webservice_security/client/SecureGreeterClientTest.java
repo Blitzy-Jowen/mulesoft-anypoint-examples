@@ -16,23 +16,29 @@ import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathEqualTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlPathMatching;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.IOException;
 import java.io.StringReader;
 import java.net.ConnectException;
 import java.net.ServerSocket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
@@ -44,35 +50,61 @@ import javax.xml.xpath.XPathConstants;
 import javax.xml.xpath.XPathExpressionException;
 import javax.xml.xpath.XPathFactory;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import org.apache.wss4j.common.crypto.Crypto;
 import org.apache.wss4j.common.ext.WSPasswordCallback;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
+import org.springframework.core.env.Environment;
+import org.springframework.oxm.jaxb.Jaxb2Marshaller;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.util.xml.SimpleNamespaceContext;
 import org.springframework.ws.client.WebServiceIOException;
+import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.soap.client.SoapFaultClientException;
+import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.w3c.dom.Document;
 import org.xml.sax.InputSource;
 
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.github.tomakehurst.wiremock.stubbing.ServeEvent;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.soap_webservice_security.SoapWebserviceSecurityApplication;
 import com.mulesoft.examples.soap_webservice_security.client.SecureGreeterClient.OutboundSecurity;
+import com.mulesoft.examples.soap_webservice_security.config.PasswordCallback;
+import com.mulesoft.examples.soap_webservice_security.config.SAMLCallbackHandler;
 import com.mulesoft.examples.soap_webservice_security.config.SoapSecurityProperties;
+import com.mulesoft.examples.soap_webservice_security.config.WebServiceConfig;
 import com.mulesoft.examples.soap_webservice_security.config.WrongPasswordCallback;
 
 /**
@@ -84,7 +116,8 @@ import com.mulesoft.examples.soap_webservice_security.config.WrongPasswordCallba
  * inspected on the wire: the security headers come from the real {@code merlinCrypto}, {@code passwordCallback},
  * {@code samlCallbackHandler}, message factory and marshaller beans, configured with the demo values of the
  * {@code test} profile. The context uses the default mock web environment, so no listener (63081, 63080) is bound;
- * {@code soap-security.client.base-url} points the client at the stub.
+ * {@code soap-security.client.base-url} points the client at the stub. The nested {@link UnderRootTrace} run covers
+ * the logger levels {@code application.yml} pins for the client's side of each call.
  */
 @SpringBootTest(classes = SoapWebserviceSecurityApplication.class)
 @ActiveProfiles("test")
@@ -116,6 +149,16 @@ class SecureGreeterClientTest {
 
     private static final Map<String, String> NAMESPACES = namespaces();
 
+    /** Milliseconds; the Mule default response timeout that {@code soap-security.client.response-timeout} keeps. */
+    private static final int MULE_DEFAULT_RESPONSE_TIMEOUT = 10000;
+
+    private static final String NON_POSITIVE_RESPONSE_TIMEOUT =
+            "soap-security.client.response-timeout must be a positive number of milliseconds: ";
+
+    /** Binds {@code soap-security.*} alone, as the application does at start-up. */
+    private static final ApplicationContextRunner PROPERTIES_BINDING =
+            new ApplicationContextRunner().withUserConfiguration(PropertiesBinding.class);
+
     @RegisterExtension
     static final WireMockExtension WIREMOCK = WireMockExtension.newInstance()
             .options(WireMockConfiguration.wireMockConfig().dynamicPort())
@@ -132,6 +175,26 @@ class SecureGreeterClientTest {
 
     @Autowired
     private SoapSecurityProperties properties;
+
+    @Autowired
+    @Qualifier("merlinCrypto")
+    private Supplier<Crypto> merlinCrypto;
+
+    @Autowired
+    private PasswordCallback passwordCallback;
+
+    @Autowired
+    private SAMLCallbackHandler samlCallbackHandler;
+
+    @Autowired
+    private ObjectProvider<SaajSoapMessageFactory> messageFactory;
+
+    @Autowired
+    @Qualifier(WebServiceConfig.GREETER_MARSHALLER_BEAN_NAME)
+    private ObjectProvider<Jaxb2Marshaller> marshaller;
+
+    @Autowired
+    private Environment environment;
 
     @BeforeEach
     void stubGreeterService() {
@@ -164,6 +227,9 @@ class SecureGreeterClientTest {
         assertThat(request.getHeader("Content-Type")).contains("text/xml");
         // The CXF clients sent an empty SOAPAction on every client type.
         assertThat(request.getHeader("SOAPAction")).isEqualTo("\"\"");
+        // One fixed-length body: Content-Length is the envelope's byte count and nothing is chunked.
+        assertThat(request.getHeader("Content-Length")).isEqualTo(String.valueOf(request.getBody().length));
+        assertThat(request.containsHeader("Transfer-Encoding")).isFalse();
     }
 
     @Test
@@ -258,6 +324,23 @@ class SecureGreeterClientTest {
         assertUsernameTokenDigest(envelope, configuredPassword());
         assertTimestamp(envelope);
         assertThat(count(envelope, "//ds:Signature")).isZero();
+    }
+
+    /** The original token {@code Encrypt} and WSS4J's {@code Encryption} both encrypt with the configured crypto. */
+    @ParameterizedTest(name = "[{0}]")
+    @ValueSource(strings = { "UsernameToken Timestamp Encrypt", "UsernameToken Timestamp Encryption" })
+    void eitherEncryptionTokenEncryptsTheBody(String actions) throws Exception {
+        String reply = client.greet(client.endpoint(SecureGreeterClient.PATH_ENCRYPTED),
+                client.getUsernameTokenProps(actions), NAME);
+
+        assertThat(reply).isEqualTo(GREETING);
+        String body = lastRequestBody();
+        Document envelope = parse(body);
+        assertThat(count(envelope, SECURITY + "/xenc:EncryptedKey")).isEqualTo(1);
+        assertThat(count(envelope, "/soap:Envelope/soap:Body/xenc:EncryptedData")).isEqualTo(1);
+        assertThat(body).doesNotContain(">" + NAME + "<");
+        assertUsernameTokenDigest(envelope, configuredPassword());
+        assertTimestamp(envelope);
     }
 
     @Test
@@ -397,6 +480,39 @@ class SecureGreeterClientTest {
         WIREMOCK.verify(0, anyRequestedFor(anyUrl()));
     }
 
+    /**
+     * The service closes or resets the connection after reading the request and before any response byte. A
+     * buffered JDK connection would silently send the POST again; every client type sends it exactly once and the
+     * connectivity failure reaches the caller.
+     */
+    @ParameterizedTest(name = "{0} -> /services/{1}, {2}")
+    @CsvSource({
+            "unsecure,               unsecure,   EMPTY_RESPONSE",
+            "unsecure,               unsecure,   CONNECTION_RESET_BY_PEER",
+            "usernameToken,          username,   EMPTY_RESPONSE",
+            "usernameToken,          username,   CONNECTION_RESET_BY_PEER",
+            "usernameTokenSigned,    signed,     EMPTY_RESPONSE",
+            "usernameTokenSigned,    signed,     CONNECTION_RESET_BY_PEER",
+            "usernameTokenEncrypted, encrypted,  EMPTY_RESPONSE",
+            "usernameTokenEncrypted, encrypted,  CONNECTION_RESET_BY_PEER",
+            "samlToken,              saml,       EMPTY_RESPONSE",
+            "samlToken,              saml,       CONNECTION_RESET_BY_PEER",
+            "samlTokenSigned,        signedsaml, EMPTY_RESPONSE",
+            "samlTokenSigned,        signedsaml, CONNECTION_RESET_BY_PEER"
+    })
+    void connectionLostBeforeTheResponseRaisesWebServiceIOExceptionAfterExactlyOneRequest(String clientType,
+            String path, Fault fault) {
+        WIREMOCK.stubFor(post(urlPathEqualTo(SERVICES + path)).atPriority(1)
+                .willReturn(aResponse().withFault(fault)));
+
+        WebServiceIOException failure = assertThrows(WebServiceIOException.class,
+                () -> client.invoke(clientType, NAME));
+
+        assertThat(causes(failure)).anyMatch(SocketException.class::isInstance);
+        WIREMOCK.verify(1, postRequestedFor(urlPathEqualTo(SERVICES + path)));
+        WIREMOCK.verify(1, anyRequestedFor(anyUrl()));
+    }
+
     /** A context of its own whose client gives up reading after {@code soap-security.client.response-timeout}. */
     @Nested
     @TestPropertySource(properties = "soap-security.client.response-timeout=500")
@@ -422,6 +538,304 @@ class SecureGreeterClientTest {
             assertThat(causes(failure)).anyMatch(SocketTimeoutException.class::isInstance);
             assertThat(elapsedMillis).isLessThan(2500);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Logger levels: no security header, secret or greeted name in the log under a root TRACE level
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /** The client calls of {@link LoggedClientCalls} under {@code logging.level.root=TRACE}. */
+    @Nested
+    @TestPropertySource(properties = "logging.level.root=TRACE")
+    @DirtiesContext
+    class UnderRootTrace extends LoggedClientCalls {
+    }
+
+    /**
+     * Tests the logger levels {@code application.yml} pins, which keep the WS-Security header the client sends, the
+     * configured secrets and the plaintext that signing and encryption cover out of the log under a root {@code TRACE}
+     * level: {@code service-clients.xml} declares no logger.
+     *
+     * <p>The nested run keeps this class's configuration, the WireMock Greeter service included, in a context of its
+     * own whose client user is {@link #SENTINEL_USER} with the password {@link #SENTINEL_PASSWORD}, a user that only
+     * sends UsernameTokens; the signing profiles keep the original user {@code joe}, whose password is also his
+     * private-key password. Each call, the one the stub answers with a security fault included, is asserted to have
+     * sent its security header, then its own log events are asserted to hold the unpinned {@code WebServiceTemplate}
+     * {@code DEBUG} connection line and the JDK HTTP client's {@code TRACE} proxy line, which prove the capture sees
+     * those levels, and no {@code WARN} of Santuario's {@code DOMReference}, and the console output is asserted to hold
+     * no serialized security-header element, no sentinel and not the greeted name. The run restores the logger levels
+     * it found and closes its context, so later test classes do not run at {@code TRACE}.
+     */
+    @ExtendWith(OutputCaptureExtension.class)
+    abstract static class LoggedClientCalls {
+
+        /** A UsernameToken user configured for this run alone, and its password; neither may reach the log. */
+        static final String SENTINEL_USER = "sentinelutuser";
+        static final String SENTINEL_PASSWORD = "SENTINEL_UT_PASSWORD";
+
+        /** The name every call greets: it travels in the signed or encrypted body. */
+        static final String SENTINEL_NAME = "SentinelGreetedName";
+
+        /** The start tags of the security-header elements WSS4J writes, which only a serialized envelope holds. */
+        static final List<String> SECURITY_HEADER_ELEMENTS = List.of("<wsse:Security", "<wsse:UsernameToken",
+                "<wsse:Password", "<wsse:Nonce", "<wsse:BinarySecurityToken", "<saml2:Assertion",
+                "<ds:SignatureValue", "<xenc:CipherValue");
+
+        /** The JDK HTTP client's logger, whose proxy line each new request connection writes at {@code TRACE}. */
+        private static final String JDK_HTTP_LOGGER = "sun.net.www.protocol.http.HttpURLConnection";
+
+        /** Santuario's reference logger, whose null-digest-input WARN a signed assertion's STR-Transform raises. */
+        private static final String DOM_REFERENCE_LOGGER = "org.apache.jcp.xml.dsig.internal.dom.DOMReference";
+
+        /** How long lines written after a call get to arrive before the output is scanned. */
+        private static final Duration SETTLE = Duration.ofMillis(300);
+
+        /** Most offending lines a failure reports; the capture holds the whole run, so it is never dumped. */
+        private static final int REPORTED_LINES = 20;
+
+        /** The logger levels set before this run's context started, by logger name. */
+        private static final Map<String, Level> LEVELS_BEFORE = new HashMap<>();
+
+        @Autowired
+        SecureGreeterClient client;
+
+        @Autowired
+        SoapSecurityProperties properties;
+
+        @Autowired
+        @Qualifier("passwordCallback")
+        PasswordCallback passwordCallback;
+
+        @Autowired
+        @Qualifier("samlCallbackHandler")
+        SAMLCallbackHandler samlCallbackHandler;
+
+        @DynamicPropertySource
+        static void sentinelUser(DynamicPropertyRegistry registry) {
+            registry.add("soap-security.users." + SENTINEL_USER, () -> SENTINEL_PASSWORD);
+            registry.add("soap-security.client.user", () -> SENTINEL_USER);
+        }
+
+        @BeforeAll
+        static void recordLevels() {
+            LEVELS_BEFORE.clear();
+            for (Logger logger : loggerContext().getLoggerList()) {
+                if (logger.getLevel() != null) {
+                    LEVELS_BEFORE.put(logger.getName(), logger.getLevel());
+                }
+            }
+        }
+
+        @AfterAll
+        static void restoreLevels() {
+            for (Logger logger : loggerContext().getLoggerList()) {
+                Level before = LEVELS_BEFORE.get(logger.getName());
+                // The root logger always has a level and cannot be given none.
+                if (before != null || !org.slf4j.Logger.ROOT_LOGGER_NAME.equals(logger.getName())) {
+                    logger.setLevel(before);
+                }
+            }
+        }
+
+        static Stream<ClientCall> clientCalls() {
+            return Stream.of(
+                    new ClientCall("usernameToken", SecureGreeterClient.PATH_USERNAME,
+                            SecureGreeterClient.CLIENT_TYPE_USERNAME_TOKEN, null, null, false, false),
+                    new ClientCall("usernameTokenEncrypted", SecureGreeterClient.PATH_ENCRYPTED,
+                            SecureGreeterClient.CLIENT_TYPE_USERNAME_TOKEN_ENCRYPTED, null, null, false, false),
+                    new ClientCall("samlToken", SecureGreeterClient.PATH_SAML,
+                            SecureGreeterClient.CLIENT_TYPE_SAML_TOKEN, null, null, false, false),
+                    new ClientCall("usernameTokenSigned profile as joe", SecureGreeterClient.PATH_SIGNED, null,
+                            SecureGreeterClient.USERNAME_TOKEN_SIGNATURE_TIMESTAMP, null, false, false),
+                    new ClientCall("samlTokenSigned profile as joe", SecureGreeterClient.PATH_SIGNED_SAML, null,
+                            SecureGreeterClient.SAML_TOKEN_SIGNED, SecureGreeterClient.DIRECT_REFERENCE, true, false),
+                    new ClientCall("usernameToken answered with a security fault", SecureGreeterClient.PATH_USERNAME,
+                            SecureGreeterClient.CLIENT_TYPE_USERNAME_TOKEN, null, null, false, true));
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("clientCalls")
+        void callSendsItsSecurityHeaderWhileTheLogHoldsNone(ClientCall call, CapturedOutput output) {
+            String url = WIREMOCK.baseUrl() + SERVICES + call.path();
+            if (call.securityFault()) {
+                WIREMOCK.stubFor(post(urlPathEqualTo(SERVICES + call.path())).atPriority(1)
+                        .willReturn(fault("wsse:FailedAuthentication", " xmlns:wsse=\"" + WSSE_NS + "\"",
+                                "The security token could not be authenticated or authorized")));
+            }
+            Logger root = loggerContext().getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.setContext(loggerContext());
+            events.start();
+            root.addAppender(events);
+            String greeting = null;
+            SoapFaultClientException fault = null;
+            try {
+                greeting = send(call);
+            } catch (SoapFaultClientException e) {
+                fault = e;
+            } finally {
+                root.detachAppender(events);
+                events.stop();
+            }
+            // The appender appends under its own lock, so reading under it sees every event the call wrote.
+            List<ILoggingEvent> logged;
+            synchronized (events) {
+                logged = List.copyOf(events.list);
+            }
+
+            if (call.securityFault()) {
+                assertThat(fault).as("the security fault the stub answered").isNotNull();
+                assertThat(fault.getFaultCode()).isEqualTo(new QName(WSSE_NS, "FailedAuthentication"));
+            } else {
+                assertThat(fault).as("a fault of the accepted call").isNull();
+                assertThat(greeting).isEqualTo(GREETING);
+            }
+            String sent = lastRequestBody();
+            assertThat(sent).as("the request the stub received").contains("<wsse:Security");
+            if (call.clientType() != null && !SecureGreeterClient.CLIENT_TYPE_SAML_TOKEN.equals(call.clientType())) {
+                assertThat(sent).as("the UsernameToken of the sentinel user").contains(SENTINEL_USER);
+            }
+
+            assertThat(logged).as("the unpinned WebServiceTemplate DEBUG connection line of the call")
+                    .anyMatch(event -> event.getLevel() == Level.DEBUG
+                            && WebServiceTemplate.class.getName().equals(event.getLoggerName())
+                            && event.getFormattedMessage().startsWith("Opening [")
+                            && event.getFormattedMessage().endsWith("] to [" + url + "]"));
+            ILoggingEvent proxyLine = logged.stream()
+                    .filter(event -> event.getLevel() == Level.TRACE
+                            && JDK_HTTP_LOGGER.equals(event.getLoggerName())
+                            && event.getFormattedMessage().equals("ProxySelector Request for " + url))
+                    .findFirst()
+                    .orElse(null);
+            assertThat(proxyLine).as("the unpinned JDK HTTP client TRACE line of the call").isNotNull();
+            assertThat(output.getAll()).as("the console capture holds the TRACE line of the call")
+                    .contains(proxyLine.getFormattedMessage());
+            assertThat(logged).as("WARN events of Santuario's DOMReference, which a signed SAML assertion's"
+                            + " STR-Transform reference raises")
+                    .noneMatch(event -> DOM_REFERENCE_LOGGER.equals(event.getLoggerName())
+                            && event.getLevel().isGreaterOrEqual(Level.WARN));
+
+            List<String> forbidden = forbiddenValues();
+            // Lines written after the call get SETTLE to arrive; the capture only grows, so one scan covers the wait.
+            await().pollDelay(SETTLE).until(() -> true);
+            assertThat(linesHolding(output.getAll(), forbidden))
+                    .as("console lines holding a security-header element, a secret or the greeted name").isEmpty();
+        }
+
+        /** The call's client type through {@link SecureGreeterClient#invoke}, otherwise its profile as {@code joe}. */
+        private String send(ClientCall call) {
+            if (call.clientType() != null) {
+                return client.invoke(call.clientType(), SENTINEL_NAME);
+            }
+            OutboundSecurity security = new OutboundSecurity(call.actions(), CLIENT_USER,
+                    properties.getClient().getEncryptionUser(), call.keyIdentifier(), passwordCallback,
+                    call.saml() ? samlCallbackHandler : null);
+            return client.greet(client.endpoint(call.path()), security, SENTINEL_NAME);
+        }
+
+        /** Every value no console line may hold; the keystore password is read from the configuration. */
+        private List<String> forbiddenValues() {
+            List<String> values = new ArrayList<>(SECURITY_HEADER_ELEMENTS);
+            values.add(SENTINEL_USER);
+            values.add(SENTINEL_PASSWORD);
+            values.add(SENTINEL_NAME);
+            values.add(properties.getKeystore().getPassword());
+            return values;
+        }
+
+        /** The distinct lines of {@code output} holding one of {@code values}, at most {@link #REPORTED_LINES}. */
+        private static List<String> linesHolding(String output, List<String> values) {
+            // The capture of a TRACE run is large, so it is split into lines only when it holds a value at all.
+            if (values.stream().noneMatch(output::contains)) {
+                return List.of();
+            }
+            return output.lines()
+                    .filter(line -> values.stream().anyMatch(line::contains))
+                    .distinct()
+                    .limit(REPORTED_LINES)
+                    .toList();
+        }
+
+        private static LoggerContext loggerContext() {
+            return (LoggerContext) LoggerFactory.getILoggerFactory();
+        }
+    }
+
+    /**
+     * One logged client call and what it must produce.
+     *
+     * @param name          the case's display name
+     * @param path          the Greeter path the call reaches
+     * @param clientType    the client type invoked, or {@code null} to send {@code actions} as {@code joe}
+     * @param actions       the WSS4J actions of a profile sent as {@code joe}
+     * @param keyIdentifier the signature key identifier of that profile, or {@code null} for WSS4J's default
+     * @param saml          whether that profile carries the SAML assertion of {@code saml.properties}
+     * @param securityFault whether the stub answers the call with a {@code wsse:FailedAuthentication} fault
+     */
+    record ClientCall(String name, String path, String clientType, String actions, String keyIdentifier,
+                      boolean saml, boolean securityFault) {
+
+        @Override
+        public String toString() {
+            return name;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Response timeout: a positive number of milliseconds, never the indefinite wait of zero
+    // ---------------------------------------------------------------------------------------------------------------
+
+    @Test
+    void responseTimeoutDefaultsToTheMuleDefaultResponseTimeout() {
+        assertThat(properties.getClient().getResponseTimeout()).isEqualTo(MULE_DEFAULT_RESPONSE_TIMEOUT);
+        PROPERTIES_BINDING.run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context.getBean(SoapSecurityProperties.class).getClient().getResponseTimeout())
+                    .isEqualTo(MULE_DEFAULT_RESPONSE_TIMEOUT);
+        });
+    }
+
+    @ParameterizedTest(name = "[{0}]")
+    @ValueSource(strings = { "0", "-1", "-2147483648" })
+    void nonPositiveResponseTimeoutFailsStartUp(String responseTimeout) {
+        PROPERTIES_BINDING.withPropertyValues("soap-security.client.response-timeout=" + responseTimeout)
+                .run(context -> assertThat(context).getFailure().rootCause()
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessage(NON_POSITIVE_RESPONSE_TIMEOUT + responseTimeout));
+    }
+
+    @ParameterizedTest(name = "[{0}]")
+    @ValueSource(ints = { 0, -1, Integer.MIN_VALUE })
+    void responseTimeoutSetterRejectsANonPositiveValueAndKeepsTheCurrentOne(int responseTimeout) {
+        SoapSecurityProperties.Client settings = new SoapSecurityProperties.Client();
+
+        IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+                () -> settings.setResponseTimeout(responseTimeout));
+
+        assertThat(rejected).hasMessage(NON_POSITIVE_RESPONSE_TIMEOUT + responseTimeout);
+        assertThat(settings.getResponseTimeout()).isEqualTo(MULE_DEFAULT_RESPONSE_TIMEOUT);
+    }
+
+    /** Settings whose getter bypasses the setter's check still never reach a connection. */
+    @ParameterizedTest(name = "[{0}]")
+    @ValueSource(ints = { 0, -1 })
+    void nonPositiveResponseTimeoutBuildsNoTemplateAndSendsNothing(int responseTimeout) {
+        SoapSecurityProperties unchecked = new SoapSecurityProperties();
+        unchecked.setClient(new SoapSecurityProperties.Client() {
+            @Override
+            public int getResponseTimeout() {
+                return responseTimeout;
+            }
+        });
+        unchecked.getClient().setBaseUrl(WIREMOCK.baseUrl() + "/services");
+        SecureGreeterClient guarded = new SecureGreeterClient(unchecked, merlinCrypto, passwordCallback,
+                samlCallbackHandler, messageFactory, marshaller, environment);
+
+        IllegalArgumentException rejected = assertThrows(IllegalArgumentException.class,
+                () -> guarded.invoke(SecureGreeterClient.CLIENT_TYPE_UNSECURE, NAME));
+
+        assertThat(rejected).hasMessage(NON_POSITIVE_RESPONSE_TIMEOUT + responseTimeout);
+        WIREMOCK.verify(0, anyRequestedFor(anyUrl()));
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -580,6 +994,11 @@ class SecureGreeterClientTest {
             chain.add(cause);
         }
         return chain;
+    }
+
+    /** Registers {@link SoapSecurityProperties} for binding, as {@code @EnableConfigurationProperties} on the application. */
+    @EnableConfigurationProperties(SoapSecurityProperties.class)
+    static class PropertiesBinding {
     }
 
     private static Map<String, String> namespaces() {

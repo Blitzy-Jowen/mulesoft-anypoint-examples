@@ -70,3 +70,17 @@ listeners:
         trust-store-password: ${truststore.password}
       routes:
         - patterns: ["/authorization", "/redirectUrl"]
+
+# Below INFO these loggers write the authorization code, the Box client secret and the Box tokens, which the original
+# never logged. A logger's own level outranks logging.level.root and the groups that --debug and --trace raise, so
+# pinning each at INFO, or WARN where noted, keeps them out of the log at every root level. The application's own
+# packages are not pinned: the original "Redirecting user to Box login page" logger still writes at INFO.
+logging:
+  level:
+    # the callback's request line with its query (/redirectUrl?code=<code>&state=...) and, with
+    # spring.mvc.log-request-details, its parameters. WARN, not INFO: its only INFO lines are the servlet start-up pair,
+    # which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    # httpclient5 under BoxApiClient: the Authorization: Bearer header of each search, and the wire bytes of every
+    # exchange, the token forms (code or refresh_token, with client_secret) and the token responses included
+    org.apache.hc: INFO

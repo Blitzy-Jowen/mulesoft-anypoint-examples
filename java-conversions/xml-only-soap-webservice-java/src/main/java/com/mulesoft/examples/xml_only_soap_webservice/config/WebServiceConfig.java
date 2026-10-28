@@ -51,6 +51,7 @@ import org.springframework.ws.server.EndpointInterceptor;
 import org.springframework.ws.server.endpoint.MethodEndpoint;
 import org.springframework.ws.server.endpoint.mapping.AbstractEndpointMapping;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
+import org.springframework.ws.soap.server.SoapMessageDispatcher;
 import org.springframework.ws.transport.WebServiceConnection;
 import org.springframework.ws.transport.context.TransportContext;
 import org.springframework.ws.transport.context.TransportContextHolder;
@@ -72,10 +73,12 @@ import org.w3c.dom.Element;
  *       {@code handle(Element)} method of the endpoint bean named {@value #ADMISSION_ENDPOINT},
  *       {@value #PATIENT_ENDPOINT} or {@value #EHR_ENDPOINT}. Looking the endpoints up by name keeps this package free
  *       of any dependency on the endpoint classes.</li>
- *   <li>{@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory and the listener boundary by their bean
- *       names, {@value #MESSAGE_FACTORY_BEAN_NAME} and {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME}. The
+ *   <li>{@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory, the listener boundary and the message
+ *       receiver by their bean names, {@value #MESSAGE_FACTORY_BEAN_NAME},
+ *       {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME} and {@value #MESSAGE_RECEIVER_BEAN_NAME}. The
  *       boundary declares no POST-only path, so a non-POST request without a metadata query is read as a message and
- *       an unreadable body is answered with a {@code soap:Client} fault.</li>
+ *       an unreadable body is answered with a {@code soap:Client} fault. The receiver checks no {@code mustUnderstand}
+ *       header block, as Mule's {@code cxf:proxy-service} checked none.</li>
  *   <li>The servlet is mapped to exactly the three listener paths, and {@link ListenerPathFilter} answers every other
  *       path with the listener's {@code No listener for endpoint: <path>} 404 before anything else runs.</li>
  *   <li>{@code GET <listener path>?wsdl} serves the listener's carried WSDL and {@code ?xsd=<location>} its schema
@@ -98,6 +101,9 @@ public class WebServiceConfig implements WsConfigurer {
 
     /** Name under which {@code MessageDispatcherServlet} looks up the adapter that receives every SOAP request. */
     public static final String MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME = "messageReceiverHandlerAdapter";
+
+    /** Name under which {@code MessageDispatcherServlet} looks up the receiver it hands every SOAP request to. */
+    public static final String MESSAGE_RECEIVER_BEAN_NAME = "messageReceiver";
 
     /** Name of the {@code MessageDispatcherServlet} registration bean of Boot's web-services auto-configuration. */
     public static final String MESSAGE_DISPATCHER_SERVLET_BEAN_NAME = "messageDispatcherServlet";
@@ -162,14 +168,16 @@ public class WebServiceConfig implements WsConfigurer {
 
     /**
      * The SOAP 1.1 message factory shared by the dispatcher servlet, the listener boundary and the outbound template.
-     * {@code faultstring} is written without {@code xml:lang}, as CXF wrote it. The container initializes it.
+     * {@code faultstring} is written without {@code xml:lang}, as CXF wrote it. The container initializes it. It is
+     * SC-11's {@link SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory}, so characters outside the Basic
+     * Multilingual Plane are written as raw UTF-8, as CXF wrote them.
      *
      * @throws SOAPException when no SAAJ SOAP 1.1 implementation is available
      */
     @Bean(name = MESSAGE_FACTORY_BEAN_NAME)
     public SaajSoapMessageFactory messageFactory() throws SOAPException {
-        SaajSoapMessageFactory messageFactory =
-                new SaajSoapMessageFactory(MessageFactory.newInstance(SOAPConstants.SOAP_1_1_PROTOCOL));
+        SaajSoapMessageFactory messageFactory = new SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory(
+                MessageFactory.newInstance(SOAPConstants.SOAP_1_1_PROTOCOL));
         messageFactory.setLangAttributeOnSoap11FaultString(false);
         return messageFactory;
     }
@@ -182,6 +190,20 @@ public class WebServiceConfig implements WsConfigurer {
     @Bean(name = MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME)
     public SoapListenerBoundaryAdapter messageReceiverHandlerAdapter(WebServiceMessageFactory messageFactory) {
         return new SoapListenerBoundaryAdapter(messageFactory, List.of(), styler);
+    }
+
+    /**
+     * The receiver the servlet hands every SOAP request to once the listener boundary has read it: Spring WS dispatch
+     * in the unchecked mode of {@link SoapFaultConfig.CxfStyleSoapMessageDispatcher}, which examines no
+     * {@code mustUnderstand} header block, so a request whose header holds a block nothing understands is processed
+     * as any other. All three listeners were {@code cxf:proxy-service}s, from whose binding Mule 3.8 removes CXF's
+     * {@code MustUnderstandInterceptor}, so the original never answered such a request with a MustUnderstand fault.
+     * Spring's default receiver would answer it with one. Like that receiver, it collects every endpoint mapping,
+     * endpoint adapter and exception resolver bean of the context when the context is set on it.
+     */
+    @Bean(name = MESSAGE_RECEIVER_BEAN_NAME)
+    public SoapMessageDispatcher messageReceiver() {
+        return new SoapFaultConfig.CxfStyleSoapMessageDispatcher(styler, false);
     }
 
     /**
@@ -338,16 +360,18 @@ public class WebServiceConfig implements WsConfigurer {
 
     /**
      * Answers every request whose path is not a listener path, whatever its method, as the Mule HTTP listener did:
-     * status 404, Content-Type {@code text/plain;charset=UTF-8} and body {@code No listener for endpoint: <path>} in
-     * UTF-8, the path being the request URI without context path or query. The chain does not continue for such a
-     * request. A sub-path ({@code /AdmissionService/x}) or a trailing slash ({@code /AdmissionService/}) is another
-     * path. Listener paths pass through unchanged. The path set is immutable, so one instance serves all requests
-     * concurrently.
+     * status 404, Content-Type {@code text/plain} without a charset parameter and body
+     * {@code No listener for endpoint: <path>} in UTF-8, the same bytes as the platform's no-listener answer in every
+     * other converted listener, the path being the request URI without context path or query. The body goes out
+     * through the output stream with its exact length, never through a writer, which would add a charset to the
+     * Content-Type. The chain does not continue for such a request. A sub-path ({@code /AdmissionService/x}) or a
+     * trailing slash ({@code /AdmissionService/}) is another path. Listener paths pass through unchanged. The path set
+     * is immutable, so one instance serves all requests concurrently.
      */
     public static class ListenerPathFilter extends OncePerRequestFilter {
 
         private static final String NO_LISTENER_PREFIX = "No listener for endpoint: ";
-        private static final String CONTENT_TYPE = "text/plain;charset=UTF-8";
+        private static final String CONTENT_TYPE = "text/plain";
 
         private final Set<String> listenerPaths;
 

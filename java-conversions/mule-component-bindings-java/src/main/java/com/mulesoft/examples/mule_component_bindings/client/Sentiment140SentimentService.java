@@ -27,6 +27,7 @@ import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StreamUtils;
+import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestClient;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -99,8 +100,22 @@ public class Sentiment140SentimentService implements SentimentService {
 		this.client = restClientBuilder.requestFactory(requestFactory).build();
 	}
 
+	/**
+	 * Classifies {@code tweets} with one Sentiment140 bulk request, posted for an empty list too, and sets each
+	 * tweet's sentiment from the polarity returned for its id.
+	 *
+	 * @param tweets the tweets to classify
+	 * @throws IllegalStateException when {@code stockstats.sentiment140ApiKey} has no text (absent, empty or
+	 *                               whitespace only), before any request is made, whether or not {@code tweets} is
+	 *                               empty; the message names the key, never a configured value
+	 */
 	@Override
 	public void classify(List<Tweet> tweets) {
+
+		if (!StringUtils.hasText(properties.sentiment140ApiKey())) {
+			throw new IllegalStateException(
+					"Sentiment140 application ID (stockstats.sentiment140ApiKey) is not configured");
+		}
 
 		URI target = URI.create(properties.sentiment140BaseUrl() + "bulkClassifyJson");
 

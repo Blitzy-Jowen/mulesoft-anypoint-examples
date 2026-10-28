@@ -3,8 +3,8 @@
 # importing-a-CSV-file-into-Mongo-DB/src/test/java/org/mule/examples/ImportCSVfileIntoMongoDBIT.java
 # (DB_NAME, MONGO_USER, MONGO_PASSWORD), set there as the same system properties.
 # Never used in production, where database.* come from the TODO placeholders of application.yml.
-# The values must be non-empty: an empty password cannot bind to spring.data.mongodb.password, and an
-# empty user makes the connection string Boot builds from host, port and credentials unparseable.
+# Tests that connect to MongoDB set spring.data.mongodb.uri, so config/MongoConfig applies no
+# credential from the user and password; they are kept as the original test supplied them.
 # database.name also selects the database when a test supplies its own connection string, so documents
 # land in collection "customers" of database "customers", where the original test counted them.
 database:

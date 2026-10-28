@@ -63,6 +63,7 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService.Reply;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.service.BoxOAuthService.TokenSet;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.support.TestProfileValues;
 
 /**
  * Unit test of {@link BoxOAuthService}, the logic of
@@ -72,8 +73,8 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * ({@code /redirectUrl}) with every {@code authorizationStatus} marker and its platform text, the state decoding
  * and the per-resource-owner token store.
  *
- * <p>{@link BoxApiClient} is a strict Mockito mock, {@link BoxProperties} is real and built from literals (its TLS
- * context is never built), and the log is read from a Logback {@link ListAppender} on the root logger. No Spring
+ * <p>{@link BoxApiClient} is a strict Mockito mock, {@link BoxProperties} is real and built from literals and the
+ * store passwords of {@code application-test.yml} (its TLS context is never built), and the log is read from a Logback {@link ListAppender} on the root logger. No Spring
  * context, network or WireMock is used. The refresh-coordination tests run {@code loginDone} on threads of their own,
  * ordered by latches whose every wait is bounded by {@link #WAIT}.
  */
@@ -89,7 +90,10 @@ class BoxOAuthServiceTest {
     private static final String API_BASE_URL = "https://api.box.test/2.0";
     private static final String LOGIN_REDIRECT_LOCATION =
             "https://localhost:8082/authorization?onCompleteRedirectTo=http://localhost:8081/web/loginDone";
-    private static final String STORE_PASSWORD = "mule123";
+    /** The demo store passwords of {@code application-test.yml}; this test never builds the TLS context. */
+    private static final String KEYSTORE_PASSWORD = TestProfileValues.required("keystore.password");
+    private static final String KEY_PASSWORD = TestProfileValues.required("keystore.keyPassword");
+    private static final String TRUSTSTORE_PASSWORD = TestProfileValues.required("truststore.password");
 
     private static final String LOGIN_DONE_URL = "http://localhost:8081/web/loginDone";
     /** The state {@code /redirectUrl} receives, URL-decoded, after {@code /authorization?onCompleteRedirectTo=}. */
@@ -114,6 +118,8 @@ class BoxOAuthServiceTest {
     private static final String REDIRECT_PROCESSING_FAILURE =
             "Failed processing redirect URL request done from OAuth provider. See logs for details.";
     private static final String LOGIN_LOG = "Redirecting user to Box login page";
+    private static final String NO_CLIENT_ID = "Box client ID (box.id) is not configured";
+    private static final String NO_CLIENT_SECRET = "Box client secret (box.secret) is not configured";
 
     private static final String CODE = "authorization-code-1";
     private static final String ACCESS = "access-token-1";
@@ -456,6 +462,41 @@ class BoxOAuthServiceTest {
         verifyNoMoreInteractions(client);
     }
 
+    /**
+     * Client credentials with a missing value, with the key reported and its message: an unset, empty or
+     * whitespace-only value is missing, and {@code box.id} is reported before {@code box.secret}.
+     */
+    static Stream<Arguments> missingClientCredentials() {
+        return Stream.of(
+                Arguments.of(null, CLIENT_SECRET, "box.id", NO_CLIENT_ID),
+                Arguments.of("", CLIENT_SECRET, "box.id", NO_CLIENT_ID),
+                Arguments.of(" \t ", CLIENT_SECRET, "box.id", NO_CLIENT_ID),
+                Arguments.of(CLIENT_ID, null, "box.secret", NO_CLIENT_SECRET),
+                Arguments.of(CLIENT_ID, "", "box.secret", NO_CLIENT_SECRET),
+                Arguments.of(CLIENT_ID, " \t ", "box.secret", NO_CLIENT_SECRET),
+                Arguments.of("", "", "box.id", NO_CLIENT_ID));
+    }
+
+    @ParameterizedTest(name = "[{index}] box.id={0}, box.secret={1}")
+    @MethodSource("missingClientCredentials")
+    void loginDoneFailsNamingAMissingClientCredentialWithoutCallingTheTokenUrl(String clientId, String clientSecret,
+            String missingKey, String expectedMessage) {
+        BoxOAuthService unconfigured = new BoxOAuthService(properties(clientId, clientSecret), client);
+        unconfigured.storeTokens(DEFAULT_OWNER, STORED);
+        when(client.search(ACCESS)).thenReturn(json(401, ""));
+
+        Throwable thrown = catchThrowable(unconfigured::loginDone);
+
+        assertThat(thrown).isExactlyInstanceOf(IllegalStateException.class).hasMessage(expectedMessage).hasNoCause();
+        assertThat(unconfigured.tokens(DEFAULT_OWNER)).containsSame(STORED);
+        assertThat(serviceEvents()).extracting(ILoggingEvent::getLevel, ILoggingEvent::getFormattedMessage)
+                .containsExactly(tuple(Level.ERROR,
+                        "The access token cannot be refreshed: " + missingKey + " is not configured"));
+        assertThat(everythingLogged()).doesNotContain(CLIENT_ID, CLIENT_SECRET, REFRESH);
+        verify(client).search(ACCESS);
+        verifyNoMoreInteractions(client);
+    }
+
     // ---------------------------------------------------------------- /web/loginDone refresh coordination
 
     @Test
@@ -669,6 +710,33 @@ class BoxOAuthServiceTest {
                 .isEqualTo(AUTHORIZE_WITHOUT_STATE.replace(CLIENT_ID, "id with space"));
     }
 
+    @ParameterizedTest(name = "[{index}] box.id={0}")
+    @NullAndEmptySource
+    @ValueSource(strings = {"   ", " \t\n"})
+    void authorizationWithoutAClientIdFailsNamingTheKeyBeforeAnyRedirect(String clientId) {
+        BoxOAuthService unconfigured = new BoxOAuthService(properties(clientId, CLIENT_SECRET), client);
+
+        Throwable thrown = catchThrowable(() -> unconfigured.authorization(LOGIN_DONE_URL));
+
+        assertThat(thrown).isExactlyInstanceOf(IllegalStateException.class).hasMessage(NO_CLIENT_ID).hasNoCause();
+        assertThat(everythingLogged()).doesNotContain(CLIENT_SECRET);
+        verifyNoInteractions(client);
+    }
+
+    /** The redirect to Box carries the client ID only, so it is sent whatever {@code box.secret} holds. */
+    @ParameterizedTest(name = "[{index}] box.secret={0}")
+    @NullAndEmptySource
+    @ValueSource(strings = "   ")
+    void authorizationNeedsOnlyTheClientId(String clientSecret) {
+        BoxOAuthService withoutSecret = new BoxOAuthService(properties(CLIENT_ID, clientSecret), client);
+
+        Reply reply = withoutSecret.authorization(null);
+
+        assertThat(reply.status()).isEqualTo(302);
+        assertThat(reply.location()).isEqualTo(AUTHORIZE_WITHOUT_STATE);
+        verifyNoInteractions(client);
+    }
+
     // ---------------------------------------------------------------- /redirectUrl (redirectionUrl)
 
     @ParameterizedTest(name = "[{index}] code={0}")
@@ -712,6 +780,45 @@ class BoxOAuthServiceTest {
         });
         verify(client).requestToken(CODE);
         verifyNoMoreInteractions(client);
+    }
+
+    /** Each credential case of {@link #missingClientCredentials()}, with and without {@code onCompleteRedirectTo}. */
+    static Stream<Arguments> codeExchangesWithAMissingClientCredential() {
+        return missingClientCredentials().flatMap(credentials -> Stream.of(true, false).map(withRedirect -> {
+            Object[] values = credentials.get();
+            return Arguments.of(values[0], values[1], values[2], withRedirect);
+        }));
+    }
+
+    /** A token call that cannot be made is the token call failing: marker 200, its reply, and Box never called. */
+    @ParameterizedTest(name = "[{index}] box.id={0}, box.secret={1}, onCompleteRedirectTo={3}")
+    @MethodSource("codeExchangesWithAMissingClientCredential")
+    void redirectCallbackWithAMissingClientCredentialSendsStatus200WithoutCallingBox(String clientId,
+            String clientSecret, String missingKey, boolean withRedirect) {
+        BoxOAuthService unconfigured = new BoxOAuthService(properties(clientId, clientSecret), client);
+
+        Reply reply = unconfigured.redirectCallback(CODE, withRedirect ? LOGIN_DONE_STATE : null,
+                "/redirectUrl?code=" + CODE);
+
+        if (withRedirect) {
+            assertThat(reply.status()).isEqualTo(302);
+            assertThat(reply.location()).isEqualTo(LOGIN_DONE_URL + "?authorizationStatus=200");
+            assertThat(reply.body()).isEmpty();
+        } else {
+            assertThat(reply.status()).isEqualTo(500);
+            assertThat(reply.location()).isNull();
+            assertThat(text(reply)).isEqualTo(TOKEN_URL_FAILURE + ". Exception message is null");
+        }
+        assertThat(reply.contentType()).isNull();
+        assertThat(unconfigured.tokens(DEFAULT_OWNER)).isEmpty();
+        assertThat(serviceEvents()).singleElement().satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+            assertThat(event.getFormattedMessage()).isEqualTo(
+                    "Redirect URL request failed, authorizationStatus 200: " + missingKey + " is not configured");
+            assertThat(event.getThrowableProxy()).isNull();
+        });
+        assertThat(everythingLogged()).doesNotContain(CLIENT_ID, CLIENT_SECRET, CODE);
+        verifyNoInteractions(client);
     }
 
     static Stream<Arguments> unusableTokenResponses() {
@@ -995,9 +1102,13 @@ class BoxOAuthServiceTest {
     }
 
     private static BoxProperties properties(String clientId) {
-        return new BoxProperties(clientId, CLIENT_SECRET, AUTHORIZATION_URL, LOCAL_AUTHORIZATION_URL, REDIRECT_URL,
-                TOKEN_URL, API_BASE_URL, LOGIN_REDIRECT_LOCATION, "keystore.jks", STORE_PASSWORD, STORE_PASSWORD,
-                "trust-store", STORE_PASSWORD);
+        return properties(clientId, CLIENT_SECRET);
+    }
+
+    private static BoxProperties properties(String clientId, String clientSecret) {
+        return new BoxProperties(clientId, clientSecret, AUTHORIZATION_URL, LOCAL_AUTHORIZATION_URL, REDIRECT_URL,
+                TOKEN_URL, API_BASE_URL, LOGIN_REDIRECT_LOCATION, "keystore.jks", KEYSTORE_PASSWORD, KEY_PASSWORD,
+                "trust-store", TRUSTSTORE_PASSWORD);
     }
 
     /** A Box answer with {@code Content-Type: application/json} and a UTF-8 body. */

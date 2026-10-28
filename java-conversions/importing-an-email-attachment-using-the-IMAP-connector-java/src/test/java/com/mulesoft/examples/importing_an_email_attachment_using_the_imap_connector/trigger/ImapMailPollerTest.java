@@ -12,7 +12,9 @@ import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.mockito.ArgumentMatchers.any;
@@ -90,6 +92,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.MockedStatic;
 import org.mockito.invocation.InvocationOnMock;
@@ -137,11 +140,18 @@ import com.mulesoft.examples.importing_an_email_attachment_using_the_imap_connec
  * {@code \Deleted}, a mail without attachments, an import failure, an unreachable port, a rejected password and the
  * attachment naming of Mule 3.8's {@code MailUtils}.
  *
+ * <p>Unconfigured mailbox: a null or blank {@code imap.host}, {@code imap.user} or {@code imap.password} skips every
+ * poll without a connection to a local listener the poller points at, and logs one WARN naming the missing keys and
+ * their environment variables, then a DEBUG line per poll, never a configured value.
+ *
  * <p>Socket deadlines: the connect, read and write deadlines default to the original endpoint's 10 s
  * {@code responseTimeout}, follow their dedicated keys and positive {@code imap.properties} entries, and refuse at
  * construction every value Angus Mail would apply as no deadline. Against local peers that accept and then stall
  * (no TLS handshake, a withheld LOGIN reply, a withheld FETCH reply) every poll ends at the read deadline without
  * throwing, and the next poll is not blocked. A GreenMail IMAPS mailbox is polled within the default deadlines.
+ *
+ * <p>Poll frequency: a zero, negative or unreadable {@code imap.check-frequency} is refused at construction, directly
+ * and as Spring creates the poller, with a message naming the key and the value.
  *
  * <p>Log safety: every diagnostic the poller writes (connect, message listing, message processing, folder close,
  * store close) is provoked with an exception whose message and nested causes quote a sentinel user, a sentinel
@@ -154,6 +164,8 @@ class ImapMailPollerTest {
     private static final int PORT = 993;
     private static final String FOLDER = "INBOX";
     private static final String DEFAULT_DEADLINE = "10000";
+    /** The original {@code checkFrequency}, passed as {@code imap.check-frequency} to every directly built poller. */
+    private static final String DEFAULT_FREQUENCY = "100";
 
     /** The deadline the stall tests configure, short enough to keep them fast. */
     private static final int STALL_DEADLINE_MS = 500;
@@ -358,6 +370,62 @@ class ImapMailPollerTest {
         assertNoEventLeaks();
     }
 
+    /**
+     * Each mailbox setting null, empty or blank while the other two hold a loopback host or sentinels, and all three
+     * empty at once, with the WARN and the DEBUG line each case must log.
+     */
+    static Stream<Arguments> unconfiguredMailboxes() {
+        String loopback = "127.0.0.1";
+        List<Arguments> cases = new ArrayList<>();
+        for (String blank : Arrays.asList(null, "", "   ")) {
+            String shown = blank == null ? "null" : "\"" + blank + "\"";
+            cases.add(Arguments.of(Named.of("imap.host " + shown, blank), SENTINEL_USER, SENTINEL_PASSWORD,
+                    "imap.host (IMAP_HOST) is not configured; IMAPS polling is skipped",
+                    "imap.host is not configured; IMAPS poll skipped"));
+            cases.add(Arguments.of(Named.of("imap.user " + shown, loopback), blank, SENTINEL_PASSWORD,
+                    "imap.user (IMAP_USER) is not configured; IMAPS polling is skipped",
+                    "imap.user is not configured; IMAPS poll skipped"));
+            cases.add(Arguments.of(Named.of("imap.password " + shown, loopback), SENTINEL_USER, blank,
+                    "imap.password (IMAP_PASSWORD) is not configured; IMAPS polling is skipped",
+                    "imap.password is not configured; IMAPS poll skipped"));
+        }
+        cases.add(Arguments.of(Named.of("all three empty, as application.yml ships them", ""), "", "",
+                "imap.host (IMAP_HOST), imap.user (IMAP_USER), imap.password (IMAP_PASSWORD) are not configured; "
+                        + "IMAPS polling is skipped",
+                "imap.host, imap.user, imap.password are not configured; IMAPS poll skipped"));
+        return cases.stream();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unconfiguredMailboxes")
+    @DisplayName("a null or blank imap.host, imap.user or imap.password skips every poll without connecting; "
+            + "one WARN names the missing keys")
+    void unconfiguredMailboxIsNeverConnected(String host, String user, String password, String warning, String debug)
+            throws Exception {
+        // Listens on every local address and never accepts: a connection from any poll, a blank host resolving to
+        // the loopback address included, would complete in its backlog. The short deadlines bound a poll that did
+        // connect, which would then stall in the TLS handshake.
+        try (ServerSocket listener = new ServerSocket(0)) {
+            String deadline = String.valueOf(STALL_DEADLINE_MS);
+            ImapMailPoller poller = new ImapMailPoller(service, trustingEnvironment(), host, listener.getLocalPort(),
+                    user, password, FOLDER, deadline, deadline, deadline, DEFAULT_FREQUENCY);
+
+            for (int poll = 0; poll < 3; poll++) {
+                assertThat(assertDoesNotThrow(poller::pollOnce)).isZero();
+            }
+
+            listener.setSoTimeout(200);
+            assertThatExceptionOfType(SocketTimeoutException.class).as("no poll connected to the listener")
+                    .isThrownBy(listener::accept);
+        }
+        verifyNoInteractions(service);
+        // The WARN once, at the first skipped poll; a DEBUG line at every skipped poll; nothing else, so no value.
+        assertThat(pollerEvents.list).extracting(ILoggingEvent::getLevel, ILoggingEvent::getFormattedMessage)
+                .containsExactly(tuple(Level.WARN, warning), tuple(Level.DEBUG, debug), tuple(Level.DEBUG, debug),
+                        tuple(Level.DEBUG, debug));
+        assertNoEventLeaks();
+    }
+
     @Test
     void deadlinesDefaultToTenSecondsWhenNothingIsConfigured() {
         Properties properties = pollerFromContext(new MockEnvironment()).sessionProperties();
@@ -424,6 +492,30 @@ class ImapMailPollerTest {
                         + "2147483647)");
     }
 
+    @ParameterizedTest(name = "imap.check-frequency = \"{0}\"")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void frequencyThatIsNotPositiveIsRefusedAtConstructionNamingKeyAndValue(String frequency) {
+        assertThatThrownBy(() -> pollerWithFrequency(frequency))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(frequencyRefusal(frequency));
+    }
+
+    @ParameterizedTest(name = "imap.check-frequency = \"{0}\"")
+    @ValueSource(strings = {"1", "100", "PT10S", "pt0.5s"})
+    void positiveFrequencyInMillisecondsOrIso8601Constructs(String frequency) {
+        assertThatCode(() -> pollerWithFrequency(frequency)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void nonPositiveFrequencyFromTheEnvironmentStopsSpringFromCreatingThePoller() {
+        MockEnvironment environment = new MockEnvironment().withProperty("imap.check-frequency", "-5");
+
+        assertThatThrownBy(() -> pollerFromContext(environment))
+                .rootCause()
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(frequencyRefusal("-5"));
+    }
+
     @Test
     void pollsAGreenMailMailboxWithinTheDefaultDeadlines() throws Exception {
         GreenMail greenMail = new GreenMail(smtpAndImaps());
@@ -442,7 +534,7 @@ class ImapMailPollerTest {
             });
             ImapMailPoller poller = new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1",
                     greenMail.getImaps().getPort(), "poller@localhost", "poller-test-pw", FOLDER, DEFAULT_DEADLINE,
-                    DEFAULT_DEADLINE, DEFAULT_DEADLINE);
+                    DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_FREQUENCY);
 
             assertThat(poller.pollOnce()).isEqualTo(1);
 
@@ -530,7 +622,7 @@ class ImapMailPollerTest {
     private ImapMailPoller stallPoller(int port) {
         String deadline = String.valueOf(STALL_DEADLINE_MS);
         return new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1", port, STALL_USER, STALL_PASSWORD,
-                FOLDER, deadline, deadline, deadline);
+                FOLDER, deadline, deadline, deadline, DEFAULT_FREQUENCY);
     }
 
     /**
@@ -580,7 +672,19 @@ class ImapMailPollerTest {
             default -> environment.setProperty(key, value);
         }
         return new ImapMailPoller(service, environment, HOST, PORT, STALL_USER, STALL_PASSWORD, FOLDER, connect,
-                read, write);
+                read, write, DEFAULT_FREQUENCY);
+    }
+
+    /** A poller with the default deadlines and {@code frequency} as its {@code imap.check-frequency}. */
+    private ImapMailPoller pollerWithFrequency(String frequency) {
+        return new ImapMailPoller(service, new MockEnvironment(), HOST, PORT, STALL_USER, STALL_PASSWORD, FOLDER,
+                DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE, frequency);
+    }
+
+    /** The refusal of {@code frequency} as {@code imap.check-frequency}, naming the key and the quoted value. */
+    private static String frequencyRefusal(String frequency) {
+        return "Invalid imap.check-frequency value \"" + frequency + "\": the polling frequency must be a positive "
+                + "number of milliseconds or a positive ISO-8601 duration";
     }
 
     private static List<String> deadlinesOf(Properties properties) {
@@ -610,7 +714,7 @@ class ImapMailPollerTest {
 
     private ImapMailPoller poller(MockEnvironment environment, String user, String password) {
         return new ImapMailPoller(service, environment, HOST, PORT, user, password, FOLDER, DEFAULT_DEADLINE,
-                DEFAULT_DEADLINE, DEFAULT_DEADLINE);
+                DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_FREQUENCY);
     }
 
     /** No captured event, on any logger, quotes a sentinel or carries a throwable. */
@@ -747,7 +851,8 @@ class ImapMailPollerTest {
                 closedPort = probe.getLocalPort();
             }
             ImapMailPoller poller = new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1", closedPort,
-                    RECEIVER, RECEIVER_PASSWORD, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE);
+                    RECEIVER, RECEIVER_PASSWORD, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE,
+                    DEFAULT_FREQUENCY);
 
             assertThat(assertDoesNotThrow(poller::pollOnce)).isZero();
 
@@ -818,7 +923,8 @@ class ImapMailPollerTest {
 
         private ImapMailPoller mailboxPoller(String password) {
             return new ImapMailPoller(service, trustingEnvironment(), "127.0.0.1", mailbox.getImaps().getPort(),
-                    RECEIVER, password, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE);
+                    RECEIVER, password, FOLDER, DEFAULT_DEADLINE, DEFAULT_DEADLINE, DEFAULT_DEADLINE,
+                    DEFAULT_FREQUENCY);
         }
     }
 

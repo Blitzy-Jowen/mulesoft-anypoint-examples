@@ -9,6 +9,7 @@
 package com.mulesoft.examples.soap_webservice_security.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.ByteArrayInputStream;
@@ -18,9 +19,13 @@ import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
 
 import javax.security.auth.callback.Callback;
@@ -35,24 +40,43 @@ import javax.wsdl.xml.WSDLReader;
 import javax.xml.namespace.QName;
 import javax.xml.parsers.DocumentBuilderFactory;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.apache.wss4j.common.ext.WSPasswordCallback;
+import org.apache.wss4j.common.ext.WSSecurityException;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.boot.web.servlet.filter.OrderedRequestContextFilter;
 import org.springframework.oxm.jaxb.Jaxb2Marshaller;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.NestedTestConfiguration;
+import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.util.TestSocketUtils;
 import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.client.support.interceptor.ClientInterceptor;
 import org.springframework.ws.context.MessageContext;
+import org.springframework.ws.server.endpoint.adapter.DefaultMethodEndpointAdapter;
+import org.springframework.ws.soap.SoapMessage;
 import org.springframework.ws.soap.client.SoapFaultClientException;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.springframework.ws.soap.security.wss4j2.Wss4jSecurityInterceptor;
@@ -70,7 +94,9 @@ import com.mulesoft.examples.soap_webservice_security.SoapWebserviceSecurityAppl
 import com.mulesoft.examples.soap_webservice_security.client.SecureGreeterClient;
 import com.mulesoft.examples.soap_webservice_security.client.SecureGreeterClient.OutboundSecurity;
 import com.mulesoft.examples.soap_webservice_security.config.PasswordCallback;
+import com.mulesoft.examples.soap_webservice_security.config.PathScopedSecurityInterceptor;
 import com.mulesoft.examples.soap_webservice_security.config.SAMLCallbackHandler;
+import com.mulesoft.examples.soap_webservice_security.config.SoapSecurityProperties;
 import com.mulesoft.examples.soap_webservice_security.config.WebServiceConfig;
 import com.mulesoft.examples.soap_webservice_security.config.WrongPasswordCallback;
 import com.mulesoft.examples.soap_webservice_security.config.WsSecurityConfig.LazyMerlinCrypto;
@@ -97,7 +123,8 @@ import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient;
  * The test covers every original success and negative request, a second configured user, reordered action sets, the
  * {@code BinarySecurityToken} results of {@code DirectReference} signatures that the check ignores, missing and extra
  * actions, a missing security header on every secured path, the MustUnderstand fault of the unsecured path, the
- * published WSDL and the CXF response envelope.
+ * published WSDL and the CXF response envelope. The nested {@link UnderRootTrace} run covers the logger levels
+ * {@code application.yml} pins for the server's side of each secured request.
  *
  * <p>Requests travel over HTTP to the running application: through {@link SecureGreeterClient} for the original
  * client profiles, through {@link WebServiceTemplate}s built here when the wire request or the HTTP status is asserted,
@@ -120,6 +147,8 @@ class GreeterEndpointTest {
     private static final String XENC_NS = "http://www.w3.org/2001/04/xmlenc#";
 
     private static final String SOAP11_NS = "http://schemas.xmlsoap.org/soap/envelope/";
+
+    private static final String SAML2_NS = "urn:oasis:names:tc:SAML:2.0:assertion";
 
     private static final String INVALID_SECURITY_TEXT = "An error was discovered processing the <wsse:Security> header";
 
@@ -310,6 +339,7 @@ class GreeterEndpointTest {
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
+        assertNoRequestHeaders(response);
         Fault fault = rawFault(response);
         assertThat(fault.code()).isEqualTo(new QName(WSSE_NS, "InvalidSecurity"));
         assertThat(fault.text()).isEqualTo(INVALID_SECURITY_TEXT);
@@ -353,6 +383,62 @@ class GreeterEndpointTest {
         assertSecurityFault(e, "InvalidSecurity", INVALID_SECURITY_TEXT, "<wsse:Security> header");
     }
 
+    /**
+     * Values of the signed sender-vouches assertion that {@code SAMLCustomValidator} does not check, each with the
+     * change made to it after signing; the changed instants stay valid for WSS4J's own assertion checks.
+     */
+    static Stream<Arguments> uncheckedAssertionValues() {
+        UnaryOperator<String> secondEarlier = instant -> Instant.parse(instant).minusSeconds(1).toString();
+        return Stream.of(
+                Arguments.of("Assertion", "IssueInstant", secondEarlier),
+                Arguments.of("NameID", "NameQualifier", (UnaryOperator<String>) qualifier -> qualifier + ".invalid"),
+                Arguments.of("AuthnStatement", "AuthnInstant", secondEarlier));
+    }
+
+    /**
+     * The message signature of {@code SAMLTokenSigned} covers the sender-vouches assertion through the
+     * STR-Transform reference to it: a value of the assertion changed after signing fails the signature check
+     * ({@code FAILED_CHECK}), while the same request left unchanged is greeted.
+     */
+    @ParameterizedTest(name = "saml2:{0}/@{1} changed after signing")
+    @MethodSource("uncheckedAssertionValues")
+    void signedSamlSignatureCoversTheAssertionThroughItsTokenReference(String element, String attribute,
+            UnaryOperator<String> change) throws Exception {
+        AssertionChange unchanged = new AssertionChange(element, attribute, UnaryOperator.identity());
+        assertThat(greetVia(template(securement("SAMLTokenSigned", JOE, DIRECT_REFERENCE, samlCallbackHandler),
+                unchanged), uri("signedsaml"), "Mule")).isEqualTo("Hello Mule");
+
+        AssertionChange changed = new AssertionChange(element, attribute, change);
+        Capture capture = new Capture();
+        WebServiceTemplate template = template(
+                securement("SAMLTokenSigned", JOE, DIRECT_REFERENCE, samlCallbackHandler), changed, capture);
+        Logger rejections = (Logger) LoggerFactory.getLogger(PathScopedSecurityInterceptor.class);
+        ListAppender<ILoggingEvent> events = new ListAppender<>();
+        events.setContext(rejections.getLoggerContext());
+        events.start();
+        rejections.addAppender(events);
+        SoapFaultClientException e;
+        try {
+            e = assertThrows(SoapFaultClientException.class, () -> greetVia(template, uri("signedsaml"), "Mule"));
+        } finally {
+            rejections.detachAppender(events);
+            events.stop();
+        }
+
+        assertThat(changed.after).isNotEqualTo(changed.before);
+        assertThat(single(capture.request(), SAML2_NS, element).getAttribute(attribute))
+                .as("the value sent").isEqualTo(changed.after);
+        assertThat(capture.status).isEqualTo(500);
+        assertSecurityFault(e, "InvalidSecurity", INVALID_SECURITY_TEXT, "<wsse:Security> header");
+        List<String> rejected;
+        synchronized (events) {
+            rejected = events.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+        }
+        assertThat(rejected).as("the rejection the server logged").containsExactly(
+                "WS-Security validation failed on /services/signedsaml: error code FAILED_CHECK, exception "
+                        + WSSecurityException.class.getName());
+    }
+
     @Test
     void samlPathRejectsAnAssertionFromTheWrongIssuer() {
         SoapFaultClientException e = assertThrows(SoapFaultClientException.class, () -> client.greet(uri("saml"),
@@ -383,8 +469,11 @@ class GreeterEndpointTest {
         assertThat(single(capture.request(), WSSE_NS, "Security").getAttributeNS(SOAP11_NS, "mustUnderstand"))
                 .isEqualTo("1");
         assertThat(capture.status).isEqualTo(500);
-        // Only the fault code is asserted: the MustUnderstand faultstring CXF wrote is a Tier 2A verification point.
         assertThat(e.getFaultCode()).isEqualTo(new QName(SOAP11_NS, "MustUnderstand"));
+        // CXF 2.7's MUST_UNDERSTAND text, derived from CXF's source; the bytes the original sent remain a Tier 2A
+        // verification point.
+        assertThat(e.getFaultStringOrReason())
+                .isEqualTo("MustUnderstand headers: [{" + WSSE_NS + "}Security] are not understood.");
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -427,7 +516,25 @@ class GreeterEndpointTest {
 
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
+        assertNoRequestHeaders(response);
         assertThat(new String(response.body(), StandardCharsets.UTF_8)).isEqualTo(HELLO_JOHN_ENVELOPE);
+    }
+
+    /**
+     * U+1F600 lies outside the Basic Multilingual Plane: CXF answered it as its four UTF-8 bytes, as it did the BMP
+     * characters, where SAAJ alone writes {@code &#128512;}; Content-Length counts the bytes sent.
+     */
+    @Test
+    void unsecureGreetingCarriesCharactersOutsideTheBmpAsRawUtf8() {
+        String name = "M\u00fcller \u65e5\u672c \uD83D\uDE00";
+        HttpTestClient.Response response = postEnvelope("/services/unsecure",
+                GREET_ENVELOPE.replace("<name>John</name>", "<name>" + name + "</name>"));
+
+        assertThat(response.status()).as(response.toString()).isEqualTo(200);
+        assertThat(response.body()).isEqualTo(
+                HELLO_JOHN_ENVELOPE.replace("Hello John", "Hello " + name).getBytes(StandardCharsets.UTF_8));
+        assertThat(response.header("Content-Length")).isEqualTo(Integer.toString(response.body().length));
+        assertNoRequestHeaders(response);
     }
 
     @Test
@@ -442,6 +549,262 @@ class GreeterEndpointTest {
         assertThat(fault.code()).isEqualTo(new QName(SOAP11_NS, "Client"));
         // The parser's message is the faultstring; its exact text is a Tier 2A verification point.
         assertThat(fault.text()).isNotBlank();
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Logger levels: no security header, secret or greeted name in the log under a root TRACE level
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /** The secured requests of {@link LoggedSecuredRequests} under {@code logging.level.root=TRACE}. */
+    @Nested
+    @TestPropertySource(properties = "logging.level.root=TRACE")
+    class UnderRootTrace extends LoggedSecuredRequests {
+    }
+
+    /**
+     * Tests the logger levels {@code application.yml} pins, which keep the WS-Security header each Greeter path
+     * receives, the configured secrets and the plaintext that decryption and signature validation process out of the
+     * log under a root {@code TRACE} level: {@code mule-config.xml} declares no logger.
+     *
+     * <p>The application runs in a context of its own, on a random SOAP port and a client listener port drawn for it
+     * alone, so it lives beside the enclosing class's context. The UsernameToken requests are sent as a user
+     * configured for this run alone, {@link #SENTINEL_USER} with the password {@link #SENTINEL_PASSWORD}; the signing
+     * requests keep {@code joe}, whose password is also his private-key password. Each request, the one the server
+     * rejects for a wrong password included, is asserted to be answered as its path answers it, then its own log
+     * events are asserted to hold the unpinned request-context filter's {@code TRACE} line, which proves the capture
+     * sees that level, the endpoint adapter's {@code TRACE} invocation line of an accepted request or the interceptor's
+     * {@code WARN} rejection line of a rejected one, and no {@code WARN} of Santuario's {@code DOMReference}, and the
+     * console output is asserted to hold no serialized security-header element, no sentinel and not the greeted name.
+     * The run restores the logger levels it found and closes its context, so later test classes do not run at
+     * {@code TRACE}.
+     */
+    @SpringBootTest(classes = SoapWebserviceSecurityApplication.class,
+            webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    @ActiveProfiles("test")
+    @NestedTestConfiguration(NestedTestConfiguration.EnclosingConfiguration.OVERRIDE)
+    @DirtiesContext
+    @ExtendWith(OutputCaptureExtension.class)
+    abstract static class LoggedSecuredRequests {
+
+        /** A UsernameToken user configured for this run alone, and its password; neither may reach the log. */
+        static final String SENTINEL_USER = "sentinelserveruser";
+        static final String SENTINEL_PASSWORD = "SENTINEL_SERVER_PASSWORD";
+
+        /** The password the rejected request sends for {@link #SENTINEL_USER}; it may not reach the log either. */
+        static final String SENTINEL_WRONG_PASSWORD = "SENTINEL_WRONG_PASSWORD";
+
+        /** The name every request greets: it travels in the signed or encrypted body and in the reply. */
+        static final String SENTINEL_NAME = "SentinelGreetedName";
+
+        /** The start tags of the security-header elements WSS4J writes, which only a serialized envelope holds. */
+        static final List<String> SECURITY_HEADER_ELEMENTS = List.of("<wsse:Security", "<wsse:UsernameToken",
+                "<wsse:Password", "<wsse:Nonce", "<wsse:BinarySecurityToken", "<saml2:Assertion",
+                "<ds:SignatureValue", "<xenc:CipherValue");
+
+        /** Port of this context's client listener, apart from the enclosing class's, whose context stays open. */
+        private static final int LOGGED_CLIENT_PORT = portOtherThan(CLIENT_PORT);
+
+        /** Santuario's reference logger, whose null-digest-input WARN a signed assertion's STR-Transform raises. */
+        private static final String DOM_REFERENCE_LOGGER = "org.apache.jcp.xml.dsig.internal.dom.DOMReference";
+
+        /** How long lines written after a reply get to arrive before the output is scanned. */
+        private static final Duration SETTLE = Duration.ofMillis(300);
+
+        /** Most offending lines a failure reports; the capture holds the whole run, so it is never dumped. */
+        private static final int REPORTED_LINES = 20;
+
+        /** The logger levels set before this run's context started, by logger name. */
+        private static final Map<String, Level> LEVELS_BEFORE = new HashMap<>();
+
+        @LocalServerPort
+        int port;
+
+        @Autowired
+        SecureGreeterClient client;
+
+        @Autowired
+        SoapSecurityProperties properties;
+
+        @Autowired
+        @Qualifier("passwordCallback")
+        PasswordCallback passwordCallback;
+
+        @Autowired
+        @Qualifier("samlCallbackHandler")
+        SAMLCallbackHandler samlCallbackHandler;
+
+        @DynamicPropertySource
+        static void listenersAndSentinelUser(DynamicPropertyRegistry registry) {
+            registry.add("ports.client", () -> LOGGED_CLIENT_PORT);
+            registry.add("soap-security.client.host", () -> "localhost");
+            registry.add("soap-security.users." + SENTINEL_USER, () -> SENTINEL_PASSWORD);
+        }
+
+        @BeforeAll
+        static void recordLevels() {
+            LEVELS_BEFORE.clear();
+            for (Logger logger : loggerContext().getLoggerList()) {
+                if (logger.getLevel() != null) {
+                    LEVELS_BEFORE.put(logger.getName(), logger.getLevel());
+                }
+            }
+        }
+
+        @AfterAll
+        static void restoreLevels() {
+            for (Logger logger : loggerContext().getLoggerList()) {
+                Level before = LEVELS_BEFORE.get(logger.getName());
+                // The root logger always has a level and cannot be given none.
+                if (before != null || !org.slf4j.Logger.ROOT_LOGGER_NAME.equals(logger.getName())) {
+                    logger.setLevel(before);
+                }
+            }
+        }
+
+        static Stream<SecuredRequest> securedRequests() {
+            return Stream.of(
+                    new SecuredRequest("UsernameToken Timestamp of the sentinel user", "username",
+                            "UsernameToken Timestamp", SENTINEL_USER, null, false, false),
+                    new SecuredRequest("encrypted UsernameToken Timestamp of the sentinel user", "encrypted",
+                            "UsernameToken Timestamp Encrypt", SENTINEL_USER, null, false, false),
+                    new SecuredRequest("unsigned SAML assertion and Timestamp", "saml",
+                            "SAMLTokenUnsigned Timestamp", null, null, true, false),
+                    new SecuredRequest("signed UsernameToken Timestamp of joe", "signed",
+                            "UsernameToken Signature Timestamp", JOE, null, false, false),
+                    new SecuredRequest("signed SAML assertion of joe", "signedsaml",
+                            "SAMLTokenSigned", JOE, DIRECT_REFERENCE, true, false),
+                    new SecuredRequest("UsernameToken Timestamp of the sentinel user with a wrong password", "username",
+                            "UsernameToken Timestamp", SENTINEL_USER, null, false, true));
+        }
+
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("securedRequests")
+        void requestIsAnsweredAsItsPathAnswersWhileTheLogHoldsNoSecurityHeader(SecuredRequest request,
+                CapturedOutput output) {
+            // WrongPasswordCallback answers for joe alone, so the sentinel user's wrong password is supplied here.
+            CallbackHandler wrongPassword =
+                    callbacks -> ((WSPasswordCallback) callbacks[0]).setPassword(SENTINEL_WRONG_PASSWORD);
+            OutboundSecurity security = new OutboundSecurity(request.actions(), request.user(),
+                    properties.getClient().getEncryptionUser(), request.keyIdentifier(),
+                    request.wrongPassword() ? wrongPassword : passwordCallback,
+                    request.saml() ? samlCallbackHandler : null);
+            URI uri = URI.create("http://localhost:" + port + "/services/" + request.path());
+            Logger root = loggerContext().getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.setContext(loggerContext());
+            events.start();
+            root.addAppender(events);
+            String greeting = null;
+            SoapFaultClientException fault = null;
+            try {
+                greeting = client.greet(uri, security, SENTINEL_NAME);
+            } catch (SoapFaultClientException e) {
+                fault = e;
+            } finally {
+                root.detachAppender(events);
+                events.stop();
+            }
+            // The appender appends under its own lock, so reading under it sees every event the request wrote.
+            List<ILoggingEvent> logged;
+            synchronized (events) {
+                logged = List.copyOf(events.list);
+            }
+
+            if (request.wrongPassword()) {
+                assertThat(fault).as("the security fault of the wrong password").isNotNull();
+                assertSecurityFault(fault, "FailedAuthentication", FAILED_AUTH_TEXT, "security token");
+                assertThat(logged).as("the interceptor's WARN rejection line of the request")
+                        .anyMatch(event -> event.getLevel() == Level.WARN
+                                && PathScopedSecurityInterceptor.class.getName().equals(event.getLoggerName())
+                                && event.getFormattedMessage().startsWith(
+                                        "WS-Security validation failed on /services/" + request.path() + ": "));
+            } else {
+                assertThat(fault).as("a fault of the accepted request").isNull();
+                assertThat(greeting).isEqualTo("Hello " + SENTINEL_NAME);
+                assertThat(logged).as("the unpinned endpoint adapter TRACE invocation line of the request")
+                        .anyMatch(event -> event.getLevel() == Level.TRACE
+                                && DefaultMethodEndpointAdapter.class.getName().equals(event.getLoggerName())
+                                && event.getFormattedMessage().startsWith("Invoking [")
+                                && event.getFormattedMessage().contains(GreeterEndpoint.class.getName() + ".greet("));
+            }
+            ILoggingEvent bound = logged.stream()
+                    .filter(event -> event.getLevel() == Level.TRACE
+                            && OrderedRequestContextFilter.class.getName().equals(event.getLoggerName())
+                            && event.getFormattedMessage().startsWith("Bound request context to thread: ")
+                            && event.getFormattedMessage().endsWith("[ POST /services/" + request.path() + " ]"))
+                    .findFirst()
+                    .orElse(null);
+            assertThat(bound).as("the unpinned request-context filter TRACE line of the request").isNotNull();
+            assertThat(output.getAll()).as("the console capture holds the TRACE line of the request")
+                    .contains(bound.getFormattedMessage());
+            assertThat(logged).as("WARN events of Santuario's DOMReference, which a signed SAML assertion's"
+                            + " STR-Transform reference raises when the client signs and when the server validates")
+                    .noneMatch(event -> DOM_REFERENCE_LOGGER.equals(event.getLoggerName())
+                            && event.getLevel().isGreaterOrEqual(Level.WARN));
+
+            List<String> forbidden = forbiddenValues();
+            // Lines written after the reply get SETTLE to arrive; the capture only grows, so one scan covers the wait.
+            await().pollDelay(SETTLE).until(() -> true);
+            assertThat(linesHolding(output.getAll(), forbidden))
+                    .as("console lines holding a security-header element, a secret or the greeted name").isEmpty();
+        }
+
+        /** Every value no console line may hold; the keystore password is read from the configuration. */
+        private List<String> forbiddenValues() {
+            List<String> values = new ArrayList<>(SECURITY_HEADER_ELEMENTS);
+            values.add(SENTINEL_USER);
+            values.add(SENTINEL_PASSWORD);
+            values.add(SENTINEL_WRONG_PASSWORD);
+            values.add(SENTINEL_NAME);
+            values.add(properties.getKeystore().getPassword());
+            return values;
+        }
+
+        /** The distinct lines of {@code output} holding one of {@code values}, at most {@link #REPORTED_LINES}. */
+        private static List<String> linesHolding(String output, List<String> values) {
+            // The capture of a TRACE run is large, so it is split into lines only when it holds a value at all.
+            if (values.stream().noneMatch(output::contains)) {
+                return List.of();
+            }
+            return output.lines()
+                    .filter(line -> values.stream().anyMatch(line::contains))
+                    .distinct()
+                    .limit(REPORTED_LINES)
+                    .toList();
+        }
+
+        /** A free port other than {@code taken}. */
+        private static int portOtherThan(int taken) {
+            int candidate = TestSocketUtils.findAvailableTcpPort();
+            while (candidate == taken) {
+                candidate = TestSocketUtils.findAvailableTcpPort();
+            }
+            return candidate;
+        }
+
+        private static LoggerContext loggerContext() {
+            return (LoggerContext) LoggerFactory.getILoggerFactory();
+        }
+    }
+
+    /**
+     * One logged secured request and how its path answers it.
+     *
+     * @param name          the case's display name
+     * @param path          the Greeter path the request reaches
+     * @param actions       the WSS4J actions the request is secured with
+     * @param user          the UsernameToken user and signature key alias, or {@code null} for an unsigned assertion
+     * @param keyIdentifier the signature key identifier, or {@code null} for WSS4J's default
+     * @param saml          whether the request carries the SAML assertion of {@code saml.properties}
+     * @param wrongPassword whether the UsernameToken carries a wrong password, which the path rejects
+     */
+    record SecuredRequest(String name, String path, String actions, String user, String keyIdentifier, boolean saml,
+                          boolean wrongPassword) {
+
+        @Override
+        public String toString() {
+            return name;
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -531,6 +894,12 @@ class GreeterEndpointTest {
         assertThat(e.getMessage()).contains(originalSubstring);
     }
 
+    /** SAAJ keeps {@code Accept} and {@code SOAPAction} in every message's MIME headers; CXF sent neither back. */
+    private static void assertNoRequestHeaders(HttpTestClient.Response response) {
+        assertThat(response.header("Accept")).as("Accept of %s", response).isNull();
+        assertThat(response.header("SOAPAction")).as("SOAPAction of %s", response).isNull();
+    }
+
     /** The {@code faultcode}, resolved against its prefix, and {@code faultstring} of a raw SOAP 1.1 fault. */
     private static Fault rawFault(HttpTestClient.Response response) throws Exception {
         Element fault = single(parse(response.body()), SOAP11_NS, "Fault");
@@ -583,6 +952,57 @@ class GreeterEndpointTest {
 
     /** A SOAP 1.1 fault as read from the wire. */
     private record Fault(QName code, String text) {
+    }
+
+    /**
+     * Changes one attribute of the request's single SAML 2.0 {@code element} and records its value before and after;
+     * following the securing interceptor, it changes the signed message.
+     */
+    private static final class AssertionChange implements ClientInterceptor {
+
+        private final String element;
+
+        private final String attribute;
+
+        private final UnaryOperator<String> change;
+
+        private String before;
+
+        private String after;
+
+        AssertionChange(String element, String attribute, UnaryOperator<String> change) {
+            this.element = element;
+            this.attribute = attribute;
+            this.change = change;
+        }
+
+        @Override
+        public boolean handleRequest(MessageContext messageContext) {
+            NodeList matches = ((SoapMessage) messageContext.getRequest()).getDocument()
+                    .getElementsByTagNameNS(SAML2_NS, element);
+            assertThat(matches.getLength()).as("number of saml2:%s elements in the request", element).isEqualTo(1);
+            Element target = (Element) matches.item(0);
+            assertThat(target.hasAttribute(attribute)).as("saml2:%s has @%s", element, attribute).isTrue();
+            before = target.getAttribute(attribute);
+            after = change.apply(before);
+            target.setAttribute(attribute, after);
+            return true;
+        }
+
+        @Override
+        public boolean handleResponse(MessageContext messageContext) {
+            return true;
+        }
+
+        @Override
+        public boolean handleFault(MessageContext messageContext) {
+            return true;
+        }
+
+        @Override
+        public void afterCompletion(MessageContext messageContext, Exception ex) {
+            // Nothing to release: the change is made on the request itself.
+        }
     }
 
     /**

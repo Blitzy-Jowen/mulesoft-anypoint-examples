@@ -9,12 +9,14 @@ spring:
       host: localhost                   # Mule MongoDB connector default; the original flow sets none
       port: 27017                       # Mule MongoDB connector default; the original flow sets none
       database: ${database.name}
-      username: ${database.user}
-      password: ${database.password}
+      # No username or password here: config/MongoConfig applies database.user and database.password as
+      # the client's credential when both are set, so an empty value is never bound to a Boot key.
 
-# Original mongo:config placeholders (l.4). All three must be supplied: an empty password cannot
-# bind to spring.data.mongodb.password (char[]), so startup fails until it is set, even when
-# spring.data.mongodb.uri is set (test profiles included); an empty user fails the MongoClient.
+# Original mongo:config placeholders (l.4). The application starts while any of them is empty:
+# config/MongoConfig then logs one WARN naming the missing key, opens no MongoDB connection, and
+# every import fails until it is supplied. The user and password are supplied together or not at all
+# (a server without access control). Once spring.data.mongodb.uri is set, it alone gives the server
+# and credentials, as in Spring Boot, while database.name, when set, still selects the database.
 database:
   name: ${DATABASE_NAME:}               # TODO: supply the MongoDB database name
   user: ${DATABASE_USER:}               # TODO: supply the MongoDB user

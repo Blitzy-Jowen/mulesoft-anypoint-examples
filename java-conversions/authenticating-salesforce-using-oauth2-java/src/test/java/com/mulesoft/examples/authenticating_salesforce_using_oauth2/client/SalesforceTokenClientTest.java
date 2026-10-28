@@ -21,30 +21,40 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatusCode;
+import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforceTokenClient.TokenEndpointException;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforceTokenClient.TokenResponse;
@@ -52,6 +62,9 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.Sales
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.SalesforceProperties;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.UpstreamAuthenticationException;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.UpstreamUnavailableException;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.LoopbackHttpStub;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.LoopbackHttpStub.Ending;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.LoopbackHttpStub.Reply;
 
 /**
  * Unit test of {@link SalesforceTokenClient}, the code exchange and token refresh that the original
@@ -59,13 +72,16 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.Up
  * {@code consumerKey}/{@code consumerSecret} of {@code sfdc:config-with-oauth}.
  *
  * <p>A WireMock server stands in for the Salesforce token endpoint, so no credential and no live host is involved.
- * The client runs behind a real {@link UpstreamCallExecutor} and a spied, otherwise real,
- * {@link SalesforceFailureClassifier}; counting the classifier's invocations together with the requests WireMock
- * received proves that a rejected grant is rethrown unchanged and that a read timeout or a refused connection
- * becomes {@link UpstreamUnavailableException} for Salesforce after exactly one attempt, never retried.
+ * Where an error status and part of its body must arrive before the connection stalls or is reset, which WireMock
+ * cannot time deterministically, a {@link LoopbackHttpStub} writes the raw answer instead. The client runs behind a
+ * real {@link UpstreamCallExecutor} and a spied, otherwise real, {@link SalesforceFailureClassifier}; counting the
+ * classifier's invocations together with the requests the endpoint received proves that a rejected grant is
+ * rethrown unchanged and that a read timeout, a reset or a refused connection, before the answer or within an error
+ * body, becomes {@link UpstreamUnavailableException} for Salesforce with the socket's own message after exactly one
+ * attempt, never retried.
  *
- * <p>No Spring context is started: the client is built directly from fresh configuration beans. Only the read-timeout
- * case shortens the timeouts, to {@link #SHORT_TIMEOUT}.
+ * <p>No Spring context is started: the client is built directly from fresh configuration beans. Only the cases that
+ * wait for a read timeout shorten the timeouts, to {@link #SHORT_TIMEOUT}.
  */
 class SalesforceTokenClientTest {
 
@@ -101,6 +117,16 @@ class SalesforceTokenClientTest {
 
     private static final String INVALID_GRANT_JSON =
             "{\"error\":\"invalid_grant\",\"error_description\":\"expired authorization code\"}";
+
+    /**
+     * A 400 whose status line, headers and first body bytes arrive while the rest of its declared 200-byte body
+     * never does: the start of Salesforce's error object, cut off in transit.
+     */
+    private static final String ERROR_HEAD_AND_PARTIAL_BODY = "HTTP/1.1 400 Bad Request\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: 200\r\n"
+            + "\r\n"
+            + "{\"error\":\"invalid_grant\",";
 
     private final SalesforceFailureClassifier classifier = spy(new SalesforceFailureClassifier());
 
@@ -190,37 +216,50 @@ class SalesforceTokenClientTest {
         verify(classifier, times(1)).classify(any());
     }
 
-    @Test
-    void errorResponseWithoutErrorFieldsUsesHttpStatusMessage() {
-        stubTokenEndpoint(aResponse()
-                .withStatus(500)
-                .withHeader("Content-Type", "text/plain")
-                .withBody("oops"));
+    /**
+     * An error answer without a readable error object, its body absent included, is a status-only grant failure: an
+     * answer without a body is not a transport failure.
+     */
+    @ParameterizedTest
+    @CsvSource({
+            "500, text/plain, oops",
+            "400, application/json, ",
+            "400, text/html, <html><body>Bad Request</body></html>",
+            "404, , "})
+    void errorResponseWithoutErrorFieldsUsesHttpStatusMessage(int status, String contentType, String body) {
+        ResponseDefinitionBuilder answer = aResponse().withStatus(status);
+        if (contentType != null) {
+            answer.withHeader("Content-Type", contentType);
+        }
+        if (body != null) {
+            answer.withBody(body);
+        }
+        stubTokenEndpoint(answer);
         SalesforceTokenClient client = newClient(tokenUrl());
 
         TokenEndpointException thrown = assertThrows(TokenEndpointException.class,
                 () -> client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI));
 
-        assertThat(thrown).hasMessage("HTTP 500");
-        assertThat(thrown.getStatus()).isEqualTo(500);
+        assertThat(thrown).isExactlyInstanceOf(TokenEndpointException.class).hasMessage("HTTP " + status);
+        assertThat(thrown.getStatus()).isEqualTo(status);
         assertThat(thrown.getError()).isNull();
         assertThat(thrown.getErrorDescription()).isNull();
         wireMock.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
         verify(classifier, times(1)).classify(any());
     }
 
-    @Test
-    void readTimeoutIsUnavailableAndNotRetried() {
-        // With the 10 s default read timeout this delayed answer would succeed, so the failure also proves that the
-        // configured read timeout is the one applied.
-        stubTokenEndpoint(success().withFixedDelay(3000));
-        SalesforceTokenClient client = newClient(tokenUrl(), SHORT_TIMEOUT);
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("failuresBeforeTheAnswer")
+    void transportFailureBeforeTheAnswerIsUnavailableWithTheSocketMessageAndNotRetried(
+            ResponseDefinitionBuilder answer, Duration timeout, Class<? extends IOException> socketFailure,
+            String socketMessage) {
+        stubTokenEndpoint(answer);
+        SalesforceTokenClient client = newClient(tokenUrl(), timeout);
 
         UpstreamUnavailableException thrown = assertThrows(UpstreamUnavailableException.class,
                 () -> client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI));
 
-        assertThat(thrown.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
-        assertThat(causeChain(thrown)).anyMatch(SocketTimeoutException.class::isInstance);
+        assertUnavailableWithSocketMessage(thrown, socketFailure, socketMessage);
         // WireMock may journal a request whose answer is still being delayed only after the client gave up.
         await().atMost(Duration.ofSeconds(5))
                 .untilAsserted(() -> wireMock.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH))));
@@ -235,21 +274,226 @@ class SalesforceTokenClientTest {
             UpstreamUnavailableException thrown = assertThrows(UpstreamUnavailableException.class,
                     () -> client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI));
 
-            assertThat(thrown.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
-            assertThat(causeChain(thrown)).anyMatch(ConnectException.class::isInstance);
+            assertUnavailableWithSocketMessage(thrown, ConnectException.class, "Connection refused");
             verify(classifier, times(1)).classify(any());
         }
+    }
+
+    /**
+     * The error status and headers arrive, then the error body stalls past the read timeout or is reset: the body was
+     * lost in transit, not absent, so the grant fails as unavailable rather than as a status-only refusal, for both
+     * grants and after one request.
+     */
+    @ParameterizedTest(name = "{0}, error body {1}")
+    @MethodSource("errorBodyTransportFailures")
+    void errorBodyCutOffInTransitIsUnavailableWithTheSocketMessageAndNotRetried(Grant grant, Ending ending,
+            Duration timeout, Class<? extends IOException> socketFailure, String socketMessage) throws IOException {
+        try (LoopbackHttpStub tokenEndpoint = LoopbackHttpStub.start(new Reply(ERROR_HEAD_AND_PARTIAL_BODY, ending))) {
+            SalesforceTokenClient client = newClient(tokenEndpoint.baseUrl() + TOKEN_PATH, timeout);
+
+            UpstreamUnavailableException thrown = assertThrows(UpstreamUnavailableException.class,
+                    () -> grant.request(client));
+
+            assertUnavailableWithSocketMessage(thrown, socketFailure, socketMessage);
+            assertThat(tokenEndpoint.requests())
+                    .singleElement()
+                    .asString()
+                    .startsWith("POST " + TOKEN_PATH + " ")
+                    .contains(grant.formField);
+            verify(classifier, times(1)).classify(any());
+        }
+    }
+
+    /**
+     * An error body that cannot be opened is absent, and leaves the status-only error, unless opening it failed for
+     * a timeout or connectivity failure. The endpoint answers with a full {@code invalid_grant} object, so a status-only
+     * error also proves that no body was read.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("errorBodyOpenings")
+    void errorBodyThatCannotBeOpenedIsAbsentUnlessTheTransportFailed(BodyOpening opening,
+            Class<? extends RuntimeException> expected, String message) {
+        stubTokenEndpoint(aResponse()
+                .withStatus(400)
+                .withHeader("Content-Type", "application/json")
+                .withBody(INVALID_GRANT_JSON));
+        SalesforceTokenClient client = newClient(tokenUrl(), TIMEOUT, openingBodiesWith(opening));
+
+        RuntimeException thrown = assertThrows(expected, () -> client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI));
+
+        assertThat(thrown).isExactlyInstanceOf(expected).hasMessage(message);
+        wireMock.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+        verify(classifier, times(1)).classify(any());
+    }
+
+    /**
+     * A failure {@code RestClient} wraps without a timeout or connectivity cause, a body read failing on its own or a
+     * success body that is not JSON, is rethrown unchanged after one request: it is neither a refused grant nor an
+     * unavailable endpoint.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("failuresWithoutATransportCause")
+    void restClientFailureWithoutATransportCauseIsRethrownUnchanged(ResponseDefinitionBuilder answer,
+            BodyOpening opening, Class<? extends Exception> cause) {
+        stubTokenEndpoint(answer);
+        SalesforceTokenClient client = newClient(tokenUrl(), TIMEOUT, openingBodiesWith(opening));
+
+        RestClientException thrown = assertThrows(RestClientException.class,
+                () -> client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI));
+
+        assertThat(thrown).isExactlyInstanceOf(RestClientException.class).hasCauseInstanceOf(cause);
+        wireMock.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+        verify(classifier, times(1)).classify(any());
+    }
+
+    static Stream<Arguments> errorBodyOpenings() {
+        return Stream.of(
+                Arguments.of(Named.<BodyOpening>of("no body stream", answer -> null),
+                        TokenEndpointException.class, "HTTP 400"),
+                Arguments.of(Named.<BodyOpening>of("no error stream", answer -> {
+                    throw new IOException("Server returned HTTP response code: 400 for URL: " + TOKEN_PATH);
+                }), TokenEndpointException.class, "HTTP 400"),
+                Arguments.of(Named.<BodyOpening>of("timed out while opening", answer -> {
+                    throw new SocketTimeoutException("Read timed out");
+                }), UpstreamUnavailableException.class, "Read timed out"));
+    }
+
+    static Stream<Arguments> failuresWithoutATransportCause() {
+        return Stream.of(
+                Arguments.of(Named.of("error body read failing without a transport cause", aResponse()
+                                .withStatus(400)
+                                .withHeader("Content-Type", "application/json")
+                                .withBody(INVALID_GRANT_JSON)),
+                        (BodyOpening) answer -> new InputStream() {
+                            @Override
+                            public int read() throws IOException {
+                                throw new IOException("Premature EOF");
+                            }
+                        },
+                        IOException.class),
+                Arguments.of(Named.of("success body that is not JSON", aResponse()
+                                .withStatus(200)
+                                .withHeader("Content-Type", "application/json")
+                                .withBody("not json")),
+                        (BodyOpening) ClientHttpResponse::getBody,
+                        HttpMessageNotReadableException.class));
+    }
+
+    static Stream<Arguments> failuresBeforeTheAnswer() {
+        return Stream.of(
+                // With the 10 s default read timeout this delayed answer would succeed, so the failure also proves
+                // that the configured read timeout is the one applied.
+                Arguments.of(Named.of("answer delayed past the read timeout", success().withFixedDelay(3000)),
+                        SHORT_TIMEOUT, SocketTimeoutException.class, "Read timed out"),
+                Arguments.of(Named.of("connection reset before the answer",
+                        aResponse().withFault(Fault.CONNECTION_RESET_BY_PEER)),
+                        TIMEOUT, SocketException.class, "Connection reset"));
+    }
+
+    static Stream<Arguments> errorBodyTransportFailures() {
+        return Stream.of(Grant.values()).flatMap(grant -> Stream.of(
+                Arguments.of(grant, Ending.STALL, SHORT_TIMEOUT, SocketTimeoutException.class, "Read timed out"),
+                Arguments.of(grant, Ending.RESET, TIMEOUT, SocketException.class, "Connection reset")));
+    }
+
+    /** The two grants the client posts, each with the form field that names it on the wire. */
+    enum Grant {
+
+        CODE_EXCHANGE("grant_type=authorization_code") {
+            @Override
+            TokenResponse request(SalesforceTokenClient client) {
+                return client.exchangeCode(AUTHORIZATION_CODE, REDIRECT_URI);
+            }
+        },
+
+        REFRESH("grant_type=refresh_token") {
+            @Override
+            TokenResponse request(SalesforceTokenClient client) {
+                return client.refresh(REFRESH_TOKEN);
+            }
+        };
+
+        private final String formField;
+
+        Grant(String formField) {
+            this.formField = formField;
+        }
+
+        abstract TokenResponse request(SalesforceTokenClient client);
+    }
+
+    /** How the client is handed the body of each answer, in place of the stream the connection exposes. */
+    @FunctionalInterface
+    interface BodyOpening {
+
+        InputStream open(ClientHttpResponse answer) throws IOException;
+    }
+
+    /** A builder whose requests return each answer with its body opened by {@code opening}. */
+    private static RestClient.Builder openingBodiesWith(BodyOpening opening) {
+        return RestClient.builder().requestInterceptor((request, body, execution) ->
+                new BodyOpeningResponse(execution.execute(request, body), opening));
+    }
+
+    /** An answer exactly as received, except that {@link #getBody()} goes through {@code opening}. */
+    private record BodyOpeningResponse(ClientHttpResponse answer, BodyOpening opening) implements ClientHttpResponse {
+
+        @Override
+        public HttpStatusCode getStatusCode() throws IOException {
+            return answer.getStatusCode();
+        }
+
+        @Override
+        public String getStatusText() throws IOException {
+            return answer.getStatusText();
+        }
+
+        @Override
+        public HttpHeaders getHeaders() {
+            return answer.getHeaders();
+        }
+
+        @Override
+        public InputStream getBody() throws IOException {
+            return opening.open(answer);
+        }
+
+        @Override
+        public void close() {
+            answer.close();
+        }
+    }
+
+    /**
+     * Asserts the 503 of a transport failure: Salesforce as the upstream, the socket failure itself as the cause, and
+     * its own message as the caller-facing one, never the text of Spring's wrapper, which names internal types.
+     */
+    private static void assertUnavailableWithSocketMessage(UpstreamUnavailableException thrown,
+            Class<? extends IOException> socketFailure, String socketMessage) {
+        assertThat(thrown.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
+        assertThat(thrown.getCause()).isInstanceOf(socketFailure).hasMessage(socketMessage);
+        assertThat(thrown)
+                .hasMessage(socketMessage)
+                .message()
+                .doesNotContain("TokenResponse")
+                .doesNotContain("Error while extracting")
+                .doesNotContain("I/O error on");
     }
 
     private SalesforceTokenClient newClient(String tokenUrl) {
         return newClient(tokenUrl, TIMEOUT);
     }
 
-    /**
-     * Builds a client over fresh configuration. Every property is set before construction, so the client sees the
-     * same values whether it reads them at construction or on each call.
-     */
+    /** Builds a client over fresh configuration and a plain {@link RestClient} builder. */
     private SalesforceTokenClient newClient(String tokenUrl, Duration timeout) {
+        return newClient(tokenUrl, timeout, RestClient.builder());
+    }
+
+    /**
+     * Builds a client over fresh configuration and {@code restClientBuilder}. Every property is set before
+     * construction, so the client sees the same values whether it reads them at construction or on each call.
+     */
+    private SalesforceTokenClient newClient(String tokenUrl, Duration timeout, RestClient.Builder restClientBuilder) {
         SalesforceOAuthProperties oauthProperties = new SalesforceOAuthProperties();
         oauthProperties.setKey(CLIENT_ID);
         oauthProperties.setSecret(CLIENT_SECRET);
@@ -257,7 +501,7 @@ class SalesforceTokenClientTest {
         SalesforceProperties salesforceProperties = new SalesforceProperties();
         salesforceProperties.setConnectTimeout(timeout);
         salesforceProperties.setReadTimeout(timeout);
-        return new SalesforceTokenClient(RestClient.builder(), oauthProperties, salesforceProperties, executor);
+        return new SalesforceTokenClient(restClientBuilder, oauthProperties, salesforceProperties, executor);
     }
 
     private String tokenUrl() {
@@ -327,15 +571,5 @@ class SalesforceTokenClientTest {
             assertThat(form.put(name, value)).as("form parameter %s sent more than once", name).isNull();
         }
         return form;
-    }
-
-    /** Lists a throwable and its causes, each once, so a cause chain that loops back on itself still ends. */
-    private static List<Throwable> causeChain(Throwable failure) {
-        List<Throwable> chain = new ArrayList<>();
-        Set<Throwable> visited = Collections.newSetFromMap(new IdentityHashMap<>());
-        for (Throwable current = failure; current != null && visited.add(current); current = current.getCause()) {
-            chain.add(current);
-        }
-        return chain;
     }
 }

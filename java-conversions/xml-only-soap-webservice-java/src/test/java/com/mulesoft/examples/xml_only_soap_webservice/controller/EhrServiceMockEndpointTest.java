@@ -165,6 +165,22 @@ class EhrServiceMockEndpointTest {
         assertThat(fields.get(0).getTextContent()).isEqualTo(expectedPatientId);
     }
 
+    /**
+     * U+1F600 lies outside the Basic Multilingual Plane: CXF echoed it as its four UTF-8 bytes, as it did the BMP
+     * characters, where SAAJ alone writes {@code &#128512;}; Content-Length counts the bytes sent.
+     */
+    @Test
+    void findEpisodesEchoesCharactersOutsideTheBmpAsRawUtf8() throws Exception {
+        String patientId = "Zo\u00eb-\u674e-\uD83D\uDE00";
+        Response response = postXml(P,
+                envelope("<ns0:findEpisodes><ns1:PatientId>" + patientId + "</ns1:PatientId></ns0:findEpisodes>"));
+
+        Element root = assertSoapResponse(response);
+        assertThat(children(children(root).get(0)).get(0).getTextContent()).isEqualTo(patientId);
+        assertThat(response.bodyAsString()).contains(">" + patientId + "</ns1:PatientId>").doesNotContain("&#");
+        assertThat(response.header("Content-Length")).isEqualTo(Integer.toString(response.body().length));
+    }
+
     static Stream<Arguments> otherwiseBranchBodies() {
         return Stream.of(
                 Arguments.of(Named.of("findEpisodes echoes its PatientId",
@@ -211,7 +227,7 @@ class EhrServiceMockEndpointTest {
         Response response = http.get(target);
 
         assertStatus(response, 404, "Not Found");
-        assertThat(contentType(response)).startsWith("text/plain");
+        assertThat(contentType(response)).isEqualTo("text/plain");
         assertThat(response.body()).as("%s", response)
                 .isEqualTo(("No listener for endpoint: " + expectedPath).getBytes(UTF_8));
     }
@@ -309,12 +325,15 @@ class EhrServiceMockEndpointTest {
     }
 
     /**
-     * Asserts status, reason, an XML Content-Type and the CXF envelope style ({@link #ENVELOPE_START} ...
-     * {@link #ENVELOPE_END}, Envelope holding only Body, no Header anywhere), and returns the Body's single element.
+     * Asserts status, reason, an XML Content-Type without the {@code Accept} and {@code SOAPAction} request headers
+     * SAAJ keeps on every message, the CXF envelope style ({@link #ENVELOPE_START} ... {@link #ENVELOPE_END},
+     * Envelope holding only Body, no Header anywhere), and returns the Body's single element.
      */
     private static Element assertEnvelope(Response response, int status, String reason) throws Exception {
         assertStatus(response, status, reason);
         assertThat(contentType(response)).startsWith("text/xml");
+        assertThat(response.header("Accept")).as("Accept of %s", response).isNull();
+        assertThat(response.header("SOAPAction")).as("SOAPAction of %s", response).isNull();
         assertThat(response.bodyAsString()).as("%s", response).startsWith(ENVELOPE_START).endsWith(ENVELOPE_END);
 
         Document document = parse(response.body());

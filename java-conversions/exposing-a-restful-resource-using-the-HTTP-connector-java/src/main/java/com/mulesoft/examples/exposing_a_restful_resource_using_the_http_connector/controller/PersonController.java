@@ -9,12 +9,14 @@
 package com.mulesoft.examples.exposing_a_restful_resource_using_the_http_connector.controller;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
+import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
@@ -46,17 +48,25 @@ import com.mulesoft.examples.exposing_a_restful_resource_using_the_http_connecto
  * of {@code exception/PersonExceptionHandler}, every other one the 500 of SC-1 {@code GlobalExceptionHandler}.
  *
  * <p>No mapping restricts the request or response media type, because the Mule listener ignored the request's
- * {@code Content-Type} and {@code Accept}; each response presets its Content-Type instead, so Spring skips content
- * negotiation and never answers 406 or 415. GET and POST in any letter case, which the Mule listener matched
+ * {@code Content-Type} and {@code Accept}. {@link #getPersons} presets its Content-Type, so Spring skips content
+ * negotiation, and the other two flows write their bytes to the servlet response directly, so no message converter
+ * runs; none answers 406 or 415. GET and POST in any letter case, which the Mule listener matched
  * ignoring case, reach these mappings through {@code config/ListenerMethodFilter}. Methods outside each listener's
  * {@code allowedMethods} reach SC-1's 405: PUT, DELETE, PATCH and other spellings such as {@code head} or
  * {@code options} through Spring's own method check, HEAD and OPTIONS through the rejecting mappings below, which
  * Spring would otherwise answer itself with 200. A CORS pre-flight is dispatched as the plain OPTIONS it is by
  * {@code config/PreflightDispatchConfig}, so it reaches the rejecting mappings below and gets the 405 too.
  *
- * <p>Tier 2A verification point: the Content-Types the Mule listener emitted, {@code application/json} for the two
- * GET flows (their {@code object-to-json-transformer}) and {@code text/plain;charset=UTF-8} for the
- * {@code set-payload} of {@code storePersonFlow}. A captured fixture of the original governs where they differ.
+ * <p>Content-Types follow the payload each flow ends with. {@code retrieveAllPersonsFlow} ends in an
+ * {@code object-to-json-transformer} (line 13), so its reply is {@code application/json}. {@code storePersonFlow}
+ * ends in the literal {@code set-payload} of line 24 and {@code retrievePersonFlow} in the {@code set-payload} of the
+ * stored {@code Person} (line 36), with no transformer after it; neither declares a MIME type, and the Mule listener
+ * sent no Content-Type for such a payload. Those two replies therefore carry their {@code Content-Length} and no
+ * {@code Content-Type}, and they are written only after {@link PersonService} returns, so its exceptions still find
+ * an uncommitted response for {@code PersonExceptionHandler} and SC-1.
+ *
+ * <p>Tier 2A verification point: the Content-Type of each of the three replies, or its absence. A captured fixture
+ * of the original governs where it differs.
  */
 @RestController
 public class PersonController {
@@ -67,9 +77,6 @@ public class PersonController {
      * application listens on; it is never derived from the configuration or the request.
      */
     public static final String LOCATION_PREFIX = "http://0.0.0.0:8081/person/";
-
-    /** Content-Type of the {@code storePersonFlow} success response, the string payload of line 24. */
-    public static final MediaType STORE_RESPONSE_CONTENT_TYPE = MediaType.parseMediaType("text/plain;charset=UTF-8");
 
     private final PersonService personService;
 
@@ -101,18 +108,21 @@ public class PersonController {
      * map, which {@code json-to-object-transformer} (line 21) rejected, so the original failed it too (Tier 2A
      * verification point).
      *
-     * @param body the request body, {@code null} when empty
-     * @return 201 with {@code Location} {@value #LOCATION_PREFIX}{@code <id>}, {@code text/plain;charset=UTF-8} and
-     *         {@link PersonService#STORE_SUCCESS_RESPONSE}
-     * @throws IOException when the body is empty, malformed or not a person
+     * <p>The reply is written as 201 with {@code Location} {@value #LOCATION_PREFIX}{@code <id>}, the UTF-8 bytes of
+     * {@link PersonService#STORE_SUCCESS_RESPONSE} with their {@code Content-Length}, and no {@code Content-Type}:
+     * the untyped {@code set-payload} of line 24.
+     *
+     * @param body     the request body, {@code null} when empty
+     * @param response the response the reply is written to once the person is stored
+     * @throws IOException when the body is empty, malformed or not a person, or when writing the reply fails
      */
     @PostMapping("/person")
-    public ResponseEntity<String> storePerson(@RequestBody(required = false) byte[] body) throws IOException {
+    public void storePerson(@RequestBody(required = false) byte[] body, HttpServletResponse response)
+            throws IOException {
         int id = personService.storePerson(body);
-        return ResponseEntity.status(HttpStatus.CREATED)
-                .header(HttpHeaders.LOCATION, LOCATION_PREFIX + id)
-                .contentType(STORE_RESPONSE_CONTENT_TYPE)
-                .body(PersonService.STORE_SUCCESS_RESPONSE);
+        response.setStatus(HttpServletResponse.SC_CREATED);
+        response.setHeader(HttpHeaders.LOCATION, LOCATION_PREFIX + id);
+        writeUntypedPayload(response, PersonService.STORE_SUCCESS_RESPONSE);
     }
 
     /**
@@ -122,15 +132,19 @@ public class PersonController {
      * did (line 31), so a non-numeric id reaches SC-1's 500 with the {@link NumberFormatException} message rather
      * than Spring's 400 type mismatch.
      *
+     * <p>The reply is written as 200 with the UTF-8 bytes of the stored person's JSON, their {@code Content-Length}
+     * and no {@code Content-Type}: the untyped {@code set-payload} of line 36, which no transformer follows.
+     *
      * @param personId the {@code personId} URI parameter, unconverted
-     * @return 200 {@code application/json}, the stored person
-     * @throws IOException when the stored person cannot be serialized
+     * @param response the response the stored person is written to once it is found
+     * @throws IOException when the stored person cannot be serialized or writing the reply fails
      */
     @GetMapping("/person/{personId}")
-    public ResponseEntity<String> getPerson(@PathVariable("personId") String personId) throws IOException {
-        return ResponseEntity.ok()
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(personService.retrievePersonJson(personId));
+    public void getPerson(@PathVariable("personId") String personId, HttpServletResponse response)
+            throws IOException {
+        String person = personService.retrievePersonJson(personId);
+        response.setStatus(HttpServletResponse.SC_OK);
+        writeUntypedPayload(response, person);
     }
 
     /**
@@ -156,5 +170,22 @@ public class PersonController {
     @RequestMapping(value = "/person/{personId}", method = {RequestMethod.HEAD, RequestMethod.OPTIONS})
     public void rejectPersonMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
         throw new HttpRequestMethodNotSupportedException(request.getMethod(), List.of("GET"));
+    }
+
+    /**
+     * Writes a payload whose flow declared no MIME type: its UTF-8 bytes and their {@code Content-Length}, and no
+     * {@code Content-Type}, on a response whose status the caller has set. Writing to the servlet response directly
+     * keeps every message converter, and the Content-Type it would add, out of the reply.
+     *
+     * @param response the response to write to
+     * @param payload  the flow's payload
+     * @throws IOException when writing the reply fails
+     */
+    private static void writeUntypedPayload(HttpServletResponse response, String payload) throws IOException {
+        byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
+        response.setContentLength(bytes.length);
+        ServletOutputStream stream = response.getOutputStream();
+        stream.write(bytes);
+        stream.flush();
     }
 }

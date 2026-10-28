@@ -106,6 +106,18 @@ public class TshirtServiceClient {
     /** Mule's default response timeout, used when a timeout is not configured. */
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
 
+    /**
+     * Shortest usable timeout: {@link HttpURLConnection} takes whole milliseconds and waits forever on 0, which a
+     * zero or sub-millisecond {@link Duration} truncates to.
+     */
+    private static final Duration MIN_TIMEOUT = Duration.ofMillis(1);
+
+    /**
+     * Shortest timeout too long to use: its whole milliseconds no longer fit the {@code int}
+     * {@link HttpURLConnection} takes.
+     */
+    private static final Duration OVERFLOWING_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE + 1L);
+
     /** Message of the failure {@link FaultStringCheckingResolver} raises for a fault without a readable string. */
     private static final String INCOMPLETE_FAULT_MESSAGE =
             "The T-shirt service returned a SOAP fault without a readable fault string";
@@ -131,16 +143,22 @@ public class TshirtServiceClient {
     /**
      * Builds the SOAP 1.1 template for the configured service address, timeouts and API key.
      *
-     * @param properties the {@code tshirt.*} settings
+     * @param properties the {@code tshirt.*} settings; a timeout that is not configured is 10 s
+     * @throws IllegalArgumentException when {@code tshirt.connect-timeout} or {@code tshirt.read-timeout} is not
+     *         between 1 ms and {@link Integer#MAX_VALUE} ms in whole milliseconds; the message names the key and
+     *         the value, and nothing is built
      */
     public TshirtServiceClient(TshirtServiceProperties properties) {
+        Duration connectTimeout = usableTimeout("tshirt.connect-timeout", properties.getConnectTimeout());
+        Duration readTimeout = usableTimeout("tshirt.read-timeout", properties.getReadTimeout());
+
         SaajSoapMessageFactory messageFactory = new SaajSoapMessageFactory();
         messageFactory.setSoapVersion(SoapVersion.SOAP_11);
         messageFactory.afterPropertiesSet();
 
         HttpUrlConnectionMessageSender messageSender = new SingleAttemptMessageSender();
-        messageSender.setConnectionTimeout(orDefault(properties.getConnectTimeout()));
-        messageSender.setReadTimeout(orDefault(properties.getReadTimeout()));
+        messageSender.setConnectionTimeout(connectTimeout);
+        messageSender.setReadTimeout(readTimeout);
         // Requests do not advertise gzip: Spring WS decides whether a response exists from the raw, still
         // compressed bytes, so a gzip-encoded empty body would be read as an envelope and fail to parse
         // instead of yielding no response.
@@ -423,8 +441,28 @@ public class TshirtServiceClient {
         return delimiter.getBytes(StandardCharsets.US_ASCII);
     }
 
-    private static Duration orDefault(Duration timeout) {
-        return timeout == null ? DEFAULT_TIMEOUT : timeout;
+    /**
+     * The configured timeout, or {@link #DEFAULT_TIMEOUT} when it is not configured, checked against what
+     * {@link HttpURLConnection} honours. Spring WS hands it {@link Duration#toMillis()} as an {@code int} on every
+     * request: 0, which a zero or sub-millisecond value truncates to, waits forever, and a negative or
+     * {@code int}-overflowing value fails each call. Such a value is rejected here instead. The bounds are compared
+     * as durations, because {@code toMillis()} itself overflows for the longest ones.
+     *
+     * @param key the property the timeout is bound from, named in the failure
+     * @param timeout the configured timeout, or {@code null}
+     * @return {@code timeout}, or {@link #DEFAULT_TIMEOUT} when it is {@code null}
+     * @throws IllegalArgumentException when the whole milliseconds of {@code timeout} are not between 1 and
+     *         {@link Integer#MAX_VALUE}
+     */
+    private static Duration usableTimeout(String key, Duration timeout) {
+        if (timeout == null) {
+            return DEFAULT_TIMEOUT;
+        }
+        if (timeout.compareTo(MIN_TIMEOUT) < 0 || timeout.compareTo(OVERFLOWING_TIMEOUT) >= 0) {
+            throw new IllegalArgumentException(
+                    key + " must be between 1 ms and " + Integer.MAX_VALUE + " ms, was " + timeout);
+        }
+        return timeout;
     }
 
     private static DocumentBuilderFactory secureDocumentBuilderFactory() {

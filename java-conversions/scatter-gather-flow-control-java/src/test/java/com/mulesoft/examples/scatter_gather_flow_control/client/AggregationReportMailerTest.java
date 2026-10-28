@@ -11,11 +11,14 @@ package com.mulesoft.examples.scatter_gather_flow_control.client;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -33,20 +36,33 @@ import jakarta.mail.internet.MimeBodyPart;
 import jakarta.mail.internet.MimeMessage;
 import java.io.InputStream;
 import java.net.ServerSocket;
+import java.net.SocketTimeoutException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
+import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration;
+import org.springframework.boot.autoconfigure.mail.MailSenderAutoConfiguration;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.mail.MailException;
+import org.springframework.mail.MailPreparationException;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
 
 /**
  * Unit test of {@link AggregationReportMailer}, the {@code smtp:outbound-endpoint} of the original {@code outboundFlow}
  * (scatter-gather.xml:61-66), against an in-process GreenMail SMTP server standing in for the Gmail account the
- * original test read. Every collaborator is built here; no Spring context is started.
+ * original test read. Every collaborator is built here, except in the {@code mail.subject} test, which starts a
+ * minimal Spring context over the project's {@code application.yml} and profile {@code test}.
  */
 class AggregationReportMailerTest {
 
@@ -83,9 +99,45 @@ class AggregationReportMailerTest {
         assertEquals(List.of(TO), addresses(message.getRecipients(Message.RecipientType.TO)));
     }
 
+    /**
+     * The subject is {@code mail.subject} as the application resolves it: profile {@code test} over the main
+     * {@code application.yml}. The profile sets no subject, so the flow's literal default arrives unless the key is
+     * overridden; an empty override is sent as given.
+     *
+     * @param override the {@code mail.subject} value added to the context, or {@code null} for none
+     * @param expected the subject the received message must carry
+     */
+    @ParameterizedTest(name = "mail.subject override {0} -> \"{1}\"")
+    @MethodSource("subjectConfigurations")
+    void subjectComesFromMailSubjectDefaultingToTheFlowLiteral(String override, String expected) throws Exception {
+        List<String> properties = new ArrayList<>(List.of(
+                "spring.profiles.active=test", "smtp.port=" + greenMailSmtpPort()));
+        if (override != null) {
+            properties.add("mail.subject=" + override);
+        }
+
+        new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withConfiguration(AutoConfigurations.of(
+                        PropertyPlaceholderAutoConfiguration.class, MailSenderAutoConfiguration.class))
+                .withUserConfiguration(AggregationReportMailer.class)
+                .withPropertyValues(properties.toArray(String[]::new))
+                .run(context -> assertEquals(AggregationReportMailer.BODY_TEXT,
+                        context.getBean(AggregationReportMailer.class).send(CSV)));
+
+        assertEquals(expected, singleReceivedMessage().getSubject());
+    }
+
+    static Stream<Arguments> subjectConfigurations() {
+        return Stream.of(
+                Arguments.of(null, "Scatter gather example - aggregation"),
+                Arguments.of("Weekly contacts report", "Weekly contacts report"),
+                Arguments.of("", ""));
+    }
+
     @Test
     void constantsMatchOriginalFlow() {
-        assertEquals("Scatter gather example - aggregation", AggregationReportMailer.SUBJECT);
+        assertEquals("Scatter gather example - aggregation", AggregationReportMailer.DEFAULT_SUBJECT);
         assertEquals("aggregation-report", AggregationReportMailer.ATTACHMENT_NAME);
         assertEquals("text/plain", AggregationReportMailer.ATTACHMENT_CONTENT_TYPE);
         assertEquals("Please find attached your Aggregation Report", AggregationReportMailer.BODY_TEXT);
@@ -149,6 +201,85 @@ class AggregationReportMailerTest {
         assertEquals(0, greenMail.getReceivedMessages().length);
     }
 
+    /**
+     * A required setting left blank, as an unset TODO key leaves it, refuses the send before a message is built or a
+     * connection opened: the {@link MailPreparationException} names each missing key with its environment variable,
+     * in a fixed order, and no value. The loopback listener the sender is aimed at must have accepted nothing.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unconfiguredSettings")
+    void unconfiguredSettingRefusesTheSendBeforeAnyConnection(String description, String host, String user,
+                                                              String password, String from, String to,
+                                                              String expectedMessage) throws Exception {
+        try (ServerSocket listener = new ServerSocket(0)) {
+            JavaMailSenderImpl configured = senderOn(listener.getLocalPort());
+            configured.setHost(host);
+            configured.setUsername(user);
+            configured.setPassword(password);
+            JavaMailSenderImpl sender = spy(configured);
+            AggregationReportMailer mailer = mailer(sender, from, to);
+
+            MailPreparationException failure = assertThrows(MailPreparationException.class, () -> mailer.send(CSV));
+
+            assertEquals(expectedMessage, failure.getMessage());
+            assertNull(failure.getCause());
+            for (String value : List.of("localhost", PASSWORD, Integer.toString(listener.getLocalPort()))) {
+                assertFalse(failure.getMessage().contains(value), value);
+            }
+            verify(sender, never()).createMimeMessage();
+            verify(sender, never()).send(any(MimeMessage.class));
+            listener.setSoTimeout(200);
+            assertThrows(SocketTimeoutException.class, listener::accept, "the sender opened a connection");
+        }
+    }
+
+    static Stream<Arguments> unconfiguredSettings() {
+        String prefix = "SMTP mail settings are not configured: ";
+        return Stream.of(
+                Arguments.of("empty smtp.host", "", FROM, PASSWORD, FROM, TO, prefix + "smtp.host (SMTP_HOST)"),
+                Arguments.of("absent smtp.host", null, FROM, PASSWORD, FROM, TO, prefix + "smtp.host (SMTP_HOST)"),
+                Arguments.of("empty smtp.user", "localhost", "", PASSWORD, FROM, TO, prefix + "smtp.user (SMTP_USER)"),
+                Arguments.of("blank smtp.password", "localhost", FROM, "  ", FROM, TO,
+                        prefix + "smtp.password (SMTP_PASSWORD)"),
+                Arguments.of("empty mail.from", "localhost", FROM, PASSWORD, "", TO, prefix + "mail.from (MAIL_FROM)"),
+                Arguments.of("blank mail.to", "localhost", FROM, PASSWORD, FROM, " ", prefix + "mail.to (MAIL_TO)"),
+                Arguments.of("absent mail.to", "localhost", FROM, PASSWORD, FROM, null, prefix + "mail.to (MAIL_TO)"),
+                Arguments.of("smtp.host and mail.to", "", FROM, PASSWORD, FROM, "",
+                        prefix + "smtp.host (SMTP_HOST), mail.to (MAIL_TO)"),
+                Arguments.of("every TODO key unset", "", "", "", "", "",
+                        prefix + "smtp.host (SMTP_HOST), smtp.user (SMTP_USER), smtp.password (SMTP_PASSWORD), "
+                                + "mail.from (MAIL_FROM), mail.to (MAIL_TO)"));
+    }
+
+    /**
+     * With SMTP authentication off, as an unauthenticated server is used, the account is not required: a blank
+     * {@code smtp.user} and {@code smtp.password} are accepted and the report is delivered.
+     *
+     * @param auth the {@code mail.smtp.auth} value, or {@code null} for none
+     */
+    @ParameterizedTest(name = "mail.smtp.auth={0}")
+    @MethodSource("authenticationOff")
+    void authenticationOffSendsWithoutAccount(Object auth) throws Exception {
+        JavaMailSenderImpl sender = senderOn(greenMailSmtpPort());
+        sender.setUsername("");
+        sender.setPassword("");
+        if (auth == null) {
+            sender.getJavaMailProperties().remove("mail.smtp.auth");
+        } else {
+            sender.getJavaMailProperties().put("mail.smtp.auth", auth);
+        }
+
+        assertEquals(AggregationReportMailer.BODY_TEXT, mailer(sender, FROM, TO).send(CSV));
+
+        MimeMessage message = singleReceivedMessage();
+        assertEquals(AggregationReportMailer.DEFAULT_SUBJECT, message.getSubject());
+        assertEquals(List.of(TO), addresses(message.getRecipients(Message.RecipientType.TO)));
+    }
+
+    static Stream<Arguments> authenticationOff() {
+        return Stream.of(Arguments.of("false"), Arguments.of(Boolean.FALSE), Arguments.of((Object) null));
+    }
+
     @Test
     void invalidFromRaisesMailException() {
         AggregationReportMailer mailer = mailer(senderOn(greenMailSmtpPort()), "not an address", TO);
@@ -182,7 +313,7 @@ class AggregationReportMailerTest {
     }
 
     private static AggregationReportMailer mailer(JavaMailSender sender, String from, String to) {
-        return new AggregationReportMailer(sender, from, to);
+        return new AggregationReportMailer(sender, from, to, AggregationReportMailer.DEFAULT_SUBJECT);
     }
 
     private static MimeMessage singleReceivedMessage() {

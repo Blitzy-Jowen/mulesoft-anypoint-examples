@@ -28,9 +28,13 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * </ul>
  *
  * <p>{@code tshirt.connect-timeout} and {@code tshirt.read-timeout} default to 10 seconds, the Mule default
- * response timeout.
+ * response timeout. Each must be at least 1 ms and at most {@link Integer#MAX_VALUE} ms in whole milliseconds,
+ * because the HTTP connection takes an {@code int} of milliseconds and waits forever on 0, which a zero or
+ * sub-millisecond value truncates to.
  *
- * <p>Nothing is validated or trimmed at bind time: the client receives exactly what is configured.
+ * <p>Nothing is validated or trimmed at bind time: the client receives exactly what is configured, and
+ * {@code TshirtServiceClient} rejects a timeout outside those bounds when it is created at startup, with a message
+ * naming the key; a timeout bound to {@code null} gets the 10 s default there.
  *
  * <p>Registered by {@code @EnableConfigurationProperties(TshirtServiceProperties.class)} on the application
  * class. It carries no stereotype annotation, because one would register a second bean of this type.

@@ -9,18 +9,24 @@
 package com.mulesoft.examples.soap_webservice_security.controller;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 import java.net.URI;
 import java.nio.charset.Charset;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
@@ -66,9 +72,11 @@ import com.mulesoft.examples.soap_webservice_security.support.HttpTestClient.Res
  *
  * <p>Covered: the six {@code when} branches end to end, the {@code otherwise} branch (unknown, case-variant, empty and
  * missing type) without any SOAP call, the catch branch for a stubbed failure, a real transport failure and a real
- * SOAP security fault, the {@code text/plain} setter on every branch, every HTTP method, the query-string-only
- * binding (last value wins, UTF-8 decoding, a missing name greeting {@code null}), and the SC-10 no-listener 404 for
- * the client path on the SOAP listener and for the SOAP paths on the client listener.
+ * SOAP security fault, the {@code text/plain} setter on every branch, every HTTP method (extension tokens such as
+ * {@code PROPFIND} included), CORS pre-flights answered exactly as plain {@code OPTIONS} requests without any
+ * {@code Access-Control-*} or {@code Vary} header, the query-string-only binding (last value wins, UTF-8 decoding, a
+ * missing name greeting {@code null}), and the SC-10 no-listener 404 for the client path on the SOAP listener and for
+ * the SOAP paths on the client listener.
  */
 // The SOAP listener runs on RANDOM_PORT (@LocalServerPort) rather than a pre-allocated DEFINED_PORT: the conversion
 // maps the originals' fixed ports to RANDOM_PORT plus @DynamicPropertySource, as SoapWebserviceSecurityTest does, and a
@@ -85,7 +93,13 @@ class GreeterClientControllerTest {
 
     private static final String ERROR = "There has been an Error processing the request";
 
-    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain;charset=UTF-8";
+    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
+
+    /** {@code Origin} of the CORS pre-flights. */
+    private static final String PREFLIGHT_ORIGIN = "https://example.invalid";
+
+    /** Prefix of the CORS response headers, compared ignoring case. */
+    private static final String ACCESS_CONTROL_PREFIX = "Access-Control-";
 
     /** The request the original README sends to the client front: {@code /client?clientType=unsecure&name=John}. */
     private static final String UNSECURE_JOHN = "/client?clientType=unsecure&name=" + NAME;
@@ -204,13 +218,52 @@ class GreeterClientControllerTest {
         verify(secureGreeterClient).invoke("unsecure", NAME);
     }
 
+    /**
+     * The listener declares no {@code allowedMethods}, so {@code OPTIONS}, {@code TRACE} and the extension methods
+     * {@code PROPFIND} and {@code MKCOL} run the flow instead of getting Spring MVC's {@code Allow} reply, its
+     * {@code message/http} echo or the method 405.
+     */
     @ParameterizedTest(name = "{0}")
-    @ValueSource(strings = {"OPTIONS", "TRACE"})
-    void optionsAndTraceRunTheFlowInsteadOfAPlatformAnswer(String method) {
+    @ValueSource(strings = {"OPTIONS", "TRACE", "PROPFIND", "MKCOL"})
+    void optionsTraceAndExtensionMethodsRunTheFlowInsteadOfAPlatformAnswer(String method) {
         Response response = clientPort().send(method, UNSECURE_JOHN, null, null);
 
         assertTextReply(response, "Hello " + NAME);
+        assertNull(response.header(HttpHeaders.ALLOW), response::toString);
         verify(secureGreeterClient).invoke("unsecure", NAME);
+    }
+
+    /**
+     * The Mule listener applied no CORS policy, so a CORS pre-flight, whatever method it asks for, runs the flow and
+     * is answered exactly as a plain {@code OPTIONS} request to {@code /client}: not with Spring's 403
+     * {@code Invalid CORS request}, and without any {@code Access-Control-*} or {@code Vary} header.
+     */
+    @ParameterizedTest(name = "Access-Control-Request-Method {0}")
+    @ValueSource(strings = {"GET", "POST", "PROPFIND"})
+    void corsPreflightRunsTheFlowLikeAPlainOptionsRequest(String requestedMethod) {
+        Response plain = clientPort().send("OPTIONS", UNSECURE_JOHN, null, null);
+        Response preflight = clientPort().send("OPTIONS", UNSECURE_JOHN, preflightHeaders(requestedMethod), null);
+
+        assertSameReply(plain, preflight);
+        assertTextReply(preflight, "Hello " + NAME);
+        assertNull(preflight.header(HttpHeaders.ALLOW), preflight::toString);
+        assertNoCorsHeaders(preflight);
+        verify(secureGreeterClient, times(2)).invoke("unsecure", NAME);
+    }
+
+    /** A CORS pre-flight to a path a listener does not serve gets the no-listener 404, as plain OPTIONS does. */
+    @ParameterizedTest(name = "{0} listener, {1}")
+    @CsvSource({"client, /other", "client, /", "soap, /client"})
+    void corsPreflightToAnUnservedPathAnswersTheNoListener404LikeAPlainOptionsRequest(String listener, String path) {
+        HttpTestClient http = "soap".equals(listener) ? soapPort() : clientPort();
+
+        Response plain = http.send("OPTIONS", path, null, null);
+        Response preflight = http.send("OPTIONS", path, preflightHeaders("GET"), null);
+
+        assertSameReply(plain, preflight);
+        assertNoListener(preflight, path);
+        assertNoCorsHeaders(preflight);
+        verifyNoInteractions(secureGreeterClient);
     }
 
     @Test
@@ -318,6 +371,33 @@ class GreeterClientControllerTest {
         assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
         assertEquals(NO_LISTENER_CONTENT_TYPE, response.header(HttpHeaders.CONTENT_TYPE), response::toString);
         assertEquals("No listener for endpoint: " + path, text(response), response::toString);
+    }
+
+    /** The headers that make an {@code OPTIONS} request a CORS pre-flight asking for {@code requestedMethod}. */
+    private static Map<String, String> preflightHeaders(String requestedMethod) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put(HttpHeaders.ORIGIN, PREFLIGHT_ORIGIN);
+        headers.put(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, requestedMethod);
+        return headers;
+    }
+
+    /** Same status line, headers in the same order (the {@code Date} header aside) and the same body bytes. */
+    private static void assertSameReply(Response expected, Response actual) {
+        assertEquals(expected.statusLine(), actual.statusLine(), actual::toString);
+        assertEquals(withoutDate(expected.headers()), withoutDate(actual.headers()), actual::toString);
+        assertArrayEquals(expected.body(), actual.body(), actual::toString);
+    }
+
+    private static List<Map.Entry<String, String>> withoutDate(List<Map.Entry<String, String>> headers) {
+        return headers.stream().filter(header -> !HttpHeaders.DATE.equalsIgnoreCase(header.getKey())).toList();
+    }
+
+    /** No CORS processing took part: no {@code Access-Control-*} header and no {@code Vary} header. */
+    private static void assertNoCorsHeaders(Response response) {
+        assertFalse(response.headers().stream().anyMatch(header -> header.getKey()
+                        .regionMatches(true, 0, ACCESS_CONTROL_PREFIX, 0, ACCESS_CONTROL_PREFIX.length())),
+                response::toString);
+        assertNull(response.header(HttpHeaders.VARY), response::toString);
     }
 
     /** The body decoded with the charset its {@code Content-Type} declares, UTF-8 when it declares none. */

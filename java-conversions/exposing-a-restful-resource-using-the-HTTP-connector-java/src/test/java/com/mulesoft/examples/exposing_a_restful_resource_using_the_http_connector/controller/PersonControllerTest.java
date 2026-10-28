@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -53,8 +54,9 @@ import com.mulesoft.examples.exposing_a_restful_resource_using_the_http_connecto
  * deployed original, and the first stored person always gets id {@code 1}.
  *
  * <p>Content-Types written by Spring's string converter are compared by type and subtype, because it adds the
- * {@code charset} parameter to {@code text/plain} but not to {@code application/json}; the {@code storePersonFlow}
- * success Content-Type, which the controller sets explicitly, is compared exactly.
+ * {@code charset} parameter to {@code text/plain} but not to {@code application/json}. The success replies of
+ * {@code storePersonFlow} and {@code retrievePersonFlow}, whose untyped {@code set-payload}s the Mule listener sent
+ * without a Content-Type, are asserted to carry none, with a {@code Content-Length} equal to their body bytes.
  *
  * <p>The original {@code HttpRestfulResourceIT} assertions are ported separately in {@code HttpRestfulResourceTest}.
  */
@@ -165,10 +167,7 @@ class PersonControllerTest {
         assertNotEquals(ORIGINAL_LOCATION_PORT, port, "the random listener port must differ from the literal one");
         assertFalse(location.contains(":" + port + "/"), () -> "Location must not name the listener port: " + location);
 
-        assertEquals(PersonController.STORE_RESPONSE_CONTENT_TYPE.toString(), response.header(HttpHeaders.CONTENT_TYPE),
-                response::toString);
-        assertEquals("text/plain;charset=UTF-8", response.header(HttpHeaders.CONTENT_TYPE));
-        assertEquals(REPLY, response.bodyAsString());
+        assertUntypedPayload(REPLY.getBytes(StandardCharsets.UTF_8), response);
         assertEquals(PersonService.STORE_SUCCESS_RESPONSE, response.bodyAsString());
 
         // personId is the store's counter after incrementAndGet (line 22): the next person gets the next id.
@@ -189,13 +188,12 @@ class PersonControllerTest {
 
     @Test
     void postPersonIgnoresAcceptHeader() {
-        // The Mule listener checked no Accept header, so the plain-text reply is written whatever the caller accepts.
+        // The Mule listener checked no Accept header, so the untyped reply is written whatever the caller accepts.
         HttpTestClient.Response response = client.post("/person", "application/json", personJson,
                 Map.of(HttpHeaders.ACCEPT, "application/xml"));
 
         assertEquals(201, response.status(), response::toString);
-        assertEquals(PersonController.STORE_RESPONSE_CONTENT_TYPE.toString(), response.header(HttpHeaders.CONTENT_TYPE));
-        assertEquals(REPLY, response.bodyAsString());
+        assertUntypedPayload(REPLY.getBytes(StandardCharsets.UTF_8), response);
     }
 
     @Test
@@ -248,8 +246,8 @@ class PersonControllerTest {
         HttpTestClient.Response response = client.get("/person/1");
 
         assertEquals(200, response.status(), response::toString);
-        assertMediaType(MediaType.APPLICATION_JSON, response);
-        assertArrayEquals(personJsonBytes, response.body(), response::toString);
+        assertEquals("OK", response.reason(), response::toString);
+        assertUntypedPayload(personJsonBytes, response);
     }
 
     @Test
@@ -306,6 +304,17 @@ class PersonControllerTest {
         String body = response.bodyAsString();
         assertTrue(body.startsWith("{ \"message\": \""), () -> "unexpected 500 body: " + body);
         assertTrue(body.endsWith("\" }"), () -> "unexpected 500 body: " + body);
+    }
+
+    /**
+     * Asserts the reply of a flow ending in an untyped {@code set-payload}: no {@code Content-Type} header at all, a
+     * single {@code Content-Length} equal to the body's byte count, and exactly the {@code expected} body bytes.
+     */
+    private static void assertUntypedPayload(byte[] expected, HttpTestClient.Response response) {
+        assertEquals(List.of(), response.headers(HttpHeaders.CONTENT_TYPE), response::toString);
+        assertEquals(List.of(String.valueOf(expected.length)), response.headers(HttpHeaders.CONTENT_LENGTH),
+                response::toString);
+        assertArrayEquals(expected, response.body(), response::toString);
     }
 
     /** Asserts the response's Content-Type has the type and subtype of {@code expected}, whatever its parameters. */

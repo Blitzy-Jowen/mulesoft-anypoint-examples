@@ -28,6 +28,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientException;
 
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.SalesforceOAuthProperties;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.SalesforceProperties;
@@ -49,9 +50,10 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.Sales
  * <p>Both grants are posted as {@code application/x-www-form-urlencoded} to {@code sfdc.oauth.access-token-url},
  * read on every call, with {@code client_id} = {@code sfdc.key} and {@code client_secret} = {@code sfdc.secret}.
  * Every request runs through {@link UpstreamCallExecutor} for {@link UpstreamSystem#SALESFORCE}, so a timeout or
- * connectivity failure becomes {@code UpstreamUnavailableException} (503) and is never retried, while a rejected
- * grant ({@link TokenEndpointException}) is rethrown unchanged. The connect and read timeouts are
- * {@code sfdc.connect-timeout} and {@code sfdc.read-timeout} (10 s, the Mule default response timeout).
+ * connectivity failure, one that cuts off an error body included, becomes {@code UpstreamUnavailableException} (503)
+ * with the socket's own message and is never retried, while a rejected grant ({@link TokenEndpointException}) is
+ * rethrown unchanged. The connect and read timeouts are {@code sfdc.connect-timeout} and {@code sfdc.read-timeout}
+ * (10 s, the Mule default response timeout).
  *
  * <p>Nothing about a request is logged except its grant type: the consumer secret, the authorization code and the
  * tokens never reach a log line.
@@ -81,8 +83,8 @@ public class SalesforceTokenClient {
 
     /**
      * Builds the HTTP client once, over {@link SimpleClientHttpRequestFactory}, so that a read timeout surfaces as a
-     * {@code java.net.SocketTimeoutException} under Spring's {@code ResourceAccessException}, which the Salesforce
-     * classifier reads as unavailable.
+     * {@code java.net.SocketTimeoutException}, which each token request hands to the executor unwrapped and the
+     * Salesforce classifier reads as unavailable.
      *
      * @param restClientBuilder    the auto-configured prototype builder, carrying Boot's message converters
      * @param oauthProperties      the consumer key and secret and the token endpoint URL
@@ -174,21 +176,40 @@ public class SalesforceTokenClient {
     }
 
     /**
-     * Performs one token request. Runs inside the executor, so both the {@link TokenEndpointException} and any
-     * transport {@code ResourceAccessException} are raised within the executed call.
+     * Performs one token request. Runs inside the executor, so the {@link TokenEndpointException} and every transport
+     * failure are raised within the executed call.
+     *
+     * <p>{@code RestClient} wraps an {@code IOException} in a {@link RestClientException}: a failed connection or
+     * request in {@code ResourceAccessException} ({@code I/O error on POST request for "<url>": ...}), and a failure
+     * while the status, the headers or an error body are read in one whose message names the internal response type
+     * ({@code Error while extracting response for type [...]}). When the wrapped {@code IOException} is a timeout or
+     * connectivity failure it is thrown itself, so the executor fails the call as unavailable with the socket's own
+     * message ({@code Read timed out}, {@code Connection reset}, {@code Connection refused}) and the socket failure as
+     * its cause. Every other {@code RestClientException} is thrown unchanged.
+     *
+     * @throws IOException the token endpoint timed out or could not be reached
      */
-    private TokenResponse requestToken(URI tokenUri, MultiValueMap<String, String> form) {
-        ResponseEntity<TokenResponse> response = restClient.post()
-                .uri(tokenUri)
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .accept(MediaType.APPLICATION_JSON)
-                .body(form)
-                .retrieve()
-                // Every non-2xx answer is a grant failure, a 3xx included: redirects of a POST are not followed.
-                .onStatus(status -> !status.is2xxSuccessful(), (request, errorResponse) -> {
-                    throw tokenError(errorResponse.getStatusCode().value(), readBody(errorResponse));
-                })
-                .toEntity(TokenResponse.class);
+    private TokenResponse requestToken(URI tokenUri, MultiValueMap<String, String> form) throws IOException {
+        ResponseEntity<TokenResponse> response;
+        try {
+            response = restClient.post()
+                    .uri(tokenUri)
+                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                    .accept(MediaType.APPLICATION_JSON)
+                    .body(form)
+                    .retrieve()
+                    // Every non-2xx answer is a grant failure, a 3xx included: redirects of a POST are not followed.
+                    .onStatus(status -> !status.is2xxSuccessful(), (request, errorResponse) -> {
+                        throw tokenError(errorResponse.getStatusCode().value(), readBody(errorResponse));
+                    })
+                    .toEntity(TokenResponse.class);
+        } catch (RestClientException failure) {
+            if (failure.getCause() instanceof IOException transport
+                    && UpstreamFailureClassifier.isUnavailable(transport)) {
+                throw transport;
+            }
+            throw failure;
+        }
         TokenResponse token = response.getBody();
         if (token == null || token.access_token() == null || token.access_token().isBlank()) {
             throw new TokenEndpointException(response.getStatusCode().value(), null, null);
@@ -207,14 +228,40 @@ public class SalesforceTokenClient {
     }
 
     /**
-     * Reads an error body. {@code HttpURLConnection} may expose no error stream, in which case reading fails; that
-     * and any other read failure yield an empty body, which leaves the status-only error.
+     * Reads an error body, at most {@link #ERROR_BODY_LIMIT} bytes of it.
+     *
+     * <p>An answer without a body yields an empty one, which leaves the status-only error: either no stream is
+     * returned, or {@code HttpURLConnection} exposes no error stream and opening the body fails with its own
+     * {@code Server returned HTTP response code: <status>} ({@code FileNotFoundException} for 404 and 410). A timeout
+     * or connectivity failure while opening the body, and any failure while reading or closing it, propagates
+     * instead: the body was sent but lost in transit, so the executor classifies the transport failure itself and an
+     * error body that times out or is reset fails as unavailable rather than as a refused grant.
+     *
+     * @throws IOException the body could not be opened for a timeout or connectivity failure, or could not be read
      */
-    private static byte[] readBody(ClientHttpResponse response) {
-        try (InputStream body = response.getBody()) {
-            return body == null ? new byte[0] : body.readNBytes(ERROR_BODY_LIMIT);
-        } catch (IOException unreadable) {
+    private static byte[] readBody(ClientHttpResponse response) throws IOException {
+        InputStream body = openBody(response);
+        if (body == null) {
             return new byte[0];
+        }
+        try (body) {
+            return body.readNBytes(ERROR_BODY_LIMIT);
+        }
+    }
+
+    /**
+     * Opens an error body: the stream, or {@code null} when the answer exposes none.
+     *
+     * @throws IOException a timeout or connectivity failure while opening the body
+     */
+    private static InputStream openBody(ClientHttpResponse response) throws IOException {
+        try {
+            return response.getBody();
+        } catch (IOException noBody) {
+            if (UpstreamFailureClassifier.isUnavailable(noBody)) {
+                throw noBody;
+            }
+            return null;
         }
     }
 

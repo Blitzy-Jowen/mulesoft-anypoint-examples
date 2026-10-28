@@ -1,18 +1,25 @@
 package com.mulesoft.examples.http_oauth_provider.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.tuple;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
+import javax.crypto.spec.SecretKeySpec;
 
 import jakarta.servlet.DispatcherType;
 import jakarta.servlet.RequestDispatcher;
@@ -28,6 +35,7 @@ import jakarta.servlet.http.MappingMatch;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -38,6 +46,7 @@ import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.DefaultResourceLoader;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockFilterChain;
 import org.springframework.mock.web.MockFilterConfig;
 import org.springframework.mock.web.MockHttpServletMapping;
@@ -60,7 +69,7 @@ import ch.qos.logback.core.read.ListAppender;
  * carries this class unchanged apart from its package line and the package-relative {@code support.HttpTestClient}
  * (ST-1) import, which is why every route, port and path below is synthetic and names no project type.
  *
- * <p>The no-listener 404 is compared byte for byte (status, {@code text/plain;charset=UTF-8}, body), because it is a
+ * <p>The no-listener 404 is compared byte for byte (status, {@code text/plain}, body), because it is a
  * platform-default row whose captured fixture would govern.
  */
 class PortRoutingFilterTest {
@@ -71,7 +80,7 @@ class PortRoutingFilterTest {
     /** A local port no listener of the fixture names, so the main routes judge it. */
     private static final int UNKNOWN = 9;
 
-    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain;charset=UTF-8";
+    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
     private static final String APP_SERVLET = "appServlet";
     private static final String MAPPED_SERVLET = "mappedServlet";
 
@@ -79,6 +88,16 @@ class PortRoutingFilterTest {
     private static final String PERSONAL_SEGMENT = "alice@example.com";
     private static final String SECRET_SEGMENT = "tok-SENTINEL";
     private static final String SENTINEL_SEGMENTS = "/" + PERSONAL_SEGMENT + "/" + SECRET_SEGMENT;
+
+    /** Passwords and a placeholder default the TLS cases configure, which no start-up failure may repeat. */
+    private static final String STORE_SECRET = "store-SENTINEL";
+    private static final String KEY_SECRET = "key-SENTINEL";
+    private static final String TRUST_SECRET = "trust-SENTINEL";
+    private static final String WRONG_SECRET = "wrong-SENTINEL";
+    private static final String DEFAULT_SECRET = "default-SENTINEL";
+    /** The TLS entry is listed second, so a failure must name its own index. */
+    private static final String TLS_LABEL = "secure (listeners.additional[1])";
+    private static final String TLS_SETTING = "listeners.additional[1].ssl.";
 
     /** {@code /svc/**} stays with the servlet the container mapped; {@code /app/**} is forwarded to appServlet. */
     private static final List<ListenerPorts.Route> MAIN_ROUTES = List.of(
@@ -93,6 +112,10 @@ class PortRoutingFilterTest {
     private final MockHttpServletResponse response = new MockHttpServletResponse();
 
     private PortRoutingFilter filter;
+
+    /** Where the TLS cases write their key and trust stores. */
+    @TempDir
+    Path storeDir;
 
     @BeforeEach
     void createFilter() throws ServletException {
@@ -354,9 +377,83 @@ class PortRoutingFilterTest {
         assertThatThrownBy(() -> listenerPorts.portRoutingFilterRegistration(properties))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage(message);
-        assertThatThrownBy(() -> listenerPorts.additionalListenersCustomizer(properties, new DefaultResourceLoader()))
+        assertThatThrownBy(() -> listenerPorts.additionalListenersCustomizer(properties, new DefaultResourceLoader(),
+                new MockEnvironment()))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage(message);
+    }
+
+    static Stream<Arguments> tlsFailures() {
+        String keyStorePassword = TLS_SETTING + "key-store-password";
+        String keyPassword = TLS_SETTING + "key-password";
+        String trustStorePassword = TLS_SETTING + "trust-store-password";
+        return Stream.of(
+                // JKS checks the store's integrity with any non-null password, so an empty one fails the load.
+                Arguments.of(Named.of("empty key store password", "JKS"), "", null, null, Map.of(),
+                        "the key store password is empty; supply " + keyStorePassword),
+                Arguments.of(Named.of("empty key store password read through a placeholder", "JKS"), "", null, null,
+                        Map.of(keyStorePassword, "${tls.store-password}"),
+                        "the key store password is empty; supply tls.store-password (" + keyStorePassword + ")"),
+                Arguments.of(Named.of("empty trust store password read through a placeholder with a default", "JKS"),
+                        STORE_SECRET, null, "",
+                        Map.of(trustStorePassword, "${tls.trust-password:" + DEFAULT_SECRET + "}"),
+                        "the trust store password is empty; supply tls.trust-password (" + trustStorePassword + ")"),
+                // A value that is more than one placeholder names no key.
+                Arguments.of(Named.of("empty trust store password with a compound value", "JKS"), STORE_SECRET, null,
+                        "", Map.of(trustStorePassword, "pre-${tls.trust-password}"),
+                        "the trust store password is empty; supply " + trustStorePassword),
+                // The PKCS12 store opens with an empty password; its key does not, and no other password is left.
+                Arguments.of(Named.of("empty key password and key store password", "PKCS12"), "", "",
+                        null, Map.of(keyPassword, "${tls.key-password}", keyStorePassword, ""),
+                        "the key password is empty; supply tls.key-password (" + keyPassword + ") or "
+                                + keyStorePassword),
+                Arguments.of(Named.of("unset key password and key store password", "PKCS12"), null, null, null,
+                        Map.of(), "the key password is empty; supply " + keyPassword + " or " + keyStorePassword),
+                // A password that is set keeps the JDK's reason, however the setting is configured.
+                Arguments.of(Named.of("wrong key store password", "JKS"), WRONG_SECRET, null, null,
+                        Map.of(keyStorePassword, "${tls.store-password}"),
+                        "Keystore was tampered with, or password was incorrect"));
+    }
+
+    /**
+     * The TLS entry is the second of two, beside a plain one. Its key store is, for {@code JKS}, an empty store saved
+     * with {@link #STORE_SECRET} and, for {@code PKCS12}, a store saved with an empty password holding one key
+     * protected by {@link #KEY_SECRET}; a non-null {@code trustStorePassword} adds an empty JKS trust store saved with
+     * {@link #TRUST_SECRET}. {@code configured} holds the unresolved values the environment reports.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("tlsFailures")
+    void tlsFailureNamesTheSettingOfAnEmptyPasswordOrKeepsTheJdkReason(String keyStoreType, String keyStorePassword,
+            String keyPassword, String trustStorePassword, Map<String, String> configured, String reason)
+            throws Exception {
+        String keyStore = "PKCS12".equals(keyStoreType)
+                ? writeStore("key.p12", keyStoreType, "", KEY_SECRET)
+                : writeStore("key.jks", keyStoreType, STORE_SECRET, null);
+        String trustStore = trustStorePassword == null ? null : writeStore("trust.jks", "JKS", TRUST_SECRET, null);
+        ListenerPorts.Properties properties = tlsProperties(new ListenerPorts.Ssl(keyStore, keyStorePassword,
+                keyPassword, keyStoreType, trustStore, trustStorePassword));
+        MockEnvironment environment = new MockEnvironment();
+        configured.forEach(environment::setProperty);
+
+        assertThatThrownBy(() -> new ListenerPorts().additionalListenersCustomizer(properties,
+                new DefaultResourceLoader(), environment))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage(TLS_LABEL + ": cannot build the TLS context: " + reason)
+                .satisfies(failure -> assertThat(failure.getCause())
+                        .isInstanceOfAny(IOException.class, GeneralSecurityException.class))
+                .message()
+                .doesNotContain(STORE_SECRET, KEY_SECRET, TRUST_SECRET, WRONG_SECRET, DEFAULT_SECRET);
+    }
+
+    @Test
+    void storeAndKeyThatOpenWithAnEmptyPasswordStillBuildTheTlsContext() throws Exception {
+        String keyStore = writeStore("open.p12", "PKCS12", "", "");
+        ListenerPorts.Properties properties =
+                tlsProperties(new ListenerPorts.Ssl(keyStore, "", "", "PKCS12", null, null));
+
+        assertThatCode(() -> new ListenerPorts().additionalListenersCustomizer(properties,
+                new DefaultResourceLoader(), new MockEnvironment()))
+                .doesNotThrowAnyException();
     }
 
     static Stream<Arguments> methodRestrictions() {
@@ -377,8 +474,8 @@ class PortRoutingFilterTest {
                 new ListenerPorts.Main(List.of()),
                 List.of(new ListenerPorts.Additional("extra", extraPort, null, null, List.of())),
                 disallowedMethods);
-        WebServerFactoryCustomizer<UndertowServletWebServerFactory> customizer =
-                new ListenerPorts().additionalListenersCustomizer(properties, new DefaultResourceLoader());
+        WebServerFactoryCustomizer<UndertowServletWebServerFactory> customizer = new ListenerPorts()
+                .additionalListenersCustomizer(properties, new DefaultResourceLoader(), new MockEnvironment());
         UndertowServletWebServerFactory factory = new UndertowServletWebServerFactory(0);
         factory.setAddress(InetAddress.getByName("localhost"));
         customizer.customize(factory);
@@ -422,6 +519,32 @@ class PortRoutingFilterTest {
 
     private static ListenerPorts.Additional additional(String name, int port) {
         return new ListenerPorts.Additional(name, port, null, null, List.of());
+    }
+
+    /** A plain entry followed by the TLS entry {@code secure} with {@code ssl}. */
+    private static ListenerPorts.Properties tlsProperties(ListenerPorts.Ssl ssl) {
+        return new ListenerPorts.Properties(null, null, List.of(additional("plain", EXTRA),
+                new ListenerPorts.Additional("secure", EXTRA + 1, null, ssl, List.of())), null);
+    }
+
+    /**
+     * Writes a store of {@code type} saved with {@code storePassword} into {@link #storeDir} and returns its location.
+     * A non-null {@code keyPassword} adds one secret key protected by it, which the key manager opens with the key
+     * password when the TLS context is built.
+     */
+    private String writeStore(String file, String type, String storePassword, String keyPassword)
+            throws GeneralSecurityException, IOException {
+        KeyStore store = KeyStore.getInstance(type);
+        store.load(null, null);
+        if (keyPassword != null) {
+            store.setEntry("key", new KeyStore.SecretKeyEntry(new SecretKeySpec(new byte[16], "AES")),
+                    new KeyStore.PasswordProtection(keyPassword.toCharArray()));
+        }
+        Path location = storeDir.resolve(file);
+        try (OutputStream out = Files.newOutputStream(location)) {
+            store.store(out, storePassword.toCharArray());
+        }
+        return location.toString();
     }
 
     /** Answers every method with {@code ok:<method>}, so a response proves which method reached the servlet. */

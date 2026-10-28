@@ -11,7 +11,7 @@ The project carries these shared components, copied from their reference impleme
 | SC-17 | `controller/ApiKitConsoleController`, `src/main/resources/apikit-console/**` | the APIkit 3.8.0 console and the RAML descriptor |
 | ST-1 | `src/test/java/.../support/HttpTestClient` | raw-socket HTTP/1.1 test client that returns the status line with its reason phrase |
 
-`config/ApiKitMethodCaseFilter` and `config/PreflightDispatchConfig`, the method-token and CORS pre-flight handling of the RAML-backed projects, are copied from the same project the same way.
+`config/ApiKitMethodCaseFilter`, `config/ApiKitAcceptNegotiator` and `config/PreflightDispatchConfig`, the method-token, `Accept` negotiation and CORS pre-flight handling of the RAML-backed projects, are copied from the same project the same way.
 
 ## Original example
 
@@ -35,6 +35,7 @@ Base URL `http://localhost:8081/api`. The RAML declares no `baseUri` and the ori
 - **Requests.** The RAML declares no request body, media type, URI or query parameter for `/munit`, so any request body and `Content-Type` is accepted and ignored, as APIkit accepted it, and query parameters are ignored.
 - **Undeclared methods.** No RAML method declares HEAD, OPTIONS, PATCH or TRACE. Each gets the APIkit 405; `MunitController.headOrOptions` maps HEAD and OPTIONS explicitly so Spring does not answer them itself. A CORS pre-flight is answered like any other OPTIONS request, with no `Access-Control-*` header (`config/PreflightDispatchConfig`), because the original listener applied no CORS policy.
 - **Method case.** Under `/api`, a method token in lower or mixed case (`get`, `Post`) is routed as its upper-case form (`config/ApiKitMethodCaseFilter`), as the APIkit router lower-cased the method before routing.
+- **Accept negotiation.** The `Accept` header of each of the four methods is negotiated as the APIkit router negotiated it (`config/ApiKitAcceptNegotiator`, a port of `RestContentTypeParser.bestMatch`). The negotiation runs in each RAML action after its URI and query parameter validation and before the flow, as APIkit did; `/munit` declares no parameter, so in GET it follows the HEAD rejection and elsewhere it is the first step. A header that gives `application/json` quality 0, such as `application/json;q=0`, gets the APIkit 406. `*/*;q=0` is still accepted, because APIkit weighed a `*/*` range with the declared type's own quality.
 
 ### APIkit console and RAML descriptor
 
@@ -58,7 +59,7 @@ The original enabled the console (`apikit:config consoleEnabled="true" consolePa
 | 404 | `application/json` | `{ "message": "Resource not found" }` | a path under `/api` that no resource names, such as `/api/unknown` or `/api/munit/extra`, and a miss under the console path | `ApiKitExceptionHandler` (SC-3) |
 | 405 | `application/json` | `{ "message": "Method not allowed" }` | a method `/munit` does not declare: HEAD, OPTIONS, PATCH, TRACE or any other token | `ApiKitExceptionHandler` |
 | 415 | `application/json` | `{ "message": "Unsupported media type" }` | a request body whose media type no method consumes | `ApiKitExceptionHandler` |
-| 406 | `application/json` | `{ "message": "Not acceptable" }` | an `Accept` header that `application/json` cannot satisfy, such as `Accept: text/xml` | `ApiKitExceptionHandler` |
+| 406 | `application/json` | `{ "message": "Not acceptable" }` | an `Accept` header that `application/json` cannot satisfy, such as `Accept: text/xml`, or that gives it quality 0 under APIkit's negotiation (`application/json;q=0`, raised by `config/ApiKitAcceptNegotiator`) | `ApiKitExceptionHandler` |
 | 400 | `application/json` | `{ "message": "Bad request" }` | a body failing its schema, or a URI or query parameter outside its constraints | `ApiKitExceptionHandler` |
 | 404 | `text/plain` | `No listener for endpoint: <path>` | any path outside `/api`, which the original listener never served | `ApiKitExceptionHandler`, writing SC-1's listener default |
 | 500 | `application/json` | `{ "message": "<exception message>" }` | any other unhandled exception | `GlobalExceptionHandler` (SC-1) |
@@ -100,7 +101,7 @@ Every key of `src/main/resources/application.yml`:
 | `apikit:mapping-exception-strategy` and the flow's `exception-strategy ref` (`api.xml:10-36,42`) | `exception/ApiKitExceptionHandler`, `exception/ApiKitNotFoundException`, `config/JsonSchemaValidator` (SC-3) |
 | HTTP listener defaults outside `/api` | `exception/ErrorResponse`, `exception/GlobalExceptionHandler` (SC-1) |
 | Console and RAML descriptor (`consoleEnabled="true" consolePath="console"`) | `controller/ApiKitConsoleController` and `src/main/resources/apikit-console/**` (SC-17) |
-| APIkit's case-insensitive method routing; the listener's absence of a CORS policy | `config/ApiKitMethodCaseFilter`; `config/PreflightDispatchConfig` |
+| APIkit's case-insensitive method routing; its output negotiation (`RestContentTypeParser.bestMatch`); the listener's absence of a CORS policy | `config/ApiKitMethodCaseFilter`; `config/ApiKitAcceptNegotiator`; `config/PreflightDispatchConfig` |
 | `src/main/api/api.raml` | `src/main/resources/api/api.raml`, byte for byte |
 | `src/test/munit/api-test-suite.xml` | `src/test/java/.../ApiTestSuiteTest` ([Tests](#tests)) |
 
@@ -163,6 +164,7 @@ Open the console at `http://localhost:8081/api/console/`.
 | `exception/ApiKitExceptionHandlerTest`, `exception/GlobalExceptionHandlerTest` | SC-3's five mappings with exact bodies and their precedence; SC-1's defaults and log safety |
 | `config/JsonSchemaValidatorTest` | SC-3 draft-03 validation: body faults give 400, schema faults give 500 |
 | `config/ApiKitMethodCaseFilterTest`, `config/ApiKitMethodCaseListenerTest` | lower and mixed-case method tokens under `/api` answered as their upper-case form |
+| `config/ApiKitAcceptNegotiatorTest`, `config/ApiKitAcceptNegotiationListenerTest` | APIkit's `Accept` negotiation: the type `RestContentTypeParser.bestMatch` chose for each header, quirks included, and `negotiate` on the handler method Spring selected (method or class `produces`, negated types skipped, the rejection carrying the declared types, a request without a handler method refused); the APIkit 406 on GET, POST, PUT and DELETE for every form that gives JSON quality 0; the flow's status and literal for the forms APIkit accepted (`*/*;q=0`, `application/json;q=0.5`); and unchanged answers with `application/json;q=0` for undeclared methods, unserved paths and the console |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | CORS pre-flights answered as plain OPTIONS requests (the APIkit 405 on `/api/munit`), never running a handler |
 
 `support/HttpTestClient` is ST-1, an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes, because `java.net.http.HttpClient` hides the reason phrase.
@@ -175,9 +177,9 @@ Open the console at `http://localhost:8081/api/console/`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 267 tests, 0 failures, 0 errors, 0 skipped; enforcer `BannedDependencies passed`; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 267 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 13 of 13 lines (`service/MunitService`; the project has no mapper package). Total project LINE coverage: 80.9% (559 of 691 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 432 tests, 0 failures, 0 errors, 0 skipped; enforcer `BannedDependencies passed`; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 432 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 13 of 13 lines (`service/MunitService`; the project has no mapper package). Total project LINE coverage: 84.0% (686 of 817 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project without `FixtureParityTest`. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported MUnit assertions of `ApiTestSuiteTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 

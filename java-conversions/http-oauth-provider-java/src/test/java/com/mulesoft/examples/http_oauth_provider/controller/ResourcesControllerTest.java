@@ -60,7 +60,7 @@ class ResourcesControllerTest {
     private static final String FORM = "application/x-www-form-urlencoded";
 
     /** The SC-10 no-listener answer's Content-Type (AAP 0.4.7). */
-    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain;charset=UTF-8";
+    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
 
     /** APIkit's error body spacing, {@code { "message": "..." }}. */
     private static final Pattern MESSAGE_BODY = Pattern.compile("^\\{ \"message\": \".*\" \\}$");

@@ -14,6 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
@@ -40,6 +41,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -103,7 +106,7 @@ class CompaniesFileTriggerTest {
         inputDir = Files.createDirectories(tempDir.resolve("input"));
         // Left absent on purpose: the poller creates the move directory, as Mule's file connector did.
         outputDir = tempDir.resolve("output");
-        trigger = new CompaniesFileTrigger(accountImportService, inputDir.toString(), outputDir.toString());
+        trigger = new CompaniesFileTrigger(accountImportService, inputDir.toString(), outputDir.toString(), "10000");
 
         pollerLogger = (Logger) LoggerFactory.getLogger(FileInboundPoller.class);
         logged = new ListAppender<>();
@@ -179,6 +182,31 @@ class CompaniesFileTriggerTest {
         verify(accountImportService, times(1)).importAccounts(any());
         verifyNoMoreInteractions(accountImportService);
         assertMovedToOutput();
+    }
+
+    @ParameterizedTest(name = "companies.polling-frequency \"{0}\" -> start-up fails naming the key and the value")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void nonPositiveOrUnreadablePollingFrequencyFailsNamingKeyAndValue(String frequency) {
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new CompaniesFileTrigger(accountImportService, inputDir.toString(), outputDir.toString(),
+                        frequency));
+
+        String message = failure.getMessage();
+        assertNotNull(message, "the failure carries no message");
+        assertTrue(message.contains("companies.polling-frequency"), () -> "key not named: " + message);
+        assertTrue(message.contains("\"" + frequency + "\""), () -> "value not named: " + message);
+        verifyNoInteractions(accountImportService);
+    }
+
+    @ParameterizedTest(name = "companies.polling-frequency \"{0}\" -> accepted, as Spring schedules it")
+    @ValueSource(strings = {"1", "10000", "PT10S", "pt0.5s"})
+    void positivePollingFrequencyIsAccepted(String frequency) {
+        CompaniesFileTrigger accepted = assertDoesNotThrow(
+                () -> new CompaniesFileTrigger(accountImportService, inputDir.toString(), outputDir.toString(),
+                        frequency));
+
+        assertEquals(inputDir, accepted.inputDirectory());
+        assertEquals(outputDir, accepted.moveToDirectory());
     }
 
     /**

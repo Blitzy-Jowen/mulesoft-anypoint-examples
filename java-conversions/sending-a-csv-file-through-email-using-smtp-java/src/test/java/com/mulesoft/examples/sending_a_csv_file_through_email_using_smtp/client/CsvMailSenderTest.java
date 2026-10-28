@@ -11,6 +11,10 @@ package com.mulesoft.examples.sending_a_csv_file_through_email_using_smtp.client
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -19,6 +23,7 @@ import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -45,10 +50,15 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.mail.MailException;
 import org.springframework.mail.MailPreparationException;
-import org.springframework.mail.MailSendException;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
+
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 
 /**
  * Client test of {@link CsvMailSender}, the {@code smtp:outbound-endpoint} of the original {@code csv-to-smtpFlow}
@@ -214,7 +224,7 @@ class CsvMailSenderTest {
 
     @ParameterizedTest(name = "mail.from=''{0}'', mail.to=''{1}'' -> {2}")
     @MethodSource("unusableAddressConfigurations")
-    @DisplayName("an unusable mail.from or mail.to fails with a MailException and delivers nothing")
+    @DisplayName("a malformed mail.from fails with a MailException and delivers nothing")
     void unusableAddressConfigurationFailsWithoutDelivery(String from, String to,
                                                           Class<? extends MailException> expected) {
         CsvMailSender misconfigured = new CsvMailSender(mailSender(GREEN_MAIL.getSmtp().getPort()), from, to, SUBJECT);
@@ -225,15 +235,112 @@ class CsvMailSenderTest {
     }
 
     /**
-     * Address values the message cannot be sent with: a malformed sender, or one left at the empty default of
-     * {@code application.yml}, fails while the message is built; an empty recipient list leaves no recipient, which
-     * the SMTP send rejects.
+     * Address values the message cannot be built with: a malformed sender fails while the message is built. A blank
+     * sender or recipient is refused earlier, by the settings check of
+     * {@link #unconfiguredSettingRefusesTheSendBeforeAnyConnection}.
      */
     static Stream<Arguments> unusableAddressConfigurations() {
         return Stream.of(
-                Arguments.of("not an address", TO, MailPreparationException.class),
-                Arguments.of("", TO, MailPreparationException.class),
-                Arguments.of(FROM, "", MailSendException.class));
+                Arguments.of("not an address", TO, MailPreparationException.class));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unconfiguredSettings")
+    @DisplayName("a blank required setting refuses the send before any connection, naming the missing keys once in "
+            + "the exception and once in an ERROR line, never a value")
+    void unconfiguredSettingRefusesTheSendBeforeAnyConnection(String description, String host, String user,
+                                                              String password, String from, String to,
+                                                              String expectedMessage) throws Exception {
+        Logger senderLogger = (Logger) LoggerFactory.getLogger(CsvMailSender.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        senderLogger.addAppender(appender);
+        try (ServerSocket listener = new ServerSocket(0)) {
+            JavaMailSenderImpl configured = mailSender(listener.getLocalPort());
+            configured.setHost(host);
+            configured.setUsername(user);
+            configured.setPassword(password);
+            JavaMailSenderImpl mailSender = spy(configured);
+            CsvMailSender unconfigured = new CsvMailSender(mailSender, from, to, SUBJECT);
+
+            assertThatThrownBy(() -> unconfigured.send(EMAIL_BODY))
+                    .isExactlyInstanceOf(MailPreparationException.class)
+                    .hasMessage(expectedMessage)
+                    .hasNoCause()
+                    .satisfies(failure -> assertThat(failure.getMessage()).doesNotContain(
+                            "localhost", PASSWORD, Integer.toString(listener.getLocalPort())));
+
+            assertThat(appender.list).hasSize(1);
+            ILoggingEvent error = appender.list.get(0);
+            assertThat(error.getLevel()).isEqualTo(Level.ERROR);
+            assertThat(error.getFormattedMessage()).isEqualTo("Order lines mail not sent. " + expectedMessage);
+            assertThat(error.getThrowableProxy()).isNull();
+
+            verify(mailSender, never()).createMimeMessage();
+            verify(mailSender, never()).send(any(MimeMessage.class));
+            listener.setSoTimeout(200);
+            assertThatThrownBy(listener::accept).as("the sender opened a connection")
+                    .isInstanceOf(SocketTimeoutException.class);
+        } finally {
+            senderLogger.detachAppender(appender);
+            appender.stop();
+        }
+    }
+
+    /**
+     * Each required setting blank on its own, as an unset TODO key leaves it, then several together, with the message
+     * that names them in the fixed order {@code smtp.host}, {@code smtp.user}, {@code smtp.password},
+     * {@code mail.from}, {@code mail.to}.
+     */
+    static Stream<Arguments> unconfiguredSettings() {
+        String prefix = "SMTP mail settings are not configured: ";
+        return Stream.of(
+                Arguments.of("empty smtp.host", "", FROM, PASSWORD, FROM, TO, prefix + "smtp.host (SMTP_HOST)"),
+                Arguments.of("absent smtp.host", null, FROM, PASSWORD, FROM, TO, prefix + "smtp.host (SMTP_HOST)"),
+                Arguments.of("empty smtp.user", "localhost", "", PASSWORD, FROM, TO, prefix + "smtp.user (SMTP_USER)"),
+                Arguments.of("blank smtp.password", "localhost", FROM, "  ", FROM, TO,
+                        prefix + "smtp.password (SMTP_PASSWORD)"),
+                Arguments.of("empty mail.from", "localhost", FROM, PASSWORD, "", TO, prefix + "mail.from (MAIL_FROM)"),
+                Arguments.of("blank mail.to", "localhost", FROM, PASSWORD, FROM, " ", prefix + "mail.to (MAIL_TO)"),
+                Arguments.of("absent mail.to", "localhost", FROM, PASSWORD, FROM, null, prefix + "mail.to (MAIL_TO)"),
+                Arguments.of("smtp.host and mail.to", "", FROM, PASSWORD, FROM, "",
+                        prefix + "smtp.host (SMTP_HOST), mail.to (MAIL_TO)"),
+                Arguments.of("every TODO key unset", "", "", "", "", "",
+                        prefix + "smtp.host (SMTP_HOST), smtp.user (SMTP_USER), smtp.password (SMTP_PASSWORD), "
+                                + "mail.from (MAIL_FROM), mail.to (MAIL_TO)"));
+    }
+
+    @ParameterizedTest(name = "mail.smtp.auth={0}")
+    @MethodSource("authenticationOff")
+    @DisplayName("with SMTP authentication off, a blank smtp.user and smtp.password are accepted and the mail is sent")
+    void authenticationOffSendsWithoutAccount(Object auth) throws Exception {
+        JavaMailSenderImpl unauthenticated = mailSender(GREEN_MAIL.getSmtp().getPort());
+        unauthenticated.setUsername("");
+        unauthenticated.setPassword("");
+        if (auth == null) {
+            unauthenticated.getJavaMailProperties().remove("mail.smtp.auth");
+        } else {
+            unauthenticated.getJavaMailProperties().put("mail.smtp.auth", auth);
+        }
+
+        new CsvMailSender(unauthenticated, FROM, TO, SUBJECT).send(EMAIL_BODY);
+
+        MimeMessage message = singleReceivedMessage();
+        assertThat(addresses(message.getRecipients(Message.RecipientType.TO))).containsExactly(TO);
+        assertThat(body(message)).isEqualTo(EMAIL_BODY);
+    }
+
+    /** The {@code mail.smtp.auth} values that leave authentication off: text, {@link Boolean}, and none at all. */
+    static Stream<Arguments> authenticationOff() {
+        return Stream.of(Arguments.of("false"), Arguments.of(Boolean.FALSE), Arguments.of((Object) null));
+    }
+
+    @Test
+    @DisplayName("mail.subject is not a required setting: an empty subject is sent as given")
+    void emptySubjectIsSentAsGiven() throws Exception {
+        new CsvMailSender(mailSender(GREEN_MAIL.getSmtp().getPort()), FROM, TO, "").send(EMAIL_BODY);
+
+        assertThat(singleReceivedMessage().getSubject()).isEmpty();
     }
 
     /** The sender as the test profile configures it, mailing to the given {@code mail.to} value. */

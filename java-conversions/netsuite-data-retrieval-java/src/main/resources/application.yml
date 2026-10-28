@@ -68,10 +68,16 @@ netsuite:
     private-key-path: ${NETSUITE_OAUTH_PRIVATE_KEY_PATH:}
 
 # netsuite-api.xml logs only fixed success messages, so no NetSuite data is logged at any level: a root DEBUG/TRACE
-# override must not reach these categories, which below INFO write the access token and the NetSuite records
+# override must not reach these categories, which below INFO write the access token, the NetSuite records and the
+# name and title query values the requests search for
 logging:
   level:
     org.springframework.core.codec: INFO                          # StringDecoder: the token response and the SuiteQL and record response bodies
     org.springframework.http.codec: INFO                          # Jackson2JsonEncoder: the SuiteQL query and record-create request bodies
     org.springframework.web.HttpLogging: INFO                     # the codec loggers above fall back to this category when their own is held at INFO
     org.springframework.web.servlet.mvc.method.annotation: INFO   # the method processors: the /api response bodies carrying the NetSuite records
+    # request line with its query (the name and title values) and, with spring.mvc.log-request-details, the parameters
+    # and headers. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    org.springframework.web.method.HandlerMethod: INFO            # handler arguments: the name and title query values
+    io.undertow.request.io: INFO                                  # request-parse failures quoting a query value that does not decode

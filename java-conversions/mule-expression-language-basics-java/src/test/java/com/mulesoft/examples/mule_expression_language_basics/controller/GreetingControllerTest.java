@@ -54,10 +54,10 @@ import com.mulesoft.examples.mule_expression_language_basics.support.HttpTestCli
  * original {@code MuleExpressionLanguageBasicsIT}, asserting the reply and, for {@code greet3} to {@code greet6}, the
  * content of the single file the call writes; then its error cases: the flows' own failures (an age MEL cannot
  * compare with 18, a body {@code xpath()} or {@code json-to-object-transformer} cannot read) answered by the SC-1
- * JSON 500, the no-listener 404 of every path next to a listener, and the 400 a query that cannot be decoded gets
- * before any flow runs. The {@code greet2} branch and the {@code http.query.params} semantics the flows greet with
- * are covered as well. The dispatch of every other method, {@code HEAD} and form bodies is the subject of
- * {@code GreetingListenerBoundaryTest}.
+ * JSON 500, the no-listener 404 of every path next to a listener and of every listener path carrying {@code ;} segment
+ * parameters, and the 400 a query that cannot be decoded gets before any flow runs. The {@code greet2} branch and the
+ * {@code http.query.params} semantics the flows greet with are covered as well. The dispatch of every other method,
+ * {@code HEAD} and form bodies is the subject of {@code GreetingListenerBoundaryTest}.
  *
  * <p>Requests go through the project's ST-1 {@link HttpTestClient}, so status line, headers and body bytes are
  * asserted exactly as the listener writes them. {@code greeting.output-dir} lies under a JUnit temporary directory,
@@ -204,8 +204,9 @@ class GreetingControllerTest {
 
     /**
      * {@code http.query.params} as the Mule listener built it from the raw query: the last of repeated pairs wins,
-     * names and values are URL-decoded as UTF-8 ({@code +} included), and a pair without {@code =} holds
-     * {@code null}, which a MEL template renders as {@code null}.
+     * names and values are URL-decoded as UTF-8 ({@code +} included), a {@code ;} in the query is part of the value
+     * rather than a path parameter, and a pair without {@code =} holds {@code null}, which a MEL template renders as
+     * {@code null}.
      */
     @ParameterizedTest(name = "GET {0} replies {1}")
     @MethodSource("querySemantics")
@@ -218,14 +219,20 @@ class GreetingControllerTest {
                 Arguments.of("/greet1?username=a&username=b", "Hello b"),
                 Arguments.of("/greet1?username=M%C3%BCle", "Hello M\u00fcle"),
                 Arguments.of("/greet1?username=Mule+Soft", "Hello Mule Soft"),
+                Arguments.of("/greet1?username=a;b", "Hello a;b"),
                 Arguments.of("/greet1?username", "Hello null"),
                 Arguments.of("/greet1", "Hello null"));
     }
 
-    /** Paths next to every listener, which match exactly, and a path no listener serves. */
+    /**
+     * Paths next to every listener, which match exactly, every listener's path with {@code ;} segment parameters,
+     * which the Mule listener compared literally as well ({@code config/ListenerPathConfig}), and a path no listener
+     * serves.
+     */
     @ParameterizedTest(name = "GET {0}")
     @ValueSource(strings = {"/greet1/x", "/greet2/x", "/greet3/x", "/greet4/x", "/greet5/x", "/greet6/x",
-            "/greet1/", "/greet7"})
+            "/greet1/", "/greet1;x=1", "/greet2;x=1", "/greet3;x=1", "/greet4;x=1", "/greet5;x=1", "/greet6;x=1",
+            "/greet3;jsessionid=ABC", "/greet7"})
     void pathNoListenerServesReturnsNoListener404(String path) throws IOException {
         HttpTestClient.Response response = client().get(path);
 

@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -72,6 +73,8 @@ import ch.qos.logback.core.read.ListAppender;
  * and the client is real: the controllers and their RAML validation, {@link NetsuiteSearchService}, the record-shape
  * mapping and the DataWeave JSON writer. The mocked account holds the committed customer only while the test has
  * created it, so the customers assertion depends on the {@code createCustomerInNetsuite} step, as the original's did.
+ * The customers test runs inside {@link NetsuiteTestRecords#withTestCustomer}, the bracket {@code NetsuiteApiIT}
+ * uses, so the create carries the run's {@code externalId} and the delete runs in {@code finally}.
  *
  * <p>The test data are read from profile {@code test} ({@code application-test.yml}) under the original MUnit
  * property names. No request leaves the JVM and no credential is read; the live run of the same suite is the
@@ -180,6 +183,7 @@ class NetsuiteApiTest {
     @DisplayName("netsuite-api-test-suite-get:/customers:netsuite-api-configTest")
     void customers() {
         String companyName = env.getRequiredProperty(NetsuiteTestRecords.COMPANY_NAME_KEY);
+        String externalId = NetsuiteTestRecords.newExternalId();
         Logger recordsLogger = (Logger) LoggerFactory.getLogger(NetsuiteTestRecords.class);
         Level previousLevel = recordsLogger.getLevel();
         ListAppender<ILoggingEvent> appender = new ListAppender<>();
@@ -187,9 +191,9 @@ class NetsuiteApiTest {
         recordsLogger.addAppender(appender);
         recordsLogger.setLevel(Level.INFO);
         try {
-            String id = NetsuiteTestRecords.createCustomerInNetsuite(client, env);
-            // Deleted in finally rather than after the assertions, so a failing assertion leaves no test customer.
-            try {
+            // The IT's bracket: created inside it and deleted in its finally, so a failing assertion leaves no
+            // test customer.
+            NetsuiteTestRecords.withTestCustomer(client, env, externalId, () -> {
                 HttpTestClient.Response response = get("/api/customers?name=" + encode(companyName));
 
                 assertOkJson(response);
@@ -197,9 +201,7 @@ class NetsuiteApiTest {
                 assertNotNull(payload, NULL_PAYLOAD_MESSAGE);
                 assertTrue(payload.contains("\"companyName\": \"" + companyName + "\""),
                         () -> COMPANY_NAME_MESSAGE + " " + response);
-            } finally {
-                NetsuiteTestRecords.deleteCustomerInNetsuite(client, id);
-            }
+            });
             assertEquals(List.of("Test customer created with ID: " + CREATED_CUSTOMER_ID,
                             "Test customer with ID " + CREATED_CUSTOMER_ID + " was deleted."),
                     infoMessages(appender));
@@ -211,9 +213,11 @@ class NetsuiteApiTest {
 
         InOrder order = inOrder(client);
         order.verify(client).createRecord(NetsuiteTestRecords.CUSTOMER_RECORD_TYPE,
-                NetsuiteTestRecords.restCreateBody(NetsuiteTestRecords.customer(env)));
+                NetsuiteTestRecords.restCreateBody(NetsuiteTestRecords.customer(env), externalId));
         order.verify(client).suiteQl(NetsuiteSearchService.customerIdQuery(companyName));
         order.verify(client).deleteRecord(NetsuiteTestRecords.CUSTOMER_RECORD_TYPE, CREATED_CUSTOMER_ID);
+        // The create's ID was known, so the cleanup deleted it without the external-ID lookup.
+        verify(client, never()).suiteQl(NetsuiteTestRecords.externalIdQuery(externalId));
     }
 
     @Test

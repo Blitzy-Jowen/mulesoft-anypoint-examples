@@ -18,20 +18,21 @@ The listener binds to `0.0.0.0` on port `http.port`, default `8081` (`salesforce
 
 | Method | Path | Input | Response | Source |
 |---|---|---|---|---|
-| `GET` | `/` | none; the body, query string and `Accept` are ignored | `200 OK`, `Content-Type: text/html;charset=UTF-8`: `retrieval/index.html` with `#[message.payload]` replaced by `<?xml version='1.0' encoding='UTF-8'?>` and a `<div>` holding one `<option value="<name>"><label></option>` per `describeGlobal` object, in Salesforce order | `showFormFlow`, `salesforce-id-retrieval.xml:7-24` |
-| `POST` | `/` | form body (`Content-Type: application/x-www-form-urlencoded`) with `object`, `field` (may be empty), `searchKey`, `searchValue` | `200 OK`, `Content-Type: text/plain;charset=UTF-8`, the records of `queryAll` of `SELECT id, name [,<field>] from <object> where <searchKey> like '%<searchValue>%'` as text, for example `[{Email=..., Id=..., Name=..., type=User}, ...]`, `[]` when nothing matches | `salesforceDataRetrievalFlow`, `salesforce-id-retrieval.xml:25-36` |
+| `GET`, in any letter case | `/` | none; the body, query string and `Accept` are ignored | `200 OK`, `Content-Type: text/html;charset=UTF-8`: `retrieval/index.html` with `#[message.payload]` replaced by `<?xml version='1.0' encoding='UTF-8'?>` and a `<div>` holding one `<option value="<name>"><label></option>` per `describeGlobal` object, in Salesforce order | `showFormFlow`, `salesforce-id-retrieval.xml:7-24` |
+| `POST`, in any letter case | `/` | form body (`Content-Type: application/x-www-form-urlencoded`) with `object`, `field` (may be empty), `searchKey`, `searchValue` | `200 OK`, no `Content-Type`, `Content-Length` of the UTF-8 bytes, the records of `queryAll` of `SELECT id, name [,<field>] from <object> where <searchKey> like '%<searchValue>%'` as text, for example `[{Email=..., Id=..., Name=..., type=User}, ...]`, `[]` when nothing matches | `salesforceDataRetrievalFlow`, `salesforce-id-retrieval.xml:25-36` |
 | `POST` | `/` | any form whose query fails other than through the three upstream failure modes: an absent `field` parameter, an object or field Salesforce does not describe, a query Salesforce rejects, a body that is not a form | `200 OK`, `Content-Type: text/plain;charset=UTF-8`, body `Invalid Salesforce query.` (25 bytes, no line break) | `catch-exception-strategy`, `salesforce-id-retrieval.xml:37-39` |
 | `POST` | `/` | a form body with a malformed percent escape (`object=%ZZ`) | `400 Bad Request`, no `Content-Type`, body `Cannot decode x-www-form-urlencoded payload`; the flow never runs | Mule 3.8 listener default |
 | `GET`, `POST` | `/` | a request whose Salesforce call fails through an approved connector failure mode | `502`, `429` or `503`, `Content-Type: application/json` (next section) | AAP 0.4.8 addition |
 | `GET` | `/` | a request whose `describeGlobal` fails otherwise (`showFormFlow` declares no exception strategy) | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }` (SC-1, AAP 0.4.7) | platform default |
-| `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, `TRACE` | `/` | any | `405 Method Not Allowed`, `Content-Type: text/plain`, body `Method not allowed for endpoint: /` (SC-1) | `allowedMethods="GET"` (xml:8) and `allowedMethods="POST"` (xml:26) |
+| `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS` (a CORS pre-flight included), `TRACE`, and every other spelling that is not a letter case of `GET` or `POST` (`head`, `options`, `put`, ...) | `/` | any | `405 Method Not Allowed`, `Content-Type: text/plain`, body `Method not allowed for endpoint: /` (SC-1) | `allowedMethods="GET"` (xml:8) and `allowedMethods="POST"` (xml:26) |
 | any | any other path (`/favicon.ico`, `/error` included) | any | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1) | both listeners serve only `/` |
 
 - The POST form is read from the request body alone, as the Mule payload was: `controller/SalesforceRetrievalController#parseForm` decodes it and never consults the query string, so `POST /?object=user` without a form body is answered `Invalid Salesforce query.`. A repeated name keeps its last value; a name without `=` maps to `null`.
 - A body with another `Content-Type` (JSON, multipart, none) yields an empty form, which fails on its absent `field` with `Invalid Salesforce query.`.
 - The POST record text renders every record as the `java.util.HashMap` the connector returned (`client/SalesforcePartnerClient#toMap`, which adds the sObject `type` key), joined in a list as Mule's `List.toString()` joined them (`mapper/QueryResultFormatter`). The service logs the same text at INFO as `Result: <text>` (xml:36).
-- Each response presets its `Content-Type`, so `Accept` is never consulted and no 406 or 415 arises.
-- A CORS pre-flight to `/` (an `OPTIONS` request with `Origin` and `Access-Control-Request-Method`) is answered by Spring MVC with `403 Invalid CORS request` before any handler runs. The Mule listener answered it as any `OPTIONS` request (recorded in the root `DECISIONS.md`).
+- `Accept` is never consulted and no 406 or 415 arises: every response but the record text presets its `Content-Type`, and the record text is written to the servlet response without one. The flow ends that payload in `set-payload value="#[response]"` and a `byte-array-to-string-transformer` (xml:34-35), neither of which declares a MIME type, and the Mule 3.8 listener sent no `Content-Type` for such an untyped payload.
+- Method names are matched ignoring case, as Mule's `MethodRequestMatcher` did: on `/`, `get` and `post` in any letter case run the flows exactly as `GET` and `POST` (`config/ListenerMethodFilter`). Every other spelling (`head`, `options`, `put`, `trace`, unknown tokens) keeps the 405, and a lower-case `options` never becomes a CORS pre-flight.
+- A CORS pre-flight to `/` (an `OPTIONS` request with `Origin` and `Access-Control-Request-Method`) is answered like any other `OPTIONS` request, with the 405 and no `Access-Control-*` or `Vary` header, because the original listeners applied no CORS policy (`config/PreflightDispatchConfig`). A pre-flight to an unserved path gets the no-listener 404.
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
 Exchanges measured on this build, run without credentials and shown here on the default port. Neither request contacts Salesforce: the first form lacks `field`, and the second path is not served.
@@ -54,6 +55,8 @@ Date: <current date>
 
 No listener for endpoint: /favicon.ico
 ```
+
+The first exchange is the catch branch, which keeps `Content-Type: text/plain;charset=UTF-8`. A query that succeeds is answered `200 OK` with its `Content-Length` and no `Content-Type`.
 
 ## Connector failure modes (AAP 0.4.8)
 
@@ -129,11 +132,13 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `parse-template location="./src/main/resources/retrieval/index.html"` (xml:23) | SC-14 `mapper/ParseTemplateRenderer` over the classpath copy `src/main/resources/retrieval/index.html`, byte-identical to the original |
 | `salesforceDataRetrievalFlow` listener `POST /` (xml:25-26) | `controller/SalesforceRetrievalController#query`, with `parseForm` building the Mule form payload |
 | `sfdc:query-all` with the MEL-built SOQL (xml:27) | `SalesforceRetrievalService#query` (identifier checks and literal escaping, AAP 0.4.10) → `SalesforcePartnerClient#queryAll` |
-| `set-variable` `response`, `foreach` appending each record, `set-payload`, `byte-array-to-string-transformer` (xml:28-35) | `mapper/QueryResultFormatter#format` |
+| `set-variable` `response`, `foreach` appending each record, `set-payload`, `byte-array-to-string-transformer` (xml:28-35) | `mapper/QueryResultFormatter#format`; the controller writes the untyped text as UTF-8 bytes with `Content-Length` and no `Content-Type` |
 | `logger level="INFO" message="Result: #[payload]"` (xml:36) | SLF4J INFO `Result: {}` in `SalesforceRetrievalService#query` |
 | `catch-exception-strategy` setting `Invalid Salesforce query.` (xml:37-39) | `exception/SalesforceRetrievalExceptionHandler` (`@Order(0)`, scoped to the controller): POST failures → 200 `Invalid Salesforce query.`, GET failures → SC-1's 500 |
 | Mule listener's 400 for an undecodable form body | `SalesforceRetrievalController#rejectUndecodableForm` |
 | Platform default responses (no listener, method not allowed, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse`; `SalesforceRetrievalController.MethodNotAllowedGuard` rejects `HEAD` and `OPTIONS` |
+| Listener semantics: `allowedMethods` compared ignoring case (`MethodRequestMatcher`) | `config/ListenerMethodFilter`, scoped to `/`, canonicalizing only letter cases of `GET` and `POST` |
+| Listener semantics: no CORS policy | `config/PreflightDispatchConfig` |
 | (approved addition, no original construct) | SC-9 `exception/UpstreamExceptionHandler` and the three upstream exceptions |
 | `mule-deploy.properties` (`config.resources=salesforce-id-retrieval.xml`) | `SalesforceDataRetrievalApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` (empty) | `src/main/resources/application.yml` |
@@ -144,7 +149,7 @@ Shared components:
 
 - This project holds the reference implementations of **SC-9** (`client/UpstreamCallExecutor`, `client/UpstreamCall`, `client/UpstreamAction`, `client/UpstreamSystem`, `client/UpstreamFailureClassifier`, `client/UpstreamFailureKind`, `exception/UpstreamAuthenticationException`, `exception/UpstreamRateLimitException`, `exception/UpstreamUnavailableException`, `exception/UpstreamExceptionHandler`) and **SC-15** (`client/SalesforcePartnerClient`, `client/SalesforceFailureClassifier`, `config/SalesforceProperties`).
 - The other connector projects copy them with only the `package` line changed: the six other Salesforce projects copy SC-15, and every connector project (Salesforce, NetSuite, Workday, Dynamics) copies SC-9, `UpstreamExceptionHandler` only where HTTP-triggered. Each component's tests are copied with it.
-- This project carries copies of SC-1 (`exception/GlobalExceptionHandler`, `exception/ErrorResponse`) and ST-1 (`support/HttpTestClient`) from `rest-api-with-apikit-java`, SC-4 `mapper/DwXmlWriter` from `web-service-consumer-java`, SC-14 `mapper/ParseTemplateRenderer` from `login-form-using-the-http-connector-java`, and ST-2 (`FixtureParityTest`, the `SCENARIOS.md` format) from `hello-world-java`, each with only its `package` line changed (register in the root `DECISIONS.md`).
+- This project carries copies of SC-1 (`exception/GlobalExceptionHandler`, `exception/ErrorResponse`), ST-1 (`support/HttpTestClient`) and the listener-semantics class `config/PreflightDispatchConfig` with its `config/PreflightDispatchConfigTest` from `rest-api-with-apikit-java`, SC-4 `mapper/DwXmlWriter` from `web-service-consumer-java`, SC-14 `mapper/ParseTemplateRenderer` from `login-form-using-the-http-connector-java`, and ST-2 (`FixtureParityTest`, the `SCENARIOS.md` format) from `hello-world-java`, each with only its `package` line changed (register in the root `DECISIONS.md`). `config/ListenerMethodFilter` with its `config/ListenerMethodFilterTest`, the wire test `config/PreflightDispatchListenerTest` and the letter-case cases of `controller/SalesforceRetrievalControllerTest` are written for this project's two `/` listeners.
 
 ## Behaviours stubbed or externalized
 
@@ -154,11 +159,10 @@ Shared components:
 
 Tier 2A verification points: the plan chose these values where the original platform, not the flow, fixed the bytes. When a captured fixture of the original shows different bytes, the fixture governs and the Java code is changed to match.
 
-- The `Content-Type` of both POST replies, records and `Invalid Salesforce query.`: `text/plain;charset=UTF-8`, because the flow names no MIME type.
+- The `Content-Type` of the `Invalid Salesforce query.` reply, `text/plain;charset=UTF-8`, because the catch branch's `set-payload` names no MIME type; and the absent `Content-Type` of the record reply, whose flow payload is untyped.
 - The exact text of the POST records: `[` + each record's `HashMap` text `{K=V, …}` joined by `, ` + `]`, following Mule's `ObjectToString` and the MEL list concatenation of xml:31. The records carry the sObject `type` key, and their key order is `HashMap` iteration order.
 - The XML indentation of the option block on `GET /`. SC-4 `DwXmlWriter` indents with tabs, as the DataWeave 1.0 output committed elsewhere in the repository does, while the captured page `src/test/resources/index.html` shows two-space indentation.
 - The body of a failed `GET /` (SC-1's `{ "message": "<exception message>" }`), the 404 and 405 defaults, and the listener's 400 for an undecodable form.
-- The Mule listener ran the flows for a lower-case `get` or `post`, which get the 405 here; and it answered a CORS pre-flight as a plain `OPTIONS` request.
 
 ## Build, run and test
 
@@ -174,7 +178,7 @@ java -jar target/salesforce-data-retrieval-java-1.0.0-SNAPSHOT.jar
 ```
 
 - `mvn test` needs no licence, credential or network: Salesforce is a Mockito-mocked `SalesforcePartnerClient` or a WireMock Partner SOAP stub.
-- Without the three `sfdc.*` values the application still starts, but every request that reaches Salesforce fails at the lazy `login`. A rejected login (`INVALID_LOGIN`) is none of the three failure modes, so `GET /` answers the SC-1 500 and the POST `Invalid Salesforce query.`.
+- Without the three `sfdc.*` values the application still starts, but every request that needs Salesforce fails before any Salesforce request: the lazy `login` first checks that `sfdc.username`, `sfdc.password` and `sfdc.securityToken` are non-blank and throws an `IllegalStateException` naming each missing key, never a value (for example `sfdc.username, sfdc.password and sfdc.securityToken are not configured`). That, like a rejected login (`INVALID_LOGIN`), is none of the three failure modes, so `GET /` answers the SC-1 500 with that message and the POST `Invalid Salesforce query.`.
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
@@ -199,14 +203,17 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 |---|---|
 | `SalesforceIdRetrievalTest` | the ported `SalesforceIdRetrievalIT` (`salesforce-data-retrieval/src/test/java/org/mule/examples/SalesforceIdRetrievalIT.java:61-87`) over HTTP against a mocked `SalesforcePartnerClient`: `GET /` contains an option tag (the original regex), and the original `POST /` contains every line of `reply.txt` |
 | `SalesforceIdRetrievalIT` | the same two assertions against a live org (failsafe, previous section) |
-| `controller/SalesforceRetrievalControllerTest` | on the wire through ST-1: the form page bytes and `text/html;charset=UTF-8`, also with `Accept: application/json`; a failing `describeGlobal` → 500 `{ "message": "boom" }`; the original POST and its exact SOQL; an empty `field` → `SELECT id, name  from user where name like '%mule%'`; an unknown object, a JSON body, a query-string-only form and a form without `field` → 200 `Invalid Salesforce query.`; `PUT`, `PATCH`, `DELETE`, `OPTIONS` → 405; `/favicon.ico` → 404; 502, 429 and 503 ahead of both flows' own handling |
+| `controller/SalesforceRetrievalControllerTest` | on the wire through ST-1: the form page bytes and `text/html;charset=UTF-8`, also with `Accept: application/json`; a failing `describeGlobal` → 500 `{ "message": "boom" }`; the original POST and its exact SOQL, its record text with `Content-Length` and no `Content-Type` (UTF-8 byte length for non-ASCII records, also with `Accept: application/json`); an empty `field` → `SELECT id, name  from user where name like '%mule%'`; an unknown object, a JSON body, a query-string-only form and a form without `field` → 200 `Invalid Salesforce query.`; `PUT`, `PATCH`, `DELETE`, `OPTIONS` → 405; `get`, `Get`, `gEt` → the form page and `post`, `Post`, `pOsT` → the record text, byte for byte as `GET` and `POST`; `options` (with and without pre-flight headers), `Options`, `put`, `delete`, `trace`, `postx` and `head` → 405; `/favicon.ico` → 404; 502, 429 and 503 ahead of both flows' own handling |
 | `service/SalesforceRetrievalServiceTest`, `service/SalesforceRetrievalServicePathValidationTest` | the original SOQL; rejection of every identifier Salesforce does not describe before any query; relationship paths, polymorphic targets and one describe per type per request; describes read afresh per request; an absent `field` fails before Salesforce is called; vendor failures propagate unchanged; the `Result:` INFO log; the template rendering |
 | `mapper/SObjectOptionsMapperTest`, `mapper/QueryResultFormatterTest` | the option block in Salesforce order with escaped names and labels, the captured page's options reproduced in order; the record text equals `List`/`HashMap` `toString()`, every `reply.txt` line contained |
 | `mapper/DwXmlWriterTest`, `mapper/ParseTemplateRendererTest` | SC-4 XML bytes; SC-14 template substitution with the template kept byte-identical |
-| `exception/SalesforceRetrievalExceptionHandlerTest` | POST failures → the catch branch's 200 `Invalid Salesforce query.`; a GET failure → SC-1's 500; upstream exceptions win on both; an unmapped path, a wrong method and the `HEAD`/`OPTIONS` guard keep SC-1's 404 and 405; the advice's scope and `@Order`; a successful POST left untouched |
+| `exception/SalesforceRetrievalExceptionHandlerTest` | POST failures → the catch branch's 200 `Invalid Salesforce query.`; a GET failure → SC-1's 500; upstream exceptions win on both; an unmapped path, a wrong method and the `HEAD`/`OPTIONS` guard keep SC-1's 404 and 405; the advice's scope and `@Order`; a successful POST left untouched, with its `Content-Length` and no `Content-Type` |
 | `exception/UpstreamExceptionHandlerTest`, `client/UpstreamCallExecutorTest`, `client/SalesforceFailureClassifierTest` | SC-9 and the Salesforce classification: re-login and one retry on `INVALID_SESSION_ID`, no retry on `REQUEST_LIMIT_EXCEEDED` (no `Retry-After`) or on any timeout or connectivity cause, 502/429/503 bodies, precedence over a catch-all advice |
 | `client/SalesforcePartnerClientTest` | SC-15 against WireMock Partner SOAP stubs: login with password + token, `query`, `queryAll` paging, `create`, `delete`, `describeGlobal`, `describeSObject`, `HashMap` records, session mode, the failure modes per operation, the 10 s default timeouts |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes |
+| `config/ListenerMethodFilterTest` | the filter alone: letter cases of `GET` and `POST` on `/` (also with a query string or under a context path) reach the chain as `GET` and `POST` with everything else unchanged; other method tokens on `/`, letter cases on any other path, and a request without a method or URI pass unchanged |
+| `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/` asking for any method, from any origin, gets exactly the plain `OPTIONS` reply (the 405), runs no flow and carries no `Access-Control-*` or `Vary` header; a pre-flight to an unserved path gets the no-listener 404; cross-origin `GET` and `POST` run both flows without CORS headers |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
@@ -242,9 +249,9 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 929 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 2 tests, both skipped (`SalesforceIdRetrievalIT`, no `application-it.yml`).
-- `mvn -B test`: `BUILD SUCCESS`; 929 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 357 of 361 lines (98.9%) of `service/SalesforceRetrievalService`, `mapper/SObjectOptionsMapper`, `mapper/QueryResultFormatter`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 95.8% (993 of 1036 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 1050 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 2 tests, both skipped (`SalesforceIdRetrievalIT`, no `application-it.yml`).
+- `mvn -B test`: `BUILD SUCCESS`; 1050 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 357 of 361 lines (98.9%) of `service/SalesforceRetrievalService`, `mapper/SObjectOptionsMapper`, `mapper/QueryResultFormatter`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 96.0% (1069 of 1113 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=11`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `SalesforceIdRetrievalIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

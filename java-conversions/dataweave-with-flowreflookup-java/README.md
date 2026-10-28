@@ -128,10 +128,10 @@ Every Salesforce call, the lazy SOAP `login` included, runs through SC-9 `client
 - The client sends its SOAP requests with a chunked body, which the JDK never re-sends after a dropped connection, so a connectivity failure reaches the executor after exactly one request.
 - The ERROR lines name the upstream, the category and exception classes only, never vendor messages, credentials or record data.
 
-Measured on this build without credentials, with `sfdc.auth-endpoint` pointed at a closed local port (timestamps and thread prefixes removed). The two records are mapped, and their regions looked up, before the lazy `login` fails:
+Measured on this build with placeholder values for the three credential keys, which the client requires before it sends a `login`, and `sfdc.auth-endpoint` pointed at a closed local port (timestamps and thread prefixes removed). The two records are mapped, and their regions looked up, before the lazy `login` fails:
 
 ```console
-$ java -jar target/dataweave-with-flowreflookup-java-1.0.0-SNAPSHOT.jar --companies.input-dir=target/run/in --companies.move-to-dir=target/run/out --companies.polling-frequency=2000 --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0
+$ java -jar target/dataweave-with-flowreflookup-java-1.0.0-SNAPSHOT.jar --companies.input-dir=target/run/in --companies.move-to-dir=target/run/out --companies.polling-frequency=2000 --sfdc.auth-endpoint=http://127.0.0.1:<closed port>/services/Soap/u/65.0 --sfdc.username=placeholder --sfdc.password=placeholder --sfdc.securityToken=placeholder
 $ cp src/main/resources/companies.csv target/run/companies.csv.part && mv target/run/companies.csv.part target/run/in/companies.csv
 State to lookup is: FL
 INFO  c.m.e.d.s.SalesRegionLookupService       : Region is : South East
@@ -155,7 +155,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `spring.main.web-application-type` | `WebApplicationType` | `none` | none | fixed | the original has no HTTP listener, so no web server starts and no port is bound |
 | `companies.input-dir` | `String` (a path) | `src/main/resources/input` | none; the original hard-coded `path` on the file endpoint (xml:7) | default | directory polled for CSV files |
 | `companies.move-to-dir` | `String` (a path) | `src/main/resources/output` | none; the original hard-coded `moveToDirectory` (xml:7) | default | directory each polled file is moved to under its own name |
-| `companies.polling-frequency` | `long` (ms) | `10000` | none; the original hard-coded `pollingFrequency` (xml:7) | default | fixed delay between the end of one poll and the start of the next |
+| `companies.polling-frequency` | `long` (ms) | `10000` | none; the original hard-coded `pollingFrequency` (xml:7) | default | fixed delay between the end of one poll and the start of the next; a zero, negative or unreadable value stops start-up with an error naming the key and the value |
 | `sfdc.username` | `String` | none, `${SFDC_USERNAME:}` | **`sfdc.user`** (xml:3) | TODO | the Salesforce user the `login` call authenticates; renamed because the request's key names govern (AAP 0.4.6) |
 | `sfdc.password` | `String` | none, `${SFDC_PASSWORD:}` | `sfdc.password` (unchanged, xml:3) | TODO (secret) | that user's password, without the security token |
 | `sfdc.securityToken` | `String` | none, `${SFDC_SECURITYTOKEN:}` | `sfdc.securityToken` (unchanged, xml:3) | TODO (secret) | appended to the password at login; `sfdc.security-token` binds as well |
@@ -216,7 +216,7 @@ cp src/main/resources/companies.csv src/main/resources/input/
 Within one polling interval the console shows the two lookups of [Region lookup](#region-lookup-lookupsalesregionflow), the file moves to `src/main/resources/output/companies.csv`, and Salesforce lists Universal Exports (`Region__c` `South East`) and Best Widgets (`Region__c` `West Coast`) under **Accounts**. Delete both Accounts afterwards, and the `Region` field if you created it only for the example. For a large file, copy it next to the input directory first and then move it in, so a poll never reads a half-written file.
 
 - `mvn test` needs no licence, credential or network: Salesforce is a Mockito-mocked `SalesforcePartnerClient` or a WireMock Partner SOAP stub.
-- Without the three `sfdc.*` values the application still starts, but every import fails at the lazy `login`. A rejected login (`INVALID_LOGIN`) is none of the three failure modes, so it is logged by `FileInboundPoller` at ERROR and the file is moved.
+- Without the three `sfdc.*` values the application still starts, but every import fails before any Salesforce request: the lazy `login` first checks that `sfdc.username`, `sfdc.password` and `sfdc.securityToken` are non-blank and throws an `IllegalStateException` naming each missing key, never a value. That, like a rejected login (`INVALID_LOGIN`), is none of the three failure modes, so it is logged by `FileInboundPoller` at ERROR and the file is moved.
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
 - The build also runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2). The Salesforce Partner API runs on WSC's own XML stack.
 
@@ -278,10 +278,10 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 The root `SUMMARY.md` carries the same row for this project (AAP 0.8.7). Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 740 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`DataWeaveWithFlowRefIT`: `src/test/resources/application-it.yml not supplied`).
-- `mvn -B clean package`: `BUILD SUCCESS`; 740 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
-- `mvn -B test`: `BUILD SUCCESS`; 740 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 128 of 128 lines (100.0%) of `service/AccountImportService`, `service/SalesRegionLookupService`, `mapper/AccountMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 91.9% (670 of 729 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 780 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`DataWeaveWithFlowRefIT`: `src/test/resources/application-it.yml not supplied`).
+- `mvn -B clean package`: `BUILD SUCCESS`; 780 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`.
+- `mvn -B test`: `BUILD SUCCESS`; 780 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 128 of 128 lines (100.0%) of `service/AccountImportService`, `service/SalesRegionLookupService`, `mapper/AccountMapper` and `mapper/DwCsvReader`. Total project LINE coverage: 92.2% (695 of 754 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `DataWeaveWithFlowRefIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

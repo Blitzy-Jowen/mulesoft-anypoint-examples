@@ -22,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
@@ -66,6 +67,7 @@ import org.springframework.util.StreamUtils;
 import org.springframework.web.client.RestClient;
 
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties.ClientCredential;
 
 /**
  * Outbound adapter to Box, replacing three elements of
@@ -181,10 +183,14 @@ public class BoxApiClient implements AutoCloseable {
      *
      * @param code the authorization code Box sent to the redirection URL
      * @return the token endpoint's response, whatever its status
-     * @throws IllegalStateException when {@code box.token-url} is not a usable URL, before any request is sent
+     * @throws IllegalStateException when {@code box.id} or {@code box.secret} has no value, naming the first missing
+     *                               key ({@code Box client ID (box.id) is not configured} or
+     *                               {@code Box client secret (box.secret) is not configured}), or when
+     *                               {@code box.token-url} is not a usable URL, before any request is sent
      */
     public RawResponse requestToken(String code) {
         Objects.requireNonNull(code, "code must not be null");
+        requireClientCredentials();
         // Field order is the java.util.HashMap iteration order of the form Mule 3.8
         // AutoAuthorizationCodeTokenRequestHandler builds for these five keys.
         return postForm(formBody(
@@ -201,10 +207,13 @@ public class BoxApiClient implements AutoCloseable {
      *
      * @param refreshToken the refresh token stored from an earlier token response
      * @return the token endpoint's response, whatever its status
-     * @throws IllegalStateException when {@code box.token-url} is not a usable URL, before any request is sent
+     * @throws IllegalStateException when {@code box.id} or {@code box.secret} has no value, naming the first missing
+     *                               key as {@link #requestToken(String)} does, or when {@code box.token-url} is not a
+     *                               usable URL, before any request is sent
      */
     public RawResponse refreshToken(String refreshToken) {
         Objects.requireNonNull(refreshToken, "refreshToken must not be null");
+        requireClientCredentials();
         // HashMap iteration order of Mule 3.8's refresh form, as for requestToken.
         return postForm(formBody(
                 "refresh_token", refreshToken,
@@ -232,6 +241,19 @@ public class BoxApiClient implements AutoCloseable {
         return execute(restClient.get()
                 .uri(uri)
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken));
+    }
+
+    /**
+     * Fails before any request when a client credential both token forms carry has no value, with the
+     * {@link ClientCredential#notConfiguredMessage()} of the first missing one, {@code box.id} before
+     * {@code box.secret}. As for {@link #configuredUrl}, the message names only the key, never a value, and Box
+     * never receives a form with an empty {@code client_id} or {@code client_secret}.
+     */
+    private void requireClientCredentials() {
+        Optional<ClientCredential> missing = properties.firstMissing(ClientCredential.ID, ClientCredential.SECRET);
+        if (missing.isPresent()) {
+            throw new IllegalStateException(missing.get().notConfiguredMessage());
+        }
     }
 
     private RawResponse postForm(byte[] form) {

@@ -17,6 +17,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -41,9 +43,11 @@ import org.springframework.beans.factory.config.YamlPropertiesFactoryBean;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import com.mulesoft.examples.import_contacts_into_ms_dynamics.client.DynamicsWebApiClient;
 import com.mulesoft.examples.import_contacts_into_ms_dynamics.trigger.ContactsFileTrigger;
@@ -69,7 +73,8 @@ import com.mulesoft.examples.import_contacts_into_ms_dynamics.trigger.ContactsFi
  *       is asserted as the original asserted the first element of its list;</li>
  *   <li>test flow {@code deleteContactFromDynamics} ({@code dynamicscrm:delete logicalName="contact"}) in
  *       {@code @After}: {@link DynamicsWebApiClient#deleteContact(String)}, {@code DELETE contacts(<guid>)}, in
- *       {@code @AfterEach}, each failure logged and never thrown, as the original only printed it;</li>
+ *       {@code @AfterEach}, each failure logged and never thrown, as the original only printed it, though named by
+ *       its exception types alone rather than by the stack trace the original printed;</li>
  *   <li>{@code crm.username}, {@code crm.password}, {@code crm.service-url}, {@code crm.auth-type} of
  *       {@code mule.test.properties}: the profile {@code it} makes Spring Boot load {@code dynamics.service-url},
  *       {@code dynamics.oauth.tenant-id}, {@code dynamics.oauth.client-id} and {@code dynamics.oauth.client-secret}
@@ -83,7 +88,11 @@ import com.mulesoft.examples.import_contacts_into_ms_dynamics.trigger.ContactsFi
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of those four keys is missing,
  * blank, still {@code TODO} or an unresolvable placeholder ({@link #missingCredential()}); then no Spring context
  * starts and neither Entra nor Dataverse is called. A skipped run is not Tier 2B evidence. Logs name contact IDs and
- * e-mail addresses of the test data only, never a credential.
+ * e-mail addresses of the test data only, never a credential. A cleanup failure is named only by the class names of
+ * the exception and its causes and, for a Dataverse error answer, its HTTP status code
+ * ({@link #failureTypes(Throwable)}); no log carries an exception's message, causes' or suppressed exceptions'
+ * messages, response body or stack trace, because Entra and Dataverse failures can carry tokens, OData filters and
+ * contact fields there.
  */
 @ExtendWith(ImportContactsIntoMSDynamicsIT.LiveCredentialsGate.class)
 @SpringBootTest(classes = ImportContactsIntoMsDynamicsApplication.class,
@@ -117,6 +126,12 @@ class ImportContactsIntoMSDynamicsIT {
     private static final Duration IMPORT_TIMEOUT = Duration.ofSeconds(40);
 
     private static final Duration QUERY_POLL_INTERVAL = Duration.ofSeconds(2);
+
+    /** Separates a failure from its cause in {@link #failureTypes(Throwable)}. */
+    private static final String CAUSE_SEPARATOR = " <- ";
+
+    /** The most exceptions {@link #failureTypes(Throwable)} names: the failure and four of its causes. */
+    private static final int FAILURE_TYPES_LIMIT = 5;
 
     @TempDir
     static Path workDir;
@@ -199,8 +214,9 @@ class ImportContactsIntoMSDynamicsIT {
     /**
      * Deletes every contact read back for the two e-mails. Once the file was dropped, both are queried once more
      * first, so a contact the test never got to read back (a wait that timed out) is deleted too. Each failure is
-     * logged and never thrown, as the original only printed it, so one failed delete does not keep the others from
-     * running.
+     * logged with the e-mail or contact ID it concerns and {@link #failureTypes(Throwable)}, never with the
+     * exception itself, and never thrown, as the original only printed it, so one failed delete does not keep the
+     * others from running.
      */
     @AfterEach
     void tearDown() {
@@ -209,7 +225,8 @@ class ImportContactsIntoMSDynamicsIT {
                 try {
                     selectContacts(email);
                 } catch (Exception e) {
-                    LOG.warn("Could not query the Dataverse contacts with e-mail {} for deletion", email, e);
+                    LOG.warn("Could not query the Dataverse contacts with e-mail {} for deletion: {}", email,
+                            failureTypes(e));
                 }
             }
         }
@@ -218,7 +235,7 @@ class ImportContactsIntoMSDynamicsIT {
                 client.deleteContact(id);
                 LOG.info("Deleted Dataverse contact {}", id);
             } catch (Exception e) {
-                LOG.error("Failed to delete Dataverse contact {}", id, e);
+                LOG.error("Failed to delete Dataverse contact {}: {}", id, failureTypes(e));
             }
         }
         contactIds.clear();
@@ -268,6 +285,53 @@ class ImportContactsIntoMSDynamicsIT {
                 .filter(Objects::nonNull)
                 .map(Object::toString)
                 .collect(Collectors.toUnmodifiableSet());
+    }
+
+    /**
+     * Names {@code failure} by type identifiers only, for the cleanup logs: the {@link Class#getName() class name} of
+     * the failure and of each of its causes, separated by {@value #CAUSE_SEPARATOR}, a
+     * {@link WebClientResponseException} followed by its HTTP status code as {@code (HTTP <code>)}. No message,
+     * response body, request URI, stack trace or suppressed exception is read. The walk names at most
+     * {@value #FAILURE_TYPES_LIMIT} exceptions, then {@code ...}; it ends at a cause already named with
+     * {@code [circular]} and at a cause that cannot be read with {@code [unavailable]}, so it terminates and never
+     * throws, and a cleanup catch that calls it still goes on to the next delete.
+     *
+     * @return the description, or {@code (null)} for {@code null}
+     */
+    private static String failureTypes(Throwable failure) {
+        if (failure == null) {
+            return "(null)";
+        }
+        StringBuilder types = new StringBuilder(128);
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        Throwable current = failure;
+        for (int count = 0; current != null; count++) {
+            if (count > 0) {
+                types.append(CAUSE_SEPARATOR);
+            }
+            if (count == FAILURE_TYPES_LIMIT) {
+                types.append("...");
+                break;
+            }
+            if (!named.add(current)) {
+                types.append("[circular]");
+                break;
+            }
+            types.append(current.getClass().getName());
+            if (current instanceof WebClientResponseException response) {
+                HttpStatusCode status = response.getStatusCode();
+                if (status != null) {
+                    types.append(" (HTTP ").append(status.value()).append(')');
+                }
+            }
+            try {
+                current = current.getCause();
+            } catch (RuntimeException unreadable) {
+                types.append(CAUSE_SEPARATOR).append("[unavailable]");
+                break;
+            }
+        }
+        return types.toString();
     }
 
     /**

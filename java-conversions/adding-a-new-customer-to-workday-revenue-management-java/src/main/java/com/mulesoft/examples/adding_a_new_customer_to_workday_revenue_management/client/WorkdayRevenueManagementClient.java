@@ -69,7 +69,12 @@ import jakarta.xml.soap.SOAPException;
  * POST after a connection reset or an early end of stream while the response is awaited: Workday receives each
  * attempt once, and the failure surfaces instead.
  *
- * <p>Every call runs through {@link UpstreamCallExecutor} for {@link UpstreamSystem#WORKDAY}, with
+ * <p>Each call first checks its {@code wday.*} values with {@link WorkdayProperties#requireConfigured()}: a missing
+ * or invalid one throws {@link IllegalStateException} naming the key, so nothing is logged or sent, no
+ * re-authentication runs and nothing is retried; the flow's caller receives SC-1's 500 with that message. The
+ * constructor checks nothing, so the application starts with every value empty.
+ *
+ * <p>Every call then runs through {@link UpstreamCallExecutor} for {@link UpstreamSystem#WORKDAY}, with
  * {@link #reauthenticate()} as the single re-authentication step before its one retry. This class therefore catches,
  * wraps and retries nothing: a SOAP fault escapes as Spring WS's {@code SoapFaultClientException}, an HTTP error
  * without a fault as {@link HttpStatusException} carrying the status and {@code Retry-After}, and a timeout or
@@ -121,12 +126,15 @@ public class WorkdayRevenueManagementClient {
      * @param request the {@code wd:Put_Customer_Request} element built by {@code PutCustomerRequestMapper}, marshalled
      *                as given
      * @return the unwrapped {@code Put_Customer_Response}, or {@code null} when Workday answers with an empty body
-     * @throws IllegalStateException the response body is not a {@code Put_Customer_Response}
+     * @throws IllegalStateException a required {@code wday.*} value is missing or invalid, before anything is sent
+     *                               (see {@link WorkdayProperties#requireConfigured()}), or the response body is
+     *                               not a {@code Put_Customer_Response}
      * @throws Exception             the vendor failure unchanged, or one of the three upstream exceptions of
      *                               {@link UpstreamCallExecutor}
      */
     public PutCustomerResponseType putCustomer(JAXBElement<PutCustomerRequestType> request) throws Exception {
         Objects.requireNonNull(request, "request");
+        properties.requireConfigured();
         log.info("Calling Workday Put_Customer at {}", properties.getEndpoint());
         return executor.call(UpstreamSystem.WORKDAY,
                 () -> unwrapPutCustomerResponse(template.marshalSendAndReceive(properties.getEndpoint(), request)),
@@ -144,11 +152,14 @@ public class WorkdayRevenueManagementClient {
      * @param body the request payload, placed as the child of the SOAP Body
      * @return the response payload (the SOAP Body's child) as its own {@link Document}, or {@code null} when Workday
      *         answers with an empty body
-     * @throws Exception the vendor failure unchanged, or one of the three upstream exceptions of
-     *                   {@link UpstreamCallExecutor}
+     * @throws IllegalStateException a required {@code wday.*} value is missing or invalid, before anything is sent
+     *                               (see {@link WorkdayProperties#requireConfigured()})
+     * @throws Exception             the vendor failure unchanged, or one of the three upstream exceptions of
+     *                               {@link UpstreamCallExecutor}
      */
     public Document sendRaw(Source body) throws Exception {
         Objects.requireNonNull(body, "body");
+        properties.requireConfigured();
         log.info("Calling Workday Revenue_Management at {}", properties.getEndpoint());
         return executor.call(UpstreamSystem.WORKDAY, () -> {
             DOMResult result = new DOMResult();

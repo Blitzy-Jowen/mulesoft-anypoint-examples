@@ -27,8 +27,10 @@ import static org.mockito.Mockito.when;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
@@ -46,9 +48,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import org.springframework.web.client.RestClient;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
 import com.github.tomakehurst.wiremock.verification.LoggedRequest;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforceFailureClassifier;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforcePartnerClient;
@@ -65,6 +69,9 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.Up
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.UpstreamRateLimitException;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.exception.UpstreamUnavailableException;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.SalesforceOAuthService.AuthorizeOutcome;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.LoopbackHttpStub;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.LoopbackHttpStub.Ending;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.LoopbackHttpStub.Reply;
 import com.sforce.ws.ConnectionException;
 
 /**
@@ -81,7 +88,9 @@ import com.sforce.ws.ConnectionException;
  *
  * <p>One case leaves the mocked query service aside and drives the real {@link ContactQueryService} and SC-15
  * {@link SalesforcePartnerClient} against a local WireMock Partner API, so the session each completed grant stores is
- * observed on the SOAP requests themselves.
+ * observed on the SOAP requests themselves. Another leaves both mocks aside and adds the real
+ * {@link SalesforceTokenClient} against a {@link LoopbackHttpStub} token endpoint, so a refresh whose error body is cut
+ * off in transit is observed failing as unavailable through every layer the application runs.
  */
 @ExtendWith(MockitoExtension.class)
 class SalesforceOAuthServiceTest {
@@ -118,6 +127,18 @@ class SalesforceOAuthServiceTest {
 
     private static final String AUTHORIZATION_URL = AUTHORIZE_ENDPOINT
             + "?response_type=code&client_id=test-key&redirect_uri=" + ENCODED_REDIRECT_URI + "&display=page";
+
+    private static final String TOKEN_PATH = "/services/oauth2/token";
+
+    /**
+     * A 400 whose status line, headers and first body bytes arrive while the rest of its declared 200-byte body
+     * never does: the start of Salesforce's error object, cut off in transit.
+     */
+    private static final String ERROR_HEAD_AND_PARTIAL_BODY = "HTTP/1.1 400 Bad Request\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: 200\r\n"
+            + "\r\n"
+            + "{\"error\":\"invalid_grant\",";
 
     @Mock
     private SalesforceTokenClient tokenClient;
@@ -370,6 +391,57 @@ class SalesforceOAuthServiceTest {
         }
     }
 
+    /**
+     * A rejected session whose refresh is cut off in transit, driven through the real {@link SalesforceTokenClient},
+     * {@link ContactQueryService} and SC-15 {@link SalesforcePartnerClient} behind real SC-9 executors: a WireMock
+     * Partner API answers the callback's query and then rejects the next one with {@code INVALID_SESSION_ID}, and a
+     * {@link LoopbackHttpStub} token endpoint answers the code exchange and then sends the refresh grant's error
+     * status and the start of its body before it stalls past the read timeout or resets the connection. The refresh
+     * fails as unavailable with the socket's own message, the 503, not as a refused grant, the 502: the stored token is
+     * kept, so the next {@code /} does not redirect, and neither the refresh nor the query is retried.
+     */
+    @ParameterizedTest(name = "refresh error body {0}")
+    @MethodSource("refreshErrorBodyFailures")
+    void refreshWhoseErrorBodyIsCutOffFailsAsUnavailableKeepsTheTokenAndIsNotRetried(Ending ending, Duration timeout,
+            Class<? extends IOException> socketFailure, String socketMessage) throws Exception {
+        WireMockServer partnerApi = new WireMockServer(options().dynamicPort());
+        partnerApi.start();
+        try (LoopbackHttpStub tokenEndpoint = LoopbackHttpStub.start(
+                new Reply(codeExchangeAnswer(partnerApi.baseUrl()), Ending.CLOSE),
+                new Reply(ERROR_HEAD_AND_PARTIAL_BODY, ending))) {
+            String queryPath = SalesforceOAuthService.SOAP_ENDPOINT_PATH;
+            partnerApi.stubFor(post(urlEqualTo(queryPath)).inScenario("session")
+                    .whenScenarioStateIs(Scenario.STARTED)
+                    .willReturn(oneContactQueryResponse())
+                    .willSetStateTo("expired"));
+            partnerApi.stubFor(post(urlEqualTo(queryPath)).inScenario("session")
+                    .whenScenarioStateIs("expired")
+                    .willReturn(invalidSessionFault()));
+            properties.getOauth().setAccessTokenUrl(tokenEndpoint.baseUrl() + TOKEN_PATH);
+            SalesforceOAuthService flow = sessionModeFlow(partnerApi.baseUrl(), realTokenClient(timeout));
+            assertThat(flow.completeAuthorization(CODE, null, null)).isEqualTo(ONE_CONTACT_TEXT);
+            Session authorized = flow.current();
+
+            UpstreamUnavailableException thrown = assertThrows(UpstreamUnavailableException.class, flow::authorize);
+
+            assertThat(thrown.getSystem()).isEqualTo(UpstreamSystem.SALESFORCE);
+            assertThat(thrown).hasMessage(socketMessage);
+            assertThat(thrown.getCause()).isInstanceOf(socketFailure).hasMessage(socketMessage);
+            assertThat(flow.isAuthorized()).isTrue();
+            assertThat(flow.current()).isEqualTo(authorized);
+            assertThat(tokenEndpoint.requests())
+                    .satisfiesExactly(
+                            exchange -> assertThat(exchange).contains("grant_type=authorization_code"),
+                            refresh -> assertThat(refresh).contains("grant_type=refresh_token")
+                                    .contains("refresh_token=refresh-1"));
+            assertThat(partnerApi.findAll(postRequestedFor(urlEqualTo(queryPath))))
+                    .hasSize(2)
+                    .allSatisfy(request -> assertThat(request.getBodyAsString()).contains(">access-1<"));
+        } finally {
+            partnerApi.stop();
+        }
+    }
+
     @ParameterizedTest
     @NullAndEmptySource
     @ValueSource(strings = "   ")
@@ -582,6 +654,12 @@ class SalesforceOAuthServiceTest {
                 Arguments.of(new IOException(), "Salesforce token refresh failed: java.io.IOException"));
     }
 
+    static Stream<Arguments> refreshErrorBodyFailures() {
+        return Stream.of(
+                Arguments.of(Ending.STALL, Duration.ofSeconds(2), SocketTimeoutException.class, "Read timed out"),
+                Arguments.of(Ending.RESET, Duration.ofSeconds(10), SocketException.class, "Connection reset"));
+    }
+
     static Stream<Arguments> refreshResponsesWithoutAccessToken() {
         return Stream.of(
                 Arguments.of((TokenResponse) null),
@@ -622,13 +700,24 @@ class SalesforceOAuthServiceTest {
     }
 
     /**
-     * Wires the flow as the application context does: a real {@link ContactQueryService} over a real
-     * {@link SalesforcePartnerClient} behind the real SC-9 executor and Salesforce classifier, the new service
-     * registered as the client's {@link SessionSource}, and only the token endpoint mocked.
+     * Wires the flow as {@link #sessionModeFlow(String, SalesforceTokenClient)} does, with only the token endpoint
+     * mocked: the mocked {@link #tokenClient} exchanges and refreshes the tokens.
      *
      * @param partnerApiBase the WireMock base URL; the login endpoint points there too, so no request can leave it
      */
     private SalesforceOAuthService sessionModeFlow(String partnerApiBase) {
+        return sessionModeFlow(partnerApiBase, tokenClient);
+    }
+
+    /**
+     * Wires the flow as the application context does: a real {@link ContactQueryService} over a real
+     * {@link SalesforcePartnerClient} behind the real SC-9 executor and Salesforce classifier, and the new service
+     * registered as the client's {@link SessionSource}.
+     *
+     * @param partnerApiBase the WireMock base URL; the login endpoint points there too, so no request can leave it
+     * @param tokens         the token client the service exchanges and refreshes the tokens with
+     */
+    private SalesforceOAuthService sessionModeFlow(String partnerApiBase, SalesforceTokenClient tokens) {
         SalesforceProperties sfdc = new SalesforceProperties();
         sfdc.setAuthEndpoint(partnerApiBase + SalesforceOAuthService.SOAP_ENDPOINT_PATH);
         sfdc.setConnectTimeout(Duration.ofSeconds(2));
@@ -637,10 +726,55 @@ class SalesforceOAuthServiceTest {
         SalesforcePartnerClient partnerClient = new SalesforcePartnerClient(sfdc,
                 new UpstreamCallExecutor(List.of(new SalesforceFailureClassifier())),
                 beanFactory.getBeanProvider(SessionSource.class));
-        SalesforceOAuthService flow = new SalesforceOAuthService(properties, tokenClient,
+        SalesforceOAuthService flow = new SalesforceOAuthService(properties, tokens,
                 new ContactQueryService(partnerClient));
         beanFactory.registerSingleton("sessionSource", flow);
         return flow;
+    }
+
+    /**
+     * A real token client, behind its own SC-9 executor and Salesforce classifier, posting to
+     * {@code sfdc.oauth.access-token-url} of {@link #properties}.
+     *
+     * @param timeout its connect and read timeout
+     */
+    private SalesforceTokenClient realTokenClient(Duration timeout) {
+        SalesforceProperties timeouts = new SalesforceProperties();
+        timeouts.setConnectTimeout(timeout);
+        timeouts.setReadTimeout(timeout);
+        return new SalesforceTokenClient(RestClient.builder(), properties, timeouts,
+                new UpstreamCallExecutor(List.of(new SalesforceFailureClassifier())));
+    }
+
+    /**
+     * A token endpoint's raw answer to the code exchange: a token on {@code instanceUrl}, with the connection closed
+     * after it, so the refresh grant that follows opens a connection of its own.
+     */
+    private static String codeExchangeAnswer(String instanceUrl) {
+        String json = "{\"access_token\":\"access-1\",\"refresh_token\":\"refresh-1\",\"instance_url\":\""
+                + instanceUrl + "\",\"token_type\":\"Bearer\"}";
+        return "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: application/json\r\n"
+                + "Content-Length: " + json.getBytes(StandardCharsets.UTF_8).length + "\r\n"
+                + "Connection: close\r\n"
+                + "\r\n"
+                + json;
+    }
+
+    /** A Partner API fault rejecting the session, as Salesforce answers a query under an expired access token. */
+    private static ResponseDefinitionBuilder invalidSessionFault() {
+        String message = "Invalid Session ID found in SessionHeader: Illegal Session";
+        String body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+                + "<soapenv:Envelope xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\""
+                + " xmlns:sf=\"urn:fault.partner.soap.sforce.com\""
+                + " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><soapenv:Body><soapenv:Fault>"
+                + "<faultcode>sf:INVALID_SESSION_ID</faultcode>"
+                + "<faultstring>INVALID_SESSION_ID: " + message + "</faultstring>"
+                + "<detail><sf:UnexpectedErrorFault xsi:type=\"sf:UnexpectedErrorFault\">"
+                + "<sf:exceptionCode>INVALID_SESSION_ID</sf:exceptionCode>"
+                + "<sf:exceptionMessage>" + message + "</sf:exceptionMessage>"
+                + "</sf:UnexpectedErrorFault></detail></soapenv:Fault></soapenv:Body></soapenv:Envelope>";
+        return aResponse().withStatus(500).withHeader("Content-Type", "text/xml; charset=utf-8").withBody(body);
     }
 
     /** A Partner API {@code queryResponse} with one {@code Contact}, its {@code Id} repeated as Salesforce sends it. */

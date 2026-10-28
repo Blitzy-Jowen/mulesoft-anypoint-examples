@@ -17,3 +17,12 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+logging:
+  level:
+    # http-restful-resource.xml logs only "Person id is <id>" (ERROR, service/PersonService): below INFO these loggers
+    # write the persons' names, addresses, zip codes and ages. A logger's own level outranks logging.level.root and the
+    # --debug and --trace groups, so none of them reaches these loggers.
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, the handled exception whose message quotes a rejected person body among them
+    org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor: INFO   # DEBUG/TRACE write the Content-Type and the posted person's body bytes read for POST /person
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # DEBUG writes the handled exception's message, which quotes a rejected person body
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # DEBUG/TRACE write the response body: the person JSON of GET /person and GET /person/{personId}, the 500 body quoting a rejected person

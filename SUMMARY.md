@@ -4,7 +4,11 @@ This table reports the delivery evidence, tier by tier, for every example folder
 The request counted 57 folders: [DECISIONS.md](DECISIONS.md#1-scope-and-counts) reconciles the count (56 found, 55 delivered, 51 non-RAML parity projects) and reads the criterion "56 of 57 compile" as "every non-SAP folder present compiles".
 The four RAML-backed rows rest on the static diff in [RAML-CONTROLLER-DIFF.md](RAML-CONTROLLER-DIFF.md). Each project README repeats its row under `## Tier status`.
 
-Measured on 2026-10-28 against the source tree of the commit that last updated these figures, with Temurin JDK 17.0.21 and Apache Maven 3.9.9: `mvn -B clean package` and then `mvn -B test` in each of the 55 projects, and `mvn -B verify` in the 11 connector projects.
+Measured on 2026-10-28 against the source tree of the commit that last updated these figures, with Temurin JDK 17.0.21 and Apache Maven 3.9.9: `mvn -B clean package` and then `mvn -B test` in each of the 55 projects, and `mvn -B verify` in the 11 connector projects. The `websphere-mq-java` figures were re-measured the same day with `mvn -B clean verify`, after its start-up connection check, `wmq.host` diagnostic, Ajax server-path normalization, empty-payload listener binding and IBM MQ client-log location changes. Seven projects were measured again the same way on the tree that carries their change: `adding-a-new-customer-to-workday-revenue-management-java`, `authenticating-salesforce-using-oauth2-java`, `exposing-a-restful-resource-using-the-HTTP-connector-java`, `get-customer-list-from-netsuite-java`, `netsuite-data-retrieval-java`, `salesforce-data-retrieval-java` and `service-orchestration-and-choice-routing-java`.
+The evidence rows of `document-integration-using-the-cmis-connector-java`, `mule-component-bindings-java` and `oauth2-authorization-code-using-the-HTTP-connector-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-28 with `mvn -B clean package` on the later tree that adds their first-use configuration checks and the CMIS and Stocklytics no-retry transport.
+The evidence rows of `importing-an-email-attachment-using-the-IMAP-connector-java`, `importing-an-email-attachment-using-the-POP3-connector-java`, `proxying-a-soap-api-java`, `salesforce-data-synchronization-using-watermarking-and-batch-processing-java`, `salesforce-to-MySQL-DB-using-Batch-Processing-java` and `web-service-consumer-java` were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that carries their latest changes, and the Tier 1 tests total under Totals was updated to match.
+The rows of the six SC-10 projects (`foreach-processing-and-choice-routing-java`, `http-oauth-provider-java`, `mule-component-bindings-java`, `oauth2-authorization-code-using-the-HTTP-connector-java`, `service-orchestration-and-choice-routing-java`, `soap-webservice-security-java`) and of `xml-only-soap-webservice-java`, and the Tier 1 tests total, were re-measured on 2026-10-28 with `mvn -B clean install` on the later tree that sends every no-listener 404 as `text/plain` and names an empty TLS store or key password.
+The rows of `foreach-processing-and-choice-routing-java`, `legacy-modernization-java`, `service-orchestration-and-choice-routing-java`, `soap-webservice-security-java` and `xml-only-soap-webservice-java` were re-measured on 2026-10-28 with `mvn -B clean install` on the tree that adds their framework-logging caps, and the Tier 1 tests total under Totals was updated to match.
 
 ## Status
 
@@ -21,12 +25,12 @@ Measured on 2026-10-28 against the source tree of the commit that last updated t
 | [using-transactional-scope-in-jms-to-database-java](java-conversions/using-transactional-scope-in-jms-to-database-java/README.md) | [using-transactional-scope-in-jms-to-database](using-transactional-scope-in-jms-to-database/) | JMS/messaging-based flow | PASS | PASS | 96.6% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 | [salesforce-data-retrieval-java](java-conversions/salesforce-data-retrieval-java/README.md) | [salesforce-data-retrieval](salesforce-data-retrieval/) | Third-party connector | PASS | PASS | 98.9% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 | [import-contacts-into-salesforce-java](java-conversions/import-contacts-into-salesforce-java/README.md) | [import-contacts-into-salesforce](import-contacts-into-salesforce/) | Third-party connector | PASS | PASS | 100.0% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
-| [import-leads-into-salesforce-java](java-conversions/import-leads-into-salesforce-java/README.md) | [import-leads-into-salesforce](import-leads-into-salesforce/) | Third-party connector | PASS | PASS | 98.5% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
+| [import-leads-into-salesforce-java](java-conversions/import-leads-into-salesforce-java/README.md) | [import-leads-into-salesforce](import-leads-into-salesforce/) | Third-party connector | PASS | PASS | 98.6% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 | [authenticating-salesforce-using-oauth2-java](java-conversions/authenticating-salesforce-using-oauth2-java/README.md) | [authenticating-salesforce-using-oauth2](authenticating-salesforce-using-oauth2/) | Third-party connector | PASS | PASS | 100.0% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 | [get-customer-list-from-netsuite-java](java-conversions/get-customer-list-from-netsuite-java/README.md) | [get-customer-list-from-netsuite](get-customer-list-from-netsuite/) | Third-party connector | PASS | PASS | 98.5% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 | [netsuite-data-retrieval-java](java-conversions/netsuite-data-retrieval-java/README.md) | [netsuite-data-retrieval](netsuite-data-retrieval/) | Third-party connector (RAML-backed) | PASS | PASS | 99.3% | RAML DIFF: 1:1 (Tier 1 static) | NOT RUN — sandbox credentials not supplied |
-| [salesforce-data-synchronization-using-watermarking-and-batch-processing-java](java-conversions/salesforce-data-synchronization-using-watermarking-and-batch-processing-java/README.md) | [salesforce-data-synchronization-using-watermarking-and-batch-processing](salesforce-data-synchronization-using-watermarking-and-batch-processing/) | Third-party connector | PASS | PASS | 96.7% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
-| [salesforce-to-MySQL-DB-using-Batch-Processing-java](java-conversions/salesforce-to-MySQL-DB-using-Batch-Processing-java/README.md) | [salesforce-to-MySQL-DB-using-Batch-Processing](salesforce-to-MySQL-DB-using-Batch-Processing/) | Third-party connector | PASS | PASS | 97.0% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
+| [salesforce-data-synchronization-using-watermarking-and-batch-processing-java](java-conversions/salesforce-data-synchronization-using-watermarking-and-batch-processing-java/README.md) | [salesforce-data-synchronization-using-watermarking-and-batch-processing](salesforce-data-synchronization-using-watermarking-and-batch-processing/) | Third-party connector | PASS | PASS | 96.9% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
+| [salesforce-to-MySQL-DB-using-Batch-Processing-java](java-conversions/salesforce-to-MySQL-DB-using-Batch-Processing-java/README.md) | [salesforce-to-MySQL-DB-using-Batch-Processing](salesforce-to-MySQL-DB-using-Batch-Processing/) | Third-party connector | PASS | PASS | 97.1% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 | sap-data-retrieval-java (follow-on) | [sap-data-retrieval](sap-data-retrieval/) | Third-party connector (RAML-backed) | EXCLUDED — pending sapjco3.jar | EXCLUDED — pending sapjco3.jar | EXCLUDED — pending sapjco3.jar | EXCLUDED — pending sapjco3.jar | EXCLUDED — pending sapjco3.jar |
 | [adding-a-new-customer-to-workday-revenue-management-java](java-conversions/adding-a-new-customer-to-workday-revenue-management-java/README.md) | [adding-a-new-customer-to-workday-revenue-management](adding-a-new-customer-to-workday-revenue-management/) | Third-party connector | PASS | PASS | 100.0% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 | [import-contacts-into-ms-dynamics-java](java-conversions/import-contacts-into-ms-dynamics-java/README.md) | [import-contacts-into-ms-dynamics](import-contacts-into-ms-dynamics/) | Third-party connector | PASS | PASS | 100.0% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
@@ -113,7 +117,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 20,972 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 23,653 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 85.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -124,58 +128,58 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 
 | Project | mvn -B test: run / failures / errors / skipped | Service + mapper lines covered | Total LINE coverage (generated classes excluded) | Failsafe *IT (mvn -B verify) |
 |---|---|---|---|---|
-| rest-api-with-apikit-java | 416 / 0 / 0 / 0 | 131 of 131 | 88.7% (1072 of 1208) | — |
-| testing-apikit-with-munit-java | 267 / 0 / 0 / 0 | 13 of 13 | 80.9% (559 of 691) | — |
-| processing-orders-with-dataweave-and-APIkit-java | 581 / 0 / 0 / 0 | 421 of 461 | 88.5% (1170 of 1322) | — |
-| web-service-consumer-java | 500 / 0 / 0 / 1 | 449 of 459 | 97.4% (791 of 812) | — |
-| xml-only-soap-webservice-java | 362 / 0 / 0 / 1 | 644 of 657 | 92.2% (1290 of 1399) | — |
-| service-orchestration-and-choice-routing-java | 816 / 0 / 0 / 1 | 1149 of 1157 | 92.0% (2616 of 2842) | — |
+| rest-api-with-apikit-java | 652 / 0 / 0 / 0 | 131 of 131 | 89.9% (1200 of 1335) | — |
+| testing-apikit-with-munit-java | 432 / 0 / 0 / 0 | 13 of 13 | 84.0% (686 of 817) | — |
+| processing-orders-with-dataweave-and-APIkit-java | 704 / 0 / 0 / 0 | 421 of 461 | 89.6% (1305 of 1456) | — |
+| web-service-consumer-java | 520 / 0 / 0 / 1 | 449 of 459 | 97.4% (799 of 820) | — |
+| xml-only-soap-webservice-java | 419 / 0 / 0 / 1 | 644 of 657 | 91.6% (1457 of 1591) | — |
+| service-orchestration-and-choice-routing-java | 941 / 0 / 0 / 1 | 1149 of 1157 | 92.7% (2859 of 3084) | — |
 | jms-message-rollback-and-redelivery-java | 63 / 0 / 0 / 1 | 77 of 78 | 98.5% (201 of 204) | — |
 | sending-json-data-to-a-jms-queue-java | 272 / 0 / 0 / 1 | 163 of 163 | 98.1% (411 of 419) | — |
 | using-transactional-scope-in-jms-to-database-java | 97 / 0 / 0 / 1 | 115 of 119 | 96.6% (229 of 237) | — |
-| salesforce-data-retrieval-java | 929 / 0 / 0 / 1 | 357 of 361 | 95.8% (993 of 1036) | 2 run, 2 skipped, 0 failed, 0 errors |
-| import-contacts-into-salesforce-java | 659 / 0 / 0 / 1 | 92 of 92 | 91.5% (634 of 693) | 1 run, 1 skipped, 0 failed, 0 errors |
-| import-leads-into-salesforce-java | 745 / 0 / 0 / 1 | 330 of 335 | 96.5% (921 of 954) | 1 run, 1 skipped, 0 failed, 0 errors |
-| authenticating-salesforce-using-oauth2-java | 780 / 0 / 0 / 1 | 93 of 93 | 95.8% (806 of 841) | 1 run, 1 skipped, 0 failed, 0 errors |
-| get-customer-list-from-netsuite-java | 600 / 0 / 0 / 1 | 257 of 261 | 95.7% (1206 of 1260) | 1 run, 1 skipped, 0 failed, 0 errors |
-| netsuite-data-retrieval-java | 1040 / 0 / 0 / 0 | 438 of 441 | 92.3% (1806 of 1956) | 3 run, 3 skipped, 0 failed, 0 errors |
-| salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 687 / 0 / 0 / 1 | 327 of 338 | 96.6% (776 of 803) | 1 run, 1 skipped, 0 failed, 0 errors |
-| salesforce-to-MySQL-DB-using-Batch-Processing-java | 713 / 0 / 0 / 1 | 351 of 362 | 96.8% (806 of 833) | 1 run, 1 skipped, 0 failed, 0 errors |
-| adding-a-new-customer-to-workday-revenue-management-java | 445 / 0 / 0 / 1 | 73 of 73 | 96.0% (582 of 606) | 1 run, 1 skipped, 0 failed, 0 errors |
-| import-contacts-into-ms-dynamics-java | 405 / 0 / 0 / 1 | 106 of 106 | 91.4% (695 of 760) | 1 run, 1 skipped, 0 failed, 0 errors |
-| dataweave-with-flowreflookup-java | 740 / 0 / 0 / 1 | 128 of 128 | 91.9% (670 of 729) | 1 run, 1 skipped, 0 failed, 0 errors |
+| salesforce-data-retrieval-java | 1050 / 0 / 0 / 1 | 357 of 361 | 96.0% (1069 of 1113) | 2 run, 2 skipped, 0 failed, 0 errors |
+| import-contacts-into-salesforce-java | 692 / 0 / 0 / 1 | 92 of 92 | 91.8% (659 of 718) | 1 run, 1 skipped, 0 failed, 0 errors |
+| import-leads-into-salesforce-java | 790 / 0 / 0 / 1 | 341 of 346 | 96.7% (957 of 990) | 1 run, 1 skipped, 0 failed, 0 errors |
+| authenticating-salesforce-using-oauth2-java | 889 / 0 / 0 / 1 | 93 of 93 | 96.5% (882 of 914) | 1 run, 1 skipped, 0 failed, 0 errors |
+| get-customer-list-from-netsuite-java | 675 / 0 / 0 / 1 | 257 of 261 | 95.8% (1243 of 1298) | 1 run, 1 skipped, 0 failed, 0 errors |
+| netsuite-data-retrieval-java | 1480 / 0 / 0 / 0 | 438 of 441 | 93.4% (1980 of 2119) | 3 run, 3 skipped, 0 failed, 0 errors |
+| salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 757 / 0 / 0 / 1 | 339 of 350 | 96.9% (894 of 923) | 1 run, 1 skipped, 0 failed, 0 errors |
+| salesforce-to-MySQL-DB-using-Batch-Processing-java | 809 / 0 / 0 / 1 | 363 of 374 | 97.0% (969 of 999) | 1 run, 1 skipped, 0 failed, 0 errors |
+| adding-a-new-customer-to-workday-revenue-management-java | 577 / 0 / 0 / 1 | 73 of 73 | 96.4% (669 of 694) | 1 run, 1 skipped, 0 failed, 0 errors |
+| import-contacts-into-ms-dynamics-java | 452 / 0 / 0 / 1 | 106 of 106 | 91.6% (706 of 771) | 1 run, 1 skipped, 0 failed, 0 errors |
+| dataweave-with-flowreflookup-java | 780 / 0 / 0 / 1 | 128 of 128 | 92.2% (695 of 754) | 1 run, 1 skipped, 0 failed, 0 errors |
 | addition-using-javascript-transformer-java | 652 / 0 / 0 / 1 | 893 of 894 | 99.2% (1124 of 1133) | — |
 | cache-scope-with-fibonacci-java | 186 / 0 / 0 / 1 | 65 of 65 | 97.5% (312 of 320) | — |
 | content-based-routing-java | 216 / 0 / 0 / 1 | 17 of 17 | 97.6% (287 of 294) | — |
-| document-integration-using-the-cmis-connector-java | 143 / 0 / 0 / 1 | 16 of 18 | 94.5% (410 of 434) | — |
-| exposing-a-restful-resource-using-the-HTTP-connector-java | 219 / 0 / 0 / 1 | 23 of 23 | 97.9% (275 of 281) | — |
+| document-integration-using-the-cmis-connector-java | 172 / 0 / 0 / 1 | 16 of 18 | 95.4% (481 of 504) | — |
+| exposing-a-restful-resource-using-the-HTTP-connector-java | 229 / 0 / 0 / 1 | 23 of 23 | 97.9% (281 of 287) | — |
 | extracting-data-from-LDAP-directory-java | 132 / 0 / 0 / 1 | 17 of 17 | 95.4% (332 of 348) | — |
 | filtering-a-message-java | 172 / 0 / 0 / 1 | 36 of 36 | 96.7% (265 of 274) | — |
-| foreach-processing-and-choice-routing-java | 387 / 0 / 0 / 1 | 77 of 78 | 86.2% (1139 of 1322) | — |
-| hello-world-java | 442 / 0 / 0 / 1 | 2 of 2 | 96.8% (212 of 219) | — |
+| foreach-processing-and-choice-routing-java | 498 / 0 / 0 / 1 | 77 of 78 | 88.3% (1400 of 1585) | — |
+| hello-world-java | 452 / 0 / 0 / 1 | 2 of 2 | 96.9% (221 of 228) | — |
 | http-multipart-request-java | 302 / 0 / 0 / 1 | 158 of 185 | 92.1% (385 of 418) | — |
-| http-oauth-provider-java | 457 / 0 / 0 / 1 | 206 of 206 | 93.1% (685 of 736) | — |
+| http-oauth-provider-java | 473 / 0 / 0 / 1 | 206 of 206 | 96.6% (744 of 770) | — |
 | http-request-response-with-logger-java | 175 / 0 / 0 / 1 | 5 of 5 | 96.8% (215 of 222) | — |
 | implementing-a-choice-exception-strategy-java | 180 / 0 / 0 / 1 | 34 of 34 | 97.8% (306 of 313) | — |
-| importing-a-CSV-file-into-Mongo-DB-java | 67 / 0 / 0 / 1 | 96 of 96 | 79.8% (209 of 262) | — |
-| importing-a-csv-file-into-ms-sharepoint-java | 77 / 0 / 0 / 1 | 69 of 69 | 78.1% (422 of 540) | — |
-| importing-an-email-attachment-using-the-IMAP-connector-java | 256 / 0 / 0 / 1 | 372 of 395 | 94.8% (509 of 537) | — |
-| importing-an-email-attachment-using-the-POP3-connector-java | 200 / 0 / 0 / 1 | 374 of 397 | 93.4% (479 of 513) | — |
-| legacy-modernization-java | 297 / 0 / 0 / 1 | 224 of 247 | 88.8% (985 of 1109) | — |
-| login-form-using-the-http-connector-java | 279 / 0 / 0 / 1 | 85 of 89 | 94.3% (433 of 459) | — |
-| mule-component-bindings-java | 452 / 0 / 0 / 1 | 104 of 104 | 85.3% (931 of 1091) | — |
-| mule-expression-language-basics-java | 600 / 0 / 0 / 1 | 266 of 291 | 94.1% (495 of 526) | — |
+| importing-a-CSV-file-into-Mongo-DB-java | 107 / 0 / 0 / 1 | 96 of 96 | 85.0% (300 of 353) | — |
+| importing-a-csv-file-into-ms-sharepoint-java | 87 / 0 / 0 / 1 | 69 of 69 | 78.6% (433 of 551) | — |
+| importing-an-email-attachment-using-the-IMAP-connector-java | 280 / 0 / 0 / 1 | 372 of 395 | 95.1% (543 of 571) | — |
+| importing-an-email-attachment-using-the-POP3-connector-java | 218 / 0 / 0 / 1 | 374 of 397 | 93.7% (507 of 541) | — |
+| legacy-modernization-java | 352 / 0 / 0 / 1 | 224 of 247 | 88.7% (1154 of 1301) | — |
+| login-form-using-the-http-connector-java | 287 / 0 / 0 / 1 | 85 of 89 | 94.6% (434 of 459) | — |
+| mule-component-bindings-java | 502 / 0 / 0 / 1 | 104 of 104 | 88.3% (1045 of 1183) | — |
+| mule-expression-language-basics-java | 609 / 0 / 0 / 1 | 266 of 291 | 94.2% (504 of 535) | — |
 | munit-short-tutorial-java | 164 / 0 / 0 / 1 | 16 of 16 | 97.1% (236 of 243) | — |
-| oauth2-authorization-code-using-the-HTTP-connector-java | 394 / 0 / 0 / 1 | 166 of 166 | 95.2% (844 of 887) | — |
+| oauth2-authorization-code-using-the-HTTP-connector-java | 455 / 0 / 0 / 1 | 176 of 176 | 95.6% (905 of 947) | — |
 | oauth2-client-credentials-using-the-HTTP-connector-java | 432 / 0 / 0 / 1 | 40 of 40 | 90.7% (909 of 1002) | — |
 | proxying-a-rest-api-java | 641 / 0 / 0 / 1 | 41 of 41 | 94.3% (1213 of 1287) | — |
-| proxying-a-soap-api-java | 306 / 0 / 0 / 1 | 54 of 54 | 92.8% (823 of 887) | — |
-| querying-a-db-and-attaching-results-to-an-email-java | 269 / 0 / 0 / 1 | 137 of 139 | 98.1% (403 of 411) | — |
-| querying-a-mysql-database-java | 135 / 0 / 0 / 1 | 9 of 9 | 96.4% (214 of 222) | — |
-| scatter-gather-flow-control-java | 202 / 0 / 0 / 1 | 160 of 163 | 97.0% (384 of 396) | — |
-| sending-a-csv-file-through-email-using-smtp-java | 87 / 0 / 0 / 1 | 107 of 107 | 84.2% (245 of 291) | — |
+| proxying-a-soap-api-java | 326 / 0 / 0 / 1 | 54 of 54 | 92.8% (837 of 902) | — |
+| querying-a-db-and-attaching-results-to-an-email-java | 285 / 0 / 0 / 1 | 137 of 139 | 98.2% (427 of 435) | — |
+| querying-a-mysql-database-java | 145 / 0 / 0 / 1 | 9 of 9 | 96.4% (214 of 222) | — |
+| scatter-gather-flow-control-java | 220 / 0 / 0 / 1 | 160 of 163 | 97.1% (409 of 421) | — |
+| sending-a-csv-file-through-email-using-smtp-java | 108 / 0 / 0 / 1 | 107 of 107 | 86.0% (283 of 329) | — |
 | sending-json-data-to-a-amqp-queue-java | 185 / 0 / 0 / 1 | 42 of 42 | 97.5% (394 of 404) | — |
-| soap-webservice-security-java | 386 / 0 / 0 / 1 | 2 of 2 | 86.2% (1382 of 1604) | — |
-| track-a-custom-business-event-java | 231 / 0 / 0 / 1 | 129 of 129 | 98.3% (345 of 351) | — |
-| upload-to-ftp-after-converting-json-to-xml-java | 296 / 0 / 0 / 1 | 291 of 294 | 91.7% (552 of 602) | — |
-| websphere-mq-java | 236 / 0 / 0 / 1 | 406 of 409 | 94.5% (895 of 947) | — |
+| soap-webservice-security-java | 519 / 0 / 0 / 1 | 2 of 2 | 88.3% (1659 of 1879) | — |
+| track-a-custom-business-event-java | 237 / 0 / 0 / 1 | 129 of 129 | 98.3% (354 of 360) | — |
+| upload-to-ftp-after-converting-json-to-xml-java | 303 / 0 / 0 / 1 | 291 of 294 | 91.7% (552 of 602) | — |
+| websphere-mq-java | 301 / 0 / 0 / 1 | 406 of 409 | 95.9% (973 of 1015) | — |

@@ -35,6 +35,7 @@ Base URL `http://localhost:8080/api`, the RAML `baseUri`. Every API request and 
 - The POST `Location` is computed from the body's `id` before the team is added, in the original flow's order.
 - No RAML resource declares HEAD, OPTIONS, PATCH or TRACE. Every undeclared method gets the APIkit 405, HEAD and OPTIONS included (each controller maps them explicitly so Spring does not answer them itself). A CORS pre-flight is answered like any other OPTIONS request, with no `Access-Control-*` header (`config/PreflightDispatchConfig`), because the original listener applied no CORS policy.
 - Under `/api`, a method token in lower or mixed case (`get`, `Post`) is routed as its upper-case form (`config/ApiKitMethodCaseFilter`), as the APIkit router lower-cased the method before routing.
+- Under `/api`, the `Accept` header of each GET is negotiated as the APIkit router negotiated it (`config/ApiKitAcceptNegotiator`, a port of `RestContentTypeParser.bestMatch`). The negotiation runs in each RAML action after its URI and query parameter validation and before the flow, as APIkit did. A header that gives `application/json` quality 0, such as `application/json;q=0` or `text/xml, application/json;q=0`, gets the APIkit 406, an unknown team or match included; with a `teamId`, `homeTeamId` or `awayTeamId` that is not 3 characters long it gets the APIkit 400 instead. `*/*;q=0` is still accepted, because APIkit weighed a `*/*` range with the declared type's own quality.
 
 ### APIkit console and RAML descriptor
 
@@ -57,7 +58,7 @@ A miss under the console path is answered with the APIkit 404. The class Javadoc
 | 404 | `application/json` | `{ "message": "Resource not found" }` | unknown team or match (`Team <id> does not exist`, `There is no match between team <h> and team <a>`), or a path under `/api` that no resource names | `ApiKitExceptionHandler` (SC-3) |
 | 405 | `application/json` | `{ "message": "Method not allowed" }` | a method the resource does not declare | `ApiKitExceptionHandler` |
 | 415 | `application/json` | `{ "message": "Unsupported media type" }` | a POST or PUT body that is not `application/json` | `ApiKitExceptionHandler` |
-| 406 | `application/json` | `{ "message": "Not acceptable" }` | an `Accept` header that excludes `application/json` | `ApiKitExceptionHandler` |
+| 406 | `application/json` | `{ "message": "Not acceptable" }` | an `Accept` header that excludes `application/json`, or gives it quality 0 under APIkit's negotiation (`application/json;q=0`, raised by `config/ApiKitAcceptNegotiator`) | `ApiKitExceptionHandler` |
 | 400 | `application/json` | `{ "message": "Bad request" }` | a URI parameter that is not exactly 3 characters, or a missing, malformed or schema-violating body | `ApiKitExceptionHandler` |
 | 409 | `application/json` | `{ "message": "<exception message>" }` | `There is already a team with id <id>` (POST `/api/teams`); `The match between team <h> and team <a> has not been played yet` (PUT `/api/fixture/{h}/{a}`) | `LeagueExceptionHandler` |
 | 404 | `text/plain` | `No listener for endpoint: <path>` | any path outside `/api` | `ApiKitExceptionHandler`, writing SC-1's listener default |
@@ -154,6 +155,7 @@ Open the console at `http://localhost:8080/api/console/`.
 | `exception/ApiKitExceptionHandlerTest`, `LeagueExceptionHandlerTest`, `GlobalExceptionHandlerTest` | SC-3 mappings and precedence, the 409, SC-1 defaults and log safety |
 | `config/JsonSchemaValidatorTest` | SC-3 draft-03 validation: body faults give 400, schema faults give 500 |
 | `config/ApiKitMethodCaseFilterTest`, `ApiKitMethodCaseListenerTest` | lower and mixed-case method tokens under `/api` answered as their upper-case form |
+| `config/ApiKitAcceptNegotiatorTest`, `ApiKitAcceptNegotiationListenerTest` | APIkit's `Accept` negotiation: the type `RestContentTypeParser.bestMatch` chose for each header, quirks included, and `negotiate` on the handler method Spring selected (method or class `produces`, negated types skipped, the rejection carrying the declared types, a request without a handler method refused); the APIkit 406 on the five GETs for every form that gives JSON quality 0; the APIkit 400, exactly as without `Accept`, for those forms with a URI parameter that is not 3 characters long (`/api/teams/BA`, `/api/teams/TOOLONG`, `/api/fixture/BA/MAL`, `/api/fixture/VIL/TOOLONG`); the 200 for the forms APIkit accepted (`*/*;q=0`, `application/json;q=0.5`); and unchanged answers with `application/json;q=0` for the writes, undeclared methods, unserved paths and the console |
 | `config/PreflightDispatchConfigTest`, `PreflightDispatchListenerTest` | CORS pre-flights answered as plain OPTIONS requests, never running a write handler |
 
 `support/HttpTestClient` is ST-1, an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes, because `java.net.http.HttpClient` hides the reason phrase.
@@ -166,9 +168,9 @@ Open the console at `http://localhost:8080/api/console/`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 416 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 416 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 131 of 131 lines (`service/LeagueAPI`, `mapper/LeagueJsonMapper`, `mapper/JsonDateSerializer`). Total project LINE coverage: 88.7% (1072 of 1208 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 652 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 652 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 131 of 131 lines (`service/LeagueAPI`, `mapper/LeagueJsonMapper`, `mapper/JsonDateSerializer`). Total project LINE coverage: 89.9% (1200 of 1335 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported original assertions of `RestApiWithApiKitTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 

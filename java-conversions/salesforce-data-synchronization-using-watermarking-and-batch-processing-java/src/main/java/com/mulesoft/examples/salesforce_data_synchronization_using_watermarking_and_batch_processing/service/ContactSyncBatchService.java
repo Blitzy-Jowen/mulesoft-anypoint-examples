@@ -21,8 +21,9 @@ import org.springframework.stereotype.Service;
 /**
  * One run of the original flow {@code triggerFlow} and its batch job {@code watermarkingBatch}
  * ({@code watermarking.xml}): read the {@code timestamp} watermark, query the Contacts Salesforce modified after it,
- * run every Contact through the job's single step {@code Batch_Step}, which logs it, then move the watermark to the
- * latest {@code LastModifiedDate} the query returned.
+ * run every Contact through the job's single step {@code Batch_Step}, which logs it, then, only after a successful job,
+ * move the watermark to the latest {@code LastModifiedDate} the query returned. A job that stopped or failed a record
+ * leaves the watermark as it was, so the next scheduled poll selects the same Contacts again; nothing is retried.
  *
  * <p>The 10 s poll schedule belongs to {@code trigger/ContactPollScheduler}; this class performs one poll per
  * {@link #synchronize()} call. The original declares no exception strategy, so nothing is caught here: every Salesforce
@@ -119,13 +120,14 @@ public class ContactSyncBatchService {
     }
 
     /**
-     * Performs one poll: watermark, query, batch job, then the {@code MAX} watermark update.
+     * Performs one poll: watermark, query, batch job, then, after a successful job, the {@code MAX} watermark update.
      *
      * <p>Calls are serialized: the original scheduler never overlapped two runs of its poll, and a poll requested on
      * demand while a scheduled one runs must neither read the watermark before the running poll has moved it nor
      * move it back afterwards.
      *
-     * @return the result of the batch job run
+     * @return the result of the batch job run; unless it is {@code SUCCESSFUL} without a failed record, the watermark
+     *         was left as it was
      * @throws Exception the SC-9 upstream exception or the original Salesforce exception of the query, unchanged,
      *                   with the watermark left as it was
      */
@@ -137,10 +139,12 @@ public class ContactSyncBatchService {
 
         BatchJobResult result = batchJobRunner.run(job, () -> records);
 
-        // Whatever the job's status: batch:execute only queued the job, so the poll, and with it the watermark
-        // update, completed once the records were loaded, independent of step outcomes. An empty query selects
-        // nothing and leaves the watermark untouched.
-        watermarkStore.updateMax(WATERMARK_KEY, selectorValues(records));
+        // The watermark moves only after successful processing: a job that stopped or failed a record keeps the
+        // stored value, so the next scheduled poll selects this poll's records again instead of skipping those it
+        // did not process. An empty query selects nothing and leaves the watermark untouched.
+        if (result.isSuccessful() && result.failedRecords() == 0) {
+            watermarkStore.updateMax(WATERMARK_KEY, selectorValues(records));
+        }
         return result;
     }
 

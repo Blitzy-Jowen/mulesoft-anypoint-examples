@@ -2,6 +2,7 @@ package com.mulesoft.examples.testing_apikit_with_munit.controller;
 
 import java.util.List;
 
+import com.mulesoft.examples.testing_apikit_with_munit.config.ApiKitAcceptNegotiator;
 import com.mulesoft.examples.testing_apikit_with_munit.service.MunitService;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -9,6 +10,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -31,9 +33,11 @@ import org.springframework.web.bind.annotation.RestController;
  * APIkit accepted it.
  *
  * <p>Error responses come from the advices: a method the resource does not declare raises
- * {@link HttpRequestMethodNotSupportedException}, an {@code Accept} header excluding JSON raises
- * {@code HttpMediaTypeNotAcceptableException}, and {@code ApiKitExceptionHandler} answers them with
- * APIkit's 405 and 406 mappings.
+ * {@link HttpRequestMethodNotSupportedException}, an {@code Accept} header excluding JSON, or one under which
+ * {@link ApiKitAcceptNegotiator} chooses no declared type, raises {@link HttpMediaTypeNotAcceptableException}, and
+ * {@code ApiKitExceptionHandler} answers them with APIkit's 405 and 406 mappings. Each method negotiates
+ * immediately before it calls {@link MunitService}, GET after its HEAD check, as APIkit negotiated after its method
+ * check and before the flow ran.
  */
 @RestController
 @RequestMapping("${apikit.base-path:/api}/munit")
@@ -54,17 +58,21 @@ public class MunitController {
     /**
      * Routes to flow {@code get:/munit:api-config}.
      *
-     * @param request the current request, whose method is checked
+     * @param request the current request, whose method is checked and whose {@code Accept} header is negotiated
      * @return 200 with the GET flow payload
      * @throws HttpRequestMethodNotSupportedException for a HEAD request, which the RAML does not declare
+     * @throws HttpMediaTypeNotAcceptableException    when APIkit's negotiation chooses no declared type for the
+     *                                                {@code Accept} header
      */
     @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> get(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
+    public ResponseEntity<String> get(HttpServletRequest request)
+            throws HttpRequestMethodNotSupportedException, HttpMediaTypeNotAcceptableException {
         // Spring maps HEAD to GET handlers implicitly; this keeps get() from ever answering HEAD, whichever
         // mapping the dispatcher selects for it.
         if (RequestMethod.HEAD.name().equals(request.getMethod())) {
             throw new HttpRequestMethodNotSupportedException(request.getMethod(), SUPPORTED_METHODS);
         }
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(munitService.get());
@@ -73,10 +81,14 @@ public class MunitController {
     /**
      * Routes to flow {@code post:/munit:api-config}.
      *
+     * @param request the current request, whose {@code Accept} header is negotiated
      * @return 201 with the POST flow payload
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
      */
     @PostMapping(produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> post() {
+    public ResponseEntity<String> post(HttpServletRequest request) throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.status(HttpStatus.CREATED)
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(munitService.post());
@@ -85,10 +97,14 @@ public class MunitController {
     /**
      * Routes to flow {@code put:/munit:api-config}.
      *
+     * @param request the current request, whose {@code Accept} header is negotiated
      * @return 201 with the PUT flow payload
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
      */
     @PutMapping(produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> put() {
+    public ResponseEntity<String> put(HttpServletRequest request) throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.status(HttpStatus.CREATED)
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(munitService.put());
@@ -97,10 +113,14 @@ public class MunitController {
     /**
      * Routes to flow {@code delete:/munit:api-config}.
      *
+     * @param request the current request, whose {@code Accept} header is negotiated
      * @return 200 with the DELETE flow payload
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
      */
     @DeleteMapping(produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> delete() {
+    public ResponseEntity<String> delete(HttpServletRequest request) throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(munitService.delete());

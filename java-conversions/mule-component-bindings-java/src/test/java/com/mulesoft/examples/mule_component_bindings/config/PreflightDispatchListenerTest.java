@@ -83,11 +83,11 @@ class PreflightDispatchListenerTest {
 
     private static final String ORIGIN = "https://example.invalid";
 
-    /** The Content-Type of SC-10's no-listener 404, written by {@code PortRoutingFilter}. */
-    private static final String ROUTING_NO_LISTENER_CONTENT_TYPE = "text/plain;charset=UTF-8";
-
-    /** The Content-Type of SC-1's no-listener 404, written by {@code GlobalExceptionHandler}. */
-    private static final String HANDLER_NO_LISTENER_CONTENT_TYPE = "text/plain";
+    /**
+     * The Content-Type of the no-listener 404, the same whether SC-10's {@code PortRoutingFilter} or SC-1's
+     * {@code GlobalExceptionHandler} writes it.
+     */
+    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
 
     /** What the mocked Twitter listener flow returns; the controller writes these bytes unchanged. */
     private static final byte[] LISTENER_PAYLOAD = "Twitter listener flow payload".getBytes(StandardCharsets.UTF_8);
@@ -186,7 +186,7 @@ class PreflightDispatchListenerTest {
                 preflightHeaders(requestedMethod, requestedHeaders), null);
 
         assertSameResponse(plain, preflight);
-        assertNoListener404(preflight, path, ROUTING_NO_LISTENER_CONTENT_TYPE);
+        assertNoListener404(preflight, path);
         assertNoCorsHeaders(preflight);
         verifyNoInteractions(stockStatsService, twitterSearchService);
     }
@@ -202,7 +202,7 @@ class PreflightDispatchListenerTest {
                 preflightHeaders(requestedMethod, requestedHeaders), null);
 
         assertSameResponse(plain, preflight);
-        assertNoListener404(preflight, UNKNOWN, HANDLER_NO_LISTENER_CONTENT_TYPE);
+        assertNoListener404(preflight, UNKNOWN);
         assertNoCorsHeaders(preflight);
         verifyNoInteractions(stockStatsService, twitterSearchService);
     }
@@ -237,10 +237,10 @@ class PreflightDispatchListenerTest {
         return headers;
     }
 
-    /** 404 {@code Not Found} with {@code contentType} and the body {@code No listener for endpoint: <path>}. */
-    private static void assertNoListener404(HttpTestClient.Response response, String path, String contentType) {
+    /** 404 {@code Not Found}, {@code text/plain} and the body {@code No listener for endpoint: <path>}. */
+    private static void assertNoListener404(HttpTestClient.Response response, String path) {
         assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
-        assertEquals(contentType, response.header("Content-Type"), response::toString);
+        assertEquals(NO_LISTENER_CONTENT_TYPE, response.header("Content-Type"), response::toString);
         assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), response.body(),
                 response::toString);
     }

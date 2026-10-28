@@ -28,8 +28,10 @@ cmis:
   read-timeout: 10s
 logging:
   level:
-    # Below INFO the JDK HTTP transport under CmisAtomPubClient (RestClient over SimpleClientHttpRequestFactory) writes
-    # every request's headers, including the cmis.username/cmis.password service account as an HTTP Basic
-    # Authorization header, and every response's headers. Pinned here because a named logger's level outranks a root
-    # DEBUG or TRACE.
-    sun.net.www.protocol.http.HttpURLConnection: INFO
+    # Below INFO the Apache httpclient5 transport under CmisAtomPubClient (RestClient over
+    # HttpComponentsClientHttpRequestFactory) writes every request's headers, including the cmis.username/cmis.password
+    # service account as an HTTP Basic Authorization header, and every response's headers (headers logger), and every
+    # byte sent and received, the same header among them (wire logger). Pinned here because a named logger's level
+    # outranks a root DEBUG or TRACE.
+    org.apache.hc.client5.http.headers: INFO
+    org.apache.hc.client5.http.wire: INFO

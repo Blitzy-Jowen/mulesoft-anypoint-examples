@@ -60,8 +60,9 @@ import ch.qos.logback.core.read.ListAppender;
  * Tests {@link ContactToDatabaseBatchService}, the original flow {@code triggerFlow} and its batch job
  * {@code salesforce-to-database-Batch} ({@code salesforce-to-database.xml}): the watermark default and the stored
  * watermark in the query, the INSERT, UPDATE and {@code otherwise} branches of step {@code upsertContactInDbStep}, the
- * {@code MAX} watermark update, record failures under {@code max-failed-records} 0, the unchanged watermark after an
- * empty or failed poll, the logger texts and the system-clock default.
+ * {@code MAX} watermark update after a successful job, record failures under {@code max-failed-records} 0 with the
+ * counts of the stopped job, the unchanged watermark after an empty poll, a failed query or a failed job, the next poll
+ * selecting again what a failed job left, the logger texts and the system-clock default.
  *
  * <p>Salesforce and the database are Mockito mocks; the batch runner, the row mapper and the watermark store are the
  * project's real classes, the store kept in a file under the test's {@link TempDir}. No Spring context is started:
@@ -303,7 +304,8 @@ class ContactToDatabaseBatchServiceTest {
     }
 
     @Test
-    void insertFailureFailsTheRecordAndStopsTheJobThenTheWatermarkStillMoves() throws Exception {
+    void insertFailureFailsTheRecordAndStopsTheJobAndKeepsTheStoredWatermark() throws Exception {
+        watermarkStore.store(KEY, STORED_WATERMARK);
         pollReturns(List.of(
                 contact(JOHN_EMAIL, "John", "Doe", "2015-10-10T10:00:05.000Z"),
                 contact(JANE_EMAIL, "Jane", "Roe", "2015-10-10T10:00:07.000Z")));
@@ -314,20 +316,60 @@ class ContactToDatabaseBatchServiceTest {
         BatchJobResult result = service.synchronize();
 
         // max-failed-records 0: the first failed record stops the job, so Jane, looked up in step 1, is never
-        // offered to step 2; the runner counts her as processed and successful.
+        // offered to step 2; she is neither processed nor successful.
         assertThat(result.isSuccessful()).isFalse();
         assertThat(result.status()).isEqualTo(BatchJobResult.Status.FAILED_PROCESS_RECORDS);
         assertThat(result.loadedRecords()).isEqualTo(2);
-        assertThat(result.processedRecords()).isEqualTo(2);
-        assertThat(result.successfulRecords()).isEqualTo(1);
+        assertThat(result.processedRecords()).isEqualTo(1);
+        assertThat(result.successfulRecords()).isZero();
         assertThat(result.failedRecords()).isEqualTo(1);
         verify(contactRepository).findByEmail(JOHN_EMAIL);
         verify(contactRepository).findByEmail(JANE_EMAIL);
         verify(contactRepository, times(1)).insert(any(), any(), any());
         verifyNoMoreInteractions(contactRepository);
-        assertThat(watermarkStore.current(KEY)).isEqualTo(Optional.of("2015-10-10T10:00:07.000Z"));
+        assertThat(capturedSoql()).isEqualTo(SOQL_PREFIX + STORED_WATERMARK);
+        // The failed job keeps the stored watermark, so the next poll selects John and Jane again.
+        assertThat(watermarkStore.current(KEY)).isEqualTo(Optional.of(STORED_WATERMARK));
         assertThat(appender.list).extracting(ILoggingEvent::getFormattedMessage)
-                .containsExactly(DEFAULT_WATERMARK, ON_COMPLETE);
+                .containsExactly(STORED_WATERMARK, ON_COMPLETE);
+    }
+
+    @Test
+    void nextPollAfterAFailedJobQueriesFromTheSameWatermarkAndAdvancesOnceTheJobSucceeds() throws Exception {
+        watermarkStore.store(KEY, STORED_WATERMARK);
+        when(salesforcePartnerClient.query(anyString()))
+                .thenReturn(new ArrayList<>(List.of(
+                        contact(JOHN_EMAIL, "John", "Doe", "2015-10-10T10:00:05.000Z"),
+                        contact(JANE_EMAIL, "Jane", "Roe", "2015-10-10T10:00:07.000Z"))))
+                .thenReturn(new ArrayList<>(List.of(
+                        contact(JOHN_EMAIL, "John", "Doe", "2015-10-10T10:00:05.000Z"),
+                        contact(JANE_EMAIL, "Jane", "Roe", "2015-10-10T10:00:07.000Z"))));
+        when(contactRepository.findByEmail(anyString())).thenReturn(List.of());
+        when(contactRepository.insert("John", "Doe", JOHN_EMAIL))
+                .thenThrow(new DataAccessResourceFailureException("db down"))
+                .thenReturn(1);
+
+        BatchJobResult failed = service.synchronize();
+
+        assertThat(failed.status()).isEqualTo(BatchJobResult.Status.FAILED_PROCESS_RECORDS);
+        assertThat(failed.successfulRecords()).isZero();
+        assertThat(failed.failedRecords()).isEqualTo(1);
+        assertThat(watermarkStore.current(KEY)).isEqualTo(Optional.of(STORED_WATERMARK));
+
+        BatchJobResult recovered = service.synchronize();
+
+        // No retry inside the failed poll: the next scheduled poll queries from the kept watermark, re-selects John,
+        // whose insert failed, and Jane, whom the stopped job never wrote, and moves the watermark to the MAX.
+        ArgumentCaptor<String> soql = ArgumentCaptor.forClass(String.class);
+        verify(salesforcePartnerClient, times(2)).query(soql.capture());
+        assertThat(soql.getAllValues()).containsExactly(SOQL_PREFIX + STORED_WATERMARK, SOQL_PREFIX + STORED_WATERMARK);
+        assertThat(recovered.isSuccessful()).isTrue();
+        assertThat(recovered.processedRecords()).isEqualTo(2);
+        assertThat(recovered.successfulRecords()).isEqualTo(2);
+        assertThat(recovered.failedRecords()).isZero();
+        verify(contactRepository, times(2)).insert("John", "Doe", JOHN_EMAIL);
+        verify(contactRepository, times(1)).insert("Jane", "Roe", JANE_EMAIL);
+        assertThat(watermarkStore.current(KEY)).isEqualTo(Optional.of("2015-10-10T10:00:07.000Z"));
     }
 
     @Test
@@ -345,7 +387,9 @@ class ContactToDatabaseBatchServiceTest {
         assertThat(result.failedRecords()).isEqualTo(1);
         verify(contactRepository).findByEmail(JOHN_EMAIL);
         verifyNoMoreInteractions(contactRepository);
-        assertThat(watermarkStore.current(KEY)).isEqualTo(Optional.of("2015-10-10T10:00:05.000Z"));
+        // No watermark was stored before, and the failed job stores none: the next poll starts from the default.
+        assertThat(watermarkStore.current(KEY)).isEmpty();
+        assertThat(watermarkStore.storePath()).doesNotExist();
     }
 
     @Test

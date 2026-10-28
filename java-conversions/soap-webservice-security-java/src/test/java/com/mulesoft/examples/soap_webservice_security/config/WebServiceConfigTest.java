@@ -45,7 +45,6 @@ import org.springframework.ws.server.endpoint.annotation.ResponsePayload;
 import org.springframework.ws.soap.saaj.SaajSoapMessage;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
 import org.springframework.ws.soap.security.wss4j2.Wss4jSecurityInterceptor;
-import org.springframework.ws.soap.server.SoapMessageDispatcher;
 import org.springframework.xml.transform.StringSource;
 import org.springframework.xml.transform.TransformerFactoryUtils;
 import org.w3c.dom.Document;
@@ -222,7 +221,7 @@ class WebServiceConfigTest {
         HttpTestClient.Response response = post(WsSecurityConfig.UNSECURE_PATH, rawEnvelope(header, GREET_XML));
 
         assertFault(response, "soap:MustUnderstand", SoapEnvelopeStyleInterceptor.SOAP11_NS,
-                SoapMessageDispatcher.DEFAULT_MUST_UNDERSTAND_FAULT_STRING);
+                "MustUnderstand headers: [{" + WSS4JConstants.WSSE_NS + "}Security] are not understood.");
     }
 
     @ParameterizedTest

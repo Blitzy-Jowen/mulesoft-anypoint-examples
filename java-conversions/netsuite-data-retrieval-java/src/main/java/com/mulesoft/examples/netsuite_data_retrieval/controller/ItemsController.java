@@ -11,6 +11,7 @@ package com.mulesoft.examples.netsuite_data_retrieval.controller;
 import java.util.List;
 import java.util.Set;
 
+import com.mulesoft.examples.netsuite_data_retrieval.config.ApiKitAcceptNegotiator;
 import com.mulesoft.examples.netsuite_data_retrieval.service.NetsuiteSearchService;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -20,6 +21,7 @@ import jakarta.validation.constraints.Pattern;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -46,8 +48,9 @@ import org.springframework.web.bind.annotation.RestController;
  * conversion and the enumeration check; {@code requireValidQueryValue} adds the empty and repeated value checks,
  * which Spring's {@code defaultValue} and multi-value binding would otherwise hide, and
  * {@code requireIntegerQueryValue} the strict decimal form of {@code quantity}, which Spring's lenient number
- * conversion would otherwise widen. Every failure reaches APIkit's 400 mapping before the flow runs. Query
- * parameters the RAML does not declare are ignored, as APIkit ignored them.
+ * conversion would otherwise widen. Every failure reaches APIkit's 400 mapping before the flow runs, and before
+ * {@link ApiKitAcceptNegotiator} negotiates the {@code Accept} header, as APIkit validated parameters before it
+ * negotiated. Query parameters the RAML does not declare are ignored, as APIkit ignored them.
  *
  * <p>This class only binds, validates and answers: the item supply plan criteria, the NetSuite reads, the
  * {@code payload map $} output and the success log are {@link NetsuiteSearchService#getItems(int, String)}'s, and
@@ -93,11 +96,14 @@ public class ItemsController {
      *                 {@code int} fails binding with APIkit's 400
      * @param operator the {@code operator} query parameter, {@code GREATER_THAN} when absent; a value outside the
      *                 RAML enumeration fails validation with APIkit's 400
-     * @param request  the current request, whose method and raw query parameter values are checked
+     * @param request  the current request, whose method and raw query parameter values are checked and whose
+     *                 {@code Accept} header is negotiated
      * @return 200, {@code Content-Type: application/json}, with the item supply plans as the flow wrote them
      * @throws HttpRequestMethodNotSupportedException for a HEAD request, which the RAML does not declare
      * @throws ConstraintViolationException           for an empty or repeated {@code quantity} or {@code operator},
      *                                                or a {@code quantity} that is not a decimal {@code int}
+     * @throws HttpMediaTypeNotAcceptableException    when APIkit's negotiation chooses no declared type for the
+     *                                                {@code Accept} header of a valid request
      * @throws Exception                              the search service's exceptions, unchanged
      */
     @GetMapping(path = ITEMS_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
@@ -114,6 +120,7 @@ public class ItemsController {
         requireValidQueryValue(request, QUANTITY);
         requireIntegerQueryValue(request, QUANTITY);
         requireValidQueryValue(request, OPERATOR);
+        ApiKitAcceptNegotiator.negotiate(request);
         String json = netsuiteSearchService.getItems(quantity, operator);
         // The bare media type, without a charset parameter; the original's exact Content-Type is a Tier 2A
         // verification point.

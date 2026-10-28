@@ -145,7 +145,8 @@ class ListenerMethodFilterTest {
 
         assertEquals("HTTP/1.1 201 Created", response.statusLine(), response::toString);
         assertEquals("http://0.0.0.0:8081/person/1", response.header("Location"), response::toString);
-        assertEquals("text/plain;charset=UTF-8", response.header("Content-Type"), response::toString);
+        assertEquals(List.of(), response.headers("Content-Type"), response::toString);
+        assertEquals(List.of("74"), response.headers("Content-Length"), response::toString);
         assertEquals("{ \"status\": \"success\", \"statusDescription\": \"person created successfully\"}",
                 response.bodyAsString(), response::toString);
         HttpTestClient.Response stored = client.get("/person/1");
@@ -153,18 +154,21 @@ class ListenerMethodFilterTest {
         assertArrayEquals(PERSON, stored.body(), stored::toString);
     }
 
-    /** A {@code GET} in some letter case, the path it reads after one person was stored, and the expected body. */
+    /**
+     * A {@code GET} in some letter case, the path it reads after one person was stored, the expected
+     * {@code Content-Type} ({@code null} for none: the item flow's untyped {@code set-payload}) and the expected body.
+     */
     static Stream<Arguments> getsOfAStoredPerson() {
         String person = new String(PERSON, StandardCharsets.UTF_8);
         return Stream.of("get", "Get", "gEt").flatMap(method -> Stream.of(
-                Arguments.of(method, "/person", "[" + person + "]"),
-                Arguments.of(method, "/person/1", person)));
+                Arguments.of(method, "/person", "application/json", "[" + person + "]"),
+                Arguments.of(method, "/person/1", null, person)));
     }
 
     @ParameterizedTest(name = "{index}: {0} {1}")
     @MethodSource("getsOfAStoredPerson")
     @DirtiesContext
-    void getInAnyLetterCaseRunsTheRetrieveFlows(String method, String path, String expectedBody) {
+    void getInAnyLetterCaseRunsTheRetrieveFlows(String method, String path, String contentType, String expectedBody) {
         HttpTestClient client = HttpTestClient.localhost(port);
         HttpTestClient.Response stored = client.send("POST", "/person", JSON_CONTENT, PERSON);
         assertEquals("HTTP/1.1 201 Created", stored.statusLine(), stored::toString);
@@ -172,7 +176,8 @@ class ListenerMethodFilterTest {
         HttpTestClient.Response response = client.send(method, path, null, null);
 
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
-        assertEquals("application/json", response.header("Content-Type"), response::toString);
+        assertEquals(contentType == null ? List.of() : List.of(contentType), response.headers("Content-Type"),
+                response::toString);
         assertEquals(expectedBody, response.bodyAsString(), response::toString);
     }
 

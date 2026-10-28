@@ -148,14 +148,16 @@ public class WebServiceConfig implements WsConfigurer {
 
     /**
      * The SOAP 1.1 message factory shared by the dispatcher servlet, the listener boundary and the secured clients.
-     * {@code faultstring} is written without {@code xml:lang}, as CXF wrote it.
+     * {@code faultstring} is written without {@code xml:lang}, as CXF wrote it. It is SC-11's
+     * {@link SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory}, so characters outside the Basic Multilingual Plane
+     * are written as raw UTF-8, as CXF wrote them.
      *
      * @throws SOAPException when no SAAJ SOAP 1.1 implementation is available
      */
     @Bean(name = MESSAGE_FACTORY_BEAN_NAME)
     public SaajSoapMessageFactory messageFactory() throws SOAPException {
-        SaajSoapMessageFactory messageFactory =
-                new SaajSoapMessageFactory(MessageFactory.newInstance(SOAPConstants.SOAP_1_1_PROTOCOL));
+        SaajSoapMessageFactory messageFactory = new SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory(
+                MessageFactory.newInstance(SOAPConstants.SOAP_1_1_PROTOCOL));
         messageFactory.setLangAttributeOnSoap11FaultString(false);
         messageFactory.afterPropertiesSet();
         return messageFactory;
@@ -173,9 +175,9 @@ public class WebServiceConfig implements WsConfigurer {
 
     /**
      * The receiver the servlet hands every SOAP request to once the listener boundary has read it: the path's
-     * WS-Security policy first, then Spring WS dispatch (see {@link SecurityFirstMessageDispatcher}). Like the
-     * servlet's default receiver, it collects every endpoint mapping, endpoint adapter and exception resolver bean of
-     * the context when the context is set on it.
+     * WS-Security policy first, then Spring WS dispatch with CXF's MustUnderstand fault (see
+     * {@link SecurityFirstMessageDispatcher}). Like the servlet's default receiver, it collects every endpoint
+     * mapping, endpoint adapter and exception resolver bean of the context when the context is set on it.
      */
     @Bean(name = MESSAGE_RECEIVER_BEAN_NAME)
     public SoapMessageDispatcher messageReceiver() {
@@ -216,9 +218,9 @@ public class WebServiceConfig implements WsConfigurer {
     }
 
     /**
-     * A {@link SoapMessageDispatcher} that enforces the request path's WS-Security policy before any endpoint mapping
-     * is consulted, as each original {@code cxf:ws-security} interceptor ran before CXF bound the message to an
-     * operation.
+     * SC-11's {@link SoapFaultConfig.CxfStyleSoapMessageDispatcher}, enforcing the request path's WS-Security policy
+     * before any endpoint mapping is consulted, as each original {@code cxf:ws-security} interceptor ran before CXF
+     * bound the message to an operation.
      * <p>
      * Spring WS selects the endpoint from the body root as it arrived and runs only the selected mapping's
      * interceptors, and its dispatch step cannot be overridden. An encrypted body, whose root is
@@ -231,17 +233,18 @@ public class WebServiceConfig implements WsConfigurer {
      *   <li>an accepted request is dispatched on the processed message, whose body WSS4J has decrypted in place, so
      *       the operation is selected on the payload the endpoint reads.</li>
      * </ul>
-     * The security interceptor is on no mapping, so no request is validated twice. Spring's {@code mustUnderstand}
-     * check still asks it whether it understands each header, for every mapped chain, the unknown-operation fallback
+     * The security interceptor is on no mapping, so no request is validated twice. The {@code mustUnderstand} check
+     * still asks it whether it understands each header, for every mapped chain, the unknown-operation fallback
      * included: the {@code wsse:Security} header WSS4J-based clients mark {@code mustUnderstand="1"} by default is
-     * understood on exactly the secured paths, and an unsecured path keeps Spring's MustUnderstand fault.
+     * understood on exactly the secured paths, and on an unsecured path it gets CXF's MustUnderstand fault from the
+     * inherited check.
      * <p>
      * Spring WS's dispatcher constructor loads the default strategies of the runtime class from
      * {@code WebServiceConfig.SecurityFirstMessageDispatcher.properties} beside it, which therefore carries the
      * entries of Spring's {@code SoapMessageDispatcher.properties}. Holds no per-request state, so the one instance
      * serves concurrent requests.
      */
-    static final class SecurityFirstMessageDispatcher extends SoapMessageDispatcher {
+    static final class SecurityFirstMessageDispatcher extends SoapFaultConfig.CxfStyleSoapMessageDispatcher {
 
         private final PathScopedSecurityInterceptor securityInterceptor;
         private final SoapEnvelopeStyleInterceptor styler;
@@ -249,12 +252,14 @@ public class WebServiceConfig implements WsConfigurer {
         /**
          * @param securityInterceptor the path-scoped enforcement run before endpoint selection
          * @param styler              the CXF envelope styler applied to a security fault answered without dispatch
+         *                            and, by the inherited check, to a MustUnderstand fault
          * @throws NullPointerException if either argument is {@code null}
          */
         SecurityFirstMessageDispatcher(PathScopedSecurityInterceptor securityInterceptor,
                 SoapEnvelopeStyleInterceptor styler) {
+            super(Objects.requireNonNull(styler, "styler"));
             this.securityInterceptor = Objects.requireNonNull(securityInterceptor, "securityInterceptor");
-            this.styler = Objects.requireNonNull(styler, "styler");
+            this.styler = styler;
         }
 
         /**
@@ -282,10 +287,10 @@ public class WebServiceConfig implements WsConfigurer {
         }
 
         /**
-         * Spring's {@code mustUnderstand} check, run against a copy of the mapped chain that also holds the security
-         * interceptor, so the check asks it whether it understands each header. The copy keeps the chain's SOAP
-         * actors or roles and its ultimate-receiver flag, and serves the check alone: dispatch runs the mapping's own
-         * interceptors only.
+         * The inherited {@code mustUnderstand} check, run against a copy of the mapped chain that also holds the
+         * security interceptor, so the check asks it whether it understands each header. The copy keeps the chain's
+         * SOAP actors or roles and its ultimate-receiver flag, and serves the check alone: dispatch runs the mapping's
+         * own interceptors only.
          */
         @Override
         protected boolean handleRequest(EndpointInvocationChain mappedEndpoint, MessageContext messageContext) {

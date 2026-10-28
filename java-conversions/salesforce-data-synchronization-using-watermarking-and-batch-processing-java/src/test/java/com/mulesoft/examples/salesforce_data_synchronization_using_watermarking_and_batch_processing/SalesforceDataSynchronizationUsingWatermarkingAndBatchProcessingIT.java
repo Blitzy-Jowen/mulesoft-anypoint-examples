@@ -18,12 +18,15 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -93,7 +96,10 @@ import com.sforce.soap.partner.SaveResult;
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of {@code sfdc.username},
  * {@code sfdc.password}, {@code sfdc.securityToken} is missing, blank, still {@code TODO} or an unresolvable
  * placeholder ({@link #missingCredential()}); then no Spring context starts and Salesforce is never called. A skipped
- * run is not Tier 2B evidence. Logs name test record IDs only, never a credential.
+ * run is not Tier 2B evidence. Logs name test record IDs and the generated {@code LastName} only, never a
+ * credential. A cleanup failure is logged by the class names of the exception and its causes, and a failed delete by
+ * its {@code StatusCode} names; no log line carries exception or error text, which can hold vendor data, and none
+ * attaches a throwable.
  */
 @ExtendWith(SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT.LiveCredentialsGate.class)
 @SpringBootTest(classes = SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingApplication.class,
@@ -130,6 +136,12 @@ class SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT {
     private static final List<String> REQUIRED_KEYS = List.of("sfdc.username", "sfdc.password", "sfdc.securityToken");
 
     private static final String TODO = "TODO";
+
+    /** The number of failure classes {@link #failureTypes(Throwable)} names before it cuts the cause chain short. */
+    private static final int FAILURE_TYPE_LIMIT = 5;
+
+    /** Stands for an absent failure, error or status code in a log line. */
+    private static final String NULL_TOKEN = "(null)";
 
     /*
      * A fresh, empty watermark store per run, registered over failsafe's target/it-watermark/watermark.properties, so
@@ -349,7 +361,8 @@ class SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT {
                 }
             }
         } catch (Exception e) {
-            LOG.warn("Could not look up Salesforce Contacts with LastName {} for deletion", lastName, e);
+            LOG.warn("Could not look up Salesforce Contacts with LastName {} for deletion: {}", lastName,
+                    failureTypes(e));
         }
     }
 
@@ -364,7 +377,7 @@ class SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT {
                         result == null ? "no delete result" : errors(result.getErrors()));
             }
         } catch (Exception e) {
-            LOG.warn("Could not delete Salesforce Contact {}", id, e);
+            LOG.warn("Could not delete Salesforce Contact {}: {}", id, failureTypes(e));
         }
     }
 
@@ -382,13 +395,47 @@ class SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT {
         return false;
     }
 
+    /**
+     * Names each Salesforce error by its {@code StatusCode} only, joined by {@code "; "}. The error's message and
+     * fields are left out, because Salesforce echoes record values and query text in them.
+     */
     private static String errors(com.sforce.soap.partner.Error[] errors) {
         if (errors == null || errors.length == 0) {
             return "no error detail";
         }
         return Arrays.stream(errors)
-                .map(error -> error.getStatusCode() + " " + error.getMessage())
+                .map(error -> error == null || error.getStatusCode() == null
+                        ? NULL_TOKEN
+                        : error.getStatusCode().name())
                 .collect(Collectors.joining("; "));
+    }
+
+    /**
+     * Names {@code failure} and each of its causes by class only, joined by {@code " <- "}, never by a message, which
+     * can carry vendor data such as record values or tokens; suppressed exceptions are not named. The walk names at
+     * most {@link #FAILURE_TYPE_LIMIT} classes, then appends {@code ...}, and stops with {@code [circular]} at a cause
+     * already named, so deep and cyclic chains terminate.
+     */
+    private static String failureTypes(Throwable failure) {
+        if (failure == null) {
+            return NULL_TOKEN;
+        }
+        StringBuilder out = new StringBuilder(failure.getClass().getName());
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(failure);
+        for (Throwable cause = failure.getCause(); cause != null; cause = cause.getCause()) {
+            out.append(" <- ");
+            if (named.size() == FAILURE_TYPE_LIMIT) {
+                out.append("...");
+                break;
+            }
+            if (!named.add(cause)) {
+                out.append("[circular]");
+                break;
+            }
+            out.append(cause.getClass().getName());
+        }
+        return out.toString();
     }
 
     /**

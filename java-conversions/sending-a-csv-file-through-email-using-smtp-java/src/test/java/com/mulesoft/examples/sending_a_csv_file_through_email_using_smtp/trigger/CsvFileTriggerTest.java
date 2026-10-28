@@ -10,6 +10,7 @@ package com.mulesoft.examples.sending_a_csv_file_through_email_using_smtp.trigge
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
@@ -25,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -32,6 +34,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -65,6 +69,9 @@ class CsvFileTriggerTest {
 
     private static final String INPUT_CSV = "input.csv";
 
+    /** The {@code csv-email.polling-frequency} {@code application.yml} sets: Mule's default of 1000 ms. */
+    private static final String POLLING_FREQUENCY = "1000";
+
     @TempDir
     Path inputDir;
 
@@ -76,7 +83,7 @@ class CsvFileTriggerTest {
     @BeforeEach
     void createTriggerOverTheRealFlow() {
         CsvEmailService service = new CsvEmailService(new DwCsvReader(), new OrderLinesMapper(), sender);
-        trigger = new CsvFileTrigger(service, inputDir.toString());
+        trigger = new CsvFileTrigger(service, inputDir.toString(), POLLING_FREQUENCY);
     }
 
     @Test
@@ -161,6 +168,30 @@ class CsvFileTriggerTest {
 
         assertThat(scheduled).isNotNull();
         assertThat(scheduled.fixedDelayString()).isEqualTo("${csv-email.polling-frequency:1000}");
+    }
+
+    @ParameterizedTest(name = "csv-email.polling-frequency \"{0}\" -> start-up fails naming the key and the value")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void unschedulableFrequencyFailsNamingKeyAndValue(String frequency) {
+        CsvEmailService service = new CsvEmailService(new DwCsvReader(), new OrderLinesMapper(), sender);
+
+        assertThatThrownBy(() -> new CsvFileTrigger(service, inputDir.toString(), frequency))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("csv-email.polling-frequency")
+                .hasMessageContaining("\"" + frequency + "\"");
+    }
+
+    @ParameterizedTest(name = "csv-email.polling-frequency \"{0}\" -> the trigger is created")
+    @ValueSource(strings = {"1", "1000", "PT10S", "pt0.5s"})
+    void schedulableFrequencyCreatesTheTrigger(String frequency) {
+        CsvEmailService service = new CsvEmailService(new DwCsvReader(), new OrderLinesMapper(), sender);
+        AtomicReference<CsvFileTrigger> created = new AtomicReference<>();
+
+        assertThatCode(() -> created.set(new CsvFileTrigger(service, inputDir.toString(), frequency)))
+                .doesNotThrowAnyException();
+
+        assertThat(created.get().inputDirectory()).isEqualTo(inputDir);
+        verifyNoInteractions(sender);
     }
 
     /** Places the original {@code input.csv} in the input directory, as the original IT dispatched it there. */

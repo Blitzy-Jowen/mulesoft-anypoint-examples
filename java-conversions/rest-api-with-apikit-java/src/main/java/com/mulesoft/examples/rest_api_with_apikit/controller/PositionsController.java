@@ -10,6 +10,7 @@ package com.mulesoft.examples.rest_api_with_apikit.controller;
 
 import java.util.List;
 
+import com.mulesoft.examples.rest_api_with_apikit.config.ApiKitAcceptNegotiator;
 import com.mulesoft.examples.rest_api_with_apikit.mapper.LeagueJsonMapper;
 import com.mulesoft.examples.rest_api_with_apikit.service.LeagueAPI;
 
@@ -17,6 +18,7 @@ import jakarta.servlet.http.HttpServletRequest;
 
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -33,8 +35,9 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code schemas/positions-output.json}. The controller holds no transformation logic: the table comes from
  * {@link LeagueAPI} and its bytes from {@link LeagueJsonMapper}.
  *
- * <p>Errors are answered by the advices, never here: an {@code Accept} header excluding JSON reaches
- * APIkit's 406 mapping and any other method its 405 mapping ({@code ApiKitExceptionHandler}), and a
+ * <p>Errors are answered by the advices, never here: an {@code Accept} header excluding JSON, or one under which
+ * {@link ApiKitAcceptNegotiator} chooses no declared type, reaches APIkit's 406 mapping and any other method its
+ * 405 mapping ({@code ApiKitExceptionHandler}), and a
  * rendering failure the generic 500 ({@code GlobalExceptionHandler}). HEAD and OPTIONS, which Spring would
  * otherwise answer itself, are claimed by {@link #rejectUndeclaredMethod(HttpServletRequest)}, which raises
  * the same 405.
@@ -57,9 +60,18 @@ public class PositionsController {
         this.leagueJsonMapper = leagueJsonMapper;
     }
 
-    /** GET {@code /api/positions}: the current standing for the current season. */
+    /**
+     * GET {@code /api/positions}: the current standing for the current season.
+     *
+     * @param request the current request, whose {@code Accept} header is negotiated
+     * @return 200 {@code application/json} with the league table
+     * @throws HttpMediaTypeNotAcceptableException when APIkit's negotiation chooses no declared type for the
+     *                                             {@code Accept} header
+     */
     @GetMapping(value = POSITIONS_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<String> getPositions() {
+    public ResponseEntity<String> getPositions(HttpServletRequest request)
+            throws HttpMediaTypeNotAcceptableException {
+        ApiKitAcceptNegotiator.negotiate(request);
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
                 .body(leagueJsonMapper.toJson(leagueAPI.getPositions()));
@@ -68,7 +80,7 @@ public class PositionsController {
     /**
      * Rejects HEAD and OPTIONS on {@code /positions}, which the RAML does not declare, so they reach APIkit's
      * 405 as every undeclared method did in the original router. Without this mapping Spring would answer HEAD
-     * through {@link #getPositions()} and OPTIONS with its own 200 and {@code Allow} header. Spring ranks an
+     * through {@link #getPositions(HttpServletRequest)} and OPTIONS with its own 200 and {@code Allow} header. Spring ranks an
      * explicit HEAD mapping above the implicit HEAD of a GET mapping, and this one declares no {@code produces},
      * so it also claims a HEAD whose {@code Accept} header excludes JSON.
      *

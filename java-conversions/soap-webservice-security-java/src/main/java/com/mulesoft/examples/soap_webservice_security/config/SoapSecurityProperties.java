@@ -181,7 +181,7 @@ public class SoapSecurityProperties {
         /** Certificate alias the {@code usernameTokenEncrypted} client encrypts for. */
         private String encryptionUser = "joe";
 
-        /** Connect and read timeout in milliseconds, the Mule default response timeout; 0 waits indefinitely. */
+        /** Connect and read timeout in milliseconds, the Mule default response timeout; always positive. */
         private int responseTimeout = 10000;
 
         public String getHost() {
@@ -221,12 +221,15 @@ public class SoapSecurityProperties {
         }
 
         /**
-         * @throws IllegalArgumentException for a negative value, which no HTTP connection accepts as a timeout
+         * @throws IllegalArgumentException for zero, which an HTTP connection takes as waiting indefinitely, or a
+         *                                  negative value, which no HTTP connection accepts as a timeout; binding
+         *                                  either fails start-up
          */
         public void setResponseTimeout(int responseTimeout) {
-            if (responseTimeout < 0) {
+            if (responseTimeout <= 0) {
                 throw new IllegalArgumentException(
-                        "soap-security.client.response-timeout must not be negative: " + responseTimeout);
+                        "soap-security.client.response-timeout must be a positive number of milliseconds: "
+                                + responseTimeout);
             }
             this.responseTimeout = responseTimeout;
         }

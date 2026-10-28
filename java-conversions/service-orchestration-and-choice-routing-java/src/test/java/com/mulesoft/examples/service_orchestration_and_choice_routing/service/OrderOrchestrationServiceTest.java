@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
+import jakarta.jms.ConnectionFactory;
 import jakarta.jms.JMSException;
 import jakarta.jms.Message;
 import jakarta.jms.ObjectMessage;
@@ -64,6 +65,7 @@ import org.springframework.jms.UncategorizedJmsException;
 import org.springframework.jms.core.JmsTemplate;
 import org.springframework.jms.core.MessageCreator;
 
+import com.mulesoft.examples.service_orchestration_and_choice_routing.config.XaTransactionConfig;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.model.orders.Order;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.model.orders.OrderItem;
 import com.mulesoft.examples.service_orchestration_and_choice_routing.model.orders.OrderPerson;
@@ -85,6 +87,10 @@ import ch.qos.logback.core.read.ListAppender;
  * session variable {@code totalValue} is a string that every leg extends by concatenation, as MEL's {@code +} did, so
  * the value the audit receives records each leg in order. The service's logger is captured with a Logback
  * {@link ListAppender} at INFO, detached and restored after each test.
+ *
+ * <p>The receive timeout of the request-reply template bounds the service's wait for the in-house reply, so the
+ * template's bean method {@link XaTransactionConfig#inHouseRequestJmsTemplate} is also called here directly, over a
+ * mocked connection factory and without a Spring context.
  */
 @ExtendWith(MockitoExtension.class)
 class OrderOrchestrationServiceTest {
@@ -448,6 +454,31 @@ class OrderOrchestrationServiceTest {
         assertThatThrownBy(() -> new OrderOrchestrationService(samsung, inHouseTemplate, audit, jdbcTemplate, queue))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("orders.inhouse.queue must not be blank");
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {0, -1, Long.MIN_VALUE})
+    void inHouseRequestTemplateRejectsNonPositiveReplyTimeout(long replyTimeoutMs) {
+        // JmsTemplate would wait for the in-house reply for ever on 0 and not at all on a negative value.
+        assertThatThrownBy(() -> new XaTransactionConfig()
+                .inHouseRequestJmsTemplate(mock(ConnectionFactory.class), replyTimeoutMs))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage("orders.inhouse.reply-timeout-ms must be between 1 and " + Long.MAX_VALUE + ", was "
+                        + replyTimeoutMs);
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {1, 10000, Long.MAX_VALUE})
+    void inHouseRequestTemplateWaitsReplyTimeoutOnNonTransactedSession(long replyTimeoutMs) {
+        ConnectionFactory nonXaConnectionFactory = mock(ConnectionFactory.class);
+
+        JmsTemplate template = new XaTransactionConfig()
+                .inHouseRequestJmsTemplate(nonXaConnectionFactory, replyTimeoutMs);
+
+        assertThat(template.getReceiveTimeout()).isEqualTo(replyTimeoutMs);
+        assertThat(template.isSessionTransacted()).isFalse();
+        assertThat(template.getConnectionFactory()).isSameAs(nonXaConnectionFactory);
+        verifyNoInteractions(nonXaConnectionFactory);
     }
 
     /** The collaborator whose failure ends the order flow. */

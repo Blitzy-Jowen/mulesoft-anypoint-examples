@@ -10,9 +10,9 @@ Spring Boot 3.2.12 / Java 17 conversion of the Mule EE 3.8.0 example [`login-for
 
 The root [`SUMMARY.md`](../../SUMMARY.md) carries the same row for this project. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 279 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 279 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 85 of 89 lines (`service/LoginService` 40 of 40, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 94.3% (433 of 459 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 287 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 287 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 85 of 89 lines (`service/LoginService` 40 of 40, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 94.6% (434 of 459 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=4`, `failed=0`.
 
 Tier 2A is blocked: the Mule EE runtime licence and the EE Maven repository credentials are unconfirmed (root [`DECISIONS.md`](../../DECISIONS.md), section 9). Parity therefore rests on the fallback of AAP 0.8.4: the ported original assertions (`HttpLoginHtmlFormTest`) plus the branch tests of the controller, service and handlers. That evidence is weaker than captured fixtures: it shows the conversion meets the original's own assertions and the plan's reading of the platform, not that its bytes equal what the Mule runtime sent. The parity label stays `UNVERIFIED` and never reads PASS on this fallback. Tier 2B is `N/A`: the example calls no vendor system.
@@ -86,6 +86,8 @@ Fixed framework settings that reproduce the original listener (not keys of the o
 | `spring.web.resources.add-mappings` | `false` | an unserved path reaches SC-1's no-listener 404, not the static resource handler |
 | `spring.mvc.dispatch-trace-request` | `true` | `TRACE` gets the 405 on `/login` and runs the flow on `/requesterLogin`, instead of the servlet's echo |
 | `spring.autoconfigure.exclude` | `ErrorMvcAutoConfiguration` | no Boot `/error` endpoint; `/error` gets the no-listener 404 |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `WARN` | below it the servlet writes the request line with its query and, with `spring.mvc.log-request-details`, every form parameter, the password included, which the original never logged; it also reads the form through the servlet parameters, consuming the body `LoginController` reads, so a correct login would get the 403. A logger's own level outranks `logging.level.root`, `--debug` and `--trace`; `WARN`, not `INFO`, so that a root `WARN` also silences its servlet start-up lines |
+| `logging.level.io.undertow.request.io` | `INFO` | as above, for the listener's request-parse failures, which quote a query value that does not decode |
 
 - The original hard-coded `mule`/`mule`. The conversion never hard-codes credentials, so supply them through the environment variables `LOGIN_USERNAME` and `LOGIN_PASSWORD`, or as `--login.username=… --login.password=…`.
 - Unit tests supply the original demo values `mule`/`mule` through `src/test/resources/application-test.yml` (Spring profile `test`).
@@ -143,6 +145,7 @@ LOGIN_USERNAME=mule LOGIN_PASSWORD=mule java -jar target/login-form-using-the-ht
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` and bodies, `ErrorResponse` JSON escaping, the bounded one-line ERROR log |
 | `mapper/ParseTemplateRendererTest` | SC-14: templates byte for byte, expression replacement, `null` rendering, missing templates and unresolved expressions |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS` request: 405 on `/login`, the flow on `/requesterLogin`, 404 elsewhere, no CORS headers |
+| `config/SensitiveLogLevelsTest` | under root `TRACE`, the `web` group at `TRACE` and `spring.mvc.log-request-details`: no sentinel password reaches the log, whether configured, wrong, posted by `/requesterLogin`, undecodable in the form or sent in the query; each exchange still answers as the flow does (200, 403, the relayed 200, 400); both pinned levels hold; `User mule is trying to login` and the unpinned loggers' `TRACE` lines are still written |
 | `FixtureParityTest` | ST-2 fixture replay; skipped (`no Tier 2A fixtures captured`) until fixtures exist |
 
 `support/HttpTestClient` (ST-1) is an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, so the empty 403 reason phrase is asserted on the wire.

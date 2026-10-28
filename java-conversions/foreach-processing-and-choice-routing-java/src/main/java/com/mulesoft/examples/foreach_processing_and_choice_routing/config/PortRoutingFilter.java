@@ -38,10 +38,11 @@ import org.springframework.web.filter.OncePerRequestFilter;
  *       {@code /} when nothing is left. The first route with a pattern that matches it, by {@link AntPathMatcher},
  *       serves the request.</li>
  *   <li>No route matches: the filter writes the listener's no-listener answer itself, status 404, Content-Type
- *       {@code text/plain;charset=UTF-8}, body {@code No listener for endpoint: <path>} in UTF-8, and ends the
- *       chain. A servlet filter runs outside every {@code @ControllerAdvice}, so the answer cannot come from an
- *       exception handler, and it never calls {@code sendError}, which would hand the response to the container's
- *       error page instead.</li>
+ *       {@code text/plain} without a charset parameter, body {@code No listener for endpoint: <path>} in UTF-8, the
+ *       same bytes as the dispatcher's no-listener answer for an unmapped path, and ends the chain. A servlet filter
+ *       runs outside every {@code @ControllerAdvice}, so the answer cannot come from an exception handler, and it
+ *       never calls {@code sendError}, which would hand the response to the container's error page instead. The body
+ *       is written through the output stream, never the writer, so the container adds no charset parameter.</li>
  *   <li>The route names a servlet other than the one the container mapped: the request is forwarded to that servlet
  *       through its named dispatcher, presented as if that servlet were the default servlet ({@code /}), so it sees
  *       the whole path as its servlet path. A servlet name that is not registered fails the request with an
@@ -59,7 +60,7 @@ public class PortRoutingFilter extends OncePerRequestFilter {
     private static final Logger log = LoggerFactory.getLogger(PortRoutingFilter.class);
 
     private static final String NO_LISTENER_PREFIX = "No listener for endpoint: ";
-    private static final String CONTENT_TYPE = "text/plain;charset=UTF-8";
+    private static final String CONTENT_TYPE = "text/plain";
     private static final String ROOT_PATH = "/";
 
     private final List<ListenerPorts.Route> mainRoutes;

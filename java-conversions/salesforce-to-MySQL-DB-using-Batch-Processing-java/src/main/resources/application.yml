@@ -53,3 +53,10 @@ watermark:
   # File-backed store of the watermark "timestamp" (Mule persistent object store equivalent).
   # Its default (now - 10 s, UTC, yyyy-MM-dd'T'HH:mm:ss.SSS'Z') is computed in code.
   store-path: .mule/objectstore/watermark.properties
+
+# The original logs a contact's e-mail address only on the error branch of upsertContactInDbStep ("Error with <email>
+# contact"): a root DEBUG/TRACE override, or --debug/--trace, must not reach this category, which below INFO writes
+# every contact. A logger's own level outranks logging.level.root and the --debug/--trace groups.
+logging:
+  level:
+    org.springframework.jdbc.core.StatementCreatorUtils: INFO   # TRACE writes every bound parameter value: each lookup's e-mail address and the first name, last name and e-mail address of each INSERT and UPDATE

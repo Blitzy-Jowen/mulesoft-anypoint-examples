@@ -10,6 +10,7 @@ package com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.trigger;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.mockito.AdditionalMatchers.aryEq;
 import static org.mockito.ArgumentMatchers.any;
@@ -40,6 +41,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -75,6 +77,9 @@ class CsvFileTriggerTest {
 
     private static final String CONTACTS_CSV = "contacts.csv";
 
+    /** The {@code csv-import.polling-frequency} {@code application.yml} sets: the original's 10000 ms. */
+    private static final String POLLING_FREQUENCY = "10000";
+
     @TempDir
     Path tmp;
 
@@ -99,7 +104,7 @@ class CsvFileTriggerTest {
         SharepointProperties props = new SharepointProperties("user@example.onmicrosoft.com", "pw",
                 "http://127.0.0.1:9", "test-folder", "http://127.0.0.1:9/extSTS.srf");
         SharepointImportService service = new SharepointImportService(mockClient, props);
-        trigger = new CsvFileTrigger(service, in.toString(), out.toString());
+        trigger = new CsvFileTrigger(service, in.toString(), out.toString(), POLLING_FREQUENCY);
         originalBytes = originalContacts();
     }
 
@@ -199,6 +204,29 @@ class CsvFileTriggerTest {
 
         assertThat(scheduled).isNotNull();
         assertThat(scheduled.fixedDelayString()).isEqualTo("${csv-import.polling-frequency:10000}");
+    }
+
+    @ParameterizedTest(name = "csv-import.polling-frequency \"{0}\" -> start-up fails naming the key and the value")
+    @ValueSource(strings = {"0", "-1", "PT0S", "PT-1S", "abc", ""})
+    void unschedulableFrequencyFailsNamingKeyAndValue(String frequency) {
+        SharepointImportService importService = mock(SharepointImportService.class);
+
+        assertThatThrownBy(() -> new CsvFileTrigger(importService, in.toString(), out.toString(), frequency))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("csv-import.polling-frequency")
+                .hasMessageContaining("\"" + frequency + "\"");
+    }
+
+    @ParameterizedTest(name = "csv-import.polling-frequency \"{0}\" -> the trigger is created")
+    @ValueSource(strings = {"1", "1000", "PT10S", "pt0.5s"})
+    void schedulableFrequencyCreatesTheTrigger(String frequency) {
+        SharepointImportService importService = mock(SharepointImportService.class);
+
+        CsvFileTrigger created = assertDoesNotThrow(
+                () -> new CsvFileTrigger(importService, in.toString(), out.toString(), frequency));
+
+        assertThat(created.pollOnce()).isZero();
+        verifyNoInteractions(importService);
     }
 
     /** Asserts the SC-5 disposition: the file sits in the move directory with its bytes unchanged, the input is empty. */

@@ -14,7 +14,7 @@ The project has one listener, as the original's single `http:listener-config` di
 
 | Port | Path | Methods | Implemented by | Behaviour |
 |---|---|---|---|---|
-| `1080` (`server.port`, bound to `0.0.0.0` by `server.address`) | `/OrderFulfillment`, exactly | `POST` only (`allowedMethods="POST"`, `:5`) | `controller/FulfillmentEndpoint` → `service/FulfillmentService` → `service/ShippingOrderExportService` | SOAP 1.1 document/literal-wrapped operation `putShippingOrder` in namespace `http://ordermgmt.org/`, with `soapAction=""`. The request `putShippingOrder` has the unqualified children `shippingId`, `billingAddress`, `shippingAddress` and `order` (`orderItem*`, each with `merchantSKU` and `quantity`). Each address carries `name`, `line1`, `line2`, `city`, `stateOrProvinceCode`, `countryCode` and `postalCode`. The reply is `200 OK`, `Content-Type: text/xml;charset=utf-8`, holding `putShippingOrderResponse` with `ShippingOrderConfirmation`: the echoed `shippingOrder` and `orderReceivedStatus` `true`. Every request that reaches the fulfillment component also starts the [asynchronous CSV export](#asynchronous-csv-export). |
+| `1080` (`server.port`, bound to `0.0.0.0` by `server.address`) | `/OrderFulfillment`, exactly | `POST` only, in any letter case (`allowedMethods="POST"`, `:5`) | `controller/FulfillmentEndpoint` → `service/FulfillmentService` → `service/ShippingOrderExportService` | SOAP 1.1 document/literal-wrapped operation `putShippingOrder` in namespace `http://ordermgmt.org/`, with `soapAction=""`. The request `putShippingOrder` has the unqualified children `shippingId`, `billingAddress`, `shippingAddress` and `order` (`orderItem*`, each with `merchantSKU` and `quantity`). Each address carries `name`, `line1`, `line2`, `city`, `stateOrProvinceCode`, `countryCode` and `postalCode`. The reply is `200 OK`, `Content-Type: text/xml;charset=utf-8`, holding `putShippingOrderResponse` with `ShippingOrderConfirmation`: the echoed `shippingOrder` and `orderReceivedStatus` `true`. Every request that reaches the fulfillment component also starts the [asynchronous CSV export](#asynchronous-csv-export). |
 
 - A SOAP response has CXF's envelope form: `soap:` envelope prefix, no empty `Header`, the JAXB `ns2:` payload prefix, no XML declaration and no whitespace between elements (SC-11 `config/SoapEnvelopeStyleInterceptor`, with the `ns2` prefix kept by `config/WebServiceConfig`'s marshaller). For `src/test/resources/message.xml` the reply equals `src/test/resources/reply.xml` byte for byte:
 
@@ -29,13 +29,14 @@ The project has one listener, as the original's single `http:listener-config` di
 
 | Case | Response | Enforced by |
 |---|---|---|
-| Any method other than `POST` on `/OrderFulfillment`: `GET` (with or without `?wsdl`), `HEAD`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, `TRACE` | `405 Method Not Allowed`, `Content-Type: text/plain;charset=UTF-8`, body `Method not allowed for endpoint: /OrderFulfillment`, no `Allow` header | SC-11 `config/SoapListenerBoundaryAdapter`, given the POST-only path by `config/WebServiceConfig`; `spring.webservices.servlet.init` lets `OPTIONS` and `TRACE` reach it |
+| Any method other than `POST` on `/OrderFulfillment` (`POST` is matched in any letter case, as Mule 3.8 matched methods, so `post` is served): `GET` (with or without `?wsdl`), `HEAD`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, `TRACE` | `405 Method Not Allowed`, `Content-Type: text/plain` (no charset), body `Method not allowed for endpoint: /OrderFulfillment`, no `Allow` header | SC-11 `config/SoapListenerBoundaryAdapter`, given the POST-only path by `config/WebServiceConfig`; `spring.webservices.servlet.init` lets `OPTIONS` and `TRACE` reach it |
 | Any other path, sub-paths such as `/OrderFulfillment/extra` included | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` | SC-1 `exception/GlobalExceptionHandler`; `WebServiceConfig` maps the `MessageDispatcherServlet` to exactly `/OrderFulfillment`, so every other path reaches the MVC dispatcher |
-| A body that cannot be read as a SOAP 1.1 envelope (malformed XML, an empty body, a root other than `soap:Envelope`), or a `Content-Type` the SAAJ message factory rejects | HTTP 500, SOAP 1.1 fault, `faultcode` `soap:Client`, `faultstring` the parser's message, for example `XML document structures must start and end within the same entity.` for a truncated envelope | SC-11 `config/SoapListenerBoundaryAdapter` |
+| A body that cannot be read as a SOAP 1.1 envelope (malformed XML, an empty body, a body nested deeper than 100 elements (CXF's default `maxElementDepth`), a root other than `soap:Envelope`), or a `Content-Type` the SAAJ message factory rejects | HTTP 500, SOAP 1.1 fault, `faultcode` `soap:Client`, `faultstring` the parser's message, for example `XML document structures must start and end within the same entity.` for a truncated envelope | SC-11 `config/SoapListenerBoundaryAdapter` |
 | A valid envelope whose body root is not `{http://ordermgmt.org/}putShippingOrder` | HTTP 500, `soap:Client`, `faultstring` `Message part {http://ordermgmt.org/}unknownOperation was not recognized.  (Does it exist in service WSDL?)` for an `ord:unknownOperation` root, with two spaces before the parenthesis; `Message part null was not recognized.  (Does it exist in service WSDL?)` for an empty `Body` | SC-11 `config/SoapFaultConfig` |
-| An exception escaping the endpoint | HTTP 500, `soap:Server`, `faultstring` the exception message (CXF's `Fault occurred while processing.` when it has none); no export is started | SC-11 `config/SoapFaultConfig` |
+| A `mustUnderstand="1"` header block that nothing on the service understands, for example `<x:Sec xmlns:x="urn:x" soapenv:mustUnderstand="1"/>` | HTTP 500, `soap:MustUnderstand`, `faultstring` `MustUnderstand headers: [{<namespace>}<localName>] are not understood.`, for example `MustUnderstand headers: [{urn:x}Sec] are not understood.`; no export is started | SC-11 `config/SoapFaultConfig` (`CxfStyleSoapMessageDispatcher`) |
+| An exception escaping the endpoint | HTTP 500, `soap:Server`, `faultstring` the exception message (CXF's `Fault occurred while processing.` when it has none; a `NullPointerException` the JVM raised counts as having none); no export is started | SC-11 `config/SoapFaultConfig` |
 
-Every fault uses the envelope form above. Tier 2A verification points, where a captured fixture of the original governs and the code is changed to match: the 405 and 404 bytes, the fault texts, the `Accept` and `SOAPAction: ""` headers SAAJ adds to SOAP responses and faults, and the `soap:Client` answer to a non-`text/xml` `Content-Type` (`DECISIONS.md` section 9, "Verification points reported during conversion").
+Every fault uses the envelope form above. Tier 2A verification points, where a captured fixture of the original governs and the code is changed to match: the 405 and 404 bytes, the fault texts, the SOAP response and fault headers (SC-11 `config/SoapListenerBoundaryAdapter` drops the `Accept` and `SOAPAction: ""` request headers SAAJ keeps on every message, which CXF did not send), characters outside the Basic Multilingual Plane written as raw UTF-8 rather than SAAJ's numeric character references (SC-11 `SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory`, as CXF wrote them), and the `soap:Client` answer to a non-`text/xml` `Content-Type` (`DECISIONS.md` section 9, "Verification points reported during conversion").
 
 ### Asynchronous CSV export
 
@@ -65,9 +66,7 @@ With the application on its default port (`Date` varies):
 ```console
 $ curl -i -X POST -H 'Content-Type: text/xml;charset=UTF-8' --data-binary @src/test/resources/message.xml http://localhost:1080/OrderFulfillment
 HTTP/1.1 200 OK
-Accept: text/xml, text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2
 Connection: keep-alive
-SOAPAction: ""
 Content-Type: text/xml;charset=utf-8
 Content-Length: 1085
 Date: <current date>
@@ -77,7 +76,7 @@ Date: <current date>
 $ curl -i 'http://localhost:1080/OrderFulfillment?wsdl'
 HTTP/1.1 405 Method Not Allowed
 Connection: keep-alive
-Content-Type: text/plain;charset=UTF-8
+Content-Type: text/plain
 Content-Length: 50
 Date: <current date>
 
@@ -109,6 +108,9 @@ Every key of `src/main/resources/application.yml`. The original's `mule-app.prop
 | `spring.autoconfigure.exclude` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | no Boot `/error` page rewrites the SC-1 and SC-11 response bytes |
 | `spring.task.execution.thread-name-prefix` | `legacy-fulfillment-async-` | `async` scope, `:9-36` | names the `applicationTaskExecutor` threads behind the `@Async` export; pool sizes stay at Boot's defaults |
 | `spring.application.name` | `legacy-modernization-java` | none | application name in log lines |
+| `logging.level.org.springframework.ws.server.MessageTracing` | `INFO` | none: `FufillmentWebService.xml` declares no logger | its `.received`/`.sent` `TRACE` write every `putShippingOrder` envelope and its reply: the billing and shipping addresses |
+
+- The `logging.level` key keeps the order's billing and shipping addresses out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`. The original had no logger, so it logged neither. The application sends no SOAP request, so no client `MessageTracing` logger is pinned. The nested `UnderRootTrace` run of `controller/FulfillmentEndpointTest` asserts this.
 
 Override a key on the command line or through the environment (relaxed binding maps `FULFILLMENT_OUTPUTDIR` to `fulfillment.output-dir`):
 
@@ -174,12 +176,12 @@ ls src/main/resources/Output    # ShippingOrder-<dd-MM-yy_HH-mm-ss.SSS>.txt
 | Test class | What it asserts |
 |---|---|
 | `LegacyModernizationTest` | the ported `LegacyModernizationIT` (`legacy-modernization/src/test/java/org/mule/examples/LegacyModernizationIT.java:52-64`), end to end with nothing mocked: `POST /OrderFulfillment` with `message.xml` returns a non-empty payload equal to `reply.xml` exactly; then, within the original's 5000 ms sleep, exactly one `ShippingOrder-*.txt` is exported |
-| `controller/FulfillmentEndpointTest` | on the wire through ST-1: the exact reply and the exact CSV, written on a `legacy-fulfillment-async-` thread; the 405 for `GET /OrderFulfillment` and `GET /OrderFulfillment?wsdl`; the `soap:Client` fault for a truncated envelope, an empty body and an unknown operation; the no-listener 404 for `/OrderFulfillment/extra` and `/unknown`; and, with a failing `IFulfillment`, the `soap:Server` fault carrying the exception message and no export |
+| `controller/FulfillmentEndpointTest` | on the wire through ST-1: the exact reply and the exact CSV, written on a `legacy-fulfillment-async-` thread; the 405 for `GET /OrderFulfillment` and `GET /OrderFulfillment?wsdl`; the `soap:Client` fault for a truncated envelope, an empty body and an unknown operation; the no-listener 404 for `/OrderFulfillment/extra` and `/unknown`; and, with a failing `IFulfillment`, the `soap:Server` fault carrying the exception message and no export; nested `UnderRootTrace`, under `logging.level.root=TRACE`: the original `message.xml` order answered with `reply.xml` and exported while none of its billing or shipping address values reaches the console |
 | `service/FulfillmentServiceTest` | the ported component: the confirmation echoes its inputs with `orderReceivedStatus` `true`, the public fields hold the returned instances, the plain `IFulfillment` interface, the prototype scope, and the swallowed failure logged with type and throw site only |
 | `service/ShippingOrderExportServiceTest` | the timestamped file name and CSV content on a fixed clock, overwrite at the same instant, mapping failures swallowed and logged at ERROR with no file written, and the default-zone clock of the public constructor |
 | `mapper/ShippingOrderCsvMapperTest` | the script's CSV for a three-item confirmation and for the JAXB-unmarshalled original test message, one ordered row per item, billing and shipping columns from their own addresses, `null` names as empty fields, each `null` navigated part rejected, and no rows for an empty item list |
 | `mapper/DwCsvWriterTest`, `service/FileOutboundWriterTest` | SC-4 and SC-6, copied with their classes: DataWeave CSV bytes, quoting and empty fields; directory creation, overwrite, UTF-8 encoding, whole-file replacement and failure reporting |
-| `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server` and `soap:Client` faults inside dispatch, the boundary faults and the POST-only 405, and `?wsdl`/`?xsd=` publication as a component (registered for no path here) |
+| `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server`, `soap:Client` and `soap:MustUnderstand` faults inside dispatch, the boundary faults and the POST-only 405, and `?wsdl`/`?xsd=` publication as a component (registered for no path here) |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes |
 | `FixtureParityTest` | ST-2 fixture replay (section below); skipped while no fixture is captured |
 
@@ -223,9 +225,9 @@ No scenario is `unreachable`: `FulfillmentImpl.putShippingOrder` has a single pa
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 297 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); enforcer ban passed; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 297 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 224 of 247 lines. `service/ShippingOrderExportService` 18 of 18, `service/FulfillmentService` 10 of 10, `service/FileOutboundWriter` 94 of 117 (its `TargetLock` included), `mapper/ShippingOrderCsvMapper` 47 of 47, `mapper/DwCsvWriter` 55 of 55. Total project LINE coverage: 88.8% (985 of 1109 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 352 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); enforcer ban passed; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 352 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 224 of 247 lines. `service/ShippingOrderExportService` 18 of 18, `service/FulfillmentService` 10 of 10, `service/FileOutboundWriter` 94 of 117 (its `TargetLock` included), `mapper/ShippingOrderCsvMapper` 47 of 47, `mapper/DwCsvWriter` 55 of 55. Total project LINE coverage: 88.7% (1154 of 1301 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

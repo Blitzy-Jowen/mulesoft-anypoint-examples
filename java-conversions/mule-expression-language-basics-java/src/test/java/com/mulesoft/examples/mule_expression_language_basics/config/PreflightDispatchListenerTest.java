@@ -26,10 +26,10 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.boot.autoconfigure.ImportAutoConfiguration;
 import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration;
@@ -63,9 +63,9 @@ import com.mulesoft.examples.mule_expression_language_basics.support.HttpTestCli
  * {@code greet6}, one new file per call, because the original listeners declare no {@code allowedMethods} and apply
  * no CORS policy (mule-expression-language-basics/src/main/app/greeting.xml:4-83).
  *
- * <p>The cases run the real controller, service, mapper, file writer and SC-1 handler on Undertow
- * ({@link WireConfig}, random port), with {@code greeting.output-dir} under a JUnit temporary directory, and send
- * requests through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the
+ * <p>The cases run the real controller, service, mapper, file writer, {@link ListenerPathConfig} and SC-1 handler on
+ * Undertow ({@link WireConfig}, random port), with {@code greeting.output-dir} under a JUnit temporary directory, and
+ * send requests through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the
  * listener writes them.
  */
 @SpringBootTest(classes = PreflightDispatchListenerTest.WireConfig.class,
@@ -151,17 +151,26 @@ class PreflightDispatchListenerTest {
         assertEquals(writesFile ? 2 : 0, fileCount(), preflight::toString);
     }
 
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() throws IOException {
+    /**
+     * A path no listener serves, and a listener's path with {@code ;} segment parameters, which
+     * {@link ListenerPathConfig} refuses after the pre-flight has selected the {@code OPTIONS} handler, so the flow
+     * writes no file.
+     *
+     * @param target the request target, query string included
+     * @param path   the path the 404 names: the target without its query string
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource({"/greet7, /greet7", "/greet3;x=1" + QUERY + ", /greet3;x=1"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String target, String path) throws IOException {
         HttpTestClient client = HttpTestClient.localhost(port);
-        HttpTestClient.Response plain = client.send("OPTIONS", "/greet7", null, null);
+        HttpTestClient.Response plain = client.send("OPTIONS", target, null, null);
 
-        HttpTestClient.Response preflight = client.send("OPTIONS", "/greet7", preflightHeaders("POST", null), null);
+        HttpTestClient.Response preflight = client.send("OPTIONS", target, preflightHeaders("POST", null), null);
 
         assertSameResponse(plain, preflight);
         assertEquals("HTTP/1.1 404 Not Found", preflight.statusLine(), preflight::toString);
         assertEquals("text/plain", preflight.header("Content-Type"), preflight::toString);
-        assertArrayEquals("No listener for endpoint: /greet7".getBytes(StandardCharsets.UTF_8), preflight.body(),
+        assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), preflight.body(),
                 preflight::toString);
         assertNoCorsHeaders(preflight);
         assertEquals(0, fileCount(), preflight::toString);
@@ -223,16 +232,16 @@ class PreflightDispatchListenerTest {
     }
 
     /**
-     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig} and the
-     * listeners' own beans.
+     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig},
+     * {@link ListenerPathConfig} and the listeners' own beans.
      *
      * <p>It names the web auto-configurations rather than enabling auto-configuration and scans nothing, so the
      * context holds the listeners and nothing else; and it is not a {@code @SpringBootConfiguration}, so the
      * project's other {@code @SpringBootTest} classes still find exactly one application class.
      */
     @Configuration(proxyBeanMethods = false)
-    @Import({PreflightDispatchConfig.class, GreetingController.class, GreetingService.class, GreetingCsvMapper.class,
-            DwCsvWriter.class, FileOutboundWriter.class, GlobalExceptionHandler.class})
+    @Import({PreflightDispatchConfig.class, ListenerPathConfig.class, GreetingController.class, GreetingService.class,
+            GreetingCsvMapper.class, DwCsvWriter.class, FileOutboundWriter.class, GlobalExceptionHandler.class})
     @ImportAutoConfiguration({
             PropertyPlaceholderAutoConfiguration.class,
             ServletWebServerFactoryAutoConfiguration.class,

@@ -15,13 +15,11 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
 import java.net.SocketTimeoutException;
 import java.net.URI;
-import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
@@ -55,17 +53,16 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.Http
  * line and never follows a redirect, so the status code, the reason phrase, the headers and the body bytes are
  * asserted exactly as they leave the server.
  *
- * <p>Covered: the authorize redirect; the flow's text for every method, as the listener declares no
- * {@code allowedMethods}; the callback with a code and with a refused authorization (the platform 500); the approved
- * connector failure modes on both endpoints, which take precedence over that 500; and the no-listener 404. The text
- * of the flow and the content of the redirect are the service's; their construction is covered by
- * {@code service/SalesforceOAuthServiceTest}, and the original assertion by {@code SalesforceOauthTest}.
+ * <p>Covered: the authorize redirect; the flow's text on {@code /} and on the callback with a code for every method,
+ * as the listener declares no {@code allowedMethods}, with its {@code Content-Length} and no {@code Content-Type}, as
+ * the Mule listener sent the flow's untyped {@code set-payload}; the callback with a refused authorization (the
+ * platform 500); the approved connector failure modes on both endpoints, which take precedence over that 500; and
+ * the no-listener 404. The text of the flow and the content of the redirect are the service's; their construction is
+ * covered by {@code service/SalesforceOAuthServiceTest}, and the original assertion by {@code SalesforceOauthTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {"sfdc.key=test-key", "sfdc.secret=test-secret"})
 class SalesforceOAuthControllerTest {
-
-    private static final String TEXT_PLAIN_UTF8 = "text/plain;charset=UTF-8";
 
     private static final String APPLICATION_JSON = "application/json";
 
@@ -109,34 +106,49 @@ class SalesforceOAuthControllerTest {
         verify(oauthService, never()).completeAuthorization(any(), any(), any());
     }
 
-    @Test
-    void rootAcceptsEveryMethodWhenAuthorized() throws Exception {
+    /**
+     * Every method the text cases send, with the {@code text/plain} body it carries or {@code null} for none. The
+     * original listener declares no {@code allowedMethods}, so each one runs the flow (AAP 0.4.9): {@code OPTIONS}
+     * exercises the explicit {@code OPTIONS} mapping, {@code TRACE} the dispatched {@code TRACE} whose reply must be
+     * committed ahead of the servlet's {@code message/http} echo, {@code HEAD} the reply without its body, and an
+     * extension method and a lower-case token show that no method is matched by name.
+     */
+    static Stream<Arguments> everyMethod() {
+        return Stream.of(
+                Arguments.of("GET", null),
+                Arguments.of("HEAD", null),
+                Arguments.of("POST", "ignored"),
+                Arguments.of("PUT", "ignored"),
+                Arguments.of("DELETE", null),
+                Arguments.of("PATCH", "ignored"),
+                Arguments.of("OPTIONS", ""),
+                Arguments.of("TRACE", null),
+                Arguments.of("PROPFIND", null),
+                Arguments.of("get", null));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyMethod")
+    void rootAcceptsEveryMethodWhenAuthorized(String method, String body) throws Exception {
         given(oauthService.authorize()).willReturn(AuthorizeOutcome.completed(QUERY_TEXT));
 
-        // The original listener declares no allowedMethods, so each method runs the flow (AAP 0.4.9); OPTIONS
-        // exercises the controller's explicit OPTIONS mapping.
-        List<Response> responses = List.of(
-                http.get("/"),
-                http.post("/", "text/plain", "ignored"),
-                http.put("/", "text/plain", "ignored"),
-                http.send("OPTIONS", "/", Map.of(), new byte[0]));
+        Response response = send(method, "/", body);
 
-        for (Response response : responses) {
-            assertTextAnswer(response, QUERY_TEXT);
-        }
-        verify(oauthService, times(4)).authorize();
+        assertTextAnswer(response, method, QUERY_TEXT);
+        verify(oauthService).authorize();
         verify(oauthService, never()).completeAuthorization(any(), any(), any());
     }
 
     // ---------------------------------------------------------------- /oauth2callback
 
-    @Test
-    void callbackWithCodeCompletesAuthorization() throws Exception {
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyMethod")
+    void callbackWithCodeCompletesAuthorization(String method, String body) throws Exception {
         given(oauthService.completeAuthorization(CODE, null, null)).willReturn(QUERY_TEXT);
 
-        Response response = http.get("/oauth2callback?code=" + CODE);
+        Response response = send(method, "/oauth2callback?code=" + CODE, body);
 
-        assertTextAnswer(response, QUERY_TEXT);
+        assertTextAnswer(response, method, QUERY_TEXT);
         verify(oauthService).completeAuthorization(CODE, null, null);
         verify(oauthService, never()).authorize();
     }
@@ -271,11 +283,24 @@ class SalesforceOAuthControllerTest {
 
     // ---------------------------------------------------------------- assertions
 
-    /** 200 {@code OK} with {@code text/plain;charset=UTF-8} and exactly {@code text} as UTF-8 bytes. */
-    private static void assertTextAnswer(Response response, String text) {
+    /** {@code method} to {@code target} with {@code body} as {@code text/plain}, or with neither when it is null. */
+    private Response send(String method, String target, String body) {
+        return body == null
+                ? http.send(method, target, null, null)
+                : http.send(method, target, Map.of("Content-Type", "text/plain"), body.getBytes(UTF_8));
+    }
+
+    /**
+     * 200 {@code OK} with no {@code Content-Type}, the {@code Content-Length} of {@code text} as UTF-8 bytes and
+     * exactly those bytes as the body, which a {@code HEAD} reply leaves out.
+     */
+    private static void assertTextAnswer(Response response, String method, String text) {
+        byte[] bytes = text.getBytes(UTF_8);
         assertStatusLine(response, 200, "OK");
-        assertContentType(response, TEXT_PLAIN_UTF8);
-        assertThat(response.body()).as("body of %s", response).isEqualTo(text.getBytes(UTF_8));
+        assertThat(response.headers("Content-Type")).as("Content-Type of %s", response).isEmpty();
+        assertThat(response.headers("Content-Length")).as("Content-Length of %s", response)
+                .containsExactly(String.valueOf(bytes.length));
+        assertThat(response.body()).as("body of %s", response).isEqualTo("HEAD".equals(method) ? new byte[0] : bytes);
     }
 
     private static void assertStatusLine(Response response, int status, String reason) {

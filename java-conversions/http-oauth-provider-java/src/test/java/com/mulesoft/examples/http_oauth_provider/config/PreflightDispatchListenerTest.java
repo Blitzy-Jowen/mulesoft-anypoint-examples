@@ -81,7 +81,7 @@ class PreflightDispatchListenerTest {
     private static final String READ_RESOURCE = "READ_RESOURCE";
 
     /** The SC-10 no-listener answer's Content-Type (AAP 0.4.7). */
-    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain;charset=UTF-8";
+    private static final String NO_LISTENER_CONTENT_TYPE = "text/plain";
 
     /** Names the resource listener in test arguments, whose port is known only once the context starts. */
     private static final String RESOURCE_LISTENER = "resource";

@@ -8,6 +8,8 @@
 
 package com.mulesoft.examples.salesforce_data_retrieval.controller;
 
+import static java.nio.charset.StandardCharsets.ISO_8859_1;
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -15,12 +17,19 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -68,9 +77,11 @@ import com.sforce.ws.ConnectionException;
  *
  * <p>Covered: the form page and the record text, both branches of the original {@code field} ternary, the catch
  * branch for hostile, missing and non-form input (none of which reaches Salesforce), the platform-default 404, 405
- * and 500, and the approved connector failure modes, which take precedence over both the GET flow's 500 and the
- * POST flow's catch-all. The expected page and record text are computed by the real mapper and renderer beans from
- * the stubbed describe and query results; their own byte layout is fixed by the mapper tests.
+ * and 500, {@code GET} and {@code POST} matched ignoring case as the Mule listener matched {@code allowedMethods}
+ * while every other spelling keeps the 405, and the approved connector failure modes, which take precedence over
+ * both the GET flow's 500 and the POST flow's catch-all. The expected page and record text are computed by the real
+ * mapper and renderer beans from the stubbed describe and query results; their own byte layout is fixed by the
+ * mapper tests.
  */
 @SpringBootTest(classes = SalesforceDataRetrievalApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -171,10 +182,9 @@ class SalesforceRetrievalControllerTest {
         Response response = http.post("/", FORM_URLENCODED, ORIGINAL_FORM);
 
         assertStatusLine(response, 200, "OK");
-        assertThat(response.header("Content-Type")).isEqualTo(TEXT_PLAIN_UTF8);
         String expected = formatter.format(records());
         assertThat(expected).isEqualTo(records().toString());
-        assertThat(response.body()).isEqualTo(expected.getBytes(UTF_8));
+        assertUntypedReply(response, expected.getBytes(UTF_8));
         // The original IT's assertion: every line of reply.txt occurs in the response.
         String body = response.bodyAsString();
         List<String> replyLines = new ClassPathResource("reply.txt").getContentAsString(UTF_8).lines().toList();
@@ -188,10 +198,27 @@ class SalesforceRetrievalControllerTest {
         Response response = http.post("/", FORM_URLENCODED, "object=user&field=&searchKey=name&searchValue=mule");
 
         assertStatusLine(response, 200, "OK");
-        assertThat(response.header("Content-Type")).isEqualTo(TEXT_PLAIN_UTF8);
-        assertThat(response.body()).isEqualTo(formatter.format(records()).getBytes(UTF_8));
+        assertUntypedReply(response, formatter.format(records()).getBytes(UTF_8));
         // The ternary's empty branch: "SELECT id, name " + "" + " from ...", hence two spaces before "from".
         assertThat(capturedSoql()).isEqualTo("SELECT id, name  from user where name like '%mule%'");
+    }
+
+    /**
+     * The record text is written as UTF-8 bytes with their own length, and {@code Accept} adds no Content-Type: the
+     * flow's payload is untyped, and the Mule listener ignored {@code Accept}.
+     */
+    @Test
+    void postWritesTheRecordTextAsUtf8WithItsByteLengthAndNoContentTypeWhateverTheAccept() throws Exception {
+        List<Map<String, Object>> records = List.of(user("m\u00fcller@mule.test", "005B", "M\u00fcller \u20ac"));
+        given(client.queryAll(anyString())).willReturn(records);
+
+        Response response = http.post("/", FORM_URLENCODED, ORIGINAL_FORM, Map.of("Accept", "application/json"));
+
+        assertStatusLine(response, 200, "OK");
+        byte[] expected = formatter.format(records).getBytes(UTF_8);
+        assertThat(expected.length).isGreaterThan(formatter.format(records).length());
+        assertUntypedReply(response, expected);
+        assertThat(response.bodyAsString()).contains("M\u00fcller \u20ac");
     }
 
     static Stream<Arguments> rejectedQueries() {
@@ -227,6 +254,95 @@ class SalesforceRetrievalControllerTest {
         assertStatusLine(response, 405, "Method Not Allowed");
         assertContentType(response, "text/plain");
         assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: /");
+        verifyNoInteractions(client);
+    }
+
+    // ---------------------------------------------------------------- method letter case (config/ListenerMethodFilter)
+
+    @ParameterizedTest(name = "{0} /")
+    @ValueSource(strings = {"get", "Get", "gEt"})
+    void getInAnyLetterCaseRendersTheFormAsAnUppercaseGet(String method) throws Exception {
+        Response response = http.send(method, "/", null, null);
+
+        assertStatusLine(response, 200, "OK");
+        assertThat(response.header("Content-Type")).isEqualTo(TEXT_HTML_UTF8);
+        assertThat(response.body()).isEqualTo(expectedFormPage().getBytes(UTF_8));
+        assertSameResponse(http.get("/"), response);
+        verify(client, times(2)).describeGlobal();
+        verify(client, never()).queryAll(any());
+    }
+
+    @ParameterizedTest(name = "{0} /")
+    @ValueSource(strings = {"post", "Post", "pOsT"})
+    void postInAnyLetterCaseRunsTheQueryAsAnUppercasePost(String method) throws Exception {
+        Response response = http.send(method, "/", Map.of("Content-Type", FORM_URLENCODED),
+                ORIGINAL_FORM.getBytes(UTF_8));
+
+        assertStatusLine(response, 200, "OK");
+        assertThat(response.body()).isEqualTo(formatter.format(records()).getBytes(UTF_8));
+        assertThat(capturedSoql()).isEqualTo(ORIGINAL_SOQL);
+        assertSameResponse(http.post("/", FORM_URLENCODED, ORIGINAL_FORM), response);
+    }
+
+    /**
+     * Spellings neither listener allows, with the headers sent: each keeps the listener's 405, a lower-case
+     * {@code options} carrying the headers of a CORS pre-flight included. {@code head} has its own case below.
+     */
+    static Stream<Arguments> otherMethodSpellings() {
+        Map<String, String> preflightHeaders = new LinkedHashMap<>();
+        preflightHeaders.put("Origin", "https://example.invalid");
+        preflightHeaders.put("Access-Control-Request-Method", "GET");
+        return Stream.of(
+                Arguments.of("options", Map.of()),
+                Arguments.of("Options", Map.of()),
+                Arguments.of("options", preflightHeaders),
+                Arguments.of("put", Map.of()),
+                Arguments.of("delete", Map.of()),
+                Arguments.of("trace", Map.of()),
+                Arguments.of("postx", Map.of()));
+    }
+
+    @ParameterizedTest(name = "{0} / {1}")
+    @MethodSource("otherMethodSpellings")
+    void otherMethodSpellingKeepsTheListener405(String method, Map<String, String> headers) {
+        Response response = http.send(method, "/", headers, null);
+
+        assertStatusLine(response, 405, "Method Not Allowed");
+        assertContentType(response, "text/plain");
+        assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: /");
+        assertThat(response.headers()).noneMatch(header ->
+                header.getKey().regionMatches(true, 0, "Access-Control-", 0, "Access-Control-".length())
+                        || header.getKey().equalsIgnoreCase("Vary"));
+        verifyNoInteractions(client);
+    }
+
+    /**
+     * {@code head} keeps the listener's 405 and, like {@code HEAD}, carries no body: Undertow compares the method
+     * ignoring case when it decides whether a response has a body, so it writes the head of the 405 alone. ST-1 skips
+     * the body for the exact token {@code HEAD} only, so this case reads the raw response up to the server's close.
+     */
+    @Test
+    void lowerCaseHeadKeepsTheListener405AndIsAnsweredAsAnUppercaseHead() throws IOException {
+        Response uppercase = http.send("HEAD", "/", null, null);
+
+        String raw = new String(rawExchange("head / HTTP/1.1\r\nHost: localhost:" + port
+                + "\r\nConnection: close\r\n\r\n"), ISO_8859_1);
+
+        int headEnd = raw.indexOf("\r\n\r\n");
+        assertThat(headEnd).as(raw).isPositive();
+        assertThat(raw.substring(headEnd + 4)).as(raw).isEmpty();
+        List<String> lines = List.of(raw.substring(0, headEnd).split("\r\n"));
+        assertThat(lines.get(0)).as(raw).isEqualTo("HTTP/1.1 405 Method Not Allowed");
+        List<String> headers = lines.subList(1, lines.size()).stream()
+                .map(line -> line.substring(0, line.indexOf(':')).toLowerCase(Locale.ROOT) + ": "
+                        + line.substring(line.indexOf(':') + 1).trim())
+                .filter(line -> !line.startsWith("date: "))
+                .sorted()
+                .toList();
+        assertThat(headers).as(raw).contains("content-type: text/plain",
+                "content-length: " + "Method not allowed for endpoint: /".length());
+        assertThat(lines.get(0)).isEqualTo(uppercase.statusLine());
+        assertThat(headers).isEqualTo(headerLines(uppercase));
         verifyNoInteractions(client);
     }
 
@@ -380,5 +496,47 @@ class SalesforceRetrievalControllerTest {
 
     private static void assertContentType(Response response, String expected) {
         assertThat(response.header("Content-Type")).as("Content-Type of %s", response).isEqualTo(expected);
+    }
+
+    /**
+     * The reply of an untyped payload, as the Mule 3.8 listener wrote it: {@code body} with its
+     * {@code Content-Length} and no {@code Content-Type}.
+     */
+    private static void assertUntypedReply(Response response, byte[] body) {
+        assertThat(response.headers("Content-Type")).as("Content-Type of %s", response).isEmpty();
+        assertThat(response.headers("Content-Length")).as("Content-Length of %s", response)
+                .containsExactly(String.valueOf(body.length));
+        assertThat(response.body()).as("body of %s", response).isEqualTo(body);
+    }
+
+    /** Same status line, same body bytes and the same headers but {@code Date}, compared as sorted lines. */
+    private static void assertSameResponse(Response expected, Response actual) {
+        assertThat(actual.statusLine()).as("status line of %s", actual).isEqualTo(expected.statusLine());
+        assertThat(actual.body()).as("body of %s", actual).isEqualTo(expected.body());
+        assertThat(headerLines(actual)).as("headers of %s", actual).isEqualTo(headerLines(expected));
+    }
+
+    /** Every header but {@code Date} as {@code name: value} with the name lower-cased, sorted, duplicates kept. */
+    private static List<String> headerLines(Response response) {
+        return response.headers().stream()
+                .filter(header -> !header.getKey().equalsIgnoreCase("Date"))
+                .map(header -> header.getKey().toLowerCase(Locale.ROOT) + ": " + header.getValue())
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * Writes {@code requestHead} on a new connection and returns every byte the server sends until it closes the
+     * connection, within ST-1's timeouts.
+     */
+    private byte[] rawExchange(String requestHead) throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            OutputStream out = socket.getOutputStream();
+            out.write(requestHead.getBytes(US_ASCII));
+            out.flush();
+            return socket.getInputStream().readAllBytes();
+        }
     }
 }

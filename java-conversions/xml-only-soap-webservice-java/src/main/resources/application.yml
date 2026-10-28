@@ -29,3 +29,11 @@ spring:
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # WebServiceConfig.ListenerPathFilter owns the no-listener 404
+
+logging:
+  level:
+    # Hospital_Admissions_SOA.xml and mocks.xml declare no logger, so the patient is not logged at any level: below
+    # INFO these loggers write the Subject (nationalId, names, address, dateOfBirth). A logger's own level outranks
+    # logging.level.root and the --debug and --trace logger groups, so neither reaches them.
+    org.springframework.ws.client.MessageTracing: INFO   # .sent/.received TRACE write every SOAP envelope the PatientService and EHRService clients exchange: upsertPatient carries the Subject
+    org.springframework.ws.server.MessageTracing: INFO   # the same envelopes as AdmissionService and the two mocks receive and answer them

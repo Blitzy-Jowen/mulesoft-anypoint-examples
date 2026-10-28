@@ -17,11 +17,14 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
@@ -81,8 +84,11 @@ import com.sforce.soap.partner.DeleteResult;
  *
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of those three keys is missing,
  * blank, still {@code TODO} or an unresolvable placeholder ({@link #missingCredential()}); then no Spring context
- * starts and Salesforce is never called. A skipped run is not Tier 2B evidence. Logs name record IDs and e-mail
- * addresses of the test data only, never a credential.
+ * starts and Salesforce is never called. A skipped run is not Tier 2B evidence. Logs name the record IDs and e-mail
+ * addresses of the test data, the status codes of a failed delete and the class names of a failure and its causes
+ * ({@link #failureTypes(Throwable)}), never a credential, and never attach the failure or repeat vendor text: an
+ * exception's message, its causes' and suppressed exceptions' messages and an error's message or fields can carry
+ * record fields, SOQL values or tokens.
  */
 @ExtendWith(ImportLeadsToSfdcIT.LiveCredentialsGate.class)
 @SpringBootTest(classes = ImportLeadsIntoSalesforceApplication.class,
@@ -109,6 +115,17 @@ class ImportLeadsToSfdcIT {
     private static final List<String> REQUIRED_KEYS = List.of("sfdc.username", "sfdc.password", "sfdc.securityToken");
 
     private static final String TODO = "TODO";
+
+    /** Number of classes {@link #failureTypes(Throwable)} names, the failure's own included, before it stops. */
+    private static final int FAILURE_TYPE_LIMIT = 5;
+
+    private static final String CAUSE_SEPARATOR = " <- ";
+
+    private static final String MORE_CAUSES_MARKER = "...";
+
+    private static final String CIRCULAR_CAUSE_MARKER = "[circular]";
+
+    private static final String NULL_LOG_TOKEN = "(null)";
 
     /**
      * How long the job, and then each Lead query, may take. One job makes the lazy {@code login}, one
@@ -207,7 +224,7 @@ class ImportLeadsToSfdcIT {
      * re-query is left out before the drop, when nothing was created, and after a query that threw, when it would
      * only repeat a failed login, which counts towards the reused sandbox user's lockout; a Lead left behind then is
      * found, asserted and deleted by the next run, because the job does not create a second one. A failure is logged
-     * and never thrown, as the original only printed it; the ID list is always cleared.
+     * by its type identifiers alone and never thrown, as the original only printed it; the ID list is always cleared.
      */
     @AfterEach
     void tearDown() {
@@ -216,7 +233,8 @@ class ImportLeadsToSfdcIT {
                 try {
                     findLead(email);
                 } catch (Exception e) {
-                    LOG.warn("Could not query the Salesforce Leads with e-mail {} for deletion", email, e);
+                    LOG.warn("Could not query the Salesforce Leads with e-mail {} for deletion: {}", email,
+                            failureTypes(e));
                     break;
                 }
             }
@@ -238,7 +256,7 @@ class ImportLeadsToSfdcIT {
                 }
             }
         } catch (Exception e) {
-            LOG.warn("Could not delete Salesforce Leads {}", ids, e);
+            LOG.warn("Could not delete Salesforce Leads {}: {}", ids, failureTypes(e));
         }
     }
 
@@ -288,13 +306,50 @@ class ImportLeadsToSfdcIT {
         return value.replace("\\", "\\\\").replace("'", "\\'");
     }
 
+    /**
+     * Names the Salesforce status code of each error of a failed delete, separated by {@code "; "}, or
+     * {@code no error detail} when the result carries none; an error without a status code is named {@code (null)}.
+     * The error's message and fields are vendor text that can repeat record values, so they are never read.
+     */
     private static String errors(DeleteResult result) {
         if (result.getErrors() == null || result.getErrors().length == 0) {
             return "no error detail";
         }
         return Arrays.stream(result.getErrors())
-                .map(error -> error.getStatusCode() + " " + error.getMessage())
+                .map(error -> error == null || error.getStatusCode() == null
+                        ? NULL_LOG_TOKEN : error.getStatusCode().name())
                 .collect(Collectors.joining("; "));
+    }
+
+    /**
+     * Names {@code failure} by type identifiers only: the class name of the failure and of each cause, separated by
+     * {@code " <- "}, for example {@code com.sforce.ws.ConnectionException <- java.net.SocketTimeoutException}. At
+     * most {@link #FAILURE_TYPE_LIMIT} classes are named, then {@code ...}; a cause already named ends the walk with
+     * {@code [circular]}; a {@code null} failure is {@code (null)}. Messages, suppressed exceptions and stack traces
+     * are never read, because vendor text can repeat record fields, SOQL values or tokens.
+     */
+    private static String failureTypes(Throwable failure) {
+        if (failure == null) {
+            return NULL_LOG_TOKEN;
+        }
+        StringBuilder out = new StringBuilder(failure.getClass().getName());
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(failure);
+        int count = 1;
+        for (Throwable cause = failure.getCause(); cause != null; cause = cause.getCause()) {
+            out.append(CAUSE_SEPARATOR);
+            if (count == FAILURE_TYPE_LIMIT) {
+                out.append(MORE_CAUSES_MARKER);
+                break;
+            }
+            if (!named.add(cause)) {
+                out.append(CIRCULAR_CAUSE_MARKER);
+                break;
+            }
+            out.append(cause.getClass().getName());
+            count++;
+        }
+        return out.toString();
     }
 
     private static Path inputDir() {

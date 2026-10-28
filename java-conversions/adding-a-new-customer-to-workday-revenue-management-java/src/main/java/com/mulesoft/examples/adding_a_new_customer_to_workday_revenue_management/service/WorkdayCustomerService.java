@@ -99,7 +99,9 @@ public class WorkdayCustomerService {
      * @throws IOException                  the body cannot be read
      * @throws Exception                    from the Workday call: {@code UpstreamAuthenticationException},
      *                                      {@code UpstreamRateLimitException}, {@code UpstreamUnavailableException}
-     *                                      or the vendor failure unchanged (for example a SOAP fault)
+     *                                      or the vendor failure unchanged (for example a SOAP fault), or an
+     *                                      {@code IllegalStateException} naming a missing {@code wday.*} key,
+     *                                      thrown before anything is sent
      */
     public String addCustomer(byte[] xml) throws Exception {
         Document document = parse(xml);

@@ -73,3 +73,19 @@ soap-security:
     host: 0.0.0.0                  # HTTP_Request_Configuration host (service-clients.xml:7)
     base-url: ""                   # empty: the client derives http://<host>:<actual server port>/services
     response-timeout: 10000        # milliseconds, the Mule default response timeout
+
+logging:
+  level:
+    # mule-config.xml and service-clients.xml declare no logger, so no WS-Security header is logged at any level:
+    # below INFO these loggers write the wsse:Security tokens (UsernameToken, SAML assertion, signature) and the
+    # plaintext that signing and encryption cover. A logger's own level outranks logging.level.root and the --debug
+    # and --trace logger groups, so neither reaches them.
+    org.springframework.ws.client.MessageTracing: INFO   # .sent TRACE writes each request after WSS4J secured it, the whole wsse:Security header included; .received the reply
+    org.springframework.ws.server.MessageTracing: INFO   # the same envelopes as the six Greeter paths receive and answer them
+    org.apache.wss4j: INFO   # DEBUG writes the SAML assertion each SAMLTokenProcessor reads and the UsernameToken user name
+    org.apache.jcp.xml.dsig.internal.DigesterOutputStream: INFO   # DEBUG "Pre-digested input" writes every signed part: the Body and, through the STR-Transform, the SAML assertion
+    # WSS4J's STR-Transform writes the referenced SAML assertion straight into the digest and returns no data, which
+    # Santuario reports as a WARN on every signed SAML request, once when the client signs and once when the server
+    # validates, although that digest covers the assertion.
+    org.apache.jcp.xml.dsig.internal.dom.DOMReference: ERROR   # "The input bytes to the digest operation are null": the STR-Transform artefact. ERROR, not WARN: its only other WARN, a dereferenced reference it cannot cache, leaves WSS4J's validation without the signed element, which it rejects as FAILED_CHECK and PathScopedSecurityInterceptor logs
+    org.apache.xml.security.encryption: INFO   # DEBUG "Serialized octets"/"Decrypted octets" write the plaintext of every encrypted part, a UsernameToken a caller encrypts included

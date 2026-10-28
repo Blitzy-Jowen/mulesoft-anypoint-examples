@@ -15,6 +15,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -34,6 +35,8 @@ import java.util.Properties;
 import java.util.UUID;
 import java.util.stream.Stream;
 
+import javax.xml.namespace.QName;
+
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,13 +44,18 @@ import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
+import org.mockito.stubbing.Answer;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.config.YamlPropertiesFactoryBean;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.core.NestedExceptionUtils;
 import org.springframework.core.env.Environment;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -61,11 +69,19 @@ import org.springframework.util.FileSystemUtils;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.SalesforceToMySQLDBUsingBatchProcessingApplication;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.client.SalesforcePartnerClient;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.client.UpstreamSystem;
+import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.exception.UpstreamAuthenticationException;
+import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.exception.UpstreamRateLimitException;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.exception.UpstreamUnavailableException;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.model.BatchJobResult;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.service.ContactToDatabaseBatchService;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.service.WatermarkStore;
 import com.mulesoft.examples.salesforce_to_mysql_db_using_batch_processing.support.SfdcObjectBuilder;
+import com.sforce.soap.partner.fault.ApiFault;
+import com.sforce.soap.partner.fault.ExceptionCode;
+import com.sforce.soap.partner.fault.LoginFault;
+import com.sforce.soap.partner.fault.UnexpectedErrorFault;
+import com.sforce.ws.ConnectionException;
+import com.sforce.ws.SoapFaultException;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -82,13 +98,36 @@ import ch.qos.logback.core.read.ListAppender;
  * {@link ContactPollScheduler#pollOnce()} is that single run. The outer tests call it, and the scheduled
  * {@link ContactPollScheduler#poll()}, on a plain instance over a mocked service. {@link PollOnceAgainstH2} then runs
  * the real poll in the application context, with Salesforce mocked and the {@code contact} table in H2 (MySQL mode),
- * for one happy path and two failure cases.
+ * for one happy path and two failure cases. The {@code poll.frequency} check runs on plain instances and in a minimal
+ * context that resolves the placeholder, as start-up does.
  */
 class ContactPollSchedulerTest {
 
     private static final String JOB_NAME = "salesforce-to-database-Batch";
 
+    /** The packaged {@code poll.frequency}, which the plain instance below is created with. */
+    private static final String POLL_FREQUENCY = "60000";
+
     private static final String FAILED_POLL_PREFIX = "Poll of triggerFlow failed: ";
+
+    private static final String SECRET_MARKER = "SENTINEL_SECRET_7f3";
+
+    private static final String PII_MARKER = "jane.roe@example.com";
+
+    private static final String FORGED_LINE_MARKER = "FORGED_LOG_LINE";
+
+    /** Failure text carrying a secret, an e-mail address and a CR-LF that would start a forged log line. */
+    private static final String SENSITIVE_TEXT = "session " + SECRET_MARKER + " of " + PII_MARKER
+            + "\r\nERROR c.m.e.s.trigger.ContactPollScheduler     : " + FORGED_LINE_MARKER;
+
+    private static final String PARTNER_FAULT_NAMESPACE = "urn:fault.partner.soap.sforce.com";
+
+    /** The single frame of every failure built through {@link #thrownAt}. */
+    private static final StackTraceElement THROW_SITE =
+            new StackTraceElement("com.example.vendor.VendorClient", "call", "VendorClient.java", 42);
+
+    /** {@link #THROW_SITE} as the ERROR line renders it. */
+    private static final String THROW_SITE_TEXT = " at com.example.vendor.VendorClient.call(VendorClient.java:42)";
 
     private ContactToDatabaseBatchService batchService;
 
@@ -105,11 +144,11 @@ class ContactPollSchedulerTest {
     @BeforeEach
     void setUp() {
         batchService = mock(ContactToDatabaseBatchService.class);
-        scheduler = new ContactPollScheduler(batchService);
+        scheduler = new ContactPollScheduler(batchService, POLL_FREQUENCY);
 
         schedulerLogger = (Logger) LoggerFactory.getLogger(ContactPollScheduler.class);
         previousAdditive = schedulerLogger.isAdditive();
-        // The appender records every line; detaching the console keeps the expected failure stack traces out of the
+        // The appender records every line; detaching the console keeps the expected failed-poll ERROR lines out of the
         // build log.
         schedulerLogger.setAdditive(false);
         appender = new ListAppender<>();
@@ -177,16 +216,133 @@ class ContactPollSchedulerTest {
         List<ILoggingEvent> errors = errorEvents();
         assertThat(errors).hasSize(1);
         ILoggingEvent event = errors.get(0);
-        assertThat(event.getFormattedMessage()).isEqualTo(FAILED_POLL_PREFIX + failure.getMessage());
-        assertThat(event.getThrowableProxy()).isNotNull();
-        assertThat(event.getThrowableProxy().getClassName()).isEqualTo(failure.getClass().getName());
-        assertThat(event.getThrowableProxy().getMessage()).isEqualTo(failure.getMessage());
+        // The failure's class, its throw site and its causes' classes: neither its message nor the exception
+        // itself reaches the logger.
+        assertThat(event.getFormattedMessage())
+                .startsWith(FAILED_POLL_PREFIX + failure.getClass().getName())
+                .contains(" at ")
+                .doesNotContain(failure.getMessage());
+        if (failure.getCause() != null) {
+            assertThat(event.getFormattedMessage()).endsWith(" <- " + failure.getCause().getClass().getName());
+        }
+        assertThat(event.getThrowableProxy()).isNull();
 
         // The failed poll leaves the trigger usable: the next poll runs the job again and logs nothing.
         assertThatCode(scheduler::poll).doesNotThrowAnyException();
         verify(batchService, times(2)).synchronize();
         verifyNoMoreInteractions(batchService);
         assertThat(appender.list).hasSize(1);
+    }
+
+    /**
+     * Failures whose text carries a secret, an e-mail address and a CR-LF forged log line: in the message, in a
+     * cause's message, in a suppressed exception, in a WSC fault's exception message or fault string, and in an SC-9
+     * upstream exception's message. Each comes with the description its ERROR line carries instead.
+     */
+    static Stream<Arguments> failuresCarryingSensitiveText() {
+        RuntimeException withSuppressed = thrownAt(new RuntimeException("poll failed"));
+        withSuppressed.addSuppressed(new IOException(SENSITIVE_TEXT));
+        return Stream.of(
+                Arguments.of(Named.of("message", thrownAt(new IllegalStateException(SENSITIVE_TEXT))),
+                        IllegalStateException.class.getName() + THROW_SITE_TEXT),
+                Arguments.of(Named.of("cause message", thrownAt(new RuntimeException(new IOException(SENSITIVE_TEXT)))),
+                        RuntimeException.class.getName() + THROW_SITE_TEXT + " <- java.io.IOException"),
+                Arguments.of(Named.of("suppressed exception", withSuppressed),
+                        RuntimeException.class.getName() + THROW_SITE_TEXT),
+                Arguments.of(Named.of("UnexpectedErrorFault exceptionMessage",
+                                thrownAt(fault(new UnexpectedErrorFault(), ExceptionCode.MALFORMED_QUERY))),
+                        UnexpectedErrorFault.class.getName() + " [MALFORMED_QUERY]" + THROW_SITE_TEXT),
+                Arguments.of(Named.of("LoginFault exceptionMessage",
+                                thrownAt(fault(new LoginFault(), ExceptionCode.INVALID_LOGIN))),
+                        LoginFault.class.getName() + " [INVALID_LOGIN]" + THROW_SITE_TEXT),
+                Arguments.of(Named.of("SOAP fault string", thrownAt(new SoapFaultException(
+                                new QName(PARTNER_FAULT_NAMESPACE, "INVALID_SESSION_ID", "sf"), SENSITIVE_TEXT))),
+                        SoapFaultException.class.getName() + " [INVALID_SESSION_ID]" + THROW_SITE_TEXT),
+                Arguments.of(Named.of("upstream unavailable message", thrownAt(new UpstreamUnavailableException(
+                                UpstreamSystem.SALESFORCE, SENSITIVE_TEXT,
+                                new ConnectionException(SENSITIVE_TEXT, new ConnectException(SENSITIVE_TEXT))))),
+                        UpstreamUnavailableException.class.getName() + " [upstream Salesforce]" + THROW_SITE_TEXT
+                                + " <- " + ConnectionException.class.getName() + " <- java.net.ConnectException"),
+                Arguments.of(Named.of("upstream authentication message", thrownAt(new UpstreamAuthenticationException(
+                                UpstreamSystem.SALESFORCE, SENSITIVE_TEXT,
+                                fault(new UnexpectedErrorFault(), ExceptionCode.INVALID_SESSION_ID)))),
+                        UpstreamAuthenticationException.class.getName() + " [upstream Salesforce]" + THROW_SITE_TEXT
+                                + " <- " + UnexpectedErrorFault.class.getName() + " [INVALID_SESSION_ID]"),
+                Arguments.of(Named.of("upstream rate limit message", thrownAt(new UpstreamRateLimitException(
+                                UpstreamSystem.SALESFORCE, SENSITIVE_TEXT, null,
+                                fault(new UnexpectedErrorFault(), ExceptionCode.REQUEST_LIMIT_EXCEEDED)))),
+                        UpstreamRateLimitException.class.getName() + " [upstream Salesforce]" + THROW_SITE_TEXT
+                                + " <- " + UnexpectedErrorFault.class.getName() + " [REQUEST_LIMIT_EXCEEDED]"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("failuresCarryingSensitiveText")
+    void pollLogsTypeIdentifiersButNoFailureText(Exception failure, String description) throws Exception {
+        BatchJobResult nextResult = new BatchJobResult(JOB_NAME, UUID.randomUUID().toString(),
+                BatchJobResult.Status.SUCCESSFUL, 0, 0, 0, 0, 0);
+        when(batchService.synchronize()).thenAnswer(throwing(failure)).thenReturn(nextResult);
+
+        assertThatCode(scheduler::poll).doesNotThrowAnyException();
+
+        assertThat(appender.list).hasSize(1);
+        ILoggingEvent event = appender.list.get(0);
+        assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+        assertThat(event.getFormattedMessage()).isEqualTo(FAILED_POLL_PREFIX + description);
+        // The exception is not handed to the logger, so no appender or layout can print its text or stack trace.
+        assertThat(event.getThrowableProxy()).isNull();
+        assertThat(Stream.concat(Stream.of(event.getFormattedMessage()),
+                        Stream.ofNullable(event.getArgumentArray()).flatMap(Arrays::stream).map(String::valueOf)))
+                .allSatisfy(logged -> assertThat(logged)
+                        .doesNotContain(SECRET_MARKER, PII_MARKER, FORGED_LINE_MARKER, "\r", "\n"));
+
+        // The failed poll leaves the trigger usable: the next poll runs the job again and logs nothing.
+        assertThatCode(scheduler::poll).doesNotThrowAnyException();
+        verify(batchService, times(2)).synchronize();
+        verifyNoMoreInteractions(batchService);
+        assertThat(appender.list).hasSize(1);
+    }
+
+    /**
+     * Cause chains the ERROR line must cut short, and throw-site frames it must escape or render without a source
+     * line, each with the description the line carries.
+     */
+    static Stream<Arguments> failuresWithBoundedDescriptions() {
+        RuntimeException circular = thrownAt(new RuntimeException("first"));
+        circular.initCause(new IllegalStateException("second", circular));
+        Exception cause = new IOException("cause 12");
+        for (int depth = 11; depth >= 1; depth--) {
+            cause = new IOException("cause " + depth, cause);
+        }
+        RuntimeException twelveCauses = thrownAt(new RuntimeException("outer", cause));
+        return Stream.of(
+                Arguments.of(Named.of("circular cause chain", circular), RuntimeException.class.getName()
+                        + THROW_SITE_TEXT + " <- java.lang.IllegalStateException <- [circular]"),
+                Arguments.of(Named.of("twelve causes", twelveCauses), RuntimeException.class.getName()
+                        + THROW_SITE_TEXT + " <- java.io.IOException".repeat(10) + " <- ..."),
+                Arguments.of(Named.of("line break and backslash in the throw-site frame", failureWithFrames(
+                                new StackTraceElement("com.example.Forged\r\nERROR", "call\\", "Forged.java", 7))),
+                        "java.lang.RuntimeException at com.example.Forged\\u000d\\u000aERROR.call\\u005c(Forged.java:7)"),
+                Arguments.of(Named.of("native method frame", failureWithFrames(
+                                new StackTraceElement("java.lang.Object", "wait", null, -2))),
+                        "java.lang.RuntimeException at java.lang.Object.wait(Native Method)"),
+                Arguments.of(Named.of("frame without source file", failureWithFrames(
+                                new StackTraceElement("com.example.vendor.VendorClient", "call", null, -1))),
+                        "java.lang.RuntimeException at com.example.vendor.VendorClient.call(Unknown Source)"),
+                Arguments.of(Named.of("no stack trace", failureWithFrames()), "java.lang.RuntimeException"));
+    }
+
+    @ParameterizedTest
+    @MethodSource("failuresWithBoundedDescriptions")
+    void pollBoundsAndEscapesTheLoggedDescription(Exception failure, String description) throws Exception {
+        when(batchService.synchronize()).thenAnswer(throwing(failure));
+
+        assertThatCode(scheduler::poll).doesNotThrowAnyException();
+
+        assertThat(appender.list).hasSize(1);
+        ILoggingEvent event = appender.list.get(0);
+        assertThat(event.getLevel()).isEqualTo(Level.ERROR);
+        assertThat(event.getFormattedMessage()).isEqualTo(FAILED_POLL_PREFIX + description);
+        assertThat(event.getThrowableProxy()).isNull();
     }
 
     @Test
@@ -196,6 +352,8 @@ class ContactPollSchedulerTest {
         assertThat(scheduled).isNotNull();
         // A fixed rate, as the original fixed-frequency-scheduler measured its period between poll starts.
         assertThat(scheduled.fixedRateString()).isEqualTo("${poll.frequency:60000}");
+        // The constructor checks the very placeholder the schedule resolves.
+        assertThat(ContactPollScheduler.FREQUENCY).isEqualTo(scheduled.fixedRateString());
         assertThat(scheduled.initialDelayString()).isEqualTo("${poll.initial-delay:0}");
         assertThat(scheduled.fixedDelay()).isEqualTo(-1L);
         assertThat(scheduled.fixedDelayString()).isEmpty();
@@ -217,8 +375,74 @@ class ContactPollSchedulerTest {
         assertThat(configuration.getProperty("poll.initial-delay")).isEqualTo("0");
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "-1", "-5", "PT0S", "PT-1S", "abc", ""})
+    void constructorRejectsAFrequencyTheScheduleCannotUse(String frequency) {
+        ContactToDatabaseBatchService service = mock(ContactToDatabaseBatchService.class);
+
+        // Named key and value, in place of the executor's IllegalArgumentException without a message.
+        assertThatThrownBy(() -> new ContactPollScheduler(service, frequency))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessage(invalidFrequencyMessage(frequency));
+        verifyNoInteractions(service);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "60000", "PT10S", "pt0.5s"})
+    void constructorAcceptsAPositiveFrequency(String frequency) {
+        assertThatCode(() -> new ContactPollScheduler(mock(ContactToDatabaseBatchService.class), frequency))
+                .doesNotThrowAnyException();
+    }
+
+    /** The values the failing start-ups used: the bean's creation fails the context, naming the key and the value. */
+    @ParameterizedTest
+    @ValueSource(strings = {"-5", "0"})
+    void startUpFailsNamingTheKeyAndTheValueOfANonPositiveFrequency(String frequency) {
+        new ApplicationContextRunner()
+                .withBean(ContactToDatabaseBatchService.class, () -> mock(ContactToDatabaseBatchService.class))
+                .withBean(ContactPollScheduler.class)
+                .withPropertyValues("poll.frequency=" + frequency)
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(NestedExceptionUtils.getMostSpecificCause(context.getStartupFailure()))
+                            .isInstanceOf(IllegalArgumentException.class)
+                            .hasMessage(invalidFrequencyMessage(frequency));
+                });
+    }
+
+    private static String invalidFrequencyMessage(String frequency) {
+        return "Invalid poll.frequency value \"" + frequency + "\": the polling frequency must be a positive number"
+                + " of milliseconds or a positive ISO-8601 duration";
+    }
+
     private List<ILoggingEvent> errorEvents() {
         return appender.list.stream().filter(event -> event.getLevel() == Level.ERROR).toList();
+    }
+
+    /** Gives {@code failure} the single frame {@link #THROW_SITE}, so its ERROR line is known exactly. */
+    private static <T extends Throwable> T thrownAt(T failure) {
+        failure.setStackTrace(new StackTraceElement[] {THROW_SITE});
+        return failure;
+    }
+
+    private static RuntimeException failureWithFrames(StackTraceElement... frames) {
+        RuntimeException failure = new RuntimeException("failure with a chosen stack trace");
+        failure.setStackTrace(frames);
+        return failure;
+    }
+
+    /** Throws {@code failure} itself; Mockito's {@code thenThrow} would refill its stack trace. */
+    private static Answer<BatchJobResult> throwing(Exception failure) {
+        return invocation -> {
+            throw failure;
+        };
+    }
+
+    /** A WSC fault with {@code code} whose free-text exception message is {@link #SENSITIVE_TEXT}. */
+    private static <T extends ApiFault> T fault(T fault, ExceptionCode code) {
+        fault.setExceptionCode(code);
+        fault.setExceptionMessage(SENSITIVE_TEXT);
+        return fault;
     }
 
     /**
@@ -330,6 +554,8 @@ class ContactPollSchedulerTest {
 
         @Test
         void pollOnceRecordsContactWithoutEmailAsFailed() throws Exception {
+            String storedWatermark = "2015-01-01T00:00:00.000Z";
+            watermarkStore.store(WATERMARK_KEY, storedWatermark);
             Map<String, Object> contact = SfdcObjectBuilder.aContact()
                     .with("FirstName", "Jane")
                     .with("LastName", "Roe")
@@ -346,6 +572,11 @@ class ContactPollSchedulerTest {
             assertThat(result.successfulRecords()).isZero();
             assertThat(result.failedRecords()).isEqualTo(1);
             assertThat(jdbcTemplate.queryForObject(COUNT_CONTACTS, Integer.class)).isZero();
+
+            // The failed job keeps the watermark the poll queried from, so the next poll selects the Contact again.
+            verify(partnerClient).query(ContactToDatabaseBatchService.buildQuery(storedWatermark));
+            verifyNoMoreInteractions(partnerClient);
+            assertThat(watermarkStore.current(WATERMARK_KEY)).contains(storedWatermark);
         }
 
         @Test

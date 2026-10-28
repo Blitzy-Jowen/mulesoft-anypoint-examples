@@ -36,8 +36,8 @@ There is no HTTP endpoint. The only trigger is a POP3S mail poller:
 
 Each poll, as `Pop3MailPoller` implements it after Mule 3.8's `RetrieveMessageReceiver`:
 
-1. A blank `pop3.host` skips the poll without opening a session. The first skipped poll logs one WARN, `pop3.host (POP3_HOST) is not configured; POP3S polling is skipped`, and every skipped poll logs a DEBUG line. The original could not deploy with an unresolved `${pop3.host}`.
-2. The store connects and opens the folder read-write. A mailbox that cannot be reached, authenticated or trusted is logged at WARN, `Cannot poll POP3S mailbox <host>:<port>: <exception types>`; nothing is read, and the next poll retries.
+1. A null or blank `pop3.host`, `pop3.user` or `pop3.password` skips the poll without opening a session, so no connection is attempted. The first skipped poll logs one WARN naming every missing key with its environment variable, `pop3.host (POP3_HOST) is not configured; POP3S polling is skipped` when only the host is missing and, for example, `pop3.host (POP3_HOST), pop3.user (POP3_USER), pop3.password (POP3_PASSWORD) are not configured; POP3S polling is skipped` when all three are; every skipped poll logs a DEBUG line. Neither carries a configured value. The original could not deploy with an unresolved `${pop3.host}`.
+2. The store connects and opens the folder read-write. A mailbox that cannot be reached, authenticated or trusted is logged at ERROR, `Cannot poll POP3S mailbox <host>:<port>: <exception types>`; nothing is read, and the next poll retries.
 3. Messages are processed one by one, in mailbox order. Each message is copied out of the folder and its attachment list is built. Then the original is flagged deleted, and only then does the flow body run.
 4. The folder is closed with expunge, so on POP3 the flagged messages are removed at `QUIT`.
 
@@ -92,7 +92,7 @@ The flow declares no exception strategy, so a failure in the flow body gets Mule
 | output file cannot be written | `IOException` `Streaming failed. Could not get output stream` (Mule's message), the cause attached; the INFO line is already logged; ERROR log; mail deleted |
 | mail whose MIME structure cannot be parsed | ERROR `Cannot read POP3 message <n>; it stays in the mailbox: <exception types>`; the mail is not flagged and is read again by the next poll; the mails after it are still processed |
 | deletion flag cannot be set | WARN `Cannot mark POP3 message <n> for deletion; it is not processed: <exception types>` |
-| mailbox unreachable, login rejected, server certificate untrusted | WARN `Cannot poll POP3S mailbox <host>:<port>: <exception types>`; the mailbox is left untouched; the next poll retries |
+| mailbox unreachable, login rejected, server certificate untrusted | ERROR `Cannot poll POP3S mailbox <host>:<port>: <exception types>`; the mailbox is left untouched; the next poll retries |
 
 - Mule 3.8.0 abandoned the rest of a poll after a message that could not be read. Here each message is handled on its own, so one unreadable mail never holds back the mails behind it.
 - Diagnostics carry a fixed text, the message's ordinal in the poll and the class names of the exception and its causes. They never carry the Subject, an exception message or a stack trace, because those hold sender- or server-controlled text. The only line with mail content is the flow's own `Received:` line. Mule's default strategy logged its own error report instead; the failure-path log text is not reproduced.
@@ -111,11 +111,11 @@ Status values:
 | Key | Type | Default | Environment variable | Original name | Status | Description |
 |---|---|---|---|---|---|---|
 | `pop3.host` | `String` | none | `POP3_HOST` | `pop3.host` (unchanged) | TODO | POP3S server host; the original README used `pop.gmail.com`. Blank skips every poll (WARN once) |
-| `pop3.user` | `String` | none | `POP3_USER` | `pop3.user` (unchanged) | TODO | mailbox login in plain form, for example `receiver@gmail.com` |
-| `pop3.password` | `String` | none | `POP3_PASSWORD` | `pop3.password` (unchanged) | TODO (secret) | mailbox password; never logged |
+| `pop3.user` | `String` | none | `POP3_USER` | `pop3.user` (unchanged) | TODO | mailbox login in plain form, for example `receiver@gmail.com`. Blank skips every poll (WARN once) |
+| `pop3.password` | `String` | none | `POP3_PASSWORD` | `pop3.password` (unchanged) | TODO (secret) | mailbox password; never logged. Blank skips every poll (WARN once) |
 | `pop3.port` | `int` | `995` | — | none: `port="995"` (l.6); the original README listed `pop3.port=995` | default | POP3S port |
 | `pop3.folder` | `String` | `INBOX` | — | none | default | folder opened read-write; POP3 serves `INBOX` only |
-| `pop3.check-frequency` | `long` (ms) | `100` | — | none: `checkFrequency="100"` (l.3) | default | fixed delay between polls, and the delay before the first poll |
+| `pop3.check-frequency` | `long` (ms) | `100` | — | none: `checkFrequency="100"` (l.3) | default | fixed delay between polls, and the delay before the first poll; a zero, negative or unreadable value stops start-up with an error naming the key and value |
 | `pop3.response-timeout` | `int` (ms) | `10000` | — | none: `responseTimeout="10000"` (l.6) | default | connect and read timeout of the POP3S session (`mail.pop3s.connectiontimeout`, `mail.pop3s.timeout`) |
 | `pop3.ssl-trust` | `String` | `""` | — | none | default | test-only trust override. Empty keeps default TLS verification against the JVM trust store. A value such as `*` sets `mail.pop3s.ssl.trust` and turns off the server-identity check; the tests use it for GreenMail's self-signed certificate. Leave it empty in production |
 | `orders.output-dir` | `String` (a directory path) | `src/test/resources/output` | — | none: `path` (l.28) | default | output directory, relative to the working directory as the original's `path` was |
@@ -188,7 +188,7 @@ Supply the three TODO keys when running, for example through their environment v
 POP3_HOST=pop.gmail.com POP3_USER=… POP3_PASSWORD=… mvn spring-boot:run
 ```
 
-Without them the application starts, logs the `pop3.host (POP3_HOST)` WARN once and does not poll.
+Without them the application starts, logs the `pop3.host (POP3_HOST), pop3.user (POP3_USER), pop3.password (POP3_PASSWORD) are not configured; POP3S polling is skipped` WARN once and does not poll.
 
 The output directory is relative to the working directory. Both commands above run from the project directory, so they write `src/test/resources/output/orders.xml`, as the original did. To keep run-time files out of the source tree, pass `--orders.output-dir=target/run/output` (with `mvn spring-boot:run`, through `-Dspring-boot.run.arguments=--orders.output-dir=target/run/output`).
 
@@ -207,7 +207,7 @@ Usage, following the original README steps 3 to 6:
 | Test class | What it asserts |
 |---|---|
 | `ImportingAnEmailAttachmentUsingThePOP3ConnectorTest` | The ported `ImportingAnEmailAttachmentUsingThePOP3ConnectorIT` (`importing-an-email-attachment-using-the-POP3-connector/src/test/java/org/mule/examples/ImportingAnEmailAttachmentUsingThePOP3ConnectorIT.java:109-140`). The whole application runs with its scheduled poller at the original 100 ms, against GreenMail SMTP and POP3S on dynamic ports. The test sends the original mail: subject `This is the POP Subject Line!`, one `application/octet-stream` part with the bytes of `input.csv` and file name `report`. It waits up to 10 s, replacing the original's fixed 10 s sleep, then asserts the original assertion that the output directory holds a file (`IT.java:140`). It also asserts exactly one file, named `orders.xml`, holding the 289 bytes above, and that the mailbox is empty afterwards (`deleteReadMessages`). |
-| `trigger/Pop3MailPollerTest` | Against GreenMail POP3S, with a Mockito `AttachmentImportService`: the original mail's single attachment reaches the flow byte for byte and the mail is deleted, so a second poll finds nothing; a mail without attachment is handed over as an empty list and deleted; a processing failure is logged at ERROR by type, the mail is deleted and the next mail is processed; a rejected login, an unreachable server and an untrusted certificate are logged at WARN by exception type and return 0 without reaching the flow; after a rejected login or an untrusted certificate the mail stays in the mailbox, and after the rejected login the next poll with the right password processes it; a blank `pop3.host` (null, empty, spaces) reads nothing and logs one WARN naming `pop3.host (POP3_HOST)` plus a DEBUG line per poll; attachments come in Mule 3.8's attachment-map order; no part content is read while the list is built; a mail whose MIME cannot be parsed stays in the mailbox while the next one is processed; no Subject or exception text reaches the log. |
+| `trigger/Pop3MailPollerTest` | Against GreenMail POP3S, with a Mockito `AttachmentImportService`: the original mail's single attachment reaches the flow byte for byte and the mail is deleted, so a second poll finds nothing; a mail without attachment is handed over as an empty list and deleted; a processing failure is logged at ERROR by type, the mail is deleted and the next mail is processed; a rejected login, an unreachable server and an untrusted certificate are logged at ERROR by exception type and return 0 without reaching the flow; after a rejected login or an untrusted certificate the mail stays in the mailbox, and after the rejected login the next poll with the right password processes it; a null, empty or blank `pop3.host`, `pop3.user` or `pop3.password` (each alone, and all three empty) makes every poll return 0 without connecting to the local listener it points at, logs one WARN naming the missing keys with their environment variables plus a DEBUG line per poll, and logs no configured value; attachments come in Mule 3.8's attachment-map order; no part content is read while the list is built; a mail whose MIME cannot be parsed stays in the mailbox while the next one is processed; no Subject or exception text reaches the log. |
 | `service/AttachmentImportServiceTest` | Over the real SC-4 reader and writer, the real mapper and a spy of the real SC-6 writer: `orders.xml` gets the 289 bytes (SHA-256 checked) and one INFO `Received:` line; attachments after the first are never read; `text/plain` is decoded with its declared charset; text, stream and byte content forms are read; unsupported content, an unknown charset, a malformed CSV and a character XML 1.0 forbids fail with nothing logged at INFO and nothing written; an existing `orders.xml` is replaced; a message without attachment fails with `Message has no attachment`; a write failure propagates as `Streaming failed. Could not get output stream`, after the INFO line. |
 | `mapper/OrdersXmlMapperTest` | `input.csv` maps to the exact 289-byte literal (also through `toXmlBytes`, with its SHA-256 and a non-ASCII value); children follow script order whatever the record's key order; values pass through verbatim; extra columns are ignored; a missing column and a `null` record give empty elements; no records give `<orders/>`; a one-order document validates against the carried `orders.xsd`, whose single `order` element rejects the two-order output. |
 | `mapper/DwCsvReaderTest` | SC-4, copied with its class: header row, `,` separator, `"` quoting with the `""` and backslash escapes, LF, CRLF and lone-CR record ends, skipped empty lines, untrimmed string values. |
@@ -241,9 +241,9 @@ No scenario is `unreachable` or `nondeterministic`: the flow has one path and re
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 200 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 200 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 374 of 397 lines. The `mapper` package is fully covered (256 of 256 lines); `service` has 118 of 141 (`AttachmentImportService` 24 of 24, `FileOutboundWriter` 94 of 117). Total project LINE coverage: 93.4% (479 of 513 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 218 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 218 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 374 of 397 lines. The `mapper` package is fully covered (256 of 256 lines); `service` has 118 of 141 (`AttachmentImportService` 24 of 24, `FileOutboundWriter` 94 of 117). Total project LINE coverage: 93.7% (507 of 541 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=1`, `failed=0`.
 
 Tier 1 evidence shows that the project builds and passes its own tests. It is not parity evidence.

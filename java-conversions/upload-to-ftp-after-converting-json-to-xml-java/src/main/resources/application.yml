@@ -24,3 +24,13 @@ ftp:
   path: /Upload/                   # original fixed remote directory (non-secret default)
   user: ${FTP_USER:}               # TODO: supply the FTP user (original hard-coded the login in the flow)
   password: ${FTP_PASSWORD:}       # TODO: supply the FTP password (original hard-coded the password in the flow)
+# upload-to-ftp.xml has no logger, so neither the posted employees JSON nor the XML uploaded from it is logged at any
+# level: a root DEBUG/TRACE override, or --debug/--trace, must not reach these categories, which below INFO write the
+# employees' names and addresses. A logger's own level outranks logging.level.root and the --debug/--trace groups.
+logging:
+  level:
+    org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor: INFO   # DEBUG/TRACE write the posted employees JSON, as the decimal values of its bytes
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO          # DEBUG/TRACE write the response body: the employees XML bytes, and the 500 body carrying a parser message that quotes the payload
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # DEBUG writes the handled exception's message, which quotes the rejected payload
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, the handled exception and its message included
+    org.springframework.web.HttpLogging: INFO            # the HTTP message converters write through this category wherever their own is held at INFO

@@ -63,8 +63,8 @@ import org.w3c.dom.Document;
  * <p>
  * Paths absent from the policy table, and requests not received over HTTP, pass through unsecured; the listener's
  * routing filter answers paths the original did not serve. On an unsecured path {@link #understands} declines the
- * security header, so a {@code mustUnderstand} header there gets Spring WS's MustUnderstand fault, as CXF answered a
- * service without WS-Security.
+ * security header, so a {@code mustUnderstand} header there gets CXF's MustUnderstand fault from SC-11's message
+ * dispatcher, as CXF answered a service without WS-Security.
  * <p>
  * Deliberately neither a {@code SmartEndpointInterceptor} nor a component, and on no endpoint mapping: the
  * web-service configuration's message receiver runs it once per request, before any endpoint is selected, so an

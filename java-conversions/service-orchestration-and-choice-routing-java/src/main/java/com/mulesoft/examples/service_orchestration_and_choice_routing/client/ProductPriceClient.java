@@ -68,10 +68,16 @@ public class ProductPriceClient implements AutoCloseable {
      *                    the default is the value {@code application.yml} resolves with {@code ports.prices} 9999
      * @param timeoutMs connect and read timeout in milliseconds, from {@code orders.price.timeout-ms}; the default
      *                  10000 is Mule's default response timeout
+     * @throws IllegalArgumentException when {@code timeoutMs} is not between 1 and {@link Integer#MAX_VALUE}, since
+     *                                  httpclient5 reads a zero {@link Timeout} as no limit; nothing is built
      */
     public ProductPriceClient(
             @Value("${orders.price.url:http://localhost:9999/api/prices/{productId}}") String urlTemplate,
             @Value("${orders.price.timeout-ms:10000}") int timeoutMs) {
+        if (timeoutMs < 1) {
+            throw new IllegalArgumentException(
+                    "orders.price.timeout-ms must be between 1 and " + Integer.MAX_VALUE + ", was " + timeoutMs);
+        }
         this.urlTemplate = urlTemplate;
         Timeout limit = Timeout.ofMilliseconds(timeoutMs);
         // HttpURLConnection imposed no concurrency cap, so concurrent in-house orders must not queue behind

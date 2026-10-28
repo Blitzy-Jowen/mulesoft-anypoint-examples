@@ -58,6 +58,12 @@
                 </exclusion>
             </exclusions>
         </dependency>
+        <!-- StocklyticsStockService transport under RestClient: its automatic retries can be switched off, so the
+             Stocklytics GET is never re-sent, which the JDK HttpURLConnection does once after a connection failure. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+        </dependency>
         <!-- Replaces the Mule Twitter connector and its twitter4j 3.0.3; this artefact has no runtime dependencies. -->
         <dependency>
             <groupId>org.twitter4j</groupId>

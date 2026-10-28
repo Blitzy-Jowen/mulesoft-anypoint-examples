@@ -327,7 +327,7 @@ class PatientServiceMockEndpointTest {
     private static void assertNoListener(Response response, String path) {
         assertThat(response.status()).as("%s", response).isEqualTo(404);
         assertThat(response.reason()).as("%s", response).isEqualTo("Not Found");
-        assertThat(contentType(response)).startsWith("text/plain");
+        assertThat(contentType(response)).isEqualTo("text/plain");
         assertThat(response.body()).containsExactly(("No listener for endpoint: " + path).getBytes(UTF_8));
     }
 

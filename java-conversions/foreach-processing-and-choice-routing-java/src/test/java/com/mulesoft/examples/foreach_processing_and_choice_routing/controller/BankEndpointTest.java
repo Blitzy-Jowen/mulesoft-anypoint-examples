@@ -32,6 +32,7 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import javax.xml.parsers.ParserConfigurationException;
 
 import com.mulesoft.examples.foreach_processing_and_choice_routing.client.BankClient;
+import com.mulesoft.examples.foreach_processing_and_choice_routing.config.SoapFaultConfig;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.CreditProfile;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanBrokerQuoteRequest;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanQuote;
@@ -160,6 +161,7 @@ class BankEndpointTest {
 
         assertThat(response.statusLine()).as("status line").isEqualTo("HTTP/1.1 200 OK");
         assertThat(response.header("Content-Type")).startsWith("text/xml");
+        assertNoRequestHeaders(response);
         assertThat(response.bodyAsString()).doesNotStartWith("<?xml").doesNotContain(":Header");
         double rate = rateIn(response, bank);
         assertThat(rate).isGreaterThanOrEqualTo(0.0).isLessThan(10.0);
@@ -294,7 +296,7 @@ class BankEndpointTest {
         HttpTestClient.Response response = post(bankPort(1), bankPath(2), envelope(loanQuoteRequest(GOLD_SCORE)));
 
         assertThat(response.status()).isEqualTo(404);
-        assertThat(response.header("Content-Type")).isEqualTo("text/plain;charset=UTF-8");
+        assertThat(response.header("Content-Type")).isEqualTo("text/plain");
         assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: /mule/TheBank2");
     }
 
@@ -317,6 +319,7 @@ class BankEndpointTest {
 
         assertThat(response.status()).isEqualTo(500);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
+        assertNoRequestHeaders(response);
         assertThat(response.bodyAsString()).startsWith(CLIENT_FAULT_PREFIX).endsWith(FAULT_SUFFIX);
         assertThat(faultcode(response)).isEqualTo("soap:Client");
         assertThat(faultstring(response)).isNotBlank();
@@ -349,7 +352,11 @@ class BankEndpointTest {
         assertThat(faultstring(response)).isEqualTo(faultString);
     }
 
-    /** The bank dereferences the request's credit profile, so a request without one fails inside the bank. */
+    /**
+     * The bank dereferences the request's credit profile, so a request without one fails inside the bank with a
+     * NullPointerException the JVM raised. Its computed message names internal classes, so the fault carries CXF's
+     * text for an exception without a message, as the original's Java 8 runtime did.
+     */
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {
             "<bank:getLoanQuote xmlns:bank=\"" + BANK_NS + "\"/>",
@@ -359,9 +366,11 @@ class BankEndpointTest {
 
         assertThat(response.status()).isEqualTo(500);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
-        assertThat(response.bodyAsString()).startsWith(SERVER_FAULT_PREFIX).endsWith(FAULT_SUFFIX);
+        assertNoRequestHeaders(response);
+        assertThat(response.bodyAsString())
+                .isEqualTo(SERVER_FAULT_PREFIX + SoapFaultConfig.DEFAULT_FAULT_STRING + FAULT_SUFFIX);
         assertThat(faultcode(response)).isEqualTo("soap:Server");
-        assertThat(faultstring(response)).isNotBlank();
+        assertThat(faultstring(response)).isEqualTo(SoapFaultConfig.DEFAULT_FAULT_STRING);
     }
 
     private static int bankPort(int bank) {
@@ -447,6 +456,12 @@ class BankEndpointTest {
         String contentType = response.header("Content-Type");
         assertThat(contentType).as("Content-Type").isNotNull();
         return contentType.replace(" ", "").toLowerCase(Locale.ROOT);
+    }
+
+    /** SAAJ keeps {@code Accept} and {@code SOAPAction} in every message's MIME headers; CXF sent neither back. */
+    private static void assertNoRequestHeaders(HttpTestClient.Response response) {
+        assertThat(response.header("Accept")).as("Accept of %s", response).isNull();
+        assertThat(response.header("SOAPAction")).as("SOAPAction of %s", response).isNull();
     }
 
     private static String faultcode(HttpTestClient.Response response) {

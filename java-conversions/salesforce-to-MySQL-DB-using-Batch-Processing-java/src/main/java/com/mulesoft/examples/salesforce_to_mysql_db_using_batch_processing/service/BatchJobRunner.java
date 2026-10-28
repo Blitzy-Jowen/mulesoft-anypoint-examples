@@ -43,6 +43,13 @@ import org.springframework.stereotype.Service;
  *       counts.</li>
  * </ul>
  *
+ * <p>Counts: a record is processed once it has failed, or once its handling in the job's last step has finished: the
+ * step did not accept it, or accepted it and every processor passed with no commit declared, or committed the group
+ * holding it. Successful records are the processed records that have not failed. A job that runs to the end processes
+ * every loaded record. A stopped job leaves every other record unprocessed, neither successful nor failed: a record
+ * that passed the earlier steps but never finished the last one, one the stop left in an uncommitted commit group, and
+ * one no step reached.
+ *
  * <p>Records are processed sequentially on the calling thread. The original {@code batch:threading-profile}
  * ({@code poolExhaustedAction="WAIT"}) only throttled a worker pool, so it is deliberately not reproduced: with no pool
  * there is nothing to exhaust, and record and step order stay deterministic.
@@ -62,8 +69,17 @@ public class BatchJobRunner {
 
     private static final String TRUNCATION_LOG_MARKER = "...[truncated]";
 
+    /** The final result of a run: instance id, job name, status, then the record counts; never a payload. */
+    private static final String FINISHED_LOG_FORMAT = "Finished job instance '{}' of job '{}' with status {}: "
+            + "loaded {}, processed {}, successful {}, failed {}, unprocessed {}";
+
     /**
      * Runs one instance of {@code job}: input phase, process phase, then on-complete.
+     *
+     * <p>The final result, the one returned, is logged once after on-complete with its status and the loaded,
+     * processed, successful, failed and unprocessed record counts: at DEBUG when the status is {@code SUCCESSFUL},
+     * otherwise at WARN, for a job the process phase stopped ({@code FAILED_PROCESS_RECORDS}) and for one whose
+     * on-complete threw ({@code FAILED_ON_COMPLETE}).
      *
      * <p>On-complete runs after the process phase ends or stops, and also after an empty input, which completes with
      * zero counts and status {@code SUCCESSFUL}; that empty-input behaviour is a Tier 2A verification point. An
@@ -96,11 +112,18 @@ public class BatchJobRunner {
         // The wall clock may step back; BatchJobResult rejects a negative duration.
         long elapsed = Math.max(0L, System.currentTimeMillis() - start);
         BatchJobResult result = instance.result(elapsed);
-        LOG.debug("Finished job instance '{}' of job '{}' with status {}: processed {}, successful {}, failed {}",
-                jobInstanceId, job.name(), result.status(), result.processedRecords(), result.successfulRecords(),
-                result.failedRecords());
-
-        return complete(job, result);
+        BatchJobResult finalResult = complete(job, result);
+        Object[] finished = {jobInstanceId, job.name(), finalResult.status(), finalResult.loadedRecords(),
+                finalResult.processedRecords(), finalResult.successfulRecords(), finalResult.failedRecords(),
+                finalResult.loadedRecords() - finalResult.processedRecords()};
+        if (finalResult.isSuccessful()) {
+            LOG.debug(FINISHED_LOG_FORMAT, finished);
+        } else {
+            // A job that stopped, or whose on-complete threw, shows its final status and counts, the records it left
+            // unprocessed included, at the default level.
+            LOG.warn(FINISHED_LOG_FORMAT, finished);
+        }
+        return finalResult;
     }
 
     private static BatchJobResult complete(JobDefinition<?> job, BatchJobResult result) {
@@ -126,9 +149,8 @@ public class BatchJobRunner {
         private final JobDefinition<T> job;
         private final String jobInstanceId;
         private final List<BatchRecord<T>> records;
-        private final boolean[] offered;
         private final Set<String> loggedFailures = new HashSet<>();
-        private long offeredCount;
+        private long completedCount;
         private long failedCount;
         private boolean stopped;
 
@@ -139,42 +161,56 @@ public class BatchJobRunner {
             for (T payload : payloads) {
                 records.add(new BatchRecord<>(payload));
             }
-            this.offered = new boolean[records.size()];
         }
 
         void processRecords() {
-            for (Step<T> step : job.steps()) {
+            List<Step<T>> steps = job.steps();
+            for (int s = 0; s < steps.size(); s++) {
+                Step<T> step = steps.get(s);
                 LOG.debug("Starting step '{}' of job instance '{}' of job '{}'", step.name(), jobInstanceId,
                         job.name());
-                processStep(step);
+                processStep(step, s == steps.size() - 1);
                 if (stopped) {
                     return;
                 }
             }
         }
 
-        private void processStep(Step<T> step) {
+        private void processStep(Step<T> step, boolean lastStep) {
             List<BatchRecord<T>> commitGroup = new ArrayList<>();
             for (int i = 0; i < records.size() && !stopped; i++) {
                 BatchRecord<T> record = records.get(i);
-                markOffered(i);
-                if (accepts(step, record) && process(step, record) && step.hasCommit()) {
-                    commitGroup.add(record);
-                    if (commitGroup.size() == step.commitSize()) {
-                        commit(step, commitGroup);
+                if (!accepts(step, record)) {
+                    completeIfLast(lastStep, List.of(record));
+                } else if (process(step, record)) {
+                    if (!step.hasCommit()) {
+                        completeIfLast(lastStep, List.of(record));
+                    } else {
+                        commitGroup.add(record);
+                        if (commitGroup.size() == step.commitSize()) {
+                            commit(step, commitGroup, lastStep);
+                        }
                     }
                 }
             }
-            // A stopped job leaves the pending group uncommitted, and its records unfailed.
+            // A stopped job leaves the pending group uncommitted, and its records neither failed nor completed.
             if (!stopped && !commitGroup.isEmpty()) {
-                commit(step, commitGroup);
+                commit(step, commitGroup, lastStep);
             }
         }
 
-        private void markOffered(int index) {
-            if (!offered[index]) {
-                offered[index] = true;
-                offeredCount++;
+        /**
+         * Counts the records of {@code handled} that have not failed as completed when {@code lastStep} is set: their
+         * handling in the job's last step has finished, so nothing remains to process them.
+         */
+        private void completeIfLast(boolean lastStep, List<BatchRecord<T>> handled) {
+            if (!lastStep) {
+                return;
+            }
+            for (BatchRecord<T> record : handled) {
+                if (!record.isFailed()) {
+                    completedCount++;
+                }
             }
         }
 
@@ -203,10 +239,11 @@ public class BatchJobRunner {
             }
         }
 
-        private void commit(Step<T> step, List<BatchRecord<T>> group) {
+        private void commit(Step<T> step, List<BatchRecord<T>> group, boolean lastStep) {
             List<T> payloads = group.stream().map(BatchRecord::getPayload).toList();
             try {
                 step.commitProcessor().orElseThrow().commit(payloads);
+                completeIfLast(lastStep, group);
             } catch (Exception ex) {
                 fail(step, ex, group);
             }
@@ -234,8 +271,9 @@ public class BatchJobRunner {
         }
 
         BatchJobResult result(long elapsedTimeInMillis) {
-            // A job that ran to the end offered every record, including the case of a job without steps.
-            long processed = stopped ? offeredCount : records.size();
+            // A job that ran to the end processed every record, including the case of a job without steps; a stopped
+            // one only the records that failed or completed its last step.
+            long processed = stopped ? failedCount + completedCount : records.size();
             BatchJobResult.Status status = stopped
                     ? BatchJobResult.Status.FAILED_PROCESS_RECORDS
                     : BatchJobResult.Status.SUCCESSFUL;

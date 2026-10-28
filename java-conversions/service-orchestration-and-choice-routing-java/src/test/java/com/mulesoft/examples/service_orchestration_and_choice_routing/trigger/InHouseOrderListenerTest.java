@@ -15,6 +15,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -72,7 +73,8 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.service.Pr
  * {@code xa-transaction action="ALWAYS_BEGIN"} of the {@code inhouseOrder} flow ({@code fulfillment.xml:98-129}). The
  * original has no test of this flow, so this class stands in for its endpoint test: the accepted path, the
  * {@code rollback-exception-strategy maxRedeliveryAttempts="3"} with its redeliveries, the rollback of an insert that
- * already ran, the {@code on-redelivery-attempts-exceeded} branch and a body that is not an order item.
+ * already ran, the {@code on-redelivery-attempts-exceeded} branch, a body that is not an order item and the one
+ * broker connection the idle listener keeps open.
  *
  * <p>The whole application runs, so every request travels the production path: the embedded Artemis broker, the
  * JTA-transacted {@code inHouseListenerContainerFactory} (Narayana over the XA Artemis session and the XA Derby
@@ -123,8 +125,15 @@ class InHouseOrderListenerTest {
     /** {@code JMSXDeliveryCount} of the delivery on which redelivery is exhausted: 4 redeliveries exceed 3. */
     private static final int EXHAUSTED_DELIVERY = 5;
 
+    /** Idle time spanning three receives of the listener container, whose receive timeout is Spring's 1000 ms. */
+    private static final Duration IDLE_RECEIVES = Duration.ofMillis(3_500);
+
     @MockBean
     private PriceCacheService priceCacheService;
+
+    /** The XA-wrapped Artemis factory of {@code inHouseListenerContainerFactory}; Narayana recovery never uses it. */
+    @SpyBean(name = "jmsConnectionFactory")
+    private ConnectionFactory xaConnectionFactory;
 
     @SpyBean
     private OrderOrchestrationService orderOrchestrationService;
@@ -314,6 +323,23 @@ class InHouseOrderListenerTest {
         assertThat(deliveryCounts).as("deliveries that reached the flow body").isEmpty();
         verify(priceCacheService, never()).price(anyString());
         assertThat(ordersRows()).isEqualTo(rowsBefore);
+    }
+
+    @Test
+    void idleListenerReceivesOnTheOneConnectionItKeepsOpen() {
+        long connectionsBefore = connectionsCreated();
+
+        await().pollDelay(IDLE_RECEIVES).until(() -> true);
+
+        assertThat(connectionsCreated()).as("connections the idle listener opened over three receives")
+                .isEqualTo(connectionsBefore);
+    }
+
+    /** How many connections {@link #xaConnectionFactory} has created since the spy was last reset. */
+    private long connectionsCreated() {
+        return mockingDetails(xaConnectionFactory).getInvocations().stream()
+                .filter(invocation -> "createConnection".equals(invocation.getMethod().getName()))
+                .count();
     }
 
     /** Records the delivery's {@code JMSXDeliveryCount}, then runs the real {@link InHouseOrderService#receive}. */

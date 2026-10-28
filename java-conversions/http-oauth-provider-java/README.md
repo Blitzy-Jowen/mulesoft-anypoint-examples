@@ -24,7 +24,7 @@ Two Undertow listeners, both bound to `localhost`, as the original's `http:liste
 | listener | `/resources` | any | a token never issued or expired | `401 Unauthorized`, `application/json`, `WWW-Authenticate: Bearer realm="SampleAPI", error="invalid_token"`, `{ "message": "Invalid or expired access token" }` |
 | listener | `/resources` | any | a valid token without `READ_RESOURCE` (for example one granted `POST_RESOURCE` only) | `403 Forbidden`, `application/json`, `WWW-Authenticate: Bearer realm="SampleAPI", error="insufficient_scope", scope="READ_RESOURCE"`, `{ "message": "Insufficient scope: READ_RESOURCE required" }` |
 | listener | `/redirect[?code=<code>]` | any | the demonstration hop of `redirectFlow`, kept as a demo-only helper as in the original | `302 Found`, `Location: http://localhost:8081/token?grant_type=authorization_code&&client_id=<client-id>&client_secret=<client-secret>&code=<code>&redirect_uri=http://localhost:8082/redirect` byte for byte, the double `&&` and the unencoded values included (ports from `http.provider.port` and `http.listener.port`); a missing `code` is written `code=null`; `Content-Length: 0`, no `Content-Type`, empty body |
-| either | a path the receiving port does not serve: `/unknown`, `/resources/payroll`, `/token` on the listener port, `/resources` on the provider port | any | no listener serves it (SC-10 `PortRoutingFilter`; SC-1 for a path no handler serves) | `404 Not Found`, `text/plain;charset=UTF-8`, `No listener for endpoint: <path>` |
+| either | a path the receiving port does not serve: `/unknown`, `/resources/payroll`, `/token` on the listener port, `/resources` on the provider port | any | no listener serves it (SC-10 `PortRoutingFilter`; SC-1 for a path no handler serves) | `404 Not Found`, `text/plain`, `No listener for endpoint: <path>` |
 | provider | `/authorize`, `/token` | any other (`PUT`, `DELETE`, `PATCH`, `OPTIONS`, `TRACE`) | the provider endpoints accept `GET`, `HEAD` and `POST` only | `405 Method Not Allowed`, `text/plain`, `Method not allowed for endpoint: <path>`, no `Allow` header (SC-1) |
 | either | any served path | any | any other unhandled exception | `500 Internal Server Error`, `application/json`, `{ "message": "<exception message>" }`, one ERROR log line naming the route, never the request path (SC-1) |
 
@@ -205,7 +205,8 @@ mvn spring-boot:test-run -Dspring-boot.run.profiles=test
 | `service/ResourceOwnerAuthenticatorTest` | the accepted owner, every rejected variant (case, truncation, padding, `null`, blank), the fail-closed blank configuration, the authorities |
 | `config/OAuthProviderConfigurationCheckTest` | the startup WARN names exactly the blank keys and no value; nothing is logged when every credential is configured; the application starts with blank credentials |
 | `config/SensitiveLogLevelsTest` | the whole flow under root `TRACE` and `spring.mvc.log-request-details`: the client secret, codes, tokens and owner password never reach the log |
-| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, the additional listener registration |
+| `config/OAuthProviderPropertiesTest` | the `OAuthProviderProperties` and `Owner` renderings show `clientSecret` and the owner `password` as `****` when set (blank included) and empty when unset (`null` or empty), never the value; every other component keeps the generated record form in declaration order, the owner masked inside the enclosing record |
+| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, the additional listener registration, an empty TLS password named in the start-up failure |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type`, absent `Allow` header and bodies; `ErrorResponse` escaping; the one-line, escaped ERROR log |
 | `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS` request, first at the handler mapping, then on the wire: the token check and payroll on `/resources`, the 302 on `/redirect`, the 405 on `/authorize` and `/token`, the 404 on an unserved path, no CORS headers |
 | `config/RequestBodyDrainFilterTest` | pipelined requests behind a body-less request are all answered on both listeners, including the routing filter's own 404s; the drain filter is registered ahead of `PortRoutingFilter`; draining never changes the chain's outcome |
@@ -251,9 +252,9 @@ The scenarios, the fixture contract and the capture procedure are in [`src/test/
 
 The root `SUMMARY.md` carries the same row for this project. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; enforcer `BannedDependencies` passed; 457 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 457 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 206 of 206 lines (`service/OAuthProviderService` 182 of 182, `service/ResourceOwnerAuthenticator` 24 of 24; no `mapper` package). Total project LINE coverage: 93.1% (685 of 736 lines).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; enforcer `BannedDependencies` passed; 473 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 473 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 206 of 206 lines (`service/OAuthProviderService` 182 of 182, `service/ResourceOwnerAuthenticator` 24 of 24; no `mapper` package). Total project LINE coverage: 96.6% (744 of 770 lines).
 
 ## Fallback evidence (AAP 0.8.4)
 

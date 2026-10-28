@@ -48,8 +48,8 @@ The listener binds to `0.0.0.0` on port `http.port`, default `8081` (`get-custom
   ```
 
 - SuiteQL results are read 1000 rows per page until NetSuite reports `hasMore` `false`; each page is its own NetSuite call.
-- A CORS pre-flight to `/customers` (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered by Spring MVC with `403 Invalid CORS request` before any handler runs. The Mule listener answered it as any `OPTIONS` request (recorded in the root `DECISIONS.md`).
-- Nothing logs NetSuite data: the flow has no logger, and `application.yml` holds the Spring codec and response-body loggers at `INFO`, so a root `DEBUG` or `TRACE` level cannot write the access token or customer data.
+- A CORS pre-flight to `/customers` (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered like any other `OPTIONS` request, whatever method it asks for: it runs the flow once and gets the page, the empty 200 of the filter rejection, or the 502, 429, 503 or 500 of a failed call, with no `Access-Control-*` or `Vary` header, because the original listener applied no CORS policy (`config/PreflightDispatchConfig`). A pre-flight to any other path gets the no-listener 404.
+- Nothing logs NetSuite data: the flow has no logger, and `application.yml` holds the Spring codec and response-body loggers and Undertow's request-parse logger at `INFO` and the `DispatcherServlet` at `WARN`, so a root `DEBUG` or `TRACE` level cannot write the access token, customer data or the `lastName` searched for.
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
 The original README's request, which needs the NetSuite keys of the configuration section:
@@ -138,6 +138,8 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `netsuite.time-zone` | `ZoneId` | `America/Los_Angeles` | none | default | part of the SC-16 configuration; `netsuite-data-retrieval-java` renders record dates with it, this flow reads no date |
 | `netsuite.custom-field-type-ids` | `Map<String, String>` | empty | none | unset | part of the SC-16 configuration; only `netsuite-data-retrieval-java` reads it (select-field `typeId` overrides) |
 | `logging.level.org.springframework.core.codec`, `logging.level.org.springframework.http.codec`, `logging.level.org.springframework.web.HttpLogging`, `logging.level.org.springframework.web.servlet.mvc.method.annotation` | `LogLevel` | `INFO` | none | fixed | below `INFO` these categories write the token response, the SuiteQL request and response bodies and the rendered page; held at `INFO` so no NetSuite data is logged, as the original logged none |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `WARN` | none | fixed | below it the servlet writes the request line with its query (the `lastName` value) and, with `spring.mvc.log-request-details`, the parameters and headers. `WARN`, not `INFO`: its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
+| `logging.level.io.undertow.request.io` | `LogLevel` | `INFO` | none | fixed | below `INFO` Undertow writes the request-parse failures, which quote a query value that does not decode |
 
 Original-to-new key map (also in the root `DECISIONS.md`):
 
@@ -172,6 +174,7 @@ The requester registers the credentials inside the existing NetSuite account; th
 | `netsuite:config` with `${netsuite.account}`, `${netsuite.email}`, `${netsuite.password}`, `${netsuite.roleId}` (xml:4) | SC-16 OAuth 2.0 M2M: `client/NetsuiteTokenProvider` with `config/NetsuiteProperties`; every call through `client/UpstreamCallExecutor` and `client/NetsuiteFailureClassifier` |
 | `http:listener-config` host `0.0.0.0`, port `${http.port}` (xml:5) | Undertow (`spring-boot-starter-undertow`, Tomcat excluded) with `server.address` and `server.port` from `application.yml` |
 | `http:listener path="/customers"` without `allowedMethods` (xml:8) | `controller/NetsuiteCustomerController`, `@RequestMapping("/customers")`: `customers` (every method but `OPTIONS`) and `customersOptions` (`OPTIONS`), both giving the same answer |
+| Listener semantics: no CORS policy, so a pre-flight is an ordinary `OPTIONS` request | `config/PreflightDispatchConfig` |
 | `expression-filter` `http.query.params["lastName"] != null` (xml:9) | `NetsuiteCustomerController#queryParameter` reads the value; the guard in `service/NetsuiteCustomerService#customerListPage` returns no page, and the controller commits the empty 200 |
 | `netsuite:query-records` with the `dsql:` query (xml:10) | `NetsuiteCustomerService#customerQuery` (SuiteQL, AAP 0.4.10) → SC-16 `client/NetsuiteRestClient#suiteQl` |
 | `dw:transform-message` "Customer List to XML" (`%dw 1.0`, header line 13) | `mapper/CustomerHtmlMapper#toXml` over SC-4 `mapper/DwXmlWriter` |
@@ -188,6 +191,7 @@ Shared components:
 
 - This project holds the reference implementation of **SC-16**, the NetSuite REST client: `client/NetsuiteTokenProvider`, `client/NetsuiteRestClient`, `client/NetsuiteFailureClassifier`, `config/NetsuiteProperties` and their tests `client/NetsuiteTokenProviderTest`, `client/NetsuiteRestClientTest`, `client/NetsuiteFailureClassifierTest`. `netsuite-data-retrieval-java` copies them unchanged apart from the `package` line. This project calls only `NetsuiteRestClient#suiteQl`; the record API, metadata catalog and custom-field source lookup serve that copy.
 - This project carries copies of SC-1 (`exception/GlobalExceptionHandler`, `exception/ErrorResponse`) and ST-1 (`support/HttpTestClient`) from `rest-api-with-apikit-java`, SC-4 `mapper/DwXmlWriter` from `web-service-consumer-java`, SC-9 including `exception/UpstreamExceptionHandler` from `salesforce-data-retrieval-java`, SC-14 `mapper/ParseTemplateRenderer` from `login-form-using-the-http-connector-java`, and ST-2 (`FixtureParityTest`, the `SCENARIOS.md` format) from `hello-world-java`, each with only its `package` line changed and its tests copied with it (register in the root `DECISIONS.md`).
+- `config/PreflightDispatchConfig` and its `config/PreflightDispatchConfigTest` are the listener-semantics classes the other HTTP projects carry, copied from `rest-api-with-apikit-java` with only the `package` line changed; the wire test `config/PreflightDispatchListenerTest` is written for this project's listener.
 
 ## Behaviours stubbed or externalized
 
@@ -204,7 +208,7 @@ Tier 2A verification points: the plan chose these values where the original plat
 - A customer without a first name or email: its cell is written `<td/>`.
 - Result ordering: SuiteQL `ORDER BY lastname ASC` in place of the SuiteTalk search order, and the case-insensitive prefix match.
 - `lastName` given twice (the last value is used) or without a value (rejected by the filter).
-- The tab indentation of the row block (SC-4 `DwXmlWriter`), the bytes of the 404 and 500 defaults, Undertow's 400 for a malformed percent escape in the query, and the 403 answer to a CORS pre-flight.
+- The tab indentation of the row block (SC-4 `DwXmlWriter`), the bytes of the 404 and 500 defaults, and Undertow's 400 for a malformed percent escape in the query.
 
 The capture of the three NetSuite-backed scenarios needs more than the original. The original called SuiteTalk SOAP, while this project calls REST, so a recording of the original's upstream calls cannot drive the replay. Those scenarios also need a REST recording taken against the same tenant state (`netsuite.base-url` pointed at a WireMock recording proxy). Until both exist they are skipped and counted unverified (`src/test/resources/fixtures/SCENARIOS.md`, notes under Scenarios).
 
@@ -256,7 +260,9 @@ While `application-it.yml` or one of the five keys is missing, blank or still `T
 | `client/NetsuiteTokenProviderTest` | the client credentials request and the PS256 client assertion with its claims; token caching, the 60 s expiry margin and `evict()`; PKCS#1 keys rejected with the `openssl` hint; missing settings named; the account-derived and explicit base URLs |
 | `client/NetsuiteFailureClassifierTest`, `client/UpstreamCallExecutorTest`, `exception/UpstreamExceptionHandlerTest` | SC-9 and the NetSuite classification: one eviction and retry on 401, no retry on 429 or on any timeout or connectivity cause, NetSuite's error text as the message, 502/429/503 bodies, precedence over a catch-all advice |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes |
-| `config/ApplicationLogLevelsTest` | the four logger categories held at `INFO` keep NetSuite data out of a root `TRACE` log |
+| `config/ApplicationLogLevelsTest` | the six `logging.level` categories bound from `application.yml`, each at its level; under root `TRACE`, the access-token, customer-e-mail and rendered-body sentinels of the three NetSuite calls and a rendered response stay out of the log, with no-caps and codec-categories-only controls proving the leak is seen; the real `DispatcherServlet` and Undertow listener on a random port under root `DEBUG` and `TRACE` with `spring.mvc.log-request-details`: no logger writes the `lastName` value for a served search, an upstream 500 or an undecodable query (Undertow's 400), while the no-caps control names the dispatcher, the SuiteQL encoder at `TRACE` and `io.undertow.request.io` as the writers |
+| `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
+| `config/PreflightDispatchListenerTest` | on the wire, with the flow mocked: a CORS pre-flight to `/customers` with `lastName` present, empty, absent or bare runs the flow once and gets exactly the plain `OPTIONS` reply (the page as `text/html;charset=UTF-8`, or the empty 200 without `Content-Type`), whatever method it asks for; a failing flow's 502, 429 with `Retry-After`, 503 and 500 likewise; never Spring's 403, and no `Access-Control-*` or `Vary` header; a pre-flight to `/customers/` or `/unknown` gets the no-listener 404 and runs no flow |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
@@ -291,9 +297,9 @@ While `application-it.yml` or one of the five keys is missing, blank or still `T
 
 This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 600 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`GetCustomersListFromNetsuiteIT`, no `application-it.yml`).
-- `mvn -B test`: `BUILD SUCCESS`; 600 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 257 of 261 lines (98.5%) of `service/NetsuiteCustomerService`, `mapper/CustomerHtmlMapper`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 95.7% (1206 of 1260 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 675 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`GetCustomersListFromNetsuiteIT`, no `application-it.yml`).
+- `mvn -B test`: `BUILD SUCCESS`; 675 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 257 of 261 lines (98.5%) of `service/NetsuiteCustomerService`, `mapper/CustomerHtmlMapper`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 95.8% (1243 of 1298 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=10`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `GetCustomersListFromNetsuiteIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

@@ -16,6 +16,7 @@ import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -253,6 +254,33 @@ class OrderProcessingSoapClientTest {
         assertEquals(summary, call.invoke(client, MESSAGE));
     }
 
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("callsAndNonPositiveTimeouts")
+    void constructorRejectsNonPositiveOwnTimeout(Call call, int timeoutMs) {
+        // HttpURLConnection reads a zero timeout as an infinite wait; the other call's timeout is valid.
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> call.clientWithOwnTimeout(ordersUrl(), timeoutMs, TIMEOUT_MS));
+
+        assertEquals(ownTimeoutKey(call) + " must be between 1 and " + Integer.MAX_VALUE + ", was " + timeoutMs,
+                thrown.getMessage());
+    }
+
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("callsAndTimeoutBounds")
+    void constructorAcceptsOwnTimeoutBounds(Call call, int timeoutMs) {
+        assertDoesNotThrow(() -> call.clientWithOwnTimeout(ordersUrl(), timeoutMs, TIMEOUT_MS));
+    }
+
+    static Stream<Arguments> callsAndNonPositiveTimeouts() {
+        return Stream.of(Call.values()).flatMap(call -> Stream.of(0, -1, Integer.MIN_VALUE)
+                .map(timeoutMs -> Arguments.of(call, timeoutMs)));
+    }
+
+    static Stream<Arguments> callsAndTimeoutBounds() {
+        return Stream.of(Call.values()).flatMap(call -> Stream.of(1, Integer.MAX_VALUE)
+                .map(timeoutMs -> Arguments.of(call, timeoutMs)));
+    }
+
     static Stream<Arguments> callsAndConnectionFaults() {
         // A reset, or a close without any response, before the response head: the cases a client could re-send.
         return Stream.of(Call.values()).flatMap(call -> Stream.of(Fault.CONNECTION_RESET_BY_PEER, Fault.EMPTY_RESPONSE)
@@ -267,6 +295,14 @@ class OrderProcessingSoapClientTest {
 
     private static String ordersUrl() {
         return "http://localhost:" + wm.getPort() + ORDERS_PATH;
+    }
+
+    /**
+     * @param call the call whose own timeout {@link Call#clientWithOwnTimeout} sets
+     * @return the configuration key of that timeout
+     */
+    private static String ownTimeoutKey(Call call) {
+        return call == Call.POST_ORDER_REQUEST ? "orders.soap.request-timeout-ms" : "orders.soap.proxy-timeout-ms";
     }
 
     /** Exactly one POST reached the orders path and no other request reached the server: no retry was made. */

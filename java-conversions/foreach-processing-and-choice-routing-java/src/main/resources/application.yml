@@ -35,6 +35,17 @@ loanbroker:
   outbound-host: 0.0.0.0           # host of the outbound request config and bank URIs, :5, :83-89
   response-timeout: 10000          # responseTimeout, :73, :108 (milliseconds)
 
+logging:
+  level:
+    # loanbroker-simple.xml logs the credit profile, the banks, the quotes and the rate, never the applicant: below
+    # INFO these loggers write the applicant's name and ssn. A logger's own level outranks logging.level.root and the
+    # --debug and --trace logger groups, so neither reaches them.
+    org.springframework.ws.client.MessageTracing: INFO   # .sent/.received TRACE write every SOAP envelope: getCreditProfile carries the name and ssn
+    org.springframework.ws.server.MessageTracing: INFO   # the same envelopes as the credit agency and the banks receive and answer them
+    org.springframework.web.servlet.DispatcherServlet: WARN   # request line with the query (name, ssn). WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, the NumberFormatException quoting a malformed ssn or amount among them
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # DEBUG writes the handled exception's message, which quotes a malformed ssn or amount
+
 listeners:
   host: 0.0.0.0
   disallowed-methods: []           # every original listener accepts every method, TRACE included

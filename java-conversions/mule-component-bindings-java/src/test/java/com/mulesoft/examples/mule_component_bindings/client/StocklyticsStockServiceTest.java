@@ -9,6 +9,8 @@
 package com.mulesoft.examples.mule_component_bindings.client;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
@@ -47,12 +49,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.github.tomakehurst.wiremock.http.Fault;
 import com.github.tomakehurst.wiremock.junit5.WireMockExtension;
 import com.mulesoft.examples.mule_component_bindings.config.StockStatsProperties;
 import com.mulesoft.examples.mule_component_bindings.exception.InvalidStockSymbol;
@@ -65,14 +70,19 @@ import com.mulesoft.examples.mule_component_bindings.model.StockStats;
  * {@code http://api.stocklytics.com/}: the historical prices are requested with a bare GET carrying the original
  * headers, the closing date's open, close, high, low and volume are read from the body with absent values as 0 and
  * numeric text coerced, a status other than 200 fails with the original message, a 200 carrying Stocklytics' error
- * text fails with {@link InvalidStockSymbol}, an unreadable body fails with a plain {@link RuntimeException}, and
+ * text fails with {@link InvalidStockSymbol}, an unreadable body fails with a plain {@link RuntimeException}, an API
+ * key without text fails naming {@code stockstats.stocklyticsApiKey} before any request is sent, and
  * through the timed transport an upstream that never answers, or that sends its headers and stalls its body, fails
- * once with a {@link SocketTimeoutException} cause within the timeout; the constructor accepts only a timeout the
- * transport can enforce.
+ * once with a {@link SocketTimeoutException} cause within the timeout; a connection fault fails the call after one
+ * request; redirects are followed as {@code HttpURLConnection} followed them; the constructor accepts only a
+ * timeout the transport can enforce.
  */
 class StocklyticsStockServiceTest {
 
     private static final String HISTORICAL_PRICES = "/historicalPrices/1.0";
+
+    /** Where the redirect cases move the historical prices. */
+    private static final String MOVED_HISTORICAL_PRICES = "/moved/historicalPrices/1.0";
 
     @RegisterExtension
     static WireMockExtension wm = WireMockExtension.newInstance()
@@ -173,6 +183,25 @@ class StocklyticsStockServiceTest {
         wm.verify(1, getRequestedFor(urlEqualTo(HISTORICAL_PRICES)).withHeader("stock", equalTo("ZZZZ")));
     }
 
+    // null, empty and whitespace only: none has text, so none may reach the api_key header.
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = "   ")
+    void apiKeyWithoutTextFailsNamingTheKeyBeforeAnyRequest(String apiKey) {
+        wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(okJson("{\"2012-10-26\":{\"close\":1.5}}")));
+        StocklyticsStockService service = new StocklyticsStockService(RestClient.builder(),
+                new StockStatsProperties("test-access-key", "test-access-secret", "test-api-key", "test-api-secret",
+                        wm.baseUrl() + "/1.1/", apiKey, wm.baseUrl() + "/", "test-sentiment140-key",
+                        wm.baseUrl() + "/"));
+
+        assertThatThrownBy(() -> service.getHistoricalPrices("AAPL", date("2012-10-26")))
+                .isExactlyInstanceOf(IllegalStateException.class)
+                .hasMessage("Stocklytics API key (stockstats.stocklyticsApiKey) is not configured")
+                .hasNoCause();
+        wm.verify(0, anyRequestedFor(anyUrl()));
+        assertThat(wm.getAllServeEvents()).isEmpty();
+    }
+
     @Test
     void malformedJsonRaisesRuntimeException() {
         wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(aResponse().withStatus(200)
@@ -183,6 +212,68 @@ class StocklyticsStockServiceTest {
         assertThatThrownBy(() -> service.getHistoricalPrices("AAPL", date("2012-10-26")))
                 .isExactlyInstanceOf(RuntimeException.class)
                 .hasCauseInstanceOf(JsonProcessingException.class);
+    }
+
+    /**
+     * A GET whose connection is reset, closed before any response, answered with garbage or broken inside the body
+     * fails with a {@link ResourceAccessException} and is sent exactly once: the transport never re-sends the
+     * bodiless GET after a connectivity failure, as the JDK {@code HttpURLConnection} did once.
+     */
+    @ParameterizedTest
+    @EnumSource(Fault.class)
+    void connectionFaultFailsOnceWithAnIoFailure(Fault fault) {
+        wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(aResponse().withFault(fault)));
+        StocklyticsStockService service = newService();
+
+        Throwable thrown = catchThrowable(() -> service.getHistoricalPrices("AAPL", date("2012-10-26")));
+
+        assertThat(thrown).isInstanceOf(ResourceAccessException.class);
+        assertThat(causeChain(thrown)).anyMatch(IOException.class::isInstance);
+        assertThat(wm.getAllServeEvents()).hasSize(1);
+    }
+
+    /** A redirect that keeps the scheme is followed, as HttpURLConnection followed it, with the original headers. */
+    @ParameterizedTest
+    @ValueSource(ints = {300, 301, 302, 303, 307})
+    void sameSchemeRedirectIsFollowedWithTheOriginalHeaders(int status) throws Exception {
+        wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(aResponse()
+                .withStatus(status)
+                .withHeader("Location", MOVED_HISTORICAL_PRICES)));
+        wm.stubFor(get(urlPathEqualTo(MOVED_HISTORICAL_PRICES)).willReturn(okJson(
+                "{\"2012-10-26\":{\"open\":1.0,\"close\":2.0,\"high\":3.0,\"low\":0.5,\"volume\":7}}")));
+
+        StockStats stats = newService().getHistoricalPrices("AAPL", date("2012-10-26"));
+
+        assertPrices(stats.getFinancialStats(), 1.0, 2.0, 3.0, 0.5, 7L);
+        wm.verify(1, getRequestedFor(urlEqualTo(MOVED_HISTORICAL_PRICES))
+                .withHeader("api_key", equalTo(properties().stocklyticsApiKey()))
+                .withHeader("stock", equalTo("AAPL"))
+                .withHeader("Accept", equalTo("application/json")));
+        assertThat(wm.getAllServeEvents()).hasSize(2);
+    }
+
+    static Stream<Arguments> unfollowedRedirects() {
+        return Stream.of(
+                Arguments.of(Named.of("301 from http to https", 301), "https"),
+                Arguments.of(Named.of("308, which HttpURLConnection does not follow", 308), "http"));
+    }
+
+    /**
+     * A redirect HttpURLConnection did not follow is returned as received, so its status fails the call with the
+     * original message, and nothing is sent to its location.
+     */
+    @ParameterizedTest
+    @MethodSource("unfollowedRedirects")
+    void unfollowedRedirectFailsWithItsStatusAfterOneRequest(int status, String scheme) {
+        wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(aResponse()
+                .withStatus(status)
+                .withHeader("Location", scheme + "://localhost:" + wm.getPort() + MOVED_HISTORICAL_PRICES)));
+        StocklyticsStockService service = newService();
+
+        assertThatThrownBy(() -> service.getHistoricalPrices("AAPL", date("2012-10-26")))
+                .isExactlyInstanceOf(RuntimeException.class)
+                .hasMessage("Stockylitics returned status " + status);
+        assertThat(wm.getAllServeEvents()).hasSize(1);
     }
 
     static Stream<Arguments> silentUpstreams() {

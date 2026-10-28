@@ -16,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
@@ -55,28 +56,30 @@ import com.mulesoft.examples.salesforce_data_retrieval.service.SalesforceRetriev
  *       becomes the original catch exception strategy's 200 {@code Invalid Salesforce query.} (xml:37-39), and any
  *       other failure of {@link #showForm()}, whose flow declares no strategy, the generic 500;</li>
  *   <li>{@code GlobalExceptionHandler} (SC-1, lowest precedence): the no-listener 404 for every other path, the
- *       405 for every method other than GET and POST on {@code /}, and the 500.</li>
+ *       405 for every method other than GET and POST, in any letter case, on {@code /}, and the 500.</li>
  * </ol>
  * The one exception is a form body the Mule listener could not decode, which it answered itself before any flow ran;
  * {@link #rejectUndecodableForm} reproduces that 400.
  *
  * <p>No mapping declares {@code consumes} or {@code produces}: the listeners accepted any request Content-Type and
- * ignored {@code Accept}, so neither a 415 nor a 406 can arise. Each response presets its Content-Type, which makes
- * Spring write the body without consulting {@code Accept}. Stateless and thread-safe.
+ * ignored {@code Accept}, so neither a 415 nor a 406 can arise. The form page presets its Content-Type, which makes
+ * Spring write the body without consulting {@code Accept}; the record text is written to the servlet response with
+ * no Content-Type, so no message converter consults it either. Stateless and thread-safe.
  *
- * <p>Two listener behaviours are left to captured fixtures rather than reproduced: the Mule listener compared
- * {@code allowedMethods} ignoring case, so it ran the flows for a lowercase {@code get} or {@code post}, which get the
- * 405 here; and it decoded the body of every request, so a GET carrying an undecodable form body got its 400, while
- * {@link #showForm()} never reads a body.
+ * <p>The Mule listener compared {@code allowedMethods} ignoring case: {@code config/ListenerMethodFilter} hands
+ * {@code get}, {@code Post} and every other letter case of the two methods to these mappings as {@code GET} and
+ * {@code POST}, while every other spelling keeps the 405. A CORS pre-flight is dispatched as the plain
+ * {@code OPTIONS} request it is ({@code config/PreflightDispatchConfig}), so it gets the same 405.
+ *
+ * <p>One listener behaviour is left to captured fixtures rather than reproduced: the Mule listener decoded the body
+ * of every request, so a GET carrying an undecodable form body got its 400, while {@link #showForm()} never reads a
+ * body.
  */
 @RestController
 public class SalesforceRetrievalController {
 
     /** Content-Type of the form page, the {@code object-to-string-transformer mimeType="text/html"} of xml:21. */
     static final MediaType TEXT_HTML_UTF8 = new MediaType("text", "html", StandardCharsets.UTF_8);
-
-    /** Content-Type of the query result text. */
-    static final MediaType TEXT_PLAIN_UTF8 = new MediaType("text", "plain", StandardCharsets.UTF_8);
 
     /**
      * Body of the 400 the Mule 3.8 listener sent for a form body it could not URL-decode:
@@ -118,22 +121,34 @@ public class SalesforceRetrievalController {
 
     /**
      * {@code salesforceDataRetrievalFlow} (xml:25-40): hands the posted form to
-     * {@link SalesforceRetrievalService#query} and answers 200 {@code text/plain;charset=UTF-8} with the record text.
+     * {@link SalesforceRetrievalService#query} and answers 200 with the record text as its UTF-8 bytes, their
+     * {@code Content-Length} and no Content-Type.
      *
      * <p>The form is the request body alone, as the Mule payload was: the query string never contributes, so
      * {@code POST /?object=user} with no form body reaches the service with an empty map. The body is read off the
      * servlet input stream (see {@link #parseForm}); servlet parameters are never consulted, because they merge the
      * query string into the form.
      *
-     * @param request the query request
-     * @return the record text
+     * <p>The flow ends in {@code set-payload value="#[response]"} and a {@code byte-array-to-string-transformer}
+     * (xml:34-35), neither of which declares a MIME type, so the payload is untyped and the Mule 3.8 listener sent no
+     * Content-Type for it. The reply is therefore written to the servlet response directly, so that no message
+     * converter adds one. The record text is obtained before the response is touched, so a failure still finds an
+     * uncommitted response for the advices.
+     *
+     * @param request  the query request
+     * @param response the response the record text is written to
      * @throws Exception the service's or the binding's failure, unchanged, for the advices; a form body that cannot
      *                   be URL-decoded leaves as {@link UndecodableFormException} for {@link #rejectUndecodableForm}
      */
     @PostMapping("/")
-    public ResponseEntity<String> query(HttpServletRequest request) throws Exception {
+    public void query(HttpServletRequest request, HttpServletResponse response) throws Exception {
         Map<String, String> form = parseForm(request.getHeader(HttpHeaders.CONTENT_TYPE), request);
-        return ResponseEntity.ok().contentType(TEXT_PLAIN_UTF8).body(service.query(form));
+        byte[] body = service.query(form).getBytes(StandardCharsets.UTF_8);
+        response.setStatus(HttpServletResponse.SC_OK);
+        response.setContentLength(body.length);
+        ServletOutputStream stream = response.getOutputStream();
+        stream.write(body);
+        stream.flush();
     }
 
     /**
@@ -238,8 +253,9 @@ public class SalesforceRetrievalController {
      * of {@code GlobalExceptionHandler}, {@code Method not allowed for endpoint: /}. Without this mapping Spring MVC
      * would answer {@code HEAD} through {@link SalesforceRetrievalController#showForm()}, calling Salesforce, and
      * {@code OPTIONS} itself, both with 200. An explicit {@code HEAD} mapping outranks the implicit {@code HEAD} match
-     * of the GET mapping, and Boot dispatches {@code OPTIONS} to handlers. Every other method outside GET and POST is
-     * rejected by the handler mapping itself.
+     * of the GET mapping, and Boot dispatches {@code OPTIONS} to handlers; {@code config/PreflightDispatchConfig}
+     * dispatches a CORS pre-flight here as the plain {@code OPTIONS} request it is. Every other method outside GET
+     * and POST is rejected by the handler mapping itself.
      *
      * <p>The mapping lives on its own controller because a method of {@link SalesforceRetrievalController} would be
      * answered by {@code SalesforceRetrievalExceptionHandler}, scoped to that class, with a 500. This class is not

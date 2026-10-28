@@ -20,7 +20,8 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * {@code config.resources=csv-to-mongodb.xml} loaded the single flow {@code csv-to-mongodbFlow1} into the Mule
  * runtime; this class starts the application as a standalone process without a web server, as
  * {@code application.yml} sets, because the flow has no HTTP listener. Boot's MongoDB auto-configuration supplies
- * the {@code MongoTemplate} that replaces the flow's {@code mongo:config}, from the {@code database.*} keys.
+ * the {@code MongoTemplate} that replaces the flow's {@code mongo:config}, from the {@code database.*} keys as
+ * {@code config.MongoConfig} wires them; while one is missing, the application still starts and every import fails.
  *
  * <p>{@code @EnableScheduling} drives {@code trigger.CsvFileTrigger.poll()}, the replacement of the flow's
  * {@code file:inbound-endpoint}, with {@code csv-import.polling-frequency} milliseconds between polls (default 1000,

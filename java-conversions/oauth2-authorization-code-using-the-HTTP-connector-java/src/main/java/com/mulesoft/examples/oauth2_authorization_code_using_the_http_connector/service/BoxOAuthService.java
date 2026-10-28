@@ -33,6 +33,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.client.BoxApiClient;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.client.BoxApiClient.RawResponse;
 import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties;
+import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.config.BoxProperties.ClientCredential;
 
 /**
  * Every behaviour of {@code oauth2-authorization-code-using-the-HTTP-connector/src/main/app/http-authorization-code-web.xml}:
@@ -62,6 +63,10 @@ import com.mulesoft.examples.oauth2_authorization_code_using_the_http_connector.
  * <p>Platform-generated statuses and texts (the redirect-URL replies, the refresh failures, the missing-token and
  * failure-status messages) reproduce Mule 3.8.0 and are Tier 2A verification points: a captured fixture of the
  * original application overrides them.
+ *
+ * <p>The Box client credentials are checked where they are about to be used, never at start-up: the authorization
+ * redirect needs {@code box.id}, and the code exchange and the refresh need {@code box.id} and {@code box.secret}.
+ * A missing one fails locally, naming its key and never a value, and Box is not contacted.
  */
 @Service
 public class BoxOAuthService {
@@ -294,8 +299,17 @@ public class BoxOAuthService {
      * response without a new refresh token keeps the old one. The failure messages are Tier 2A verification points.
      * Token response bodies are never logged, because they carry the tokens, and a failed token call is logged by
      * its exception types only ({@link #describe(Throwable)}) before it is rethrown unchanged.
+     *
+     * <p>Without a {@code box.id} or {@code box.secret} value no token request is made: the missing key, the
+     * client ID checked first, is logged at ERROR and the refresh fails with its
+     * {@link ClientCredential#notConfiguredMessage()}.
      */
     private TokenSet refresh(TokenSet current) {
+        Optional<ClientCredential> missing = properties.firstMissing(ClientCredential.ID, ClientCredential.SECRET);
+        if (missing.isPresent()) {
+            LOGGER.error("The access token cannot be refreshed: {} is not configured", missing.get().key());
+            throw new IllegalStateException(missing.get().notConfiguredMessage());
+        }
         RawResponse response;
         try {
             response = client.refreshToken(current.refreshToken());
@@ -331,8 +345,14 @@ public class BoxOAuthService {
      * @param onCompleteRedirectTo where {@code /redirectUrl} sends the browser afterwards; {@code null} or empty for
      *                             none
      * @return 302 to the Box authorization URL, with no body
+     * @throws IllegalStateException {@code Box client ID (box.id) is not configured} when {@code box.id} has no
+     *                               value, before any URL is built, so no browser is sent to Box without a client ID
      */
     public Reply authorization(String onCompleteRedirectTo) {
+        Optional<ClientCredential> missing = properties.firstMissing(ClientCredential.ID);
+        if (missing.isPresent()) {
+            throw new IllegalStateException(missing.get().notConfiguredMessage());
+        }
         StringBuilder url = new StringBuilder(properties.getAuthorizationUrl())
                 .append("?response_type=code&client_id=").append(properties.getId());
         if (onCompleteRedirectTo != null && !onCompleteRedirectTo.isEmpty()) {
@@ -350,11 +370,12 @@ public class BoxOAuthService {
      * token URL, extracts the tokens and stores them for the state's resource owner, or {@code default}.
      *
      * <p>The outcome is an {@code authorizationStatus} marker: 0 tokens stored; 100 no code; 200 the token call
-     * threw or answered 400 or more; 201 no access or refresh token in the response; 300 any other failure. When
-     * the state names an {@code onCompleteRedirectTo} URL the browser is sent there with the marker; otherwise the
-     * platform text is returned. Every status and text here is platform-generated and a Tier 2A verification point.
-     * A failure marker is logged at ERROR with its detail and, when an exception caused it, that exception's types
-     * only ({@link #describe(Throwable)}).
+     * threw or answered 400 or more, or could not be made because {@code box.id} or {@code box.secret} has no value,
+     * in which case Box is not called and the log names the missing key; 201 no access or refresh token in the
+     * response; 300 any other failure. When the state names an {@code onCompleteRedirectTo} URL the browser is sent
+     * there with the marker; otherwise the platform text is returned. Every status and text here is
+     * platform-generated and a Tier 2A verification point. A failure marker is logged at ERROR with its detail and,
+     * when an exception caused it, that exception's types only ({@link #describe(Throwable)}).
      *
      * @param code       the {@code code} query parameter, {@code null} when absent
      * @param state      the {@code state} query parameter, URL-decoded, {@code null} when absent
@@ -400,10 +421,16 @@ public class BoxOAuthService {
     /**
      * Steps of the redirect-URL processor that decide the marker. Only the token call itself maps an exception to
      * 200; any other runtime failure, a {@code null} client response included, reaches the caller's 300 branch.
+     * A token call that cannot be made because a client credential has no value is the token call failing, 200,
+     * with the missing key as the detail the caller logs.
      */
     private Outcome exchangeCode(String code, String owner) {
         if (code == null || code.isEmpty()) {
             return new Outcome(NO_AUTHORIZATION_CODE, "no authorization code in the request", null);
+        }
+        Optional<ClientCredential> missing = properties.firstMissing(ClientCredential.ID, ClientCredential.SECRET);
+        if (missing.isPresent()) {
+            return new Outcome(TOKEN_URL_CALL_FAILED, missing.get().key() + " is not configured", null);
         }
         RawResponse response;
         try {

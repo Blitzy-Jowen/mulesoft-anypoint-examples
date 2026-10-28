@@ -100,8 +100,8 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-        <!-- Embedded Artemis stands in for the IBM MQ queue manager in tests: when no wmq.host is configured the
-             MQ factory is skipped and Boot's Artemis auto-configuration supplies an in-VM ConnectionFactory.
+        <!-- Embedded Artemis stands in for the IBM MQ queue manager in tests: the test profile sets wmq.enabled
+             false, so the MQ factory is skipped and Boot's Artemis auto-configuration supplies an in-VM ConnectionFactory.
              Test scope only, so production never falls back to a local broker instead of IBM MQ. -->
         <dependency>
             <groupId>org.apache.activemq</groupId>

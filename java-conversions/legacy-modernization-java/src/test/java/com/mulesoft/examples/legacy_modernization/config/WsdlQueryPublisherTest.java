@@ -24,6 +24,8 @@ import java.util.stream.Stream;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
 
+import jakarta.servlet.Filter;
+
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -197,12 +199,21 @@ class WsdlQueryPublisherTest {
         }
     }
 
-    /** Every request path a registered pattern matches, and the {@code wsdl} query in any case. */
+    /**
+     * Every request path a registered pattern matches, and a {@code wsdl} parameter in any case or position, with or
+     * without a value, which takes precedence over {@code xsd}.
+     */
     static Stream<Arguments> wsdlQueries() {
         return Stream.of(
                 Arguments.of(ECHO_PATH, "wsdl"),
                 Arguments.of(ECHO_PATH, "WSDL"),
-                Arguments.of(ECHO_PATH + "/sub", "wsdl"));
+                Arguments.of(ECHO_PATH + "/sub", "wsdl"),
+                Arguments.of(ECHO_PATH, "wsdl="),
+                Arguments.of(ECHO_PATH, "wsdl&x=1"),
+                Arguments.of(ECHO_PATH, "x=1&wsdl"),
+                Arguments.of(ECHO_PATH, "x=1&Wsdl=&y=2"),
+                Arguments.of(ECHO_PATH, "wsdl=anything"),
+                Arguments.of(ECHO_PATH, "xsd=" + MESSAGE_KEY + "&wsdl"));
     }
 
     @ParameterizedTest(name = "GET {0}?{1}")
@@ -232,7 +243,7 @@ class WsdlQueryPublisherTest {
 
             for (Map.Entry<String, Resource> schema : publisher.registrations().get(0).schemas().entrySet()) {
                 // Fully form-encoded here, unlike the publisher's own rewrite (which crawl() follows): the key is
-                // matched after the container decodes the parameter, so either encoding selects the same schema.
+                // matched after the publisher decodes the raw value, so either encoding selects the same schema.
                 String served = metadata(publisher, ECHO_PATH, "xsd=" + URLEncoder.encode(schema.getKey(), UTF_8));
 
                 assertThat(locations(served)).as("references of %s", schema.getKey())
@@ -240,6 +251,28 @@ class WsdlQueryPublisherTest {
                 assertSameDocumentApartFromLocations(new String(schema.getValue().getContentAsByteArray(), UTF_8),
                         served);
             }
+        }
+    }
+
+    /**
+     * An {@code xsd} parameter among others, in any case, form-encoded or repeated (the last value wins), and the
+     * schema it names.
+     */
+    static Stream<Arguments> xsdQueries() {
+        return Stream.of(
+                Arguments.of("x=1&xsd=" + MODEL_KEY, ECHO_MODEL_XSD),
+                Arguments.of("xsd=" + MODEL_KEY + "&x=1", ECHO_MODEL_XSD),
+                Arguments.of("XSD=" + MODEL_KEY, ECHO_MODEL_XSD),
+                Arguments.of("xsd=unknown.xsd&xsd=" + MODEL_KEY, ECHO_MODEL_XSD),
+                Arguments.of("x=1&xsd=" + URLEncoder.encode(MESSAGE_KEY, UTF_8) + "&y=2", ECHO_MESSAGE_XSD));
+    }
+
+    @ParameterizedTest(name = "GET " + ECHO_PATH + "?{0}")
+    @MethodSource("xsdQueries")
+    void xsdParameterAmongOthersServesTheSchemaItNames(String query, String schema, @TempDir Path root)
+            throws Exception {
+        try (TemporaryClasspath classpath = TemporaryClasspath.of(root)) {
+            assertSameDocumentApartFromLocations(schema, metadata(classpath.echoPublisher(), ECHO_PATH, query));
         }
     }
 
@@ -316,12 +349,24 @@ class WsdlQueryPublisherTest {
         }
     }
 
-    /** Requests the publisher must hand down the chain untouched: wrong path, no or unknown query, or not GET. */
+    /**
+     * Requests the publisher must hand down the chain untouched: wrong path, no query, a query with neither a
+     * {@code wsdl} parameter nor an {@code xsd} parameter naming a registered key, or not GET. Parameter names are
+     * matched raw, so a percent-encoded {@code wsdl} is not one.
+     */
     static Stream<Arguments> passThroughRequests() {
         return Stream.of(
                 Arguments.of("GET", "/other/path", "wsdl"),
                 Arguments.of("GET", ECHO_PATH, null),
+                Arguments.of("GET", ECHO_PATH, ""),
+                Arguments.of("GET", ECHO_PATH, "&"),
+                Arguments.of("GET", ECHO_PATH, "x=1"),
+                Arguments.of("GET", ECHO_PATH, "wsdlx"),
+                Arguments.of("GET", ECHO_PATH, "x=wsdl"),
+                Arguments.of("GET", ECHO_PATH, "%77sdl"),
+                Arguments.of("GET", ECHO_PATH, "xsd"),
                 Arguments.of("GET", ECHO_PATH, "xsd=unknown.xsd"),
+                Arguments.of("GET", ECHO_PATH, "xsd=unknown.xsd&x=1"),
                 Arguments.of("POST", ECHO_PATH, "wsdl"),
                 Arguments.of("PUT", ECHO_PATH, "wsdl"),
                 Arguments.of("HEAD", ECHO_PATH, "wsdl"),
@@ -334,6 +379,23 @@ class WsdlQueryPublisherTest {
             @TempDir Path root) throws Exception {
         try (TemporaryClasspath classpath = TemporaryClasspath.of(root)) {
             MockHttpServletRequest request = request(method, path, query);
+
+            Served served = serve(classpath.echoPublisher(), request);
+
+            assertThat(served.chainInvoked()).isTrue();
+            assertThat(served.chain().getRequest()).isSameAs(request);
+            assertThat(served.response().getStatus()).isEqualTo(200);
+            assertThat(served.response().getContentType()).isNull();
+            assertThat(served.response().getContentAsByteArray()).isEmpty();
+        }
+    }
+
+    @Test
+    void malformedEscapeInTheXsdValuePassesDownTheChainUntouched(@TempDir Path root) throws Exception {
+        try (TemporaryClasspath classpath = TemporaryClasspath.of(root)) {
+            // Only the raw query: request() would fail to decode %zz into a parameter, and the publisher reads none.
+            MockHttpServletRequest request = get(ECHO_PATH, null);
+            request.setQueryString("xsd=%zz");
 
             Served served = serve(classpath.echoPublisher(), request);
 
@@ -365,7 +427,7 @@ class WsdlQueryPublisherTest {
         void everyRegisteredWsdlAndSchemaIsServedOnItsListenerPath() throws Exception {
             List<WsdlQueryPublisher> publishers = context.getBeansOfType(FilterRegistrationBean.class).values()
                     .stream()
-                    .map(FilterRegistrationBean::getFilter)
+                    .map(WsdlQueryPublisherTest::installedFilter)
                     .filter(WsdlQueryPublisher.class::isInstance)
                     .map(WsdlQueryPublisher.class::cast)
                     .toList();
@@ -604,5 +666,13 @@ class WsdlQueryPublisherTest {
 
     private static Path file(Resource resource) throws IOException {
         return resource.getFile().toPath().toRealPath();
+    }
+
+    /**
+     * The filter {@code registration} installs. The wildcard type accepts the raw registrations
+     * {@code getBeansOfType(FilterRegistrationBean.class)} returns without a raw-type use.
+     */
+    static Filter installedFilter(FilterRegistrationBean<?> registration) {
+        return registration.getFilter();
     }
 }

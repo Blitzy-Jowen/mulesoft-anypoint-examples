@@ -25,3 +25,14 @@ spring:
   sql:
     init:
       mode: never       # never auto-run import.sql or any schema/data script
+# database-to-json.xml has no logger, so neither the queried last name nor the employees' first names are logged at
+# any level: a root DEBUG/TRACE override, or --debug/--trace, must not reach these categories, which below INFO write
+# them. A logger's own level outranks logging.level.root and the --debug/--trace groups.
+logging:
+  level:
+    org.springframework.web.servlet.DispatcherServlet: WARN   # DEBUG/TRACE write the request line with its ?lastname=<last name> query string. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.jdbc.core.StatementCreatorUtils: INFO   # TRACE writes every bound parameter value: the queried last name
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # DEBUG/TRACE write the response body: the matching first names as JSON
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, a handled exception and its message included
+    org.springframework.web.HttpLogging: INFO            # the HTTP message converters write through this category wherever their own is held at INFO
+    io.undertow.request.io: INFO                         # DEBUG writes request-parse failures quoting a query value that does not decode: the queried last name

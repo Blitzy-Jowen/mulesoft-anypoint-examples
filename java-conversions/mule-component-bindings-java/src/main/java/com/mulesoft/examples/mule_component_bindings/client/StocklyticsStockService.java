@@ -10,21 +10,48 @@ package com.mulesoft.examples.mule_component_bindings.client;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.util.Date;
+import java.util.Objects;
+import java.util.Set;
 
+import org.apache.hc.client5.http.DnsResolver;
+import org.apache.hc.client5.http.SystemDefaultDnsResolver;
+import org.apache.hc.client5.http.config.ConnectionConfig;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.DefaultRedirectStrategy;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.routing.SystemDefaultRoutePlanner;
+import org.apache.hc.client5.http.protocol.HttpClientContext;
+import org.apache.hc.client5.http.protocol.RedirectLocations;
+import org.apache.hc.core5.http.Header;
+import org.apache.hc.core5.http.HttpRequest;
+import org.apache.hc.core5.http.HttpResponse;
+import org.apache.hc.core5.http.Method;
+import org.apache.hc.core5.http.ProtocolException;
+import org.apache.hc.core5.http.io.EofSensorInputStream;
+import org.apache.hc.core5.http.protocol.HttpContext;
+import org.apache.hc.core5.io.CloseMode;
+import org.apache.hc.core5.util.TimeValue;
+import org.apache.hc.core5.util.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.ClientHttpResponse;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StreamUtils;
+import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestClient;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -37,29 +64,50 @@ import com.mulesoft.examples.mule_component_bindings.service.StockService;
 /**
  * A StockService implementation that delegates to the Stocklytics cloud API.
  *
- * <p>The call runs over {@link java.net.HttpURLConnection} with a 10 s connect timeout and a 10 s read timeout,
- * the Mule default response timeout, as the project's Sentiment140 and Twitter clients do; the original Jersey
- * client had none, so an upstream that never answered held the stock statistics request forever. The read timeout
- * is the socket's own, so it bounds the wait for the response headers and every blocking read of the body: an
- * upstream that falls silent fails the call 10 s later with a
- * {@link org.springframework.web.client.ResourceAccessException} caused by a
- * {@link java.net.SocketTimeoutException}. A failed call is never retried.
+ * <p>The call has a 10 s connect timeout and a 10 s read timeout, the Mule default response timeout, as the
+ * project's Sentiment140 and Twitter clients do; the original Jersey client had none, so an upstream that never
+ * answered held the stock statistics request forever. The read timeout is the socket's own, so it bounds the wait
+ * for the response headers and every blocking read of the body: an upstream that falls silent fails the call 10 s
+ * later with a {@link org.springframework.web.client.ResourceAccessException} caused by a
+ * {@link java.net.SocketTimeoutException}.
+ *
+ * <p>A failed call is never retried, neither here nor by the transport, so the GET is sent once, whether it fails
+ * with a timeout, a refused, reset or early-closed connection or an error status. RestClient sends through Apache
+ * httpclient5 with its automatic retries switched off, because the JDK {@link java.net.HttpURLConnection} under
+ * Spring's default request factory re-sends a bodiless request, as this GET is, once when its connection is reset
+ * or closes before a response arrives, and has no setting to stop it. Apart from that re-send,
+ * {@link #buildHttpClient(Timeout)} keeps every behaviour of the {@code HttpURLConnection} transport. The service
+ * owns a connection pool, which {@link #close()} releases when the application context shuts down.
  */
 @Component
-public class StocklyticsStockService implements StockService {
+public class StocklyticsStockService implements StockService, AutoCloseable {
 
 	private static final String FORMAT = "JSON";
 
 	/** Connect and read timeout of the application's client: the Mule default response timeout. */
 	private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
 
-	/** Shortest accepted timeout: {@link java.net.HttpURLConnection} takes whole milliseconds and reads 0 as none. */
+	/** Shortest accepted timeout: a socket timeout counts whole milliseconds and reads 0 as none. */
 	private static final Duration MIN_TIMEOUT = Duration.ofMillis(1);
 
-	/** Longest accepted timeout: {@link java.net.HttpURLConnection} takes an {@code int} of milliseconds. */
+	/** Longest accepted timeout: a socket timeout is an {@code int} of milliseconds. */
 	private static final Duration MAX_TIMEOUT = Duration.ofMillis(Integer.MAX_VALUE);
 
+	/**
+	 * The most redirects the GET follows. {@code HttpURLConnection} sends at most {@code http.maxRedirects}, by JDK
+	 * default 20, requests per exchange and fails with an I/O error when the last is answered with a redirect too;
+	 * httpclient5 sends one request more than its limit before failing the same way.
+	 */
+	private static final int MAX_REDIRECTS_FOLLOWED = 19;
+
+	/**
+	 * How long an idle pooled connection stays reusable when the server's {@code Keep-Alive} header names no
+	 * timeout: the 5 s the JDK keep-alive cache kept one, so no request is written to a connection idle for longer.
+	 */
+	private static final TimeValue IDLE_CONNECTION_LIFETIME = TimeValue.ofSeconds(5);
+
 	private final StockStatsProperties properties;
+	private final CloseableHttpClient httpClient;
 	private final RestClient client;
 	private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -75,7 +123,8 @@ public class StocklyticsStockService implements StockService {
 	}
 
 	/**
-	 * Creates the service with the given connect and read timeout. Building the client opens no connection.
+	 * Creates the service with the given connect and read timeout. Building the client and its connection pool
+	 * opens no connection.
 	 *
 	 * @param restClientBuilder the builder the client is built from; its request factory is replaced by the timed one
 	 * @param properties        the Stocklytics base URL and API key
@@ -90,15 +139,91 @@ public class StocklyticsStockService implements StockService {
 			throw new IllegalArgumentException("Stocklytics timeout must be from " + MIN_TIMEOUT.toMillis()
 					+ " ms to " + MAX_TIMEOUT.toMillis() + " ms, was " + timeout);
 		}
-		SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
-		requestFactory.setConnectTimeout(timeout);
-		requestFactory.setReadTimeout(timeout);
 		this.properties = properties;
-		this.client = restClientBuilder.requestFactory(requestFactory).build();
+		this.httpClient = buildHttpClient(Timeout.ofMilliseconds(timeout.toMillis()));
+		// No factory timeout is set, so the client's own configuration governs the exchange.
+		this.client = restClientBuilder.requestFactory(new HttpComponentsClientHttpRequestFactory(httpClient)).build();
 	}
 
+	/** Closes the connection pool and its connections; Spring calls it when the application context shuts down. */
+	@Override
+	public void close() {
+		httpClient.close(CloseMode.GRACEFUL);
+	}
+
+	/**
+	 * Builds the transport, configured so that the GET is never sent twice:
+	 * <ul>
+	 *   <li>automatic retries are off, so a request whose connection is refused, reset or closed before or while
+	 *       the response arrives fails instead of being sent again;</li>
+	 *   <li>a host name resolves to its first address only, as {@code HttpURLConnection} connected, so a refused or
+	 *       timed-out connect is not repeated against the host's other addresses;</li>
+	 *   <li>a pooled connection is checked before every reuse and kept idle no longer than the server's
+	 *       {@code Keep-Alive} timeout, or {@link #IDLE_CONNECTION_LIFETIME} without one, so one the server closed
+	 *       is replaced before the request is written rather than failing it, which {@code HttpURLConnection} hid
+	 *       by re-sending the request.</li>
+	 * </ul>
+	 *
+	 * <p>Everything else is as {@code HttpURLConnection} did it. {@code timeout} bounds the TCP connect and every
+	 * wait for response bytes, the TLS handshake included, each wait on its own. Redirects are followed as
+	 * {@link HttpUrlConnectionRedirectStrategy} describes, with the same request headers. An HTTP proxy is used where
+	 * the JVM's default {@link java.net.ProxySelector}, read for every route, names one, and {@code https} connects
+	 * with the JSSE default context, protocols and cipher suites ({@code https.protocols}, {@code https.cipherSuites}).
+	 * Content compression is off, so no {@code Accept-Encoding} is sent and the body is read as sent; there is no
+	 * cookie store, auth cache or connection state, and authentication challenges are not answered. The pool has no
+	 * size limit, as {@code HttpURLConnection} had none, so no request waits for another's connection.
+	 */
+	private static CloseableHttpClient buildHttpClient(Timeout timeout) {
+		return HttpClients.custom()
+				.setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()
+						.useSystemProperties()
+						.setDnsResolver(new FirstAddressDnsResolver(SystemDefaultDnsResolver.INSTANCE))
+						.setDefaultConnectionConfig(ConnectionConfig.custom()
+								.setConnectTimeout(timeout)
+								.setSocketTimeout(timeout)
+								.setValidateAfterInactivity(TimeValue.ZERO_MILLISECONDS)
+								.build())
+						.setMaxConnTotal(Integer.MAX_VALUE)
+						.setMaxConnPerRoute(Integer.MAX_VALUE)
+						.build())
+				// A null selector reads ProxySelector.getDefault() for every route.
+				.setRoutePlanner(new SystemDefaultRoutePlanner(null))
+				.setDefaultRequestConfig(RequestConfig.custom()
+						.setResponseTimeout(timeout)
+						.setConnectionKeepAlive(IDLE_CONNECTION_LIFETIME)
+						.setRedirectsEnabled(true)
+						.setMaxRedirects(MAX_REDIRECTS_FOLLOWED)
+						// A redirect loop ends at the redirect limit, as it did for HttpURLConnection, where
+						// httpclient5's loop check would end it at the first repeated location.
+						.setCircularRedirectsAllowed(true)
+						.setAuthenticationEnabled(false)
+						.build())
+				.disableAutomaticRetries()
+				.disableContentCompression()
+				.disableCookieManagement()
+				.disableAuthCaching()
+				.disableConnectionState()
+				.setRedirectStrategy(new HttpUrlConnectionRedirectStrategy())
+				.build();
+	}
+
+	/**
+	 * Fetches the open, close, high, low and volume of {@code stock} on {@code closingDate} from Stocklytics.
+	 *
+	 * @param stock       the stock symbol, sent as header {@code stock}
+	 * @param closingDate the day, sent as headers {@code start} and {@code end} in {@code yyyy-MM-dd}
+	 * @return the day's financial statistics
+	 * @throws InvalidStockSymbol    when Stocklytics answers 200 with its no-data text for {@code stock}
+	 * @throws IllegalStateException when {@code stockstats.stocklyticsApiKey} has no text (absent, empty or
+	 *                               whitespace only), before any request is made; the message names the key,
+	 *                               never a configured value
+	 */
 	@Override
 	public StockStats getHistoricalPrices(String stock, Date closingDate) throws InvalidStockSymbol {
+
+		if (!StringUtils.hasText(properties.stocklyticsApiKey())) {
+			throw new IllegalStateException("Stocklytics API key (stockstats.stocklyticsApiKey) is not configured");
+		}
 
 		DateFormat df = new SimpleDateFormat("yyyy-MM-dd");
 		String closingDateStr = df.format(closingDate);
@@ -147,10 +272,12 @@ public class StocklyticsStockService implements StockService {
 	}
 
 	/**
-	 * Reads the status and the whole body. The status comes first, because {@link java.net.HttpURLConnection}
-	 * hands out the body of an error status only once that status has been read. When reading the body fails, a
-	 * read timeout included, the body stream is closed before the failure propagates: closing the response drains
-	 * the stream first, and on a stalled body that drain would block for a second full read timeout.
+	 * Reads the status and the whole body. When reading the body fails, a read timeout included, the connection the
+	 * body arrives on is discarded before the failure propagates: closing the body stream or the response reads the
+	 * rest of the body first, to keep the connection, and on a stalled body that read would block for a second full
+	 * read timeout. httpclient5 hands such a body out as an {@link EofSensorInputStream}, whose
+	 * {@link EofSensorInputStream#abort()} discards the connection without reading on; any other body is not backed
+	 * by a connection and is closed.
 	 */
 	private static RawResponse readResponse(ClientHttpResponse response) throws IOException {
 		int status = response.getStatusCode().value();
@@ -160,7 +287,11 @@ public class StocklyticsStockService implements StockService {
 					StreamUtils.copyToString(bodyStream, charsetOf(response.getHeaders().getContentType())));
 		} catch (IOException | RuntimeException failure) {
 			try {
-				bodyStream.close();
+				if (bodyStream instanceof EofSensorInputStream connectionBody) {
+					connectionBody.abort();
+				} else {
+					bodyStream.close();
+				}
 			} catch (IOException closeFailure) {
 				failure.addSuppressed(closeFailure);
 			}
@@ -176,6 +307,66 @@ public class StocklyticsStockService implements StockService {
 	}
 
 	private record RawResponse(int status, String body) {
+	}
+
+	/**
+	 * Follows a redirect only where {@code HttpURLConnection}, as {@code SimpleClientHttpRequestFactory} set it up,
+	 * followed one: the request is a GET, the status is 300, 301, 302, 303 or 307 with a {@code Location}, and that
+	 * location keeps the scheme of the URL that answered, which a relative one always does. Any other redirect, a
+	 * 308 or a {@code 305 Use Proxy} among them, is returned as received, and nothing is sent to its location.
+	 */
+	private static final class HttpUrlConnectionRedirectStrategy extends DefaultRedirectStrategy {
+
+		private static final Set<Integer> FOLLOWED_STATUSES = Set.of(300, 301, 302, 303, 307);
+
+		@Override
+		public boolean isRedirected(HttpRequest request, HttpResponse response, HttpContext context)
+				throws ProtocolException {
+			Header location = response.getFirstHeader(HttpHeaders.LOCATION);
+			if (location == null || !Method.GET.isSame(request.getMethod())
+					|| !FOLLOWED_STATUSES.contains(response.getCode())) {
+				return false;
+			}
+			String targetScheme = createLocationURI(location.getValue()).getScheme();
+			return targetScheme == null || targetScheme.equalsIgnoreCase(answeredScheme(request, context));
+		}
+
+		/**
+		 * The scheme of the URL that answered with the redirect. httpclient5 passes the original request on every
+		 * hop, so that URL is the last redirect location followed, or the original request's before any has been.
+		 */
+		private static String answeredScheme(HttpRequest original, HttpContext context) {
+			RedirectLocations followed = HttpClientContext.adapt(context).getRedirectLocations();
+			return followed == null || followed.size() == 0
+					? original.getScheme()
+					: followed.get(followed.size() - 1).getScheme();
+		}
+	}
+
+	/**
+	 * The first address {@code delegate} resolves a host to, alone; with the system resolver that is the one address
+	 * {@code HttpURLConnection} connected to. httpclient5 would otherwise move on to each further address of the host
+	 * after a refused or timed-out connect: a second connection attempt after a connectivity failure, which could
+	 * also stretch the connect past its timeout.
+	 */
+	private static final class FirstAddressDnsResolver implements DnsResolver {
+
+		private final DnsResolver delegate;
+
+		FirstAddressDnsResolver(DnsResolver delegate) {
+			this.delegate = Objects.requireNonNull(delegate, "delegate");
+		}
+
+		@Override
+		public InetAddress[] resolve(String host) throws UnknownHostException {
+			InetAddress[] addresses = delegate.resolve(host);
+			return addresses.length <= 1 ? addresses : new InetAddress[] {addresses[0]};
+		}
+
+		@Override
+		public String resolveCanonicalHostname(String host) throws UnknownHostException {
+			return delegate.resolveCanonicalHostname(host);
+		}
 	}
 
 }

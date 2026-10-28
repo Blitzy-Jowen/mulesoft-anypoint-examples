@@ -11,6 +11,7 @@ package com.mulesoft.examples.netsuite_data_retrieval.controller;
 import java.util.List;
 import java.util.Set;
 
+import com.mulesoft.examples.netsuite_data_retrieval.config.ApiKitAcceptNegotiator;
 import com.mulesoft.examples.netsuite_data_retrieval.service.NetsuiteSearchService;
 
 import jakarta.servlet.http.HttpServletRequest;
@@ -19,6 +20,7 @@ import jakarta.validation.ConstraintViolationException;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -41,8 +43,9 @@ import org.springframework.web.bind.annotation.RestController;
  * ignored, as APIkit ignored them.
  *
  * <p>Error responses come from the advices, so nothing is caught here: a method the resource does not declare
- * raises {@link HttpRequestMethodNotSupportedException} and an {@code Accept} header excluding JSON raises
- * {@code HttpMediaTypeNotAcceptableException}, answered by {@code ApiKitExceptionHandler} with APIkit's 405 and
+ * raises {@link HttpRequestMethodNotSupportedException} and an {@code Accept} header excluding JSON, or one under
+ * which {@link ApiKitAcceptNegotiator} chooses no declared type once {@code title} has passed its check, raises
+ * {@link HttpMediaTypeNotAcceptableException}, answered by {@code ApiKitExceptionHandler} with APIkit's 405 and
  * 406 mappings; a repeated {@code title} gets its 400 mapping; the SC-9 upstream failures reach
  * {@code UpstreamExceptionHandler} (502/429/503) and every other failure reaches {@code GlobalExceptionHandler}'s
  * 500.
@@ -74,10 +77,13 @@ public class OpportunitiesController {
      * Routes to flow {@code get:/oportunities:netsuite-api-config}.
      *
      * @param title   the {@code title} query parameter: {@code null} when absent, {@code ""} when sent empty
-     * @param request the current request, whose method and repeated parameters are checked
+     * @param request the current request, whose method and repeated parameters are checked and whose
+     *                {@code Accept} header is negotiated
      * @return 200, {@code Content-Type: application/json}, with the opportunities as DataWeave JSON
      * @throws HttpRequestMethodNotSupportedException for a HEAD request, which the RAML does not declare
      * @throws ConstraintViolationException           when {@code title} is sent more than once
+     * @throws HttpMediaTypeNotAcceptableException    when APIkit's negotiation chooses no declared type for the
+     *                                                {@code Accept} header of a valid request
      * @throws Exception                              the service's exceptions, unchanged
      */
     @GetMapping(path = OPPORTUNITIES_PATH, produces = MediaType.APPLICATION_JSON_VALUE)
@@ -89,6 +95,7 @@ public class OpportunitiesController {
             throw new HttpRequestMethodNotSupportedException(request.getMethod(), SUPPORTED_METHODS);
         }
         requireSingleValue(request, TITLE);
+        ApiKitAcceptNegotiator.negotiate(request);
         String json = netsuiteSearchService.getOpportunities(title);
         // The bare media type, without a charset parameter; the body is written as UTF-8 bytes.
         return ResponseEntity.ok()

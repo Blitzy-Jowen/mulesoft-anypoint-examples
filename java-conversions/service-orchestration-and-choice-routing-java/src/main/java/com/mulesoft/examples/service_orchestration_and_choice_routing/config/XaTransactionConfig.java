@@ -29,6 +29,7 @@ import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jms.config.DefaultJmsListenerContainerFactory;
 import org.springframework.jms.core.JmsTemplate;
+import org.springframework.jms.listener.DefaultMessageListenerContainer;
 import org.springframework.transaction.PlatformTransactionManager;
 
 /**
@@ -124,6 +125,11 @@ public class XaTransactionConfig {
 	 * {@code SimpleMessageConverter} is kept, so {@code OrderItem} and {@code PurchaseReceipt} travel as
 	 * {@code ObjectMessage} bodies.
 	 *
+	 * <p>The container keeps one Artemis connection open, as the original XA connector did ({@code CACHE_CONNECTION}).
+	 * With a transaction manager set it would default to {@code CACHE_NONE} and open and close a connection on every
+	 * receive, about once a second while the queue is idle. Sessions stay uncached: each receive creates its session
+	 * inside its own JTA transaction, which is where Narayana's connection proxy enlists the XA session.
+	 *
 	 * @param jmsConnectionFactory the {@code @Primary} XA-wrapped Artemis connection factory
 	 * @param transactionManager   the Narayana {@code JtaTransactionManager}
 	 * @return the JTA-transacted, single-consumer listener container factory
@@ -136,6 +142,7 @@ public class XaTransactionConfig {
 		factory.setTransactionManager(transactionManager);
 		factory.setSessionTransacted(true);
 		factory.setConcurrency("1");
+		factory.setCacheLevel(DefaultMessageListenerContainer.CACHE_CONNECTION);
 		return factory;
 	}
 
@@ -164,11 +171,18 @@ public class XaTransactionConfig {
 	 * @param connectionFactory the non-XA Artemis connection factory
 	 * @param replyTimeoutMs    how long to wait for the in-house reply, {@code orders.inhouse.reply-timeout-ms}
 	 * @return the non-transacted request-reply template
+	 * @throws IllegalArgumentException when {@code replyTimeoutMs} is not between 1 and {@link Long#MAX_VALUE}, since
+	 *                                  {@code JmsTemplate} waits for ever on 0 and does not wait at all on a negative
+	 *                                  value; no template is built
 	 */
 	@Bean
 	public JmsTemplate inHouseRequestJmsTemplate(
 			@Qualifier("nonXaJmsConnectionFactory") ConnectionFactory connectionFactory,
 			@Value("${orders.inhouse.reply-timeout-ms:10000}") long replyTimeoutMs) {
+		if (replyTimeoutMs < 1) {
+			throw new IllegalArgumentException("orders.inhouse.reply-timeout-ms must be between 1 and " + Long.MAX_VALUE
+					+ ", was " + replyTimeoutMs);
+		}
 		JmsTemplate template = new JmsTemplate(connectionFactory);
 		template.setSessionTransacted(false);
 		template.setReceiveTimeout(replyTimeoutMs);

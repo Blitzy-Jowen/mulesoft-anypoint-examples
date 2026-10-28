@@ -23,8 +23,10 @@ import java.util.regex.Pattern;
 import jakarta.annotation.PreDestroy;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -66,8 +68,9 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.service.Aj
  * filtering, so the array is never wrapped in a comment. Without {@code jsonp} the Content-Type is
  * {@code text/json;charset=UTF-8}, the Jetty cometd servlet's; with it the body is {@code <jsonp>(<array>)} as
  * {@code text/javascript;charset=UTF-8}. Bayeux errors are always in-band. A request whose {@code message} is
- * absent, is not JSON, or is neither an object nor an array of objects is answered HTTP 400 with the body
- * {@code []}. That Content-Type and the 400 framing are Tier 2A verification points.
+ * absent, is not JSON, carries anything but whitespace after its single JSON value, or is neither an object nor an
+ * array of objects is answered HTTP 400 with the body {@code []}. That Content-Type and the 400 framing are Tier 2A
+ * verification points.
  *
  * <p>Connection phase: the first connect after a handshake is answered at once with whatever is queued, as Jetty
  * answered it, because {@code dojox.cometd} flushes the subscriptions and publications queued at page load only after
@@ -157,6 +160,14 @@ public class BayeuxLongPollingController {
 
     private final AjaxChannelBroker broker;
     private final ObjectMapper objectMapper;
+
+    /**
+     * Reads the {@code message} parameter with {@link #objectMapper}'s configuration plus
+     * {@code FAIL_ON_TRAILING_TOKENS}, so input after the single JSON value refuses the batch. It is derived rather
+     * than enabled on the injected mapper, which Spring shares with the rest of the application.
+     */
+    private final ObjectReader messageReader;
+
     private final long connectTimeoutMs;
     private final long holdTimeoutMs;
 
@@ -182,7 +193,8 @@ public class BayeuxLongPollingController {
      * Creates the endpoint.
      *
      * @param broker the channel state of the Ajax transport
-     * @param objectMapper Spring's JSON mapper, which parses the messages and writes the responses
+     * @param objectMapper Spring's JSON mapper, which writes the responses and, through a reader derived from it that
+     *        refuses input after the single JSON value, parses the messages; the mapper itself is not modified
      * @param connectTimeoutMs {@code ajax.connect-timeout-ms}: how long a connect is held waiting for deliveries, also
      *        advised to the client as the Bayeux {@code timeout}
      * @throws IllegalArgumentException when {@code ajax.connect-timeout-ms} is not positive, which would turn every
@@ -192,6 +204,7 @@ public class BayeuxLongPollingController {
             @Value("${ajax.connect-timeout-ms:30000}") long connectTimeoutMs) {
         this.broker = Objects.requireNonNull(broker, "broker");
         this.objectMapper = Objects.requireNonNull(objectMapper, "objectMapper");
+        this.messageReader = objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
         if (connectTimeoutMs <= 0) {
             throw new IllegalArgumentException("ajax.connect-timeout-ms must be positive, was " + connectTimeoutMs);
         }
@@ -437,7 +450,8 @@ public class BayeuxLongPollingController {
 
     /**
      * The batch the {@code message} parameter holds, or {@code null}, logged at WARN, when it is absent, is not JSON,
-     * or is neither an object nor an array of objects. An array with any element that is not an object is refused
+     * carries anything but whitespace after its single JSON value, or is neither an object nor an array of objects.
+     * An array with any element that is not an object, or followed by a second value or any other text, is refused
      * whole, so no message of a malformed batch is acted on.
      */
     private List<JsonNode> parseBatch(String message) {
@@ -447,7 +461,7 @@ public class BayeuxLongPollingController {
         }
         JsonNode root;
         try {
-            root = objectMapper.readTree(message);
+            root = messageReader.readTree(message);
         } catch (JsonProcessingException unparseable) {
             LOGGER.warn("Rejected Bayeux request: the message parameter is not JSON ({})",
                     unparseable.getClass().getName());

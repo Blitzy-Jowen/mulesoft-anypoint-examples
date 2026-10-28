@@ -8,6 +8,8 @@
 
 package com.mulesoft.examples.websphere_mq.client;
 
+import java.util.Objects;
+
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.websphere_mq.service.AjaxChannelBroker;
@@ -45,6 +47,12 @@ import org.springframework.stereotype.Component;
 @Component
 public class MqQueueSender {
 
+    /** Separator of the server path's segments. */
+    private static final String SLASH = "/";
+
+    /** Characters that would turn the literal server path into a wildcard or a template variable of the patterns. */
+    private static final String PATTERN_CHARACTERS = "*?{}\\";
+
     private final JmsTemplate jmsTemplate;
 
     private final AjaxChannelBroker broker;
@@ -64,9 +72,13 @@ public class MqQueueSender {
      *                     {@code ConnectionFactory} as the listener containers
      * @param broker       the Ajax channel broker the enqueue channel is registered on
      * @param objectMapper serializes a non-text Ajax payload to the JSON text sent to {@code in}
-     * @param serverPath   {@code ajax.server-path}, the path of the Ajax connector's {@code serverUrl}
+     * @param serverPath   {@code ajax.server-path}, the path of the Ajax connector's {@code serverUrl}, kept as
+     *                     {@link #normalizeServerPath(String)} normalizes it
      * @param inQueue      {@code wmq.queues.in}, the original's {@code queue="in"}
      * @param outQueue     {@code wmq.queues.out}, the original's {@code queue="out"}
+     * @throws NullPointerException  when {@code serverPath} is {@code null}
+     * @throws IllegalStateException when {@code serverPath} is not a literal path below the root, as
+     *                               {@link #normalizeServerPath(String)} rejects it
      */
     public MqQueueSender(JmsTemplate jmsTemplate, AjaxChannelBroker broker, ObjectMapper objectMapper,
                          @Value("${ajax.server-path}") String serverPath,
@@ -75,13 +87,14 @@ public class MqQueueSender {
         this.jmsTemplate = jmsTemplate;
         this.broker = broker;
         this.objectMapper = objectMapper;
-        this.serverPath = serverPath;
+        this.serverPath = normalizeServerPath(Objects.requireNonNull(serverPath, "serverPath"));
         this.inQueue = inQueue;
         this.outQueue = outQueue;
     }
 
     /**
-     * Registers {@link #enqueue(Object)} as the handler of channel {@code <ajax.server-path>/enqueue}, replacing
+     * Registers {@link #enqueue(Object)} as the handler of channel {@code <server path>/enqueue}, the server path
+     * normalized by {@link #normalizeServerPath(String)}, replacing
      * {@code <ajax:inbound-endpoint channel="/services/wmqExample/enqueue" responseTimeout="10000"/>}
      * (websphere-mq.xml:9); the broker applies the response timeout ({@code ajax.response-timeout-ms}).
      *
@@ -145,5 +158,56 @@ public class MqQueueSender {
     public String sendToOut(String payload) {
         jmsTemplate.send(outQueue, session -> session.createTextMessage(payload));
         return payload;
+    }
+
+    /**
+     * Normalizes {@code ajax.server-path} to {@code /segment[/segment...]}, the prefix of the channels
+     * {@code <server path>/enqueue} and {@code <server path>/dequeue}, by exactly the rules with which
+     * {@code config/AjaxResourceConfig} normalizes the same value before it registers the docroot and the Mule Ajax
+     * JavaScript: surrounding blanks are trimmed, a missing leading {@code /} is added and trailing {@code /} are
+     * removed, and a value that is not a literal path below the root is rejected with the same message. The served
+     * page and the channels it talks to therefore always share one prefix: {@code /services/wmqExample/} still
+     * yields the original channels {@code /services/wmqExample/enqueue} and {@code /services/wmqExample/dequeue}
+     * (websphere-mq.xml:9,26).
+     *
+     * <p>{@code AjaxResourceConfig} is a shared component copied unchanged between projects and keeps its
+     * normalization private, so this method mirrors it rather than calls it; a change to one belongs in both.
+     *
+     * @param configured the configured server path; {@code null} is treated as empty, as {@code AjaxResourceConfig}
+     *                   treats it
+     * @return the normalized server path, with a leading and without a trailing {@code /}
+     * @throws IllegalStateException when nothing but the root path remains, or when a segment is empty, {@code .},
+     *                               {@code ..} or holds a pattern character ({@code * ? { } \})
+     */
+    public static String normalizeServerPath(String configured) {
+        String path = configured == null ? "" : configured.trim();
+        if (!path.startsWith(SLASH)) {
+            path = SLASH + path;
+        }
+        int end = path.length();
+        while (end > 0 && path.charAt(end - 1) == '/') {
+            end--;
+        }
+        path = path.substring(0, end);
+        if (path.isEmpty()) {
+            throw new IllegalStateException(
+                    "ajax.server-path must name a path below the root, but is '" + configured + "'");
+        }
+        for (String segment : path.substring(1).split(SLASH, -1)) {
+            if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment) || hasPatternCharacter(segment)) {
+                throw new IllegalStateException(
+                        "ajax.server-path must be a literal path, but is '" + configured + "'");
+            }
+        }
+        return path;
+    }
+
+    private static boolean hasPatternCharacter(String segment) {
+        for (int i = 0; i < segment.length(); i++) {
+            if (PATTERN_CHARACTERS.indexOf(segment.charAt(i)) >= 0) {
+                return true;
+            }
+        }
+        return false;
     }
 }

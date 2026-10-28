@@ -8,7 +8,7 @@ A salutation service exposed six times, once unsecured and five times under incr
 
 ## Endpoints and triggers
 
-The project has no non-HTTP trigger. Both listeners bind `0.0.0.0` and run in one process, and neither declares `allowedMethods`, so every method is accepted (`mule-config.xml:6`, `service-clients.xml:6`).
+The project has no non-HTTP trigger. Both listeners bind `0.0.0.0` and run in one process, and neither declares `allowedMethods`, so every method token is accepted, extension methods such as `PROPFIND` included (`mule-config.xml:6`, `service-clients.xml:6`). Neither applied a CORS policy, so a CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered exactly like a plain `OPTIONS` request to the same path, with no `Access-Control-*` or `Vary` header: on `/client` it runs the flow (`config/PreflightDispatchConfig`), on a SOAP path it is read as a message.
 
 ### SOAP listener — port 63081, base path `/services`
 
@@ -51,7 +51,7 @@ How a secured path checks a request (AAP 0.3.2):
 
 - WSS4J's `WSSecurityEngine.processSecurityHeader` processes the `wsse:Security` header with the path's callback, crypto and SAML validator. The results are then matched "in any order" by WSS4J's own `WSHandler.checkReceiverResultsAnyOrder`, the check CXF 2.7's `WSS4JInInterceptor` applied.
 - That check ignores signature-confirmation results, `BinarySecurityToken` results and encryption results that reference no data, so a certificate token never fails a request: a signed SAML request carrying a `DirectReference` certificate is accepted on `/services/signedsaml`, and a `/services/signed` request's signing token is ignored the same way.
-- It fails closed: a missing or empty `wsse:Security` header, a required action without a result, or an action the path does not require is rejected. On `/services/unsecure` a `mustUnderstand` security header is not understood and gets Spring WS's MustUnderstand fault, as CXF answered a service without WS-Security.
+- It fails closed: a missing or empty `wsse:Security` header, a required action without a result, or an action the path does not require is rejected. On `/services/unsecure` a `mustUnderstand` security header is not understood and gets CXF's MustUnderstand fault (table below), as CXF answered a service without WS-Security.
 - Spring's `Wss4jSecurityInterceptor` is not used inbound, because its action-mismatch fault text differs from the original's.
 
 ### Faults and listener boundary (AAP 0.4.7)
@@ -62,9 +62,10 @@ Every fault is SOAP 1.1, sent with HTTP 500, in the envelope style above.
 |---|---|---|---|
 | UsernameToken not authenticated, for example a wrong password | `wsse:FailedAuthentication` | `The security token could not be authenticated or authorized` | `PathScopedSecurityInterceptor` |
 | Any other WS-Security failure: missing signature, wrong SAML issuer (rejected by `SAMLCustomValidator`), missing `wsse:Security` header, unexpected action | `wsse:InvalidSecurity` | `An error was discovered processing the <wsse:Security> header` | `PathScopedSecurityInterceptor` |
-| An exception escaping the endpoint | `soap:Server` | the exception message (CXF's `Fault occurred while processing.` when it has none) | SC-11 `config/SoapFaultConfig` |
+| A `mustUnderstand="1"` header block that nothing on the path understands, for example `wsse:Security` on `/services/unsecure` | `soap:MustUnderstand` | `MustUnderstand headers: [{<namespace>}<localName>] are not understood.`, for example `MustUnderstand headers: [{http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd}Security] are not understood.` | SC-11 `config/SoapFaultConfig` (`CxfStyleSoapMessageDispatcher`, extended by `WebServiceConfig.SecurityFirstMessageDispatcher`) |
+| An exception escaping the endpoint | `soap:Server` | the exception message (CXF's `Fault occurred while processing.` when it has none; a `NullPointerException` the JVM raised counts as having none) | SC-11 `config/SoapFaultConfig` |
 | A body root no endpoint maps, on a path whose policy it passes | `soap:Client` | `Message part {<namespace>}<localName> was not recognized.  (Does it exist in service WSDL?)` | SC-11 `config/SoapFaultConfig` |
-| Malformed XML, an empty body, a root other than `soap:Envelope`, or a non-POST request without `?wsdl` (read as a message, so its empty body fails to parse) | `soap:Client` | the parser's message, for example `Premature end of file.` | SC-11 `config/SoapListenerBoundaryAdapter` |
+| Malformed XML, an empty body, a body nested deeper than 100 elements (CXF's default `maxElementDepth`), a root other than `soap:Envelope`, or a non-POST request without `?wsdl` (read as a message, so its empty body fails to parse) | `soap:Client` | the parser's message, for example `Premature end of file.` | SC-11 `config/SoapListenerBoundaryAdapter` |
 
 The original negative tests match these texts by substring (`security token`, `<wsse:Security> header`). The exact fault bytes are a Tier 2A verification point: when a captured fixture differs, the fixture governs and the code is changed to match.
 
@@ -100,10 +101,9 @@ Every other WS-Security setting keeps its WSS4J default, as the CXF clients did:
 
 | Case | Response |
 |---|---|
-| A path the receiving port does not serve, for example `/client` on 63081, `/services/unsecure` on 63080, or `/services/other` | `404 Not Found`, `Content-Type: text/plain;charset=UTF-8`, body `No listener for endpoint: <path>` (SC-10 `config/PortRoutingFilter`) |
-| A method token outside the eight standard ones on `/client`, for example `PROPFIND` | `405 Method Not Allowed`, `Content-Type: text/plain`, body `Method not allowed for endpoint: /client` (SC-1 `exception/GlobalExceptionHandler`) |
+| A path the receiving port does not serve, for example `/client` on 63081, `/services/unsecure` on 63080, or `/services/other`, a CORS pre-flight included | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-10 `config/PortRoutingFilter`) |
 
-Neither listener restricts methods: `GreeterClientController` maps `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS` and `TRACE`, and the SOAP paths read any method as a message. Only a non-standard token, which Spring MVC cannot map, reaches the 405. SC-1's 500 JSON default is reached by no request, because `GreeterClientExceptionHandler` answers every `/client` failure. Tier 2A verification points: the bytes of these defaults, the 405 for a non-standard method token, the `text/plain` header of the `/client` replies, the `Accept` header and `utf-8` casing SAAJ writes on SOAP responses (`DECISIONS.md` section 9, verification points), and Undertow's bare 400 for a malformed percent escape in the `/client` query, which it sends before dispatch.
+Neither listener restricts methods: `GreeterClientController` maps `/client` without a method, plus an explicit `OPTIONS` mapping because Spring MVC would otherwise answer `OPTIONS` itself with an `Allow` header, so every method token runs the flow, `PROPFIND` and other extension methods included; the SOAP paths read any method as a message. SC-1's 405 is therefore reached by no request, and its 500 JSON default by none either, because `GreeterClientExceptionHandler` answers every `/client` failure. Tier 2A verification points: the bytes of these defaults, the `text/plain` header of the `/client` replies, the `utf-8` casing SAAJ writes on SOAP responses, the SOAP response and fault headers, which carry neither the `Accept` nor the `SOAPAction` request header SAAJ keeps on every message (dropped by SC-11 `config/SoapListenerBoundaryAdapter`, as CXF sent neither), characters outside the Basic Multilingual Plane written as raw UTF-8 rather than SAAJ's numeric character references (SC-11 `SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory`, as CXF wrote them; `DECISIONS.md` section 9, verification points), and Undertow's bare 400 for a malformed percent escape in the `/client` query, which it sends before dispatch.
 
 ### Sample exchanges
 
@@ -122,7 +122,6 @@ $ curl -i -X POST -H 'Content-Type: text/xml;charset=UTF-8' -H 'SOAPAction: ""' 
     --data-binary '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><ns2:greet xmlns:ns2="http://security.example.mule.mulesoft.com/"><name>John</name></ns2:greet></soap:Body></soap:Envelope>' \
     http://localhost:63081/services/username
 HTTP/1.1 500 Internal Server Error
-Accept: text/xml, text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2
 Connection: keep-alive
 Content-Type: text/xml;charset=utf-8
 Content-Length: 366
@@ -159,12 +158,19 @@ Every key of `src/main/resources/application.yml`. The original reads no placeho
 | `soap-security.client.encryption-user` | `joe` | default | — | `encryptionUser`, `service-clients.xml:77` | certificate alias of the committed demo keystore that `usernameTokenEncrypted` encrypts for |
 | `soap-security.client.host` | `0.0.0.0` | default | — | `HTTP_Request_Configuration` host, `service-clients.xml:7` | host of the outbound Greeter calls |
 | `soap-security.client.base-url` | `""` | default | — | none | empty: the client derives `http://<host>:<actual SOAP listener port>/services`; set to call another Greeter base URL |
-| `soap-security.client.response-timeout` | `10000` (milliseconds) | default | — | Mule's default response timeout | connect and read timeout of each outbound call; negative values are rejected at start-up |
+| `soap-security.client.response-timeout` | `10000` (milliseconds) | default | — | Mule's default response timeout | connect and read timeout of each outbound call, which is sent exactly once and never retried; zero (an indefinite wait) and negative values are rejected at start-up |
+| `logging.level.org.springframework.ws.client.MessageTracing` | `INFO` | fixed | — | none: `service-clients.xml` declares no logger | its `.sent` `TRACE` writes each request after WSS4J secured it, the whole `wsse:Security` header included, and `.received` the reply |
+| `logging.level.org.springframework.ws.server.MessageTracing` | `INFO` | fixed | — | none: `mule-config.xml` declares no logger | the same envelopes as the six Greeter paths receive and answer them |
+| `logging.level.org.apache.wss4j` | `INFO` | fixed | — | none | its `DEBUG` writes the SAML assertion each `SAMLTokenProcessor` reads and the UsernameToken user name |
+| `logging.level.org.apache.jcp.xml.dsig.internal.DigesterOutputStream` | `INFO` | fixed | — | none | its `DEBUG` `Pre-digested input` writes every signed part: the Body and, through the STR-Transform, the SAML assertion |
+| `logging.level.org.apache.jcp.xml.dsig.internal.dom.DOMReference` | `ERROR` | fixed | — | none | silences the `WARN` `The input bytes to the digest operation are null` that WSS4J's STR-Transform raises on every signed SAML request, once when the client signs and once when the server validates; that digest still covers the assertion (`GreeterEndpointTest#signedSamlSignatureCoversTheAssertionThroughItsTokenReference`). `ERROR`, not `WARN`: its only other `WARN`, a dereferenced reference it cannot cache, ends in WSS4J's `FAILED_CHECK` rejection, which `PathScopedSecurityInterceptor` logs |
+| `logging.level.org.apache.xml.security.encryption` | `INFO` | fixed | — | none | its `DEBUG` `Serialized octets`/`Decrypted octets` write the plaintext of every encrypted part, a UsernameToken a caller encrypts included |
 
 - The `soap-security.users` map accepts further users the same way (`soap-security.users.<name>`).
 - The application starts with every TODO empty. Nothing that needs a secret is built until it is used, so `/services/unsecure`, `?wsdl`, and the `unsecure` and `samlToken` client types work without them, while a path or client type that needs a missing value fails: a secured path faults, and `/client` answers `There has been an Error processing the request`.
 - Unit tests supply the original example's public demo values through `src/test/resources/application-test.yml` (Spring profile `test`), because the committed demo `keystore.jks` and the original assertions depend on them: users `joe`/`secret` and `stan`/`elephant`, store password `keyStorePassword`, issuer key password `secret`, client user `joe`. They are test-only and never belong in `application.yml` (AAP 0.4.6).
 - `config/WrongPasswordCallback` keeps the original's deliberately wrong password for `joe` in code. It is not a credential: only the wrong-password negative test uses it.
+- The six `logging.level` keys keep the WS-Security headers (UsernameToken passwords, SAML assertions, signatures), the configured secrets and the plaintext that signing and encryption cover out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`. The original had no logger, so it logged none of them. The nested `UnderRootTrace` runs of `client/SecureGreeterClientTest` and `controller/GreeterEndpointTest` assert this.
 
 ## Mule-to-Java mapping
 
@@ -176,6 +182,7 @@ Every key of `src/main/resources/application.yml`. The original reads no placeho
 | `javax.jws` interface `Greeter` and its JAX-WS-derived wire shape | `model/soap/Greet`, `model/soap/GreetResponse` (Jakarta JAXB, explicit namespace) and `wsdl/GreeterService.wsdl` |
 | CXF envelope style, faults and `?wsdl` | SC-11 `config/SoapEnvelopeStyleInterceptor`, `config/SoapFaultConfig`, `config/SoapListenerBoundaryAdapter`, `config/WsdlQueryPublisher`, wired by `config/WebServiceConfig` (a `WsConfigurer` without `@EnableWs`; its `SecurityFirstMessageDispatcher` runs the security check before endpoint selection) |
 | `SecurityClients` flow: `set-payload`/`set-variable` from `http.query.params`, `set-property Content-Type text/plain` | `controller/GreeterClientController` |
+| `http:listener` `client` without `allowedMethods` or a CORS policy (`service-clients.xml:9`) | `GreeterClientController` mapped without a method plus an explicit `OPTIONS` mapping; `config/PreflightDispatchConfig` dispatches a CORS pre-flight as a plain `OPTIONS` request |
 | `choice` over `clientType` and its `otherwise` | `client/SecureGreeterClient.invoke` |
 | six `cxf:jaxws-client` + `http:request` sub-flows (`service-clients.xml:41-110`) | `client/SecureGreeterClient`: one `WebServiceTemplate` per client type, each with its own securing `Wss4jSecurityInterceptor` |
 | `catch-exception-strategy` (`service-clients.xml:36-39`) | `exception/GreeterClientExceptionHandler` (`@Order(0)`, scoped to `GreeterClientController`, ahead of SC-1) |
@@ -226,17 +233,18 @@ java -jar target/soap-webservice-security-java-1.0.0-SNAPSHOT.jar
 | Test class | What it asserts |
 |---|---|
 | `SoapWebserviceSecurityTest` | the ported `SoapWebserviceSecurityIT` (`soap-webservice-security/src/test/java/com/mulesoft/mule/example/security/SoapWebserviceSecurityIT.java:32-134`), one method per original test, each fetching the path's `?wsdl` first as the original's CXF client did: `testUnsecure`, `testUsernameToken`, `testUsernameTokenSigned`, `testUsernameTokenEncrypted`, `testSamlToken` and `testSignedSamlToken` answer exactly `Hello Mule`; `testUsernameTokenWrongPasswordError` (through `WrongPasswordCallback`) faults with a message containing `security token`; `testUsernameTokenUnsignedError` (`/services/signed` without a signature) and `testSamlTokenWrongIssuer` (`wrong-saml.properties`) fault with a message containing `<wsse:Security> header` |
-| `controller/GreeterEndpointTest` | AAP 0.5.6: each path's required actions on the wire, including every original negative and the `samlTokenSigned` client path (`SAMLTokenSigned`, `DirectReference`, user `joe`) to `/services/signedsaml` |
-| `controller/GreeterClientControllerTest` | AAP 0.5.6: the `/client` routing on the wire, its `Client type is not supported` default, the error branch and the port routing |
+| `controller/GreeterEndpointTest` | AAP 0.5.6: each path's required actions on the wire, including every original negative and the `samlTokenSigned` client path (`SAMLTokenSigned`, `DirectReference`, user `joe`) to `/services/signedsaml`; `signedSamlSignatureCoversTheAssertionThroughItsTokenReference`: a value of the signed assertion changed after signing is rejected with `FAILED_CHECK` while the unchanged request is greeted, so the STR-Transform digest covers the assertion; nested `UnderRootTrace`, under `logging.level.root=TRACE`: a request to each secured path, its UsernameTokens sent as a sentinel user and password, a wrong-password request answered with the security fault, and `samlTokenSigned` without the `DOMReference` `WARN`, each answered as its path answers it while no security-header element, secret or greeted name reaches the console |
+| `controller/GreeterClientControllerTest` | AAP 0.5.6: the `/client` routing on the wire, its `Client type is not supported` default, the error branch and the port routing; every method token running the flow, `PROPFIND` and `MKCOL` included; CORS pre-flights answered exactly as plain `OPTIONS` requests (the flow on `/client`, the no-listener 404 on an unserved path), with no `Access-Control-*` or `Vary` header |
+| `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
 | `config/PathScopedSecurityInterceptorTest` | the production policies of `WsSecurityConfig` without a server: every original success case, the three original negatives, the `samlTokenSigned` client path whose `BinarySecurityToken` result is ignored, the any-order match, and the fail-closed rules (missing header, missing Timestamp, unexpected action, empty `wsse:Username`, encoded spellings of a secured path) |
 | `config/WebServiceConfigTest` | through the real `MessageDispatcherServlet`: the policy enforced once per request before endpoint selection, an encrypted body reaching `greet`, `wsse:InvalidSecurity` for an unknown body root without a security header, `mustUnderstand` handling, anonymous `?wsdl` |
-| `client/SecureGreeterClientTest` | against a WireMock Greeter stub: each client type's target path and WS-Security header (digest UsernameToken, body signature, body encryption for the encryption user, unsigned and signed SAML), `SOAPAction: ""`, the unsupported type answering without a request, the ported negative profiles (no signature, wrong issuer, wrong password), faults propagating unwrapped, and an unreachable or slow service raising `WebServiceIOException` |
+| `client/SecureGreeterClientTest` | against a WireMock Greeter stub: each client type's target path and WS-Security header (digest UsernameToken, body signature, body encryption for the encryption user, unsigned and signed SAML), `SOAPAction: ""`, the unsupported type answering without a request, the ported negative profiles (no signature, wrong issuer, wrong password), faults propagating unwrapped, an unreachable or slow service raising `WebServiceIOException`, a connection closed or reset before the response raising `WebServiceIOException` after exactly one request for every client type, both `Encrypt` and `Encryption` encrypting the body, and a zero or negative `soap-security.client.response-timeout` failing start-up; nested `UnderRootTrace`, under `logging.level.root=TRACE`: the `usernameToken`, `usernameTokenEncrypted` and `samlToken` client types, the first two as a sentinel UsernameToken user and password, the signed UsernameToken and `samlTokenSigned` profiles of `joe`, and a `usernameToken` call the stub answers with a `wsse:FailedAuthentication` fault, each sending its `wsse:Security` header while no security-header element, sentinel, keystore password or greeted name reaches the console and `DOMReference` writes no `WARN` |
 | `config/PasswordCallbackTest` | the ported callbacks: configured passwords for `joe` and `stan` on every usage, unknown or unconfigured users getting none, `WrongPasswordCallback` affecting only `joe` |
 | `config/SAMLCustomValidatorTest` | `SAMLCustomValidator` accepting the `saml.properties` assertion and rejecting each failing check (issuer from `wrong-saml.properties`, SAML 1.1, bearer confirmation, another subject); `SAMLCallbackHandler`'s issuer-crypto diagnostics |
 | `exception/GreeterClientExceptionHandlerTest` | the catch branch's precedence over SC-1 and its scoping to `GreeterClientController`, the 200 `text/plain` reply, one ERROR line naming exception types without the message |
 | `service/GreeterServiceTest` | `greet` returns `Hello <name>`, `Hello null` and `Hello ` exactly as the original |
-| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, additional listener registration |
-| `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server` and `soap:Client` faults inside dispatch, the boundary faults, and `?wsdl`/`?xsd=` publication with rewritten addresses |
+| `config/PortRoutingFilterTest` | SC-10: per-port routing, the byte-exact no-listener 404, additional listener registration, an empty TLS password named in the start-up failure |
+| `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server`, `soap:Client` and `soap:MustUnderstand` faults inside dispatch, the boundary faults, and `?wsdl`/`?xsd=` publication with rewritten addresses |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, body bytes and the bounded ERROR log line |
 | `FixtureParityTest` | ST-2 fixture replay (section below); skipped while no fixture is captured |
 
@@ -253,6 +261,7 @@ Each shared component is a copy of its reference implementation with only the `p
 | SC-11 | `config/SoapEnvelopeStyleInterceptor`, `config/WsdlQueryPublisher`, `config/SoapFaultConfig`, `config/SoapListenerBoundaryAdapter`; tests `config/SoapEnvelopeStyleInterceptorTest`, `config/WsdlQueryPublisherTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest` | `foreach-processing-and-choice-routing-java` |
 | ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` |
 | ST-2 | `FixtureParityTest` (test), `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` |
+| — | `config/PreflightDispatchConfig`; test `config/PreflightDispatchConfigTest` | `hello-world-java` |
 
 `config/WebServiceConfig` registers `wsdl/GreeterService.wsdl` for each of the six paths and passes no POST-only path to `SoapListenerBoundaryAdapter`, because the original listener accepts every method.
 
@@ -302,11 +311,11 @@ No scenario of this project is `unreachable`.
 
 This project's row in the root [`SUMMARY.md`](../../SUMMARY.md) carries the same values. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 386 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 386 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/GreeterService` (the project has no `mapper` package). Total project LINE coverage: 86.2% (1382 of 1604 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 519 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 519 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/GreeterService` (the project has no `mapper` package). Total project LINE coverage: 88.3% (1659 of 1879 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=29`, `failed=0`.
-- The run includes `controller/GreeterEndpointTest` and `controller/GreeterClientControllerTest` (AAP 0.5.6), 34 tests each.
+- The run includes `controller/GreeterEndpointTest` and `controller/GreeterClientControllerTest` (AAP 0.5.6), 44 and 42 tests respectively.
 
 ## Fallback evidence (AAP 0.8.4)
 

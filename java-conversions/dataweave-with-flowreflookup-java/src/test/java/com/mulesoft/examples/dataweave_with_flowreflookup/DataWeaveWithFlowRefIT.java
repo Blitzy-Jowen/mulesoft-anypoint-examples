@@ -20,13 +20,17 @@ import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.StringJoiner;
 import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
@@ -52,6 +56,7 @@ import org.springframework.test.context.DynamicPropertySource;
 import com.mulesoft.examples.dataweave_with_flowreflookup.client.SalesforcePartnerClient;
 import com.mulesoft.examples.dataweave_with_flowreflookup.trigger.CompaniesFileTrigger;
 import com.sforce.soap.partner.DeleteResult;
+import com.sforce.soap.partner.StatusCode;
 
 /**
  * Tier 2B live-sandbox test, run by failsafe ({@code mvn -B verify}): the original {@code DataWeaveWithFlowRefIT}
@@ -84,7 +89,10 @@ import com.sforce.soap.partner.DeleteResult;
  * <p>The class is skipped, never failed, while {@code application-it.yml} or one of those three keys is missing,
  * blank, still {@code TODO} or an unresolvable placeholder ({@link #missingCredential()}); then no Spring context
  * starts and Salesforce is never called. A skipped run is not Tier 2B evidence. Logs name Account IDs and names of
- * the test data only, never a credential.
+ * the test data only, never a credential. A failed cleanup step is named by the class names of its exception and
+ * causes ({@link #failureTypes(Throwable)}) and a failed delete by its Salesforce status codes; no exception, cause,
+ * suppressed exception or error message is logged or attached, because vendor and transport messages can repeat
+ * tokens, credentials, record values or the SOQL.
  */
 @ExtendWith(DataWeaveWithFlowRefIT.LiveCredentialsGate.class)
 @SpringBootTest(classes = DataweaveWithFlowreflookupApplication.class,
@@ -126,6 +134,11 @@ class DataWeaveWithFlowRefIT {
     private static final Duration MOVE_TIMEOUT = Duration.ofSeconds(10);
 
     private static final Duration MOVE_POLL_INTERVAL = Duration.ofMillis(200);
+
+    /** Most exceptions {@link #failureTypes(Throwable)} names: a failure and four of its causes. */
+    private static final int FAILURE_TYPES_LIMIT = 5;
+
+    private static final String NO_ERROR_DETAIL = "no error detail";
 
     @TempDir
     static Path workDir;
@@ -213,7 +226,9 @@ class DataWeaveWithFlowRefIT {
      * Deletes every Account this import created. Once the file was dropped, both names are queried once more first,
      * so an Account the test never got to read back (a wait that timed out) is deleted too. Before that nothing was
      * created, and querying again would only repeat a failed login, which counts towards the user's lockout. A
-     * failure is logged and never thrown, as the original only printed it.
+     * failure is logged at WARN and never thrown, as the original only printed it, and a failed query still leaves
+     * the delete of the IDs already collected; the log names the Account names or IDs and only the failure's types
+     * or status codes.
      */
     @AfterEach
     void tearDown() {
@@ -222,7 +237,8 @@ class DataWeaveWithFlowRefIT {
                 try {
                     selectAccounts(name);
                 } catch (Exception e) {
-                    LOG.warn("Could not query the Salesforce Accounts named {} for deletion", name, e);
+                    LOG.warn("Could not query the Salesforce Accounts named {} for deletion: {}", name,
+                            failureTypes(e));
                 }
             }
         }
@@ -243,7 +259,7 @@ class DataWeaveWithFlowRefIT {
                 }
             }
         } catch (Exception e) {
-            LOG.warn("Could not delete Salesforce Accounts {}", ids, e);
+            LOG.warn("Could not delete Salesforce Accounts {}: {}", ids, failureTypes(e));
         }
     }
 
@@ -324,13 +340,49 @@ class DataWeaveWithFlowRefIT {
         return value.replace("\\", "\\\\").replace("'", "\\'");
     }
 
+    /**
+     * Names the Salesforce status code of each error of a failed delete, separated by {@code "; "}, or
+     * {@code no error detail} when the result names none. The error message and fields are never rendered: they are
+     * vendor free text that can repeat record values.
+     */
     private static String errors(DeleteResult result) {
-        if (result.getErrors() == null || result.getErrors().length == 0) {
-            return "no error detail";
+        if (result.getErrors() == null) {
+            return NO_ERROR_DETAIL;
         }
-        return Arrays.stream(result.getErrors())
-                .map(error -> error.getStatusCode() + " " + error.getMessage())
+        String statusCodes = Arrays.stream(result.getErrors())
+                .filter(Objects::nonNull)
+                .map(error -> error.getStatusCode())
+                .filter(Objects::nonNull)
+                .map(StatusCode::name)
                 .collect(Collectors.joining("; "));
+        return statusCodes.isEmpty() ? NO_ERROR_DETAIL : statusCodes;
+    }
+
+    /**
+     * Names {@code failure} by type alone: the class name of the failure and of each exception in its
+     * {@link Throwable#getCause()} chain, separated by {@code " <- "}. No message, cause message or suppressed
+     * exception is read, because Salesforce and transport failures can repeat credentials, tokens, record values or
+     * the SOQL. The walk stops after {@link #FAILURE_TYPES_LIMIT} names, marked {@code ...}, and at a cause already
+     * named, marked {@code [circular]}; {@code null} reads {@code (null)}.
+     */
+    private static String failureTypes(Throwable failure) {
+        if (failure == null) {
+            return "(null)";
+        }
+        StringJoiner types = new StringJoiner(" <- ");
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            if (named.size() == FAILURE_TYPES_LIMIT) {
+                types.add("...");
+                break;
+            }
+            if (!named.add(current)) {
+                types.add("[circular]");
+                break;
+            }
+            types.add(current.getClass().getName());
+        }
+        return types.toString();
     }
 
     private static Path inputDir() {

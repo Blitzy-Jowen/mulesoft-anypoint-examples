@@ -58,8 +58,9 @@ import de.bwaldvogel.mongo.backend.memory.MemoryBackend;
  *       directory, {@link CsvFileTrigger#pollOnce()} and a wait bounded by the same 5 seconds;</li>
  *   <li>{@code db.addUser}/{@code dropUser} are gone: the in-memory server checks no credentials, and the connection
  *       string below carries none. Profile {@code test} still supplies the original {@code database.user}
- *       ({@code test_user}) and {@code database.password} ({@code test_password}), which {@code application.yml}
- *       requires to be non-empty, and {@code database.name} ({@code customers}), which selects the database;</li>
+ *       ({@code test_user}) and {@code database.password} ({@code test_password}), which
+ *       {@code config.MongoConfig} does not apply once the connection string is set, and {@code database.name}
+ *       ({@code customers}), which selects the database;</li>
  *   <li>{@code getCount()} on the legacy driver's {@code DBCollection} becomes {@code countDocuments()}.</li>
  * </ul>
  * The file endpoint's disposition (no {@code moveToDirectory}, so the polled file is deleted) and the stored
@@ -119,7 +120,7 @@ public class ImportCSVfileIntoMongoDBTest {
     /**
      * Points the MongoDB connection and the file endpoint at this class's server and directory. Spring Boot uses the
      * connection string alone once {@code spring.data.mongodb.uri} is set, so host {@code localhost}, port
-     * {@code 27017} and the credentials of {@code application.yml} are not used. Dynamic properties also outrank the
+     * {@code 27017} and the {@code database.*} credentials are not used. Dynamic properties also outrank the
      * surefire system property that points {@code csv-import.input-dir} under {@code target/}. The polling frequency
      * of one hour leaves the scheduled startup poll, on the still empty directory, as the only scheduled one.
      */

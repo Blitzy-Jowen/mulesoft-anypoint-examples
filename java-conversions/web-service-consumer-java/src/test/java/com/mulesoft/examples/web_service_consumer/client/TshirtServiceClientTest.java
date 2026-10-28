@@ -27,9 +27,11 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.ConnectException;
+import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.net.URI;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -49,10 +51,15 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.ws.client.WebServiceFaultException;
 import org.springframework.ws.client.WebServiceIOException;
 import org.springframework.ws.client.WebServiceTransportException;
+import org.springframework.ws.client.core.WebServiceTemplate;
 import org.springframework.ws.soap.client.SoapFaultClientException;
+import org.springframework.ws.transport.WebServiceConnection;
+import org.springframework.ws.transport.WebServiceMessageSender;
+import org.springframework.ws.transport.http.HttpUrlConnection;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
@@ -80,6 +87,8 @@ import com.mulesoft.examples.web_service_consumer.config.TshirtServiceProperties
  * refused connection surface as the Spring WS exceptions, never retried, and a fault without a readable fault string
  * as a {@code WebServiceFaultException} with a fixed message. Requests go out byte for byte as SAAJ
  * writes them, except that characters outside the BMP are sent as UTF-8 bytes rather than character references.
+ * A connect or read timeout below 1 ms or above {@link Integer#MAX_VALUE} ms fails construction naming its key, and
+ * an unset one reaches the connection as 10 s.
  *
  * <p>Plain JUnit 5: the client is built directly from {@link TshirtServiceProperties}; no Spring context is started.
  * Every document the test reads is parsed with DOCTYPE declarations and external entities disabled.
@@ -342,6 +351,46 @@ class TshirtServiceClientTest {
         return new TshirtServiceClient(properties);
     }
 
+    /**
+     * Settings for the WireMock service with the demo key and the given timeouts.
+     *
+     * @param connectTimeout {@code tshirt.connect-timeout}, {@code null} for unset
+     * @param readTimeout {@code tshirt.read-timeout}, {@code null} for unset
+     * @return the settings
+     */
+    private static TshirtServiceProperties timeoutProperties(Duration connectTimeout, Duration readTimeout) {
+        TshirtServiceProperties properties = new TshirtServiceProperties();
+        properties.setServiceAddress(wm.baseUrl());
+        properties.setApiKey(API_KEY);
+        properties.setConnectTimeout(connectTimeout);
+        properties.setReadTimeout(readTimeout);
+        return properties;
+    }
+
+    /**
+     * Asserts the timeouts, in milliseconds, of the connection the client's one message sender prepares for the
+     * service. The sender opens and prepares that connection without connecting it, with the timeouts every request
+     * is sent with; the template is read from the client's private field.
+     *
+     * @param client the client under test
+     * @param connectMillis the expected connect timeout, in milliseconds
+     * @param readMillis the expected read timeout, in milliseconds
+     * @throws IOException when the sender cannot open the connection
+     */
+    private static void assertConnectionTimeouts(TshirtServiceClient client, int connectMillis, int readMillis)
+            throws IOException {
+        WebServiceTemplate template = (WebServiceTemplate) ReflectionTestUtils.getField(client, "template");
+        assertThat(template).isNotNull();
+        assertThat(template.getMessageSenders()).hasSize(1);
+        WebServiceMessageSender sender = template.getMessageSenders()[0];
+        try (WebServiceConnection connection = sender.createConnection(URI.create(wm.baseUrl()))) {
+            HttpURLConnection prepared = ((HttpUrlConnection) connection).getConnection();
+            assertThat(prepared.getConnectTimeout()).as("connect timeout, ms").isEqualTo(connectMillis);
+            assertThat(prepared.getReadTimeout()).as("read timeout, ms").isEqualTo(readMillis);
+        }
+        assertThat(wm.getAllServeEvents()).isEmpty();
+    }
+
     /** A SOAP 1.1 envelope whose Body holds {@code fault} alone, without whitespace between the elements. */
     private static String compactFaultEnvelope(String fault) {
         return "<soap:Envelope xmlns:soap=\"" + SOAP_ENVELOPE_NAMESPACE + "\"><soap:Body>" + fault
@@ -509,6 +558,67 @@ class TshirtServiceClientTest {
         TshirtServiceProperties configured = new TshirtServiceProperties();
         configured.setApiKey(API_KEY);
         assertThat(configured.toString()).contains("apiKey='****'").doesNotContain(API_KEY);
+    }
+
+    /**
+     * Timeouts whose whole milliseconds are outside 1 to {@link Integer#MAX_VALUE}, each given to one setting while
+     * the other keeps the default.
+     *
+     * @return the key, the rejected value, and the configured connect and read timeouts
+     */
+    static Stream<Arguments> unusableTimeouts() {
+        List<Duration> unusable = List.of(Duration.ZERO, Duration.ofNanos(1), Duration.ofNanos(500_000),
+                Duration.ofNanos(999_999), Duration.ofMillis(-1), Duration.ofMillis(Integer.MAX_VALUE + 1L),
+                Duration.ofSeconds(Long.MAX_VALUE));
+        List<Arguments> cases = new ArrayList<>();
+        for (Duration timeout : unusable) {
+            cases.add(Arguments.of("tshirt.connect-timeout", timeout, timeout, DEFAULT_TIMEOUT));
+            cases.add(Arguments.of("tshirt.read-timeout", timeout, DEFAULT_TIMEOUT, timeout));
+        }
+        return cases.stream();
+    }
+
+    // HttpURLConnection waits forever on 0 ms, which zero and sub-millisecond values truncate to.
+    @ParameterizedTest(name = "{0} = {1}")
+    @MethodSource("unusableTimeouts")
+    void timeoutOutsideOneMillisecondToIntMaxFailsConstructionNamingItsKey(String key, Duration rejected,
+            Duration connectTimeout, Duration readTimeout) {
+        TshirtServiceProperties properties = timeoutProperties(connectTimeout, readTimeout);
+
+        assertThatThrownBy(() -> new TshirtServiceClient(properties))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessageStartingWith(key + " ")
+                .hasMessage(key + " must be between 1 ms and 2147483647 ms, was " + rejected);
+    }
+
+    /**
+     * Configured timeouts that construct a client.
+     *
+     * @return a description, the connect and read timeouts ({@code null} for unset), and the whole milliseconds the
+     *         connection gets for each
+     */
+    static Stream<Arguments> usableTimeouts() {
+        Duration longest = Duration.ofMillis(Integer.MAX_VALUE);
+        return Stream.of(
+                Arguments.of("both unset: Mule's 10 s default", null, null, 10_000, 10_000),
+                Arguments.of("connect unset", null, Duration.ofMillis(250), 10_000, 250),
+                Arguments.of("read unset", Duration.ofMillis(250), null, 250, 10_000),
+                Arguments.of("1 ms, the shortest", Duration.ofMillis(1), Duration.ofMillis(1), 1, 1),
+                Arguments.of("fractions above 1 ms, truncated", Duration.ofNanos(1_999_999),
+                        Duration.ofNanos(1_000_001), 1, 1),
+                Arguments.of("Integer.MAX_VALUE ms, the longest", longest, longest.plusNanos(999_999),
+                        Integer.MAX_VALUE, Integer.MAX_VALUE));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("usableTimeouts")
+    void usableOrUnsetTimeoutReachesTheConnectionInWholeMilliseconds(String description, Duration connectTimeout,
+            Duration readTimeout, int connectMillis, int readMillis) throws IOException {
+        TshirtServiceProperties properties = timeoutProperties(connectTimeout, readTimeout);
+
+        TshirtServiceClient client = assertDoesNotThrow(() -> new TshirtServiceClient(properties));
+
+        assertConnectionTimeouts(client, connectMillis, readMillis);
     }
 
     @Test

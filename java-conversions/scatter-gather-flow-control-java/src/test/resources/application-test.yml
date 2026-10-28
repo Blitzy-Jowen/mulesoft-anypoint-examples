@@ -3,7 +3,7 @@
 # server the tests start (user scatter@localhost / secret) instead of Gmail.
 # These are GreenMail test values, not credentials. Real values come from the environment variables behind the
 # placeholders of src/main/resources/application.yml (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, MAIL_FROM,
-# MAIL_TO).
+# MAIL_TO, MAIL_SUBJECT). mail.subject is not set here, so tests receive its default, the flow's subject literal.
 # Port: GreenMail SMTP always runs on a dynamically allocated port, ServerSetupTest.SMTP.dynamicPort(), so
 # this file does not set smtp.port. Every Spring test that sends mail must register the port the server
 # actually bound as smtp.port through @DynamicPropertySource; it is read when the context is created, so

@@ -34,3 +34,17 @@ wday:
   # Connect and read timeouts: the Mule default response timeout
   connect-timeout: 10s
   read-timeout: 10s
+
+# add_a_new_customer.xml has no logger, so neither the Workday password, the UsernameToken's user@tenant principal nor
+# the customer is logged at any level: a root DEBUG/TRACE override, or --debug/--trace, must not reach these
+# categories, which below INFO write them. A logger's own level outranks logging.level.root and the --debug/--trace
+# groups; the JDK category is a java.util.logging logger, which Spring Boot bridges and holds at the same level.
+logging:
+  level:
+    org.springframework.ws.client.MessageTracing: INFO   # .sent/.received TRACE write the whole secured envelope: wsse:Username user@tenant, the PasswordText password and the customer XML; .received also the customer descriptor and Workday's fault text
+    sun.net.www.protocol.http.HttpURLConnection: INFO    # the Workday sender's JDK transport: FINE writes the request line with the tenant path and every request and response header, Set-Cookie included
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, a handled exception and the Workday fault text it carries included
+    org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor: INFO   # DEBUG/TRACE write the posted customer XML bytes
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO          # DEBUG/TRACE write the response body: "Added customer: <descriptor>" and the 500 body with the fault text
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # DEBUG writes the handled exception's message, the Workday fault text that can quote the posted customer
+    org.springframework.web.HttpLogging: INFO            # the HTTP message converters write through this category wherever their own is held at INFO

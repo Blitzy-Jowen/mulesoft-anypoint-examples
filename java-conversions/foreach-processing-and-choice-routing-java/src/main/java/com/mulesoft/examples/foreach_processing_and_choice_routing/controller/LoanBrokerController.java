@@ -37,10 +37,16 @@ import org.springframework.web.bind.annotation.RequestMethod;
  * or {@code term} and every SOAP client failure reach that handler with the response still uncommitted.
  *
  * <p>The listener declares no {@code allowedMethods} and its path {@code /*} without a base path covers every path
- * on 11081, {@code /}, {@code /error} and {@code /mule/**} included, so one mapping serves every path and method.
- * The reply is a 200 with a {@code Content-Length} and no {@code Content-Type}: the flow's string payload carries no
- * MIME type, and the Mule listener sent none for it (plan default; a Tier 2A fixture of the original governs). It is
- * written to the servlet response directly, so no message converter adds a Content-Type or a charset.
+ * on 11081, {@code /}, {@code /error} and {@code /mule/**} included, so the mapping without methods and its
+ * {@code OPTIONS} counterpart serve every path and every method token, extension methods such as {@code PROPFIND}
+ * included. A CORS pre-flight, an {@code OPTIONS} request carrying {@code Origin} and
+ * {@code Access-Control-Request-Method}, reaches the {@code OPTIONS} mapping exactly as a plain {@code OPTIONS}
+ * request does, because {@code config.PreflightDispatchConfig} dispatches it without Spring's CORS processing: it
+ * runs the flow, and its reply carries no {@code Access-Control-*} or {@code Vary} header.
+ *
+ * <p>The reply is a 200 with a {@code Content-Length} and no {@code Content-Type}: the flow's string payload carries
+ * no MIME type, and the Mule listener sent none for it (plan default; a Tier 2A fixture of the original governs). It
+ * is written to the servlet response directly, so no message converter adds a Content-Type or a charset.
  */
 @Controller
 public class LoanBrokerController {
@@ -56,14 +62,42 @@ public class LoanBrokerController {
     }
 
     /**
-     * Runs the loan broker for any request on the main listener and writes its result.
+     * Runs the loan broker for every method except {@code OPTIONS} on the main listener and writes its result.
      *
-     * <p>All eight methods are listed because a mapping without methods does not match {@code OPTIONS}, which
-     * Spring MVC would then answer itself with an {@code Allow} header instead of running the flow. {@code TRACE}
-     * reaches this method only because {@code application.yml} sets {@code spring.mvc.dispatch-trace-request}. A
+     * <p>The mapping declares no method, so every method token runs the flow, an extension method such as
+     * {@code PROPFIND} included, as the listener without {@code allowedMethods} accepted it. {@code TRACE} reaches
+     * this method only because {@code application.yml} sets {@code spring.mvc.dispatch-trace-request}. A
      * {@code HEAD} reply carries the headers without the body. No {@code consumes}, {@code produces},
      * {@code params} or {@code headers} condition is declared, so no request is rejected with 406 or 415: the
      * original listener read neither the body nor the content negotiation headers.
+     *
+     * @param request  the request, read for its raw query string only
+     * @param response the response the loan broker's result is written to, as 200 with its UTF-8 bytes
+     * @throws IOException when writing the response fails
+     */
+    @RequestMapping("/**")
+    public void handle(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        loanBrokerResponse(request, response);
+    }
+
+    /**
+     * Runs the loan broker for {@code OPTIONS}, a CORS pre-flight included, like every other method. A mapping
+     * without methods deliberately does not match {@code OPTIONS}, which Spring MVC would otherwise answer itself
+     * with an {@code Allow} header and no body; the Mule listener ran the flow for {@code OPTIONS} too.
+     *
+     * @param request  the request, read for its raw query string only
+     * @param response the response the loan broker's result is written to, as 200 with its UTF-8 bytes
+     * @throws IOException when writing the response fails
+     */
+    @RequestMapping(value = "/**", method = RequestMethod.OPTIONS)
+    public void handleOptions(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        loanBrokerResponse(request, response);
+    }
+
+    /**
+     * Binds the four query parameters, runs the loan broker and writes its result as 200 with a
+     * {@code Content-Length} and no {@code Content-Type}. The result is obtained before the response is touched, so
+     * a failure still finds an uncommitted response for the exception handler.
      *
      * <p>The reply is fully written, and so committed, before this method returns, which keeps
      * {@code FrameworkServlet} from completing an {@code OPTIONS} reply with an {@code Allow} header or a
@@ -73,10 +107,7 @@ public class LoanBrokerController {
      * @param response the response the loan broker's result is written to, as 200 with its UTF-8 bytes
      * @throws IOException when writing the response fails
      */
-    @RequestMapping(value = "/**", method = {RequestMethod.GET, RequestMethod.HEAD, RequestMethod.POST,
-            RequestMethod.PUT, RequestMethod.PATCH, RequestMethod.DELETE, RequestMethod.OPTIONS,
-            RequestMethod.TRACE})
-    public void handle(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    private void loanBrokerResponse(HttpServletRequest request, HttpServletResponse response) throws IOException {
         Map<String, String> queryParams = queryParams(request.getQueryString());
 
         String result = loanBrokerService.quote(queryParams.get("name"), queryParams.get("ssn"),
@@ -95,11 +126,11 @@ public class LoanBrokerController {
      * Decodes the raw query string as the Mule 3.8 listener built {@code http.query.params}
      * ({@code HttpParser.decodeQueryString}): pairs separated by {@code &}, each split at its first {@code =},
      * name and value URL-decoded as UTF-8, a pair without {@code =} giving its name a {@code null} value, and a
-     * repeated name keeping its first value, which is what Mule's {@code ParameterMap.get} returned. Only the query
-     * string is read, never {@code getParameter*}, because the servlet merges a form-urlencoded body into those and
-     * Mule's {@code http.query.params} held the query alone.
+     * repeated name yielding its last value, as Mule's {@code ParameterMap.get} returned it, so a later pair without
+     * {@code =} leaves that name {@code null}. Only the query string is read, never {@code getParameter*}, because
+     * the servlet merges a form-urlencoded body into those and Mule's {@code http.query.params} held the query alone.
      *
-     * <p>Repeated names, names without {@code =} and malformed percent-encodings are Tier 2A verification points.
+     * <p>Names without {@code =} and malformed percent-encodings are Tier 2A verification points.
      * Undertow already answers a request target with a malformed percent-encoding with a bare 400 before any
      * servlet runs; one that reaches this method fails {@link URLDecoder#decode(String, java.nio.charset.Charset)}
      * with an {@link IllegalArgumentException}, which propagates to the exception handler unhandled.
@@ -126,11 +157,7 @@ public class LoanBrokerController {
                 name = URLDecoder.decode(pair.substring(0, separator), StandardCharsets.UTF_8);
                 value = URLDecoder.decode(pair.substring(separator + 1), StandardCharsets.UTF_8);
             }
-            // containsKey rather than putIfAbsent: a first occurrence without '=' holds null, and putIfAbsent
-            // would let a later value replace it, while Mule's first value stays null.
-            if (!params.containsKey(name)) {
-                params.put(name, value);
-            }
+            params.put(name, value);
         }
         return params;
     }

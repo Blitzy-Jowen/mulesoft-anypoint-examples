@@ -499,9 +499,10 @@ public class AjaxChannelBroker {
      *       payload is its {@code data} and whose reply channel is its {@code replyTo} when that is a String; any
      *       other value is the payload itself, with no reply channel. The handler runs on the broker's bounded
      *       executor within {@code ajax.response-timeout-ms} (see {@link InboundHandler}); a non-null result is
-     *       published on the reply channel unless replies are disabled. A failure, a timeout or a refusal because
-     *       the executor is saturated or shut down is logged at INFO and produces no reply, and the publication is
-     *       never retried. The publication reaches the handler only, never the channel's subscribers.</li>
+     *       published on the reply channel unless replies are disabled. A failure is logged at ERROR; a timeout or a
+     *       refusal because the executor is saturated or shut down is logged at INFO. None of them produces a reply,
+     *       and the publication is never retried. The publication reaches the handler only, never the channel's
+     *       subscribers.</li>
      *   <li>Any other channel: the value is published to every subscriber, the publisher included.</li>
      * </ul>
      *
@@ -588,13 +589,14 @@ public class AjaxChannelBroker {
     }
 
     /**
-     * Logs a handler failure at INFO and DEBUG by its type identifiers alone. Neither line carries the exception's
-     * message, its causes' messages, its suppressed exceptions or the exception itself: handlers receive client
-     * payloads, which their exception texts can repeat, and those texts can carry line breaks that forge log lines.
+     * Logs a handler failure at ERROR, as Mule's default exception strategy reported an exception ending a flow, and
+     * its throw sites at DEBUG, by its type identifiers alone. Neither line carries the exception's message, its
+     * causes' messages, its suppressed exceptions or the exception itself: handlers receive client payloads, which
+     * their exception texts can repeat, and those texts can carry line breaks that forge log lines.
      */
     private static void logFailure(String channel, Throwable failure) {
         String safeChannel = loggable(channel);
-        LOGGER.info("Ajax handler for channel {} failed: {}", safeChannel, describe(failure, false));
+        LOGGER.error("Ajax handler for channel {} failed: {}", safeChannel, describe(failure, false));
         LOGGER.debug("Ajax handler failure on channel {}: {}", safeChannel, describe(failure, true));
     }
 

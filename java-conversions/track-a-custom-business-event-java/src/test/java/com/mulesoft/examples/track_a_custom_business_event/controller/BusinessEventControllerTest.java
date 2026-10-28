@@ -12,6 +12,7 @@ import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -19,9 +20,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -29,6 +32,8 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 
@@ -49,9 +54,11 @@ import com.mulesoft.examples.track_a_custom_business_event.support.HttpTestClien
  * own script failures, an unpriced item and a price nested 20000 deep, whose message is rendered on the listener's
  * worker thread without exhausting its stack, and the listener-level platform defaults of SC-1: the JSON 500 for a
  * body the flow cannot read or a {@code Content-Type} whose charset Spring cannot parse, and the no-listener 404 for
- * paths the flow does not serve, an illegal request charset included.
+ * paths the flow does not serve, an illegal request charset included. The listener's path with {@code ;} segment
+ * parameters is such a path, and the console output, captured for the class, shows that it tracks no business event.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ExtendWith(OutputCaptureExtension.class)
 class BusinessEventControllerTest {
 
     /** IPv4 loopback literal: the listener binds {@code 0.0.0.0}, and {@code localhost} may resolve to {@code ::1}. */
@@ -62,6 +69,16 @@ class BusinessEventControllerTest {
     /** A shoes request at price 10 whose email holds {@code é}, which Latin-1 encodes as the single byte 0xE9. */
     private static final String CAFE_SHOES = "{\"email\":\"caf\u00e9@abc.sk\",\"item name\":\"shoes\","
             + "\"item units\":2,\"item price per unit\":10}";
+
+    /** The start of every line {@code BusinessEventTracker} logs for a tracked event. */
+    private static final String BUSINESS_EVENT = "Business event ";
+
+    /** The event {@code BusinessEventTracker} logs for {@code message.json}. */
+    private static final String SHOES_EVENT =
+            BUSINESS_EVENT + "Price {item name=shoes, item units=2, item price per unit=10}";
+
+    /** The line {@code BusinessEventTracker} logs once the flow has set the business transaction id. */
+    private static final String TRANSACTION_ID_SET = "Transaction id set to ";
 
     @LocalServerPort
     private int port;
@@ -211,8 +228,10 @@ class BusinessEventControllerTest {
                                 + "unsupported charset 'foo'\" }"));
     }
 
+    /** Paths next to the listener's, and the listener's path with {@code ;} segment parameters. */
     @ParameterizedTest
-    @ValueSource(strings = {"/", "/customBusinessEvents/x", "/customBusinessEventsX", "/unknown"})
+    @ValueSource(strings = {"/", "/customBusinessEvents/x", "/customBusinessEventsX", "/unknown",
+            "/customBusinessEvents;x=1", "/customBusinessEvents;jsessionid=ABC"})
     void unservedPathReturnsNoListener404(String path) throws IOException {
         HttpTestClient.Response response =
                 client().send("POST", path, Map.of("Content-Type", "application/json"), message());
@@ -242,7 +261,37 @@ class BusinessEventControllerTest {
         return Stream.of(
                 Arguments.of("/unknown", "application/json; charset=bad[charset]"),
                 Arguments.of("/customBusinessEvents/x", "application/json;charset="),
-                Arguments.of("/", "text/plain; charset=\"bad[x]\""));
+                Arguments.of("/", "text/plain; charset=\"bad[x]\""),
+                Arguments.of("/customBusinessEvents;x=1", "application/json; charset=bad[charset]"));
+    }
+
+    /**
+     * The flow never runs for the listener's path followed by {@code ;} segment parameters
+     * ({@code config/ListenerPathConfig}): the request that logs its {@code Price} event and sets the transaction id
+     * at {@code /customBusinessEvents} logs neither there. The tracker logs both before the reply is written, so an
+     * exchange's lines are in the captured output once its response has arrived.
+     *
+     * @param parameters the segment parameters appended to the listener's path
+     * @param output     the captured console output, which holds the application log
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {";x=1", ";jsessionid=ABC"})
+    void pathWithSegmentParametersTracksNoBusinessEvent(String parameters, CapturedOutput output)
+            throws IOException {
+        Map<String, String> json = Map.of("Content-Type", "application/json");
+        String served = printMarker();
+        assertDiscountedPrice(client().send("POST", PATH, json, message()));
+        assertTrue(since(output, served).contains(SHOES_EVENT), "the capture holds the served request's event");
+
+        String unserved = printMarker();
+        String path = PATH + parameters;
+        HttpTestClient.Response response = client().send("POST", path, json, message());
+
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+        assertEquals("No listener for endpoint: " + path, response.bodyAsString(), response::toString);
+        String logged = since(output, unserved);
+        assertFalse(logged.contains(BUSINESS_EVENT), () -> "a business event was tracked: " + logged);
+        assertFalse(logged.contains(TRANSACTION_ID_SET), () -> "a transaction id was set: " + logged);
     }
 
     /** Asserts the 200 of shoes at 10: the text {@code 8.5} with its {@code Content-Length}. */
@@ -272,6 +321,25 @@ class BusinessEventControllerTest {
             assertNotNull(in, "message.json is on the test classpath");
             return in.readAllBytes();
         }
+    }
+
+    /** Prints a marker no other line holds to the captured output and returns it. */
+    private static String printMarker() {
+        String marker = "exchange " + UUID.randomUUID() + " starts";
+        System.out.println(marker);
+        return marker;
+    }
+
+    /**
+     * The output captured after {@code marker}. {@link CapturedOutput#getAll()} joins the class capture, which holds
+     * the context start and the earlier cases, with this case's own, so the lines written since the marker are those
+     * after its last occurrence.
+     */
+    private static String since(CapturedOutput output, String marker) {
+        String all = output.getAll();
+        int at = all.lastIndexOf(marker);
+        assertTrue(at >= 0, () -> "marker " + marker + " not captured");
+        return all.substring(at + marker.length());
     }
 
     /** {@code message.json} with only its {@code "shoes"} token replaced by {@code "<item>"}. */

@@ -44,6 +44,7 @@ import org.springframework.ws.server.endpoint.adapter.method.MethodReturnValueHa
 import org.springframework.ws.server.endpoint.support.PayloadRootUtils;
 import org.springframework.ws.soap.SoapVersion;
 import org.springframework.ws.soap.saaj.SaajSoapMessageFactory;
+import org.springframework.ws.soap.server.SoapMessageDispatcher;
 import org.springframework.ws.transport.WebServiceConnection;
 import org.springframework.ws.transport.context.TransportContext;
 import org.springframework.ws.transport.context.TransportContextHolder;
@@ -67,8 +68,9 @@ import org.w3c.dom.Node;
  * themselves are SC-10's: {@code PortRoutingFilter} forwards 1080 {@code /orders} and 9090 {@code /samsung/orders} to
  * {@code messageDispatcherServlet}, whose Boot registration this class leaves in place.
  * <p>
- * {@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory and the listener boundary by their bean
- * names, {@value #MESSAGE_FACTORY_BEAN_NAME} and {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME}. Both listeners
+ * {@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory, the listener boundary and the message
+ * receiver by their bean names, {@value #MESSAGE_FACTORY_BEAN_NAME},
+ * {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME} and {@value #MESSAGE_RECEIVER_BEAN_NAME}. Both listeners
  * accept POST only, so the boundary answers any other method with the listener's 405, {@code GET <path>?wsdl}
  * included: no WSDL or schema is published, and {@code orders.wsdl}/{@code samsung.wsdl} stay reference documents
  * that nothing reads, since the active JAXB bindings are the contract.
@@ -89,6 +91,9 @@ public class WebServiceConfig implements WsConfigurer {
 
     /** Name under which {@code MessageDispatcherServlet} looks up the adapter that receives every SOAP request. */
     public static final String MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME = "messageReceiverHandlerAdapter";
+
+    /** Name under which {@code MessageDispatcherServlet} looks up the receiver it hands every SOAP request to. */
+    public static final String MESSAGE_RECEIVER_BEAN_NAME = "messageReceiver";
 
     /** Bean name of the marshaller of the {@code IProcessOrder} service. */
     public static final String ORDERS_MARSHALLER_BEAN_NAME = "ordersMarshaller";
@@ -132,11 +137,12 @@ public class WebServiceConfig implements WsConfigurer {
     /**
      * The SOAP 1.1 message factory shared by the dispatcher servlet, the listener boundary and
      * {@code client/SamsungServiceClient}. {@code faultstring} is written without {@code xml:lang}, as CXF wrote it.
-     * The container initializes it.
+     * The container initializes it. It is SC-11's {@link SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory}, so
+     * characters outside the Basic Multilingual Plane are written as raw UTF-8, as CXF wrote them.
      */
     @Bean(name = MESSAGE_FACTORY_BEAN_NAME)
     public SaajSoapMessageFactory messageFactory() {
-        SaajSoapMessageFactory messageFactory = new SaajSoapMessageFactory();
+        SaajSoapMessageFactory messageFactory = new SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory();
         messageFactory.setSoapVersion(SoapVersion.SOAP_11);
         messageFactory.setLangAttributeOnSoap11FaultString(false);
         return messageFactory;
@@ -178,6 +184,17 @@ public class WebServiceConfig implements WsConfigurer {
     @Bean(name = MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME)
     public SoapListenerBoundaryAdapter messageReceiverHandlerAdapter(WebServiceMessageFactory messageFactory) {
         return new SoapListenerBoundaryAdapter(messageFactory, POST_ONLY_PATHS, styler);
+    }
+
+    /**
+     * The receiver the servlet hands every SOAP request to once the listener boundary has read it: Spring WS dispatch
+     * with CXF's MustUnderstand fault (see {@link SoapFaultConfig.CxfStyleSoapMessageDispatcher}). Like the servlet's
+     * default receiver, it collects every endpoint mapping, endpoint adapter and exception resolver bean of the
+     * context when the context is set on it.
+     */
+    @Bean(name = MESSAGE_RECEIVER_BEAN_NAME)
+    public SoapMessageDispatcher messageReceiver() {
+        return new SoapFaultConfig.CxfStyleSoapMessageDispatcher(styler);
     }
 
     /**

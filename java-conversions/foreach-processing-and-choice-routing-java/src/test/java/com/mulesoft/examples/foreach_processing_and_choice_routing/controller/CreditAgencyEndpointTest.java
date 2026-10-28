@@ -25,6 +25,7 @@ import javax.xml.namespace.QName;
 import javax.xml.parsers.DocumentBuilderFactory;
 
 import com.mulesoft.examples.foreach_processing_and_choice_routing.client.CreditAgencyClient;
+import com.mulesoft.examples.foreach_processing_and_choice_routing.config.SoapFaultConfig;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.config.WebServiceConfig;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.CreditProfile;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.Customer;
@@ -165,6 +166,7 @@ class CreditAgencyEndpointTest {
 
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.header("Content-Type")).startsWith("text/xml");
+        assertNoRequestHeaders(response);
         String body = response.bodyAsString();
         assertThat(body).doesNotStartWith("<?xml").doesNotContain("Header");
         Matcher matcher = CXF_RESPONSE.matcher(body);
@@ -215,7 +217,7 @@ class CreditAgencyEndpointTest {
         HttpTestClient.Response response = post(bankPath, envelope(bankQuoteRequest()));
 
         assertThat(response.status()).as(response.toString()).isEqualTo(404);
-        assertThat(response.header("Content-Type")).isEqualTo("text/plain;charset=UTF-8");
+        assertThat(response.header("Content-Type")).isEqualTo("text/plain");
         assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: " + bankPath);
     }
 
@@ -240,6 +242,7 @@ class CreditAgencyEndpointTest {
         assertThat(envelope.getLocalName()).isEqualTo("Envelope");
         assertThat(envelope.getPrefix()).isEqualTo("soap");
         assertThat(faultcode(response)).isEqualTo("soap:Client");
+        assertNoRequestHeaders(response);
     }
 
     static Stream<Arguments> unknownOperations() {
@@ -267,8 +270,10 @@ class CreditAgencyEndpointTest {
 
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(faultcode(response)).isEqualTo("soap:Server");
-        // The text is the JVM's NullPointerException message, so only its presence is asserted.
-        assertThat(faultstring(response)).isNotBlank();
+        // The agency fails with a NullPointerException the JVM raised; its computed message names internal classes,
+        // so the fault carries CXF's text for an exception without a message, as the original's Java 8 runtime did.
+        assertThat(faultstring(response)).isEqualTo(SoapFaultConfig.DEFAULT_FAULT_STRING);
+        assertNoRequestHeaders(response);
     }
 
     private static void assertProfileInOriginalRanges(CreditProfile profile) {
@@ -310,6 +315,12 @@ class CreditAgencyEndpointTest {
 
     private static String normalized(String contentType) {
         return contentType.replace(" ", "").toLowerCase(Locale.ROOT);
+    }
+
+    /** SAAJ keeps {@code Accept} and {@code SOAPAction} in every message's MIME headers; CXF sent neither back. */
+    private static void assertNoRequestHeaders(HttpTestClient.Response response) {
+        assertThat(response.header("Accept")).as("Accept of %s", response).isNull();
+        assertThat(response.header("SOAPAction")).as("SOAPAction of %s", response).isNull();
     }
 
     private static String faultcode(HttpTestClient.Response response) throws Exception {

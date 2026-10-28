@@ -82,11 +82,12 @@ import ch.qos.logback.core.read.ListAppender;
 /**
  * The six credentials of {@code application.yml} never reach the log, whatever the level: the whole application
  * runs under {@code logging.level.root=TRACE} with each secret set to a distinct sentinel and its three upstreams on
- * one WireMock stand-in. Nothing is mocked, so twitter4j signs every search with OAuth and the JDK
- * {@link java.net.HttpURLConnection} sends the Stocklytics {@code api_key} and Sentiment140 {@code appid} headers;
- * left at the root level, twitter4j writes its OAuth base string (consumer key and access token) at DEBUG and the
- * JDK's JUL logger {@code sun.net.www.protocol.http.HttpURLConnection}, bridged to SLF4J, dumps every request
- * header.
+ * one WireMock stand-in. Nothing is mocked, so twitter4j signs every search with OAuth, Apache httpclient5 sends the
+ * Stocklytics {@code api_key} header and the JDK {@link java.net.HttpURLConnection} the Sentiment140 {@code appid}
+ * header; left at the root level, twitter4j writes its OAuth base string (consumer key and access token) at DEBUG,
+ * httpclient5's loggers {@code org.apache.hc.client5.http.headers} and {@code org.apache.hc.client5.http.wire} dump
+ * every request header and byte, and the JDK's JUL logger {@code sun.net.www.protocol.http.HttpURLConnection},
+ * bridged to SLF4J, dumps every request header.
  *
  * <p>Both listeners are covered: {@code /api/stockStats} answering, failing at each upstream with an error status,
  * and failing when each upstream falls silent past its 10 s read timeout, and the Twitter search of {@code "/"}.
