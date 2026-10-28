@@ -38,6 +38,7 @@
         <spring-ws.version>4.1.4</spring-ws.version>
         <start-class>com.mulesoft.examples.foreach_processing_and_choice_routing.ForeachProcessingAndChoiceRoutingApplication</start-class>
         <wiremock.version>3.13.2</wiremock.version>
+        <jsr305.version>3.0.2</jsr305.version>
     </properties>
 
     <dependencies>
@@ -93,6 +94,17 @@
         <dependency>
             <groupId>wsdl4j</groupId>
             <artifactId>wsdl4j</artifactId>
+        </dependency>
+        <!--
+            Compile-time only: supplies javax.annotation.Nonnull and javax.annotation.meta.When, which Spring's
+            @Nullable is meta-annotated with, so javac can read that annotation's metadata. Excluded from the
+            repackaged jar below; nothing reads it at run time.
+        -->
+        <dependency>
+            <groupId>com.google.code.findbugs</groupId>
+            <artifactId>jsr305</artifactId>
+            <version>${jsr305.version}</version>
+            <scope>provided</scope>
         </dependency>
 
         <dependency>
@@ -227,6 +239,15 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <version>3.2.12</version>
+                <configuration>
+                    <!-- Repackaging copies provided dependencies into BOOT-INF/lib; the annotation-only jsr305 stays out. -->
+                    <excludes>
+                        <exclude>
+                            <groupId>com.google.code.findbugs</groupId>
+                            <artifactId>jsr305</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
                 <executions>
                     <execution>
                         <id>repackage</id>

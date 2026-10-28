@@ -129,7 +129,8 @@ public class OrderFlowService {
      * @throws org.springframework.web.client.RestClientException when the Currency API call fails; nothing is
      *         written
      * @throws java.io.UncheckedIOException when the Currency API response is not JSON; nothing is written
-     * @throws SAXException when the payload is not well-formed XML; nothing is written
+     * @throws SAXException when the payload is not well-formed XML or exceeds the JDK's entity-expansion limits;
+     *         nothing is written
      * @throws ParserConfigurationException when the platform parser rejects the hardened configuration
      * @throws IOException when an output file cannot be written; after a failed {@value #ORDERS_FILE} write,
      *         {@value #REPORT_FILE} is not attempted
@@ -148,13 +149,16 @@ public class OrderFlowService {
     /**
      * Parses the payload into a namespace-aware DOM with the JDK's built-in parser. The encoding is taken from the
      * bytes and the XML declaration, as the DataWeave reader took it. The parser resolves nothing outside the
-     * document: external general and parameter entities, external DTDs and schemas, and XInclude are disabled,
-     * and entity references are not expanded. An inline DTD stays legal, because DataWeave accepted one.
+     * document: external general and parameter entities, external DTDs and schemas, and XInclude are disabled.
+     * An inline DTD stays legal, and the internal entities it declares are expanded into the text and elements
+     * they stand for, as DataWeave's reader expanded them. Secure processing caps that expansion, so a document
+     * over the JDK's entity-expansion limits fails the parse.
      *
      * @param xml the document bytes
      * @return the parsed document
      * @throws ParserConfigurationException when the parser does not support a hardening feature
-     * @throws SAXException when the bytes are not a well-formed XML document, an empty array included
+     * @throws SAXException when the bytes are not a well-formed XML document, an empty array included, or when
+     *         the document exceeds the JDK's entity-expansion limits
      * @throws IOException when the bytes cannot be read
      */
     Document parse(byte[] xml) throws ParserConfigurationException, SAXException, IOException {
@@ -167,7 +171,7 @@ public class OrderFlowService {
         factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
         factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
         factory.setXIncludeAware(false);
-        factory.setExpandEntityReferences(false);
+        factory.setExpandEntityReferences(true);
         DocumentBuilder builder = factory.newDocumentBuilder();
         builder.setErrorHandler(FAIL_ON_ERROR);
         return builder.parse(new ByteArrayInputStream(xml));

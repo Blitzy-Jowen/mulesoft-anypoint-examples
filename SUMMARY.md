@@ -113,7 +113,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 20,925 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 20,934 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 85.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -126,7 +126,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 |---|---|---|---|---|
 | rest-api-with-apikit-java | 416 / 0 / 0 / 0 | 131 of 131 | 88.7% (1072 of 1208) | — |
 | testing-apikit-with-munit-java | 267 / 0 / 0 / 0 | 13 of 13 | 80.9% (559 of 691) | — |
-| processing-orders-with-dataweave-and-APIkit-java | 567 / 0 / 0 / 0 | 421 of 461 | 88.5% (1167 of 1319) | — |
+| processing-orders-with-dataweave-and-APIkit-java | 576 / 0 / 0 / 0 | 421 of 461 | 88.5% (1167 of 1319) | — |
 | web-service-consumer-java | 500 / 0 / 0 / 1 | 449 of 459 | 97.4% (791 of 812) | — |
 | xml-only-soap-webservice-java | 359 / 0 / 0 / 1 | 644 of 657 | 92.2% (1290 of 1399) | — |
 | service-orchestration-and-choice-routing-java | 815 / 0 / 0 / 1 | 1149 of 1157 | 92.0% (2616 of 2842) | — |

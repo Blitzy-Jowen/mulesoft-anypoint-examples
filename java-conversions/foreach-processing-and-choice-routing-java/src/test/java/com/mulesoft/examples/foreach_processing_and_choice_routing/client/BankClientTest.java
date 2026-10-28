@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -236,12 +237,26 @@ class BankClientTest {
             acceptor.start();
         }
 
+        /**
+         * Closes the server, waits for the acceptor to end, then closes every accepted socket. Each close is attempted
+         * even when an earlier one fails; the first failure is thrown once all have been attempted, carrying each
+         * later one as suppressed. Fields left unset by a failed {@link #startSilentBank()} are skipped.
+         */
         @AfterEach
-        void stopSilentBank() throws InterruptedException {
-            closeQuietly(silentServer);
-            acceptor.join(Duration.ofSeconds(1).toMillis());
+        void stopSilentBank() throws IOException, InterruptedException {
+            IOException failure = null;
+            if (silentServer != null) {
+                failure = close(silentServer, failure);
+            }
+            if (acceptor != null) {
+                // Joined before the sockets are closed, so none is accepted after the loop below has read the list.
+                acceptor.join(Duration.ofSeconds(1).toMillis());
+            }
             for (Socket socket : acceptedSockets) {
-                closeQuietly(socket);
+                failure = close(socket, failure);
+            }
+            if (failure != null) {
+                throw failure;
             }
         }
 
@@ -262,12 +277,22 @@ class BankClientTest {
             assertThat(elapsed).isGreaterThanOrEqualTo(Duration.ofMillis(400)).isLessThan(Duration.ofSeconds(5));
         }
 
-        private static void closeQuietly(AutoCloseable closeable) {
+        /**
+         * Closes {@code resource} and returns the teardown's failure so far: {@code failure} unchanged when the close
+         * succeeds, otherwise the close's {@link IOException} if it is the first, or else {@code failure} with that
+         * exception added as suppressed.
+         */
+        private static IOException close(Closeable resource, IOException failure) {
             try {
-                closeable.close();
+                resource.close();
+                return failure;
             }
-            catch (Exception ignored) {
-                // Teardown only: a socket that fails to close is already unusable.
+            catch (IOException closeFailure) {
+                if (failure == null) {
+                    return closeFailure;
+                }
+                failure.addSuppressed(closeFailure);
+                return failure;
             }
         }
     }

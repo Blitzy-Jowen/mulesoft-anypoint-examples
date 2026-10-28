@@ -255,7 +255,8 @@ class CreditAgencyClientTest {
 
         @AfterAll
         static void closeSilentServer() throws IOException {
-            try (ServerSocket server = silentServer) {
+            ServerSocket server = silentServer;
+            try (server) {
                 for (Socket connection : HELD_CONNECTIONS) {
                     connection.close();
                 }

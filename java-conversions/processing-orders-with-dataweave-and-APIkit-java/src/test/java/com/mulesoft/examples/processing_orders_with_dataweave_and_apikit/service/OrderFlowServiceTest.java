@@ -42,6 +42,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -69,7 +71,9 @@ import com.mulesoft.examples.processing_orders_with_dataweave_and_apikit.mapper.
  * the service, a mapper or a writer, never at the expectation. The processors run in the flow's order (currency
  * enrichment, one parse read by both scripts, {@code orders.json}, then {@code report.csv}), and every failure
  * reaches the caller unchanged with no file written, or, after a failed {@code orders.json} write, with
- * {@code report.csv} not attempted.
+ * {@code report.csv} not attempted. A document using an inline DTD's internal entities produces the outputs of the
+ * same document with their text written out, no external reference is ever loaded, and a document over the JDK's
+ * entity-expansion limits fails the parse with nothing written.
  *
  * <p>No Spring context is started: the Currency API client is a mock returning the tree it would parse, the
  * mappers and their DataWeave-format writers are real and spied on to observe the statement order, and the SC-6
@@ -91,6 +95,13 @@ class OrderFlowServiceTest {
 
     private static final String EXPECTED_REPORT_CSV_SHA256 =
             "a714697949e651545156ed6df4731e73c2dd4f73bda6b9fcac6eed8c5c806fc7";
+
+    /** A legal order file whose inline DTD declares the internal entities used in a title and an author. */
+    private static final String INLINE_ENTITY_ORDER = "<?xml version='1.0'?>"
+            + "<!DOCTYPE orders [<!ENTITY t 'Inline'><!ENTITY au 'Ann Author'>]>"
+            + "<orders><item><price>1</price><properties><title>Pre &t; Post</title>"
+            + "<authors><author>&au;</author><author>Bob</author></authors><year>2010</year></properties></item>"
+            + "</orders>";
 
     /**
      * The configuration {@link CurrencyClient} parses the Currency API response with: floating-point numbers as
@@ -233,6 +244,134 @@ class OrderFlowServiceTest {
 
         verifyNoInteractions(client, orderMapper, orderReportMapper);
         assertNothingWritten();
+    }
+
+    @Test
+    @DisplayName("inline-DTD internal entities in a title and an author are expanded into the orders.json text")
+    void expandsInlineDtdEntitiesInTitlesAndAuthors() throws Exception {
+        when(client.getCurrencies()).thenReturn(currencies);
+
+        service.process(INLINE_ENTITY_ORDER.getBytes(StandardCharsets.UTF_8));
+
+        assertThat(Files.readString(out.resolve(ORDERS_JSON), StandardCharsets.UTF_8))
+                .contains("\"title\": \"Pre Inline Post\"", "\"author\": \"Ann Author\"", "\"author\": \"Bob\"");
+        assertThat(outputFileNames()).containsExactlyInAnyOrder(ORDERS_JSON, REPORT_CSV);
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("inlineEntityDocuments")
+    @DisplayName("a document using inline-DTD internal entities writes the bytes of the same document with their text"
+            + " written out")
+    void writesTheOutputsOfTheEntityTextWrittenOut(String entityUse, String withEntities, String writtenOut)
+            throws Exception {
+        when(client.getCurrencies()).thenReturn(currencies);
+
+        Outputs expanded = processAndCollect(withEntities);
+        Outputs literal = processAndCollect(writtenOut);
+
+        assertThat(expanded.orders()).isEqualTo(literal.orders());
+        assertThat(expanded.report()).isEqualTo(literal.report());
+    }
+
+    static Stream<Arguments> inlineEntityDocuments() {
+        return Stream.of(
+                Arguments.of("text entities in a title and an author", INLINE_ENTITY_ORDER,
+                        "<?xml version='1.0'?><orders><item><price>1</price><properties>"
+                                + "<title>Pre Inline Post</title><authors><author>Ann Author</author>"
+                                + "<author>Bob</author></authors><year>2010</year></properties></item></orders>"),
+                Arguments.of("an entity standing for a whole item element",
+                        ordersDocument("<!DOCTYPE orders [<!ENTITY second '" + item("20", "Second", "Cy", "2006")
+                                + "'>]>", item("30", "First", "Ann", "2005"), "&second;"),
+                        ordersDocument("", item("30", "First", "Ann", "2005"), item("20", "Second", "Cy", "2006"))),
+                Arguments.of("entities inside a price and a year",
+                        ordersDocument("<!DOCTYPE orders [<!ENTITY whole '12'><!ENTITY y '2005'>]>",
+                                item("&whole;.50", "Priced", "Ann", "&y;")),
+                        ordersDocument("", item("12.50", "Priced", "Ann", "2005"))),
+                Arguments.of("an entity whose text references another entity",
+                        ordersDocument("<!DOCTYPE orders [<!ENTITY first 'Ann'><!ENTITY full '&first; Author'>]>",
+                                item("1", "Nested", "&full;", "2010")),
+                        ordersDocument("", item("1", "Nested", "Ann Author", "2010"))));
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("externalReferenceDocuments")
+    @DisplayName("an external reference is never loaded: the outputs equal those of the document without it")
+    void neverLoadsAnExternalReference(String reference, String withReference, String withoutReference)
+            throws Exception {
+        when(client.getCurrencies()).thenReturn(currencies);
+
+        Outputs referencing = processAndCollect(withReference);
+        Outputs plain = processAndCollect(withoutReference);
+
+        assertThat(new String(referencing.orders(), StandardCharsets.UTF_8)).doesNotContain("root:");
+        assertThat(referencing.orders()).isEqualTo(plain.orders());
+        assertThat(referencing.report()).isEqualTo(plain.report());
+    }
+
+    static Stream<Arguments> externalReferenceDocuments() {
+        String plain = ordersDocument("", item("1", "AB", "Bob", "2010"));
+        return Stream.of(
+                Arguments.of("external general entity referenced inside a title",
+                        ordersDocument("<!DOCTYPE orders [<!ENTITY e SYSTEM 'file:///etc/passwd'>]>",
+                                item("1", "A&e;B", "Bob", "2010")),
+                        plain),
+                Arguments.of("external parameter entity referenced in the inline DTD",
+                        ordersDocument("<!DOCTYPE orders [<!ENTITY % p SYSTEM 'file:///etc/passwd'>%p;]>",
+                                item("1", "AB", "Bob", "2010")),
+                        plain),
+                Arguments.of("external DTD subset",
+                        ordersDocument("<!DOCTYPE orders SYSTEM \"file:///etc/passwd\">",
+                                item("1", "AB", "Bob", "2010")),
+                        plain));
+    }
+
+    @Test
+    @DisplayName("a document over the JDK's entity-expansion limit fails with SAXParseException and writes nothing")
+    void rejectsADocumentOverTheEntityExpansionLimit() {
+        when(client.getCurrencies()).thenReturn(currencies);
+        // Ten levels of ten references each: &lol9; stands for 10^9 copies of "lol".
+        StringBuilder doctype = new StringBuilder("<!DOCTYPE orders [<!ENTITY lol0 'lol'>");
+        for (int level = 1; level <= 9; level++) {
+            doctype.append("<!ENTITY lol").append(level).append(" '")
+                    .append(("&lol" + (level - 1) + ";").repeat(10)).append("'>");
+        }
+        doctype.append("]>");
+        byte[] laughs = ordersDocument(doctype.toString(), item("1", "&lol9;", "Bob", "2010"))
+                .getBytes(StandardCharsets.UTF_8);
+
+        assertThatThrownBy(() -> service.process(laughs))
+                .isInstanceOf(SAXParseException.class)
+                .hasMessageContaining("entity expansions");
+
+        verify(client).getCurrencies();
+        verifyNoInteractions(orderMapper, orderReportMapper);
+        assertNothingWritten();
+    }
+
+    /** Processes one document and returns both written files, deleting them so the next run starts empty. */
+    private Outputs processAndCollect(String document) throws Exception {
+        service.process(document.getBytes(StandardCharsets.UTF_8));
+        Path orders = out.resolve(ORDERS_JSON);
+        Path report = out.resolve(REPORT_CSV);
+        Outputs outputs = new Outputs(Files.readAllBytes(orders), Files.readAllBytes(report));
+        Files.delete(orders);
+        Files.delete(report);
+        return outputs;
+    }
+
+    /** An orders document: the XML declaration, the DOCTYPE declaration ({@code ""} for none), then the items. */
+    private static String ordersDocument(String doctype, String... items) {
+        return "<?xml version='1.0'?>" + doctype + "<orders>" + String.join("", items) + "</orders>";
+    }
+
+    /** One {@code item} element holding the given price, title, single author and year content. */
+    private static String item(String price, String title, String author, String year) {
+        return "<item><price>" + price + "</price><properties><title>" + title + "</title><authors><author>"
+                + author + "</author></authors><year>" + year + "</year></properties></item>";
+    }
+
+    /** The bytes of {@code orders.json} and {@code report.csv} one run wrote. */
+    private record Outputs(byte[] orders, byte[] report) {
     }
 
     /** No overload of the writer was called and the output directory is still empty. */

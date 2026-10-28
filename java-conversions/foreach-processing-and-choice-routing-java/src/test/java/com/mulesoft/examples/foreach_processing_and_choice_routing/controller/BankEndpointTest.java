@@ -16,8 +16,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import javax.wsdl.Binding;
@@ -37,6 +35,7 @@ import com.mulesoft.examples.foreach_processing_and_choice_routing.client.BankCl
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.CreditProfile;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanBrokerQuoteRequest;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.LoanQuote;
+import com.mulesoft.examples.foreach_processing_and_choice_routing.service.Bank;
 import com.mulesoft.examples.foreach_processing_and_choice_routing.support.HttpTestClient;
 
 import org.junit.jupiter.api.Test;
@@ -48,6 +47,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.util.TestSocketUtils;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
@@ -67,7 +67,8 @@ import org.xml.sax.SAXException;
  * write it:
  * <ul>
  *   <li>the exact response bytes of {@code getLoanQuote} on every bank, only the random rate matched by pattern;</li>
- *   <li>each port answering as its own bank, on its base path and on the {@code /*} path the loan broker calls;</li>
+ *   <li>each port answering as its own bank, on its base path and on the {@code /*} path the loan broker calls, and
+ *       from its own {@code Bank} instance and rates, proven with controlled rates no other bank holds;</li>
  *   <li>the original rate selection: three rates per bank, fixed for the bank's lifetime, chosen by the credit-score
  *       bands {@code < 500}, {@code 500..699} and {@code >= 700}, lowest for the best band;</li>
  *   <li>the published {@code BankService.wsdl} with its JAX-WS identities and the request URL as address;</li>
@@ -115,6 +116,8 @@ class BankEndpointTest {
 
     private static final int GOLD_SCORE = 600;
 
+    private static final int BASIC_SCORE = 400;
+
     /** Everything a CXF fault writes before the fault code. */
     private static final String FAULT_PREFIX =
             "<soap:Envelope xmlns:soap=\"" + SOAP11_NS + "\"><soap:Body><soap:Fault><faultcode>";
@@ -130,6 +133,9 @@ class BankEndpointTest {
 
     @Autowired
     private BankClient bankClient;
+
+    @Autowired
+    private BankEndpoint bankEndpoint;
 
     /**
      * Binds the credit agency and the banks to the chosen ports. The additional listeners of {@code application.yml}
@@ -196,16 +202,55 @@ class BankEndpointTest {
     }
 
     /**
-     * Each bank is its own instance with its own three random rates, as each flow had its own singleton; two of five
-     * independently drawn doubles coinciding is not a practical outcome.
+     * Each bank port is served by its own {@code Bank} instance with its own rates, as each flow had its own
+     * singleton. Random rates may coincide between banks, so each bank's own {@code rates} array is given controlled
+     * values no other bank holds, and every port must answer with its own bank's values in all three bands: a port
+     * served by another bank, or a rates array shared between banks, answers with another bank's values. The drawn
+     * rates are restored afterwards for the other tests of this application context.
      */
     @Test
-    void everyBankDrawsItsOwnRates() {
-        Set<Double> platinumRates = IntStream.rangeClosed(1, BANK_COUNT)
-                .mapToObj(bank -> rate(bank, PLATINUM_SCORE))
-                .collect(Collectors.toSet());
+    void everyBankPortIsServedByItsOwnBankWithItsOwnRates() {
+        Map<?, ?> banksByPort = (Map<?, ?>) ReflectionTestUtils.getField(bankEndpoint, "banksByPort");
+        assertThat(banksByPort).as("banksByPort").isNotNull();
+        assertThat(banksByPort.keySet().stream().mapToInt(port -> (Integer) port).toArray())
+                .as("bank ports, in the order of ports.bank1 to ports.bank5").containsExactly(BANK_PORTS);
 
-        assertThat(platinumRates).hasSize(BANK_COUNT);
+        Bank[] banks = new Bank[BANK_COUNT];
+        double[][] rates = new double[BANK_COUNT][];
+        for (int bank = 1; bank <= BANK_COUNT; bank++) {
+            banks[bank - 1] = (Bank) banksByPort.get(bankPort(bank));
+            assertThat(banks[bank - 1].getBankName()).as("bank on the port of Bank #%d", bank)
+                    .isEqualTo("Bank #" + bank);
+            rates[bank - 1] = (double[]) ReflectionTestUtils.getField(banks[bank - 1], "rates");
+            assertThat(rates[bank - 1]).as("rates of Bank #%d", bank).hasSameSizeAs(controlledRates(bank));
+            for (int other = 1; other < bank; other++) {
+                assertThat(banks[bank - 1]).as("Bank #%d and Bank #%d", other, bank).isNotSameAs(banks[other - 1]);
+                assertThat(rates[bank - 1]).as("rates of Bank #%d and Bank #%d", other, bank)
+                        .isNotSameAs(rates[other - 1]);
+            }
+        }
+
+        double[][] drawnRates = new double[BANK_COUNT][];
+        for (int bank = 1; bank <= BANK_COUNT; bank++) {
+            drawnRates[bank - 1] = rates[bank - 1].clone();
+        }
+        try {
+            for (int bank = 1; bank <= BANK_COUNT; bank++) {
+                double[] controlled = controlledRates(bank);
+                System.arraycopy(controlled, 0, rates[bank - 1], 0, controlled.length);
+            }
+            for (int bank = 1; bank <= BANK_COUNT; bank++) {
+                double[] controlled = controlledRates(bank);
+                assertThat(rate(bank, PLATINUM_SCORE)).as("platinum rate of Bank #%d", bank).isEqualTo(controlled[0]);
+                assertThat(rate(bank, GOLD_SCORE)).as("gold rate of Bank #%d", bank).isEqualTo(controlled[1]);
+                assertThat(rate(bank, BASIC_SCORE)).as("basic rate of Bank #%d", bank).isEqualTo(controlled[2]);
+            }
+        }
+        finally {
+            for (int bank = 1; bank <= BANK_COUNT; bank++) {
+                System.arraycopy(drawnRates[bank - 1], 0, rates[bank - 1], 0, drawnRates[bank - 1].length);
+            }
+        }
     }
 
     @ParameterizedTest(name = "Bank #{0}")
@@ -369,6 +414,14 @@ class BankEndpointTest {
 
     private double rate(int bank, int creditScore) {
         return quote(bank, creditScore).getInterestRate();
+    }
+
+    /**
+     * Rates for {@code Bank #<bank>} that no other bank's controlled rates repeat, in the bank's own order: platinum,
+     * gold and basic, ascending and within the original's [0, 10).
+     */
+    private static double[] controlledRates(int bank) {
+        return new double[] {bank, bank + 0.25, bank + 0.5};
     }
 
     /**
