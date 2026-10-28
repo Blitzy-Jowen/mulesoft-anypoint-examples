@@ -110,11 +110,14 @@ public class PersonController {
      *
      * <p>The reply is written as 201 with {@code Location} {@value #LOCATION_PREFIX}{@code <id>}, the UTF-8 bytes of
      * {@link PersonService#STORE_SUCCESS_RESPONSE} with their {@code Content-Length}, and no {@code Content-Type}:
-     * the untyped {@code set-payload} of line 24.
+     * the untyped {@code set-payload} of line 24. The JSON literal {@code null} is stored as {@code null} and gets
+     * this reply too.
      *
      * @param body     the request body, {@code null} when empty
      * @param response the response the reply is written to once the person is stored
-     * @throws IOException when the body is empty, malformed or not a person, or when writing the reply fails
+     * @throws IOException when the body is absent or empty, malformed JSON, a JSON array, string, number or boolean,
+     *                     or an object with a property {@code Person} does not declare or a property value its
+     *                     declared type cannot take, or when writing the reply fails
      */
     @PostMapping("/person")
     public void storePerson(@RequestBody(required = false) byte[] body, HttpServletResponse response)

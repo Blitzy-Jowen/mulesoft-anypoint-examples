@@ -199,10 +199,12 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--proxy.upstream-url=http://loc
 java -jar target/proxying-a-soap-api-java-1.0.0-SNAPSHOT.jar --http.port=9091 --proxy.wsdl-location=file:src/test/resources/upstream/ShopService.wsdl
 ```
 
-To run without predic8, serve a stand-in upstream with WireMock standalone 3.13.2 (`org.wiremock:wiremock-standalone`, the version the tests use) on port 9090 and start the proxy with the first command above:
+To run without predic8, serve a stand-in upstream with WireMock standalone 3.13.2 (`org.wiremock:wiremock-standalone`, the version the tests use) on port 9090 and start the proxy with the first command above. The first line below copies the jar into `target/wiremock/`, which `mvn clean` deletes:
 
 ```sh
-java -jar wiremock-standalone-3.13.2.jar --port 9090 &
+mvn -B dependency:copy -Dartifact=org.wiremock:wiremock-standalone:3.13.2 -DoutputDirectory=target/wiremock
+java -jar target/wiremock/wiremock-standalone-3.13.2.jar --port 9090 &
+until curl -sf http://localhost:9090/__admin/health > /dev/null; do sleep 1; done
 curl -s -X POST http://localhost:9090/__admin/mappings -d '{"request": {"method": "POST", "url": "/shop/ShopService"}, "response": {"status": 200, "headers": {"Content-Type": "text/xml;charset=UTF-8"}, "body": "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><ns2:createResponse xmlns:ns2=\"http://predic8.com/wsdl/shop/1/\"><cartId>1001</cartId></ns2:createResponse></soap:Body></soap:Envelope>"}}'
 ```
 
