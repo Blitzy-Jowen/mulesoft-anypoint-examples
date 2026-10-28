@@ -1,0 +1,265 @@
+# WebSphere MQ Example — Spring Boot conversion
+
+Spring Boot 3.2.12 / Java 17 conversion of the Mule EE 3.8.0 example [`websphere-mq`](../../websphere-mq/) (category General). The original loads the single flow file `websphere-mq.xml` (`config.resources=websphere-mq.xml` in `websphere-mq/src/main/app/mule-deploy.properties`). It stays unchanged beside this project and is the Tier 2A capture source. The Java package is `com.mulesoft.examples.websphere_mq` and the main class is `WebsphereMqApplication`.
+
+The application runs on Undertow on port 8086 and reaches IBM MQ through the IBM MQ Jakarta JMS client in client mode. The browser side keeps the original's Mule Ajax transport: the page and the Mule 3.8.0 JavaScript are served unchanged, and the Bayeux endpoint they call is shared component SC-12, copied from `service-orchestration-and-choice-routing-java`.
+
+## Status
+
+| Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
+|---|---|---|---|---|---|---|---|
+| websphere-mq-java | websphere-mq | General | PASS | PASS | 99.3% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+
+This is the project's row of the root [`SUMMARY.md`](../../SUMMARY.md) (AAP 0.8.7). The run behind it is under [Tier status evidence](#tier-status-evidence).
+
+- Tier 2A is blocked. [`DECISIONS.md`](../../DECISIONS.md) section 9 records `Tier 2A blocked: Mule EE licence and EE Maven repository credentials unconfirmed`, so no fixture has been captured from the original. Capturing this example also needs a local IBM MQ queue manager. Parity rests on the fallback, which is weaker than captured fixtures, and the label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS ([Fallback evidence](#fallback-evidence-aap-084)).
+- Tier 2B is `N/A`: this is not a connector project, so it has no failsafe plugin and no `*IT` class.
+
+## Original example
+
+As `websphere-mq/README.md` describes it, the browser page at `http://localhost:8086/services/wmqExample` asks for a text and sends it through Ajax to the WebSphere MQ queue `in`, confirming that the message was submitted. Mule takes the message from `in`, appends ` - processed` after an intentional 15-second delay and sends the result to the queue `out`. Mule then reads `out` and delivers the text back to the page through Ajax, which shows it under "You just received" and adds it to its table. Several messages can be sent one after another while earlier ones are still waiting.
+
+Three flows of `websphere-mq/src/main/app/websphere-mq.xml` carry the round trip:
+
+- `Input` (lines 8-14): Ajax inbound endpoint on channel `/services/wmqExample/enqueue` with `responseTimeout="10000"` → `delete-message-property key="MULE_REPLYTO"` → WMQ outbound endpoint, queue `in`.
+- `MessageProcessor` (lines 15-23): WMQ inbound endpoint on `in` with `wmq:transaction action="ALWAYS_BEGIN"` → `test:component appendString=" - processed" logMessageDetails="true" waitTime="15000"` → WMQ outbound endpoint, queue `out`, with `wmq:transaction action="JOIN_IF_POSSIBLE"`.
+- `Output` (lines 24-27): WMQ inbound endpoint on `out`, without a transaction → Ajax outbound endpoint on channel `/services/wmqExample/dequeue` with `cacheMessages="true"`.
+
+The `wmq:connector` (line 4) connects as an MQ client (`transportType="CLIENT_MQ_TCPIP"`, `validateConnections="true"`). The `ajax:connector` (line 7) serves its docroot under `serverUrl="http://0.0.0.0:8086/services/wmqExample"` with `disableReplyTo="true"`. No flow declares a logger or an exception strategy.
+
+## Endpoints and triggers
+
+Every HTTP request is served by one Undertow listener on `0.0.0.0:8086` (`server.address`, `server.port`), the host and port of the original `serverUrl`.
+
+| Entry point | Methods or mode | Behaviour | Owning class | Source |
+|---|---|---|---|---|
+| HTTP `/services/wmqExample/` | `GET`, `HEAD` | `200`, `Content-Type: text/html`, the page `src/main/resources/static/services/wmqExample/index.html`, byte-identical to `websphere-mq/src/main/app/docroot/index.html` (the docroot's welcome file). Other docroot files are served by name, with the content type derived from the file name. | SC-12 `config/AjaxResourceConfig` | `websphere-mq.xml:7` |
+| HTTP `/services/wmqExample` | `GET`, `HEAD` | `302 Found` with the absolute `Location` `http://<host>:<port>/services/wmqExample/`, the redirect Jetty sent for the docroot directory | SC-12 `config/AjaxResourceConfig` | `websphere-mq.xml:7` |
+| HTTP `/services/wmqExample/mule-resource/js/**` | `GET`, `HEAD` | the Mule 3.8.0 Ajax JavaScript from `src/main/resources/mule-resource/js/`, served unchanged (`mule.js` as `text/javascript`); the page loads `mule-resource/js/dojo/dojo.js` and `mule-resource/js/mule.js` relative to itself | SC-12 `config/AjaxResourceConfig` | `docroot/index.html:17-18` |
+| HTTP `/ajax/cometd` | `GET`, `POST` | Bayeux 1.0 long polling ([Bayeux protocol](#bayeux-protocol-sc-12)). The form parameter `message` holds a JSON array of Bayeux messages, as the copied `dojox.cometd` client posts it (`application/x-www-form-urlencoded`); a single JSON object is a batch of one. The reply is `200` with a plain JSON array as `text/json;charset=UTF-8`, or `text/javascript;charset=UTF-8` with the optional `jsonp` parameter. | SC-12 `controller/BayeuxLongPollingController`, `service/AjaxChannelBroker` | Mule's `AjaxConnector` mounted its cometd servlet at `/ajax/*` |
+| Ajax channel `/services/wmqExample/enqueue` (inbound) | Bayeux publication, as the page's `mule.rpc` sends it | Flow `Input`: the publication's `data` reaches `client/MqQueueSender.enqueue`, which sends it to IBM MQ queue `in` (a string unchanged, any other value as its JSON text), one-way, committed right after the send. No reply is published on the publication's `replyTo` channel: `ajax.disable-reply-to: true` reproduces `disableReplyTo="true"`, and the sent message carries no reply destination, correlation ID or property, as flow `Input` deleted `MULE_REPLYTO`. A handler call not finished within `ajax.response-timeout-ms` (10000 ms) is cancelled. | `client/MqQueueSender` (`register`, `enqueue`, `sendToIn`) | `websphere-mq.xml:8-14` |
+| IBM MQ queue `in` (`wmq.queues.in`) | `@JmsListener` on `transactedListenerContainerFactory`: session-transacted, four consumers | Flow `MessageProcessor`: `trigger/InQueueListener.onMessage` → `service/MqProcessingService.process`, which logs `Message Received in service: MessageProcessor. Content is: <text>` at INFO, waits `wmq.processing.wait-ms` (15000 ms) and returns `<text> - processed` → `client/MqQueueSender.sendToOut` → queue `out`. The send reuses the listener's transacted session, so it commits or rolls back with the receive (`ALWAYS_BEGIN` with `JOIN_IF_POSSIBLE`). Nothing is caught: any failure rolls back both, and the message stays on `in` for redelivery. | `trigger/InQueueListener` | `websphere-mq.xml:15-23` |
+| IBM MQ queue `out` (`wmq.queues.out`) | `@JmsListener` on `autoAckListenerContainerFactory`: not transacted, `AUTO_ACKNOWLEDGE`, four consumers | Flow `Output`: `trigger/OutQueueListener.onMessage` → `publishToDequeue` → Ajax channel `/services/wmqExample/dequeue`, to which the page subscribes on load (`docroot/index.html:25`) and whose `data` it shows. While no client subscribes, the message is held for the first subscriber (`cacheMessages="true"`, key `ajax.cache-messages-channels`, at most 500 messages). A failure is logged by the listener container, and the message is not redelivered. | `trigger/OutQueueListener` | `websphere-mq.xml:24-27` |
+
+- Four consumers per queue: the connector sets no `numberOfConsumers`, so Mule 3.8's default of four concurrent receivers applied to both inbound endpoints. Up to four messages sent together are therefore confirmed together after one 15 s wait, and further messages wait on `in` until a consumer is free (`config/IbmMqConfig`, `service/MqProcessingService`).
+- The application sets no redelivery limit for `in`, as the original set none. A message that keeps failing is governed by the backout settings of queue `in` on the queue manager.
+- The project has no other trigger: no file poller, scheduler or mail poller.
+
+### Listener defaults (AAP 0.4.7)
+
+| Case | Response | Enforced by |
+|---|---|---|
+| A path nothing serves, for example `/unknown`, `/error` or a missing file under `/services/wmqExample/` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` | SC-1 `exception/GlobalExceptionHandler` |
+| A method other than `GET` or `POST` on `/ajax/cometd`, or other than `GET`, `HEAD` or `OPTIONS` on a file under `/services/wmqExample/` | `405 Method Not Allowed`, `Content-Type: text/plain`, body `Method not allowed for endpoint: <path>`, no `Allow` header | SC-1 |
+| `OPTIONS` on a file under `/services/wmqExample/` | `200`, `Allow: GET,HEAD,OPTIONS`, no body | Spring's resource handler |
+| A method other than `GET` or `HEAD` on `/services/wmqExample` or `/services/wmqExample/` | `405 Method Not Allowed`, `Allow: GET, HEAD`, `Content-Type: text/html;charset=UTF-8`, Undertow's error page `<html><head><title>Error</title></head><body>Method '<METHOD>' is not supported.</body></html>`. The view controllers that map the directory are outside `@ControllerAdvice`, and Boot's error controller is excluded. | `config/AjaxResourceConfig`, Undertow |
+| An exception escaping a controller | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }` | SC-1 |
+| A `/ajax/cometd` request whose `message` is absent, is not JSON, or is neither an object nor an array of objects | `400 Bad Request`, `Content-Type: text/json;charset=UTF-8`, body `[]` | SC-12 `controller/BayeuxLongPollingController` |
+| A Bayeux message carrying an unknown `clientId` | `200`, answered in-band with `"successful":false`, `"error":"402::Unknown client"` and the advice `reconnect: handshake` | SC-12 `controller/BayeuxLongPollingController` |
+
+### Bayeux protocol (SC-12)
+
+The copied `mule-resource/js/_mule.js` runs over `dojox.cometd`. `mule.subscribe(channel, callback)` subscribes to a channel. `mule.rpc(channel, data)` subscribes to the reply channel `<channel>#<clientId>` and publishes `{"data": <data>, "replyTo": "<channel>#<clientId>"}` on `channel`. `BayeuxLongPollingController` answers it as follows:
+
+- `/meta/handshake` returns a new `clientId`, `supportedConnectionTypes` `["long-polling","callback-polling"]` and the advice `reconnect: retry`, `interval: 0`, `timeout: 250000`.
+- The first `/meta/connect` after a handshake is answered at once with whatever is queued. Every later one is held until a delivery is queued for the client or `ajax.connect-timeout-ms` (250000 ms) passes. At most 512 connects are held at once; a further one is answered at once.
+- `/meta/subscribe`, `/meta/unsubscribe` and `/meta/disconnect` act on `AjaxChannelBroker`; any other `/meta/*` channel is answered `404::Unknown meta channel`.
+- Any other channel is a publication. Its acknowledgement carries no `data`. On `/services/wmqExample/enqueue` it is handed to `MqQueueSender.enqueue`.
+- `AjaxChannelBroker` removes a client not heard from for `ajax.max-interval-ms` (30000 ms), holds at most 500 deliveries per client between two connects, runs at most 16 inbound handlers at once and lets at most 500 publications wait for one. All channel state is in memory and lost on restart, as the connector's was.
+
+## Configuration keys
+
+Every key of `src/main/resources/application.yml`. `websphere-mq/src/main/app/mule-app.properties` is empty, so the original gave none of its placeholders a value.
+
+Status: `default` — a non-secret value the original fixed, overridable; `TODO` — no value (`${ENV_NAME:}` with a `# TODO: supply …` comment) until supplied through the named environment variable or a `--key=value` argument (AAP 0.4.6), marked `(secret)` when it is one; `fixed` — a framework setting that reproduces the original listener, not a key of the original.
+
+| Key | Default | Original name | Status | Purpose |
+|---|---|---|---|---|
+| `wmq.host` | none (`${WMQ_HOST:}`) | `wmq.host` (unchanged) | TODO | `hostName` of the connector: the host of the queue manager's listener. Without it no IBM MQ connection factory is created and the application does not start. |
+| `wmq.port` | `1414` (`${WMQ_PORT:1414}`) | `wmq.port` (unchanged) | default | `port` of the connector: the queue manager's listener port. 1414 is the value the original test set and IBM MQ's default; a blank value also means 1414, text that is not an integer fails start-up. |
+| `wmq.channel` | none (`${WMQ_CHANNEL:}`) | `wmq.channel` (unchanged) | TODO | `channel` of the connector: the server-connection (SVRCONN) channel |
+| `wmq.queue` | none (`${WMQ_QUEUE:}`) | `wmq.queue` (unchanged) | TODO | the queue manager name, not a queue: the original maps `queueManager="${wmq.queue}"` (`websphere-mq.xml:4`), and the name is kept |
+| `wmq.username` | none (`${WMQ_USERNAME:}`) | `wmq.username` (unchanged) | TODO | `username` of the connector, applied to every connection when it has text; blank connects without credentials |
+| `wmq.password` | none (`${WMQ_PASSWORD:}`) | `wmq.password` (unchanged) | TODO (secret) | `password` of the connector, applied with `wmq.username` |
+| `wmq.enabled` | `true` | none | default | switch for the IBM MQ connection factory, which exists only while this is not `false` and `wmq.host` has text (`IbmMqConfig.WmqEnabledCondition`); the `test` profile sets `false` |
+| `wmq.queues.in` | `in` | `queue="in"` (`websphere-mq.xml:13,16`) | default | queue of flows `Input` and `MessageProcessor` |
+| `wmq.queues.out` | `out` | `queue="out"` (`websphere-mq.xml:20,25`) | default | queue of flows `MessageProcessor` and `Output` |
+| `wmq.processing.wait-ms` | `15000` | `test:component waitTime="15000"` (`websphere-mq.xml:19`) | default | the processing wait before ` - processed` is returned; zero or less disables it (the `test` profile sets `0`) |
+| `wmq.transport.connect-timeout-seconds` | `10` | none | default | budget for the TCP connect to the queue manager, set as the IBM client property `com.ibm.mq.cfg.TCP.Connect_Timeout` |
+| `wmq.transport.negotiation-timeout-seconds` | `10` | none | default | budget for each reply of the negotiation that opens a connection, `com.ibm.mq.cfg.TCP.QmgrNegotiationFlowTimeout` |
+| `wmq.transport.receive-timeout-seconds` | `10` | none | default | budget for each read once connected, `com.ibm.mq.cfg.MQRCVBLKTO`; a peer that stops answering is declared broken after about twice this value |
+| `server.port` | `8086` | port of `serverUrl` (`websphere-mq.xml:7`) | default | the only HTTP listener |
+| `server.address` | `0.0.0.0` | host of `serverUrl` | default | bind host of the listener |
+| `ajax.server-path` | `/services/wmqExample` | path of `serverUrl` | default | docroot at `<path>/`, JavaScript at `<path>/mule-resource/js/**`, channels `<path>/enqueue` and `<path>/dequeue` |
+| `ajax.disable-reply-to` | `true` | `disableReplyTo="true"` (`websphere-mq.xml:7`) | default | an inbound handler's result is never published on the publication's `replyTo` channel |
+| `ajax.cache-messages-channels` | `[/services/wmqExample/dequeue]` | `cacheMessages="true"` (`websphere-mq.xml:26`) | default | outbound channels whose messages are held for the first subscriber |
+| `ajax.response-timeout-ms` | `10000` | `responseTimeout="10000"` (`websphere-mq.xml:9`) | default | an enqueue handler call still running this long after its publication is cancelled |
+| `ajax.connect-timeout-ms` | `250000` | Mule 3.8.0 `AjaxConnector` default server poll timeout; the connector sets none | default | how long a `/meta/connect` is held; the `advice.timeout` of every handshake and connect |
+| `ajax.max-interval-ms` | `30000` | Mule 3.8.0 `AjaxConnector` default `maxInterval`; the connector sets none | default | a Bayeux client not heard from for this long is removed |
+| `spring.application.name` | `websphere-mq-java` | none | fixed | application name in log lines |
+| `spring.web.resources.add-mappings` | `false` | none | fixed | no default static mapping: unknown paths reach SC-1's 404, and `AjaxResourceConfig` registers the docroot and the JavaScript itself |
+| `spring.mvc.dispatch-trace-request` | `true` | none | fixed | `TRACE` reaches the page, script and `/ajax/cometd` mappings and gets their 405 instead of the servlet's `message/http` echo |
+| `spring.autoconfigure.exclude` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
+
+- The TODO keys read the environment variables `WMQ_HOST`, `WMQ_CHANNEL`, `WMQ_QUEUE`, `WMQ_USERNAME` and `WMQ_PASSWORD`, and `wmq.port` reads `WMQ_PORT`. Every key can also be set with a `--key=value` argument.
+- The three `wmq.transport.*` budgets take whole seconds from 1 to 2147483; any other value fails start-up with a message naming the key. They are JVM-wide IBM client properties, set before the first IBM MQ connection factory is built. An operation that exceeds one fails once and is never retried. A write that the queue manager or the network stops reading is not bounded by them, because the IBM client has no write timeout (`config/IbmMqConfig`).
+- The `test` profile (`src/test/resources/application-test.yml`, tests only) sets `wmq.enabled: false`, `wmq.processing.wait-ms: 0`, an embedded non-persistent Artemis broker with the queues `in` and `out`, and `ajax.connect-timeout-ms: 1000`. It holds no host or credential. There is no `application-it.yml`.
+
+### Original-to-new key map
+
+| Original | Converted | Note |
+|---|---|---|
+| `${wmq.host}`, `${wmq.port}`, `${wmq.channel}`, `${wmq.queue}`, `${wmq.username}`, `${wmq.password}` of `wmq:connector` (`websphere-mq.xml:4`) | the same names | unchanged, with the TODO status above; `wmq.queue` still names the queue manager |
+| `${app.home}` in `ajax:connector resourceBase="${app.home}/docroot"` (`websphere-mq.xml:7`) | dropped | the page and the scripts are classpath resources served by `config/AjaxResourceConfig`, so no application home directory is needed |
+
+### IBM MQ transport
+
+- Client mode: `WMQConstants.WMQ_CM_CLIENT`, the original's `transportType="CLIENT_MQ_TCPIP"`, through `com.ibm.mq:com.ibm.mq.jakarta.client` 9.3.5.0 from Maven Central, declared in `pom.xml`. The IBM MQ client JARs no longer need to be added to the build path by hand.
+- The queue manager must define a server-connection channel and the local queues `in` and `out`, as the original README requires.
+- `config/IbmMqConfig` builds one `MQConnectionFactory` from the `wmq.*` keys and wraps it in a `UserCredentialsConnectionFactoryAdapter` when `wmq.username` has text, because JMS passes credentials when a connection is created. IBM client reconnection is disabled, so a broken connection fails the operation instead of being re-established behind it.
+- Both listener container factories and the session-transacted `JmsTemplate` use that single factory, and none has a transaction manager. That is what lets the send to `out` join the receive from `in`: the template finds the listener's transacted session bound to the thread and reuses it. A send from the Ajax handler thread (flow `Input`) has no such session, so the template opens and commits its own.
+
+## Mule-to-Java mapping
+
+| Mule construct (`websphere-mq.xml`) | Java construct (`com.mulesoft.examples.websphere_mq`) |
+|---|---|
+| `wmq:connector` (`CLIENT_MQ_TCPIP`, `validateConnections="true"`, line 4) | `config/IbmMqConfig`: the IBM MQ `connectionFactory` bean, `transactedListenerContainerFactory`, `autoAckListenerContainerFactory` and the session-transacted `jmsTemplate`; `@EnableJms` |
+| `ajax:connector` (Jetty cometd, `serverUrl`, `resourceBase`, `disableReplyTo`, line 7) | SC-12: `controller/BayeuxLongPollingController`, `service/AjaxChannelBroker`, `config/AjaxResourceConfig` and `src/main/resources/mule-resource/js/**`, copied from `service-orchestration-and-choice-routing-java` with only the `package` line changed (the controller also changes the package root of its `AjaxChannelBroker` import); Undertow on `server.address`/`server.port` |
+| docroot `src/main/app/docroot/index.html` | `src/main/resources/static/services/wmqExample/index.html`, copied byte for byte |
+| flow `Input`: `ajax:inbound-endpoint` on `/services/wmqExample/enqueue`, `delete-message-property MULE_REPLYTO`, `wmq:outbound-endpoint queue="in"` (lines 8-14) | `client/MqQueueSender`: `register()` (`@PostConstruct`) installs `enqueue` as the channel's handler on `AjaxChannelBroker`, `enqueue` → `sendToIn`; no reply destination is ever set |
+| flow `MessageProcessor`: `wmq:inbound-endpoint queue="in"` with `ALWAYS_BEGIN` (lines 16-18) | `trigger/InQueueListener` (`@JmsListener` on `transactedListenerContainerFactory`), `process` |
+| `test:component appendString=" - processed" logMessageDetails="true" waitTime="15000"` (line 19) | `service/MqProcessingService.process`: INFO log, reply `payload + " - processed"`, wait `wmq.processing.wait-ms`, return |
+| `wmq:outbound-endpoint queue="out"` with `JOIN_IF_POSSIBLE` (lines 20-22) | `client/MqQueueSender.sendToOut` on the listener's transacted session |
+| flow `Output`: `wmq:inbound-endpoint queue="out"` (line 25) | `trigger/OutQueueListener` (`@JmsListener` on `autoAckListenerContainerFactory`), `forward` |
+| `ajax:outbound-endpoint cacheMessages="true" channel="/services/wmqExample/dequeue"` (line 26) | `OutQueueListener.publishToDequeue` → `AjaxChannelBroker.publish`, the channel listed in `ajax.cache-messages-channels` |
+| platform default responses (no listener, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
+| `mule-deploy.properties` (`config.resources=websphere-mq.xml`) | `WebsphereMqApplication` (`@SpringBootApplication`) |
+| `mule-app.properties` (empty) | `src/main/resources/application.yml` |
+| `WebsphereMQIT` (`FunctionalMunitSuite`, outbound endpoints mocked) | `WebsphereMQTest` (plain JUnit 5 with Mockito spies) |
+
+## Behaviours replaced, externalized and not carried
+
+- The EE WMQ transport is replaced by the IBM MQ Jakarta JMS client under Spring JMS: `@JmsListener` containers for the inbound endpoints, `JmsTemplate` for the outbound ones. Messages are JMS text messages without application properties.
+- Connection validation and reconnection: `validateConnections="true"`, and the `ee:reconnect-forever` the original README shows, become the listener containers' recovery. At start-up and after a broken connection each container retries every 5 s without limit, logging at ERROR `Could not refresh JMS Connection for destination 'in' - retrying using FixedBackOff{interval=5000, ...}`. The Java application therefore starts and serves the page while the queue manager is unreachable, where the original's connection validation kept it from starting. An enqueue made meanwhile fails its send, and the page gets no reply either way.
+- Externalized: the queue manager connection (`wmq.host`, `wmq.channel`, `wmq.queue`, `wmq.username`, `wmq.password`) has no value and must be supplied (AAP 0.4.6). Start-up without `wmq.host` fails, by design, with `APPLICATION FAILED TO START` because no `jakarta.jms.ConnectionFactory` exists: no other broker is ever substituted for IBM MQ outside tests.
+- Test stand-in: the IBM MQ queue manager is replaced by an embedded Artemis broker in tests. The `test` profile sets `wmq.enabled: false`, so `IbmMqConfig` defines no IBM MQ factory and Boot's Artemis auto-configuration supplies the `ConnectionFactory`. Artemis is a test-scope dependency only. The IBM MQ factory settings are covered by property-binding tests in `WebsphereMqBrokerTest`, which open no MQ connection. No live MQ test exists.
+- Stubbed at run time: nothing.
+- Not carried (AAP 0.2.2): `mule-project.xml` and `src/test/resources/log4j2-test.xml`. The Anypoint Studio instructions of the original README (opening the project from Exchange, adding the client JARs to the build path, editing the Global Elements, exporting Studio documentation) belong to the original only.
+
+### Tier 2A verification points
+
+Each of these is a reading of the source or a platform default that the source alone does not settle. A captured fixture of the original governs it, and the Java code is changed to match (AAP 0.4.7):
+
+- The docroot as Jetty served it: the content types, the `302` redirect of `/services/wmqExample`, the method handling (the `405` answers above, `OPTIONS`) and the CORS pre-flight answer.
+- The Bayeux framing: the `text/json;charset=UTF-8` Content-Type and the `400 []` answer.
+- Start-up while the queue manager is unreachable, which the original prevented through `validateConnections="true"`.
+- The message properties the original's WMQ transport attached to the messages on `in` and `out`; the Java sends plain text messages without properties.
+- Four concurrent consumers per queue, the Mule 3.8 default the original relied on.
+
+## Build, run and test
+
+Run from `java-conversions/websphere-mq-java/`:
+
+```sh
+mvn -B clean install    # build, surefire tests, JaCoCo check, repackaged jar installed locally
+mvn -B clean package    # build, surefire tests, JaCoCo report and check (LINE >= 0.80 over service/** and mapper/**)
+mvn -B test             # surefire tests only
+```
+
+To run the application, supply the TODO keys first, for example through their environment variables:
+
+```sh
+export WMQ_HOST=<queue manager host> WMQ_PORT=<listener port> WMQ_CHANNEL=<server-connection channel>
+export WMQ_QUEUE=<queue manager name> WMQ_USERNAME=<MQ user> WMQ_PASSWORD=<MQ password>
+mvn spring-boot:run     # listener on 0.0.0.0:8086
+java -jar target/websphere-mq-java-1.0.0-SNAPSHOT.jar
+```
+
+Then open `http://localhost:8086/services/wmqExample`, as the original README describes. Type a text and press **Send**: the page shows it under "You just sent", and about 15 seconds later shows `<text> - processed` under "You just received" and adds it to its table.
+
+Notes:
+
+- Running the application needs port 8086 free; override it with `--server.port=<port>`. The page, the scripts and `/ajax/cometd` follow the listener, and the Ajax channels keep their names.
+- Without `wmq.host` the application does not start ([Behaviours](#behaviours-replaced-externalized-and-not-carried)). With a host that cannot be reached it starts and keeps retrying the queue manager every 5 s.
+- `mvn test` needs no queue manager, broker, credential or fixed port: the Spring tests run on the embedded Artemis broker and a random port.
+- There is no `mvn verify` live tier: the project is not a connector project, so it has no failsafe plugin and no `*IT` class (Tier 2B `N/A`).
+- Reports land under `target/`: `surefire-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.
+- The build runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` (AAP 0.3.2).
+
+## Tests
+
+| Test class | Tests | What it asserts |
+|---|---|---|
+| `WebsphereMQTest` | 1 | the ported `WebsphereMQIT` (`websphere-mq/src/test/java/org/mule/examples/WebsphereMQIT.java:40-54`): with the WMQ and Ajax outbound steps stubbed to return `test` (`MqQueueSender.sendToIn`, `MqQueueSender.sendToOut`, `OutQueueListener.publishToDequeue`), the `Input`, `MessageProcessor` and `Output` equivalents (`MqQueueSender.enqueue`, `InQueueListener.process`, `OutQueueListener.forward`) each return `test`; no Spring context, queue manager or Ajax client |
+| `WebsphereMqBrokerTest` | 7 | the whole application on a random port with the embedded Artemis broker, driven over the wire through ST-1 as the page drives it: handshake, subscription to `/services/wmqExample/dequeue`, `mule.rpc` publication of `hello` on `/services/wmqExample/enqueue`, then `hello - processed` delivered exactly once on the dequeue channel and nothing on the publisher's `replyTo`; the page served byte for byte; `mule-resource/js/mule.js` served; `/unknown` → 404 `No listener for endpoint: /unknown`; the IBM MQ factory's property binding (host, port, channel, queue manager, client mode, reconnection disabled, the 1414 fallback) and the `connectionFactory` bean's condition, without opening an MQ connection |
+| `trigger/InQueueListenerTest` | 6 | flow `MessageProcessor` with mocked collaborators: processing before the send to `out`, the sender's result returned, failures of the service or the send propagated unchanged with nothing sent after a service failure, and the listener bound to queue `in` on `transactedListenerContainerFactory` |
+| `trigger/OutQueueListenerTest` | 6 | flow `Output` with a mocked broker: publication on `/services/wmqExample/dequeue` built from the server path, the payload returned unchanged, broker failures propagated, the listener bound to queue `out` on `autoAckListenerContainerFactory`, null arguments rejected |
+| `service/MqProcessingServiceTest` | 12 | the `test:component` replacement: the constants ` - processed` and 15000, one wait of the configured length, the appended reply, no wait for zero or negative waits, the interrupted wait raising `IllegalStateException` with the flag restored, a null payload failing before any wait |
+| `client/MqQueueSenderTest` | 10 | the enqueue handler registered once on `/services/wmqExample/enqueue`; the exact text sent to `in` and `out` with no reply destination; a map payload sent as JSON; an unserializable payload failing without a send |
+| `controller/BayeuxLongPollingControllerTest` | 39 | SC-12 on standalone MockMvc: handshake, connect (the first one immediate, later ones held and released by a delivery or the timeout), subscribe, unsubscribe, disconnect, publish, rpc replies on `replyTo`, `jsonp`, the `400 []` answers, unknown-client advice and the held-connect races |
+| `service/AjaxChannelBrokerTest` | 90 | SC-12: subscriptions and deliveries, `replyTo` replies with `ajax.disable-reply-to` `false` and none with `true` while outbound messages still reach subscribers, cached channels and their bound, handler timeouts and limits, idle expiry, queue bounds, log hygiene |
+| `exception/GlobalExceptionHandlerTest` | 64 | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, Content-Types and body bytes, `ErrorResponse` JSON escaping, one bounded ERROR log line per unhandled exception |
+| `FixtureParityTest` | 1 | ST-2 fixture replay ([Fixture parity](#fixture-parity-st-2)); skipped while no fixture is captured |
+
+`support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
+
+## Shared components
+
+Each shared component is a copy of its reference implementation with only the `package` line changed, registered in [`DECISIONS.md`](../../DECISIONS.md) section 4 (AAP 0.4.4).
+
+| ID | Files in this project | Reference implementation |
+|---|---|---|
+| SC-1 | `exception/GlobalExceptionHandler`, `exception/ErrorResponse`; test `exception/GlobalExceptionHandlerTest` | `rest-api-with-apikit-java` |
+| SC-12 | `controller/BayeuxLongPollingController`, `service/AjaxChannelBroker`, `config/AjaxResourceConfig`, `src/main/resources/mule-resource/js/**`; tests `controller/BayeuxLongPollingControllerTest`, `service/AjaxChannelBrokerTest` | `service-orchestration-and-choice-routing-java` |
+| ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` |
+| ST-2 | `FixtureParityTest` (test), `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` |
+
+- SC-12 here: port 8086, server path `/services/wmqExample`, inbound channel `/services/wmqExample/enqueue`, outbound channel `/services/wmqExample/dequeue` with `cacheMessages`, and `ajax.disable-reply-to: true`. The JavaScript under `mule-resource/js/` is the Mule 3.8.0 `transports/ajax/src/main/resources/js/` tree, copied unchanged with its licence headers: `mule.js`, `_mule.js`, `dojo/dojo.js`, `dojo/dojo.js.uncompressed.js`, `dojox/cometd.js`, `dojox/cometd.js.uncompressed.js`, `dojox/cometd/timestamp.js`, `dojox/cometd/timesync.js` and `dojox/uuid/generateRandomUuid.js`.
+- A change to an SC-12 class is made in `service-orchestration-and-choice-routing-java` first and then copied here.
+
+## Fixture parity (ST-2)
+
+`FixtureParityTest` replays each fixture `src/test/resources/fixtures/<scenario>.json` against this project. The fixture format, replay drivers and comparison rules are those of the ST-2 reference, described in [`hello-world-java/README.md`, section "Fixture parity (ST-2 reference implementation)"](../hello-world-java/README.md#fixture-parity-st-2-reference-implementation). This project's `src/test/resources/fixtures/SCENARIOS.md` holds the scenario rows, the Bayeux sequences `B1` and `B2`, the `state.properties` override every fixture carries, the capture procedure against a local IBM MQ queue manager and the replay gaps.
+
+Fixtures are captured from the running original only, never written by hand or edited to match the Java output. A mismatch is fixed in the Java code. With no fixtures the test reports skipped (`no Tier 2A fixtures captured`), never failed.
+
+| Scenario | Trigger | State | Request | Status in the last run |
+|---|---|---|---|---|
+| `get-services-wmqexample-page` | `http` | `deterministic` | port `8086`: `GET /services/wmqExample/`, empty body | `UNVERIFIED-uncaptured` |
+| `ajax-enqueue-to-in-queue` | `http` | `nondeterministic` | port `8086`: `POST /ajax/cometd`, the last message of `B1`, the `mule.rpc` publication of `hello` on `/services/wmqExample/enqueue` | `UNVERIFIED-uncaptured` |
+| `mq-in-processed-to-out` | `mq` | `deterministic` | text message `hello` → queue `in` | `UNVERIFIED-uncaptured` |
+| `mq-out-to-ajax-dequeue` | `mq` | `nondeterministic` | text message `hello - processed` → queue `out`, then Bayeux sequence `B2` | `UNVERIFIED-uncaptured` |
+
+Two scenarios are `deterministic`, two `nondeterministic`, and none is `unreachable`: the example has no choice, exception strategy or unreachable branch.
+
+- The two `nondeterministic` scenarios depend on the Bayeux `clientId` the server generates at the handshake. Once captured they are compared for structure only and reported `UNVERIFIED — nondeterministic output`.
+- Replay gaps of the copied ST-2 driver, recorded in `SCENARIOS.md`, keep three rows from a faithful replay: the driver cannot carry the server-issued `clientId` into later requests (`ajax-enqueue-to-in-queue`, `mq-out-to-ajax-dequeue`), cannot stop a listener the capture stops (`ajax-enqueue-to-in-queue`, `mq-in-processed-to-out`), and cannot send requests after a message input (`mq-out-to-ajax-dequeue`). While a gap stands, the row keeps its capture evidence but gets no fixture and stays `UNVERIFIED-uncaptured`.
+- After capture, the label can therefore reach at most `PARITY: PARTIAL — Tier 2A fixtures: 1 verified, 3 unverified`, with `get-services-wmqexample-page` the one row that can become `VERIFIED`. It becomes `PARITY: FAIL — Tier 2A fixtures` when the captured page differs.
+
+## Tier status evidence
+
+The run behind the [Status](#status) row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+
+- `mvn -B clean package`: `BUILD SUCCESS`; 236 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 236 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`, nested classes counted with their outer class: 99.3%, 406 of 409 lines: `service/AjaxChannelBroker` 389 of 392 and `service/MqProcessingService` 17 of 17. The project has no `mapper` package. Total project LINE coverage: 94.5% (895 of 947 lines).
+- `target/fixture-parity/summary.properties`: `verified=0`, `unverified=4`, `failed=0`; all four scenarios `UNVERIFIED-uncaptured`.
+- Runtime check of the packaged jar against a local IBM MQ queue manager (not Tier 2A evidence): the page `200 text/html`, byte-identical to the original docroot page; `/services/wmqExample` → `302` with the absolute `Location`; `/unknown` → the no-listener 404; the Bayeux handshake answered as `text/json;charset=UTF-8`; a `mule.rpc` publication of `hello` delivered as `hello - processed` on `/services/wmqExample/dequeue` 15.1 s later, with nothing on the `replyTo` channel and the INFO line `Message Received in service: MessageProcessor. Content is: hello`. Started with an unreachable queue manager, the application served the page while both listener containers retried every 5 s; started without `wmq.host`, it failed to start.
+
+## Fallback evidence (AAP 0.8.4)
+
+Tier 2A is blocked, as [`DECISIONS.md`](../../DECISIONS.md) section 9 records: `Tier 2A blocked: Mule EE licence and EE Maven repository credentials unconfirmed`. This example's capture also needs a local IBM MQ queue manager with the queues `in` and `out`. Because of `validateConnections="true"`, even the page cannot be captured without one, and a scenario whose server cannot be provided locally stays uncaptured and counts as unverified. Parity therefore rests on the fallback:
+
+- `WebsphereMQTest` carries the three committed original assertions with their comparison semantics: with the MQ and Ajax sides mocked, `Input`, `MessageProcessor` and `Output` each return the payload `test`.
+- `WebsphereMqBrokerTest` adds the end-to-end round trip on an embedded broker, and the trigger, service and client tests cover each flow step and its failure paths.
+- This evidence is weaker than captured fixtures. It shows that the conversion meets the original's own assertions and the plan's reading of the flows and of the platform defaults. It does not show that its bytes, messages and timings equal what the original runtime produced.
+- Branches no original assertion covers, because the original test mocks every outbound endpoint, tested only by the new tests: the real send to and receive from `in` and `out` (`WebsphereMqBrokerTest`, on Artemis rather than IBM MQ), the 15000 ms wait and the ` - processed` text (`MqProcessingServiceTest`, `InQueueListenerTest`, `WebsphereMqBrokerTest`), the absent RPC reply (`WebsphereMqBrokerTest`, `AjaxChannelBrokerTest`), message caching on the dequeue channel (`AjaxChannelBrokerTest`), and the rollback on a processing failure (`InQueueListenerTest`, which shows the failure leaving the transacted listener; no test runs a redelivery on a broker).
+- Unverified scenarios, by name from `src/test/resources/fixtures/SCENARIOS.md`:
+  - `UNVERIFIED — nondeterministic output` once captured, escalated through `DECISIONS.md` as AAP 0.8.8 sets out: `ajax-enqueue-to-in-queue` and `mq-out-to-ajax-dequeue`, whose Bayeux exchange carries the server-generated `clientId`.
+  - Unverified until captured, then compared byte for byte: `get-services-wmqexample-page` and `mq-in-processed-to-out`. The MQ scenarios cannot be captured without a local IBM MQ queue manager.
+
+The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed (AAP 0.8.7).
+
+## Licence
+
+Apache License 2.0. `LICENSE` is copied unchanged from `websphere-mq/`. `NOTICE` is the original's notice followed by the credits for the Mule Ajax JavaScript under `src/main/resources/mule-resource/js/`: `mule.js` and `_mule.js` under the Common Public Attribution License 1.0 (CPAL 1.0), and the Dojo files under the Academic Free License 2.1 or the modified BSD licence.
