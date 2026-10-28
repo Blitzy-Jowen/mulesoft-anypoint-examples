@@ -181,9 +181,9 @@ No scenario of this project is `unreachable` or `nondeterministic`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 635 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 635 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 893 of 894 lines of `service/AdditionService` and its nested classes (the project has no `mapper` package). Total project LINE coverage: 99.1% (1102 of 1112 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 652 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 652 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 893 of 894 lines of `service/AdditionService` and its nested classes (the project has no `mapper` package). Total project LINE coverage: 99.2% (1124 of 1133 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=7`, `failed=0`.
 
 Tier 2A is blocked: the Mule EE licence and the EE Maven repository credentials are unconfirmed (root `DECISIONS.md`, section 9). Tier 2B is `N/A`, because the project calls no vendor system.

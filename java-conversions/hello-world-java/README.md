@@ -150,9 +150,9 @@ No scenario of this project is `unreachable` or `nondeterministic`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 267 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 267 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/HelloWorldService` (the project has no `mapper` package). Total project LINE coverage: 96.0% (190 of 198 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 442 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 442 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 2 of 2 lines of `service/HelloWorldService` (the project has no `mapper` package). Total project LINE coverage: 96.8% (212 of 219 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=3`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

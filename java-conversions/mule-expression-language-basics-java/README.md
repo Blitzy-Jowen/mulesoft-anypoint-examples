@@ -237,9 +237,9 @@ The twelve `nondeterministic` rows are the requests that write a file: each prod
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 548 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 548 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 266 of 291 lines of `service/GreetingService`, `service/FileOutboundWriter`, `mapper/GreetingCsvMapper` and `mapper/DwCsvWriter`. Total project LINE coverage: 93.7% (493 of 526 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 600 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 600 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 266 of 291 lines of `service/GreetingService`, `service/FileOutboundWriter`, `mapper/GreetingCsvMapper` and `mapper/DwCsvWriter`. Total project LINE coverage: 94.1% (495 of 526 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=22`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

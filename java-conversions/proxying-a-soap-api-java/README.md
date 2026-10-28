@@ -307,9 +307,9 @@ No scenario of this project is `unreachable`. `get-root-wsdl` is its one `nondet
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 284 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 284 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 54 of 54 lines (`service/SoapProxyService` 30, `mapper/ProxyHeaderMapper` 24). Total project LINE coverage: 89.9% (797 of 887 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 306 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 306 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 54 of 54 lines (`service/SoapProxyService` 30, `mapper/ProxyHeaderMapper` 24). Total project LINE coverage: 92.8% (823 of 887 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

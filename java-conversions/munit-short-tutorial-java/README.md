@@ -191,9 +191,9 @@ All five scenarios are `deterministic`; none is `unreachable` or `nondeterminist
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 147 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 147 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 16 of 16 lines of `service/ExampleFlowService` (the project has no `mapper` package). Total project LINE coverage: 96.4% (214 of 222 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 164 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 164 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 16 of 16 lines of `service/ExampleFlowService` (the project has no `mapper` package). Total project LINE coverage: 97.1% (236 of 243 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

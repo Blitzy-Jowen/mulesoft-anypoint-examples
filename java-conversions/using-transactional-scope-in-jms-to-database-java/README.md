@@ -184,8 +184,8 @@ No scenario of this project is `unreachable` or `nondeterministic`. The send to 
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 96 tests, 0 failures, 0 errors, 0 skipped, in the test classes above other than `FixtureParityTest`; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 96 tests, 0 failures, 0 errors, 0 skipped.
+- `mvn -B clean package`: `BUILD SUCCESS`; 97 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 97 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 115 of 119 lines, of which `service` 12 of 12 (`OrderTransactionService`, `TestComponent`) and `mapper` 103 of 107 (`OrderXmlMapper` with its `IntegerTextReader`). Total project LINE coverage: 96.6% (229 of 237 lines).
 - A run against an Artemis broker and MySQL, with the sample message sent through the Artemis CLI, logged the sequence of Setup step 6 and left `orders` empty.
 
