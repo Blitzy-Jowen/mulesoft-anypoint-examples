@@ -11,7 +11,7 @@
 smtp:
   host: localhost
   port: 3025              # GreenMail's conventional SMTP port; replaced by the dynamic port in every test
-  # GreenMail user the tests register with withUser("test@localhost", "secret"), as a plain address
+  # GreenMail user the tests register with this smtp.user and smtp.password, as a plain address
   # (the original's %40-encoded smtp.user_enc was a Mule endpoint-URI artefact).
   user: test@localhost
   password: secret
@@ -23,5 +23,8 @@ mail:
 spring:
   mail:
     properties:
-      # GreenMail SMTP is plain text; mail.smtp.auth stays true, so authentication runs against the GreenMail user.
+      # GreenMail SMTP is plain text and offers no STARTTLS, so the STARTTLS that application.yml requires is turned
+      # off here, in test configuration only; mail.smtp.auth stays true, so authentication runs against the GreenMail
+      # user.
       "[mail.smtp.starttls.enable]": false
+      "[mail.smtp.starttls.required]": false

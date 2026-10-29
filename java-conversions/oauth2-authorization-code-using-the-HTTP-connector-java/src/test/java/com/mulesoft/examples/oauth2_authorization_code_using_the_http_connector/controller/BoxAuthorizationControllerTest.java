@@ -138,9 +138,7 @@ class BoxAuthorizationControllerTest {
         r.add("box.api-base-url", () -> box.baseUrl() + "/2.0");
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // /authorization
-    // ---------------------------------------------------------------------------------------------------------
 
     @Test
     void authorizationWithOnCompleteRedirectToRedirectsToBoxWithState() {
@@ -187,9 +185,7 @@ class BoxAuthorizationControllerTest {
         assertRedirect(response, expectedAuthorizeLocation(false));
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // /redirectUrl with an onCompleteRedirectTo state: 302 to it with the authorizationStatus marker
-    // ---------------------------------------------------------------------------------------------------------
 
     @Test
     @DirtiesContext(methodMode = DirtiesContext.MethodMode.AFTER_METHOD)
@@ -281,9 +277,7 @@ class BoxAuthorizationControllerTest {
         assertNoTokensStored();
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // /redirectUrl without a state: the platform texts, with no Content-Type
-    // ---------------------------------------------------------------------------------------------------------
 
     @Test
     @DirtiesContext(methodMode = DirtiesContext.MethodMode.AFTER_METHOD)
@@ -334,9 +328,7 @@ class BoxAuthorizationControllerTest {
         assertNoTokensStored();
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // SC-10 listeners
-    // ---------------------------------------------------------------------------------------------------------
 
     @Test
     void httpsListenerRequiresClientCertificate() {
@@ -372,9 +364,7 @@ class BoxAuthorizationControllerTest {
         assertNoTokensStored();
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Helpers
-    // ---------------------------------------------------------------------------------------------------------
 
     /** ST-1 client for the HTTPS listener, trusting only the carried trust store and presenting its client key. */
     private HttpTestClient tls() {

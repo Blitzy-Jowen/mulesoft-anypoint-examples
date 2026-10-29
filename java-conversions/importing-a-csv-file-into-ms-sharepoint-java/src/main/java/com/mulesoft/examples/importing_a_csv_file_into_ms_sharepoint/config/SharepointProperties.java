@@ -44,9 +44,9 @@ import org.springframework.stereotype.Component;
  * {@code client/SharepointRestClient} calls it before its first SharePoint request: when any of the four keys above
  * is blank, or {@code Sharepoint.SiteUrl} is set but, with its trailing {@code /} removed, is not an absolute
  * {@code http} or {@code https} URL with a host and without user info, query or fragment, it throws one
- * {@link IllegalStateException} naming every blank key and the invalid site URL key with its environment variable,
- * and no request is sent. Plain {@code http} is accepted for any host, so tests can address a local stub. The
- * message never carries a configured value.
+ * {@link InvalidConfigurationException}, an {@link IllegalStateException}, naming every blank key and the invalid
+ * site URL key with its environment variable, and no request is sent. Plain {@code http} is accepted for any host, so
+ * tests can address a local stub. The message never carries a configured value.
  *
  * <p>Consumers:
  * <ul>
@@ -102,12 +102,13 @@ public final class SharepointProperties {
      * Checks the settings before SharePoint is called. {@code client/SharepointRestClient} runs it first in each
      * operation, so blank placeholders or an unusable site URL fail there, naming their keys, before any request.
      *
-     * @throws IllegalStateException when {@code Sharepoint.Username}, {@code Sharepoint.Password},
-     *                               {@code Sharepoint.SiteUrl} or {@code csvImportFolder} is {@code null} or blank,
-     *                               or when {@code Sharepoint.SiteUrl} is set but, with its trailing {@code /}
-     *                               removed, is not an absolute {@code http} or {@code https} URL with a host and
-     *                               without user info, query or fragment; one exception names every such key with
-     *                               its environment variable and none of the configured values
+     * @throws InvalidConfigurationException when {@code Sharepoint.Username}, {@code Sharepoint.Password},
+     *                                       {@code Sharepoint.SiteUrl} or {@code csvImportFolder} is {@code null} or
+     *                                       blank, or when {@code Sharepoint.SiteUrl} is set but, with its trailing
+     *                                       {@code /} removed, is not an absolute {@code http} or {@code https} URL
+     *                                       with a host and without user info, query or fragment; one exception names
+     *                                       every such key with its environment variable and none of the configured
+     *                                       values
      */
     public void requireValid() {
         List<String> missing = new ArrayList<>();
@@ -133,8 +134,23 @@ public final class SharepointProperties {
                 problems.add("Invalid SharePoint configuration: " + SITE_URL_KEY + " must be an absolute http or https"
                         + " URL with a host and without user info, query or fragment.");
             }
-            throw new IllegalStateException(String.join(" ", problems)
+            throw new InvalidConfigurationException(String.join(" ", problems)
                     + " # TODO: supply them in application.yml or as environment variables.");
+        }
+    }
+
+    /**
+     * The failure of {@link #requireValid()}. Its message is built only from the constant key and environment
+     * variable names above, never from a configured value, so it is the one exception message
+     * {@code service/SharepointImportService} writes to its ERROR line. It stays an {@link IllegalStateException}, the
+     * type callers of {@link #requireValid()} expect.
+     */
+    public static final class InvalidConfigurationException extends IllegalStateException {
+
+        private static final long serialVersionUID = 1L;
+
+        private InvalidConfigurationException(String message) {
+            super(message);
         }
     }
 

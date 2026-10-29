@@ -389,7 +389,7 @@ class NetsuiteRestClientTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------- SuiteQL
+    // SuiteQL
 
     @Test
     void suiteQlPagesUntilHasMoreIsFalseAndStripsLinks() {
@@ -690,7 +690,7 @@ class NetsuiteRestClientTest {
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
-    // ------------------------------------------------------------------------------------------- Record API
+    // Record API
 
     @Test
     void getRecordExpandsSubResourcesAndReturnsTheRecordUnchanged() {
@@ -831,7 +831,7 @@ class NetsuiteRestClientTest {
         netsuite.verify(1, deleteRequestedFor(urlEqualTo(CUSTOMER_RECORDS + "/4711")));
     }
 
-    // ------------------------------------------------------------------------------------- Metadata catalog
+    // Metadata catalog
 
     @Test
     void metadataCatalogAsksForJsonSchemaAndIsCached() {
@@ -944,7 +944,7 @@ class NetsuiteRestClientTest {
     }
 
 
-    // -------------------------------------------------------------------------- Custom-field source lookup
+    // Custom-field source lookup
 
     @Test
     void customFieldSourceIdsSendsOneUpperCasedEscapedQueryAndRendersTheRawSources() {
@@ -1157,7 +1157,7 @@ class NetsuiteRestClientTest {
         return "{\"q\": \"" + CUSTOM_FIELD_QUERY_PREFIX + "(" + inList + ")\"}";
     }
 
-    // ------------------------------------------------------------------------------------ Failure handling
+    // Failure handling
 
     @Test
     void unauthorizedEvictsTheTokenAndRetriesOnceWithAFreshOne() {
@@ -1535,7 +1535,7 @@ class NetsuiteRestClientTest {
         }
     }
 
-    // -------------------------------------------------------------------------------------- Configuration
+    // Configuration
 
     @Test
     void missingAccountFailsTheFirstCallNamingTheKeyBeforeAnyRequest() {

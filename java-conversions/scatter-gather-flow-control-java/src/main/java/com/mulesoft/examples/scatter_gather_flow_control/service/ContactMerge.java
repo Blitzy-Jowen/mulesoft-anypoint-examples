@@ -32,14 +32,12 @@ public class ContactMerge {
 	public List<Map<String, String>> mergeList(List<Map<String, String>> contactsFromA, List<Map<String, String>> contactsFromB) {
 		List<Map<String, String>> mergedContactList = new ArrayList<Map<String, String>>();
 
-		// Put all contacts from A in the merged mergedContactsList
 		for (Map<String, String> contactFromA : contactsFromA) {
 			Map<String, String> mergedContact = createMergedContact(contactFromA);
 			mergedContact.put("IDInA", contactFromA.get("Id"));
 			mergedContactList.add(mergedContact);
 		}
 
-		// Add the new contacts from B and update the exiting ones
 		for (Map<String, String> contact : contactsFromB) {
 			Map<String, String> contactFromA = findContactInList(contact.get("Email"), mergedContactList);
 			if (contactFromA != null) {

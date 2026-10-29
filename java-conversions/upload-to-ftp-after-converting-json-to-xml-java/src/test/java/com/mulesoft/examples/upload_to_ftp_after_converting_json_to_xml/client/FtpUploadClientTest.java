@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
@@ -28,21 +29,32 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
+import java.net.NoRouteToHostException;
 import java.net.Socket;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
+import org.apache.commons.net.MalformedServerReplyException;
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
+import org.apache.commons.net.ftp.FTPConnectionClosedException;
+import org.apache.commons.net.io.CopyStreamException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.mockftpserver.core.command.CommandNames;
+import org.mockftpserver.core.command.StaticReplyCommandHandler;
 import org.mockftpserver.fake.FakeFtpServer;
 import org.mockftpserver.fake.UserAccount;
 import org.mockftpserver.fake.filesystem.DirectoryEntry;
@@ -62,6 +74,11 @@ import com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.config.F
  * Mockito spy on the commons-net {@link FTPClient} the client creates, on the protocol calls: one connection, no
  * retry, binary type, passive mode, the 10 s timeouts and a closed connection on every outcome. The original test
  * made no FTP-side assertion, so this coverage is new; no Spring context is started.
+ *
+ * <p>Failure messages reach the anonymous 500 body, so they are asserted exactly: the failed operation with the
+ * server's reply code or a category of the I/O failure, while a marker in the server's reply text or the I/O
+ * exception's own message, and the configured host, port, directory, file name and login, stay out of the message
+ * and the exception's string form.
  */
 class FtpUploadClientTest {
 
@@ -73,6 +90,13 @@ class FtpUploadClientTest {
     private static final String MISSING_PATH = "/Missing/";
     private static final String UPLOADED_FILE = "/Upload/muleExample.xml";
     private static final int TIMEOUT_MILLIS = 10_000;
+
+    /** Login of a second account whose names no message may quote; {@code demo} is too common to prove absence. */
+    private static final String MARKER_USER = "marker-svc-user";
+    private static final String MARKER_PASSWORD = "MARKER-PW-7f3a9c";
+
+    /** Text a hostile server or a failing socket puts into its reply or exception message. */
+    private static final String MARKER_TEXT = "MARKER-REPLY-SECRET";
 
     /**
      * DataWeave-style XML with LF line ends, tab indentation and multi-byte UTF-8 characters, written with unicode
@@ -179,10 +203,13 @@ class FtpUploadClientTest {
         try (Socket reserved = reserveRefusingPort()) {
             int refusedPort = reserved.getLocalPort();
             FTPClient ftp = spy(new FTPClient());
+            FtpProperties properties = props(refusedPort, UPLOAD_PATH, PASSWORD);
 
-            Throwable thrown = catchUploadFailure(clientWith(props(refusedPort, UPLOAD_PATH, PASSWORD), ftp));
+            Throwable thrown = catchUploadFailure(clientWith(properties, ftp));
 
-            assertThat(thrown).isInstanceOf(UncheckedIOException.class);
+            assertThat(thrown).isInstanceOf(UncheckedIOException.class)
+                    .hasMessage("FTP connect failed: connection refused or timed out");
+            assertNoUploadDetail(thrown, properties);
             assertThat(Stream.iterate(thrown, Objects::nonNull, Throwable::getCause))
                     .anyMatch(ConnectException.class::isInstance);
             // connect(String, int) delegates to this overload, which every String-host connect reaches exactly once.
@@ -247,6 +274,122 @@ class FtpUploadClientTest {
         assertThat(content).containsExactly(utf8(XML));
     }
 
+    /**
+     * The server answers one step of the session with {@code replyCode} and a reply text that quotes the marker, the
+     * password, the target, the directory and the file name. A negative reply is reported by its code alone; a 421,
+     * on which commons-net closes the session with an exception, as the connection the server closed. The error log
+     * names the failure by its class and throw-site frame only, so that frame must lie in {@code upload} itself,
+     * where each step throws from its own line, and never in a helper shared by every step.
+     */
+    @ParameterizedTest(name = "[{index}] {0} {1}")
+    @MethodSource("serverReplyFailures")
+    void serverReplyFailureNamesOnlyTheOperationAndOutcome(String command, int replyCode,
+            Class<? extends RuntimeException> type, Class<? extends IOException> cause, String message)
+            throws Exception {
+        FtpProperties properties = markerProps();
+        server.setCommandHandler(command, new StaticReplyCommandHandler(replyCode, markerReply(properties)));
+
+        Throwable thrown = catchUploadFailure(new FtpUploadClient(properties));
+
+        assertThat(thrown).isInstanceOf(type).hasMessage(message);
+        if (cause == null) {
+            assertThat(thrown).hasNoCause();
+        } else {
+            assertThat(thrown).hasCauseInstanceOf(cause);
+        }
+        assertThat(thrown.getStackTrace()).isNotEmpty();
+        assertThat(thrown.getStackTrace()[0])
+                .returns(FtpUploadClient.class.getName(), StackTraceElement::getClassName)
+                .returns("upload", StackTraceElement::getMethodName);
+        assertNoUploadDetail(thrown, properties);
+        assertThat(fileSystem.exists(UPLOADED_FILE)).isFalse();
+    }
+
+    static Stream<Arguments> serverReplyFailures() {
+        return Stream.of(
+                Arguments.of(CommandNames.CONNECT, 554, IllegalStateException.class, null,
+                        "FTP connect failed: server replied 554"),
+                Arguments.of(CommandNames.CONNECT, 421, UncheckedIOException.class,
+                        FTPConnectionClosedException.class, "FTP connect failed: connection closed by the server"),
+                Arguments.of(CommandNames.PASS, 530, IllegalStateException.class, null,
+                        "FTP login failed: server replied 530"),
+                Arguments.of(CommandNames.TYPE, 504, IllegalStateException.class, null,
+                        "FTP set binary file type failed: server replied 504"),
+                Arguments.of(CommandNames.CWD, 550, IllegalStateException.class, null,
+                        "FTP change working directory failed: server replied 550"),
+                Arguments.of(CommandNames.CWD, 421, UncheckedIOException.class,
+                        FTPConnectionClosedException.class,
+                        "FTP change working directory failed: connection closed by the server"),
+                Arguments.of(CommandNames.STOR, 553, IllegalStateException.class, null,
+                        "FTP store failed: server replied 553"));
+    }
+
+    /**
+     * Each I/O failure, its own message quoting the marker and the target, is reported by the category of its type,
+     * or of the first cause with one, and kept as the cause.
+     */
+    @ParameterizedTest(name = "[{index}] {1}")
+    @MethodSource("connectFailures")
+    void connectIoFailureNamesOnlyTheCategoryOfItsType(IOException failure, String category) throws Exception {
+        FtpProperties properties = markerProps();
+        FTPClient ftp = spy(new FTPClient());
+        doThrow(failure).when(ftp).connect(HOST, port);
+
+        Throwable thrown = catchUploadFailure(clientWith(properties, ftp));
+
+        assertThat(thrown).isInstanceOf(UncheckedIOException.class)
+                .hasMessage("FTP connect failed: " + category);
+        assertThat(thrown.getCause()).isSameAs(failure);
+        assertNoUploadDetail(thrown, properties);
+        verify(ftp, never()).login(anyString(), anyString());
+    }
+
+    static Stream<Arguments> connectFailures() {
+        String text = MARKER_TEXT + " " + HOST + UPLOAD_PATH + " " + MARKER_PASSWORD;
+        return Stream.of(
+                Arguments.of(new FTPConnectionClosedException(text), "connection closed by the server"),
+                Arguments.of(new MalformedServerReplyException(text), "malformed server reply"),
+                Arguments.of(new SocketTimeoutException(text), "timed out"),
+                Arguments.of(new UnknownHostException(text), "unknown host"),
+                Arguments.of(new ConnectException(text), "connection refused or timed out"),
+                Arguments.of(new NoRouteToHostException(text), "host unreachable"),
+                Arguments.of(new SocketException(text), "connection error"),
+                Arguments.of(new IOException(text), "I/O error"),
+                Arguments.of(new IOException(text, new SocketTimeoutException(text)), "timed out"),
+                Arguments.of(circularFailure(text), "I/O error"));
+    }
+
+    /** Two plain I/O failures, each the other's cause, so a walk of the cause chain never reaches its end. */
+    private static IOException circularFailure(String text) {
+        IOException outer = new IOException(text);
+        outer.initCause(new IOException(text, outer));
+        return outer;
+    }
+
+    /**
+     * A data transfer that fails inside {@code storeFile}, which commons-net reports as a {@link CopyStreamException}
+     * around the socket's failure, is reported as the store operation with the category of that inner failure, and
+     * the session is still logged out and closed.
+     */
+    @Test
+    void storeTransferFailureNamesTheStoreOperation() throws Exception {
+        FtpProperties properties = markerProps();
+        FTPClient ftp = spy(new FTPClient());
+        String text = MARKER_TEXT + " " + UPLOAD_PATH + FtpUploadClient.OUTPUT_PATTERN;
+        CopyStreamException failure = new CopyStreamException(text, 0, new SocketTimeoutException(text));
+        doThrow(failure).when(ftp).storeFile(eq(FtpUploadClient.OUTPUT_PATTERN), any(InputStream.class));
+
+        Throwable thrown = catchUploadFailure(clientWith(properties, ftp));
+
+        assertThat(thrown).isInstanceOf(UncheckedIOException.class).hasMessage("FTP store failed: timed out");
+        assertThat(thrown.getCause()).isSameAs(failure);
+        assertNoUploadDetail(thrown, properties);
+        verify(ftp, times(1)).storeFile(eq(FtpUploadClient.OUTPUT_PATTERN), any(InputStream.class));
+        verify(ftp, times(1)).logout();
+        verify(ftp, atLeastOnce()).disconnect();
+        assertThat(ftp.isConnected()).isFalse();
+    }
+
     @ParameterizedTest(name = "[{index}] {0}")
     @MethodSource("unconfiguredSettings")
     void unconfiguredSettingFailsBeforeConnecting(String key, Consumer<FtpProperties> unset) throws Exception {
@@ -256,13 +399,17 @@ class FtpUploadClientTest {
 
         assertThatThrownBy(() -> clientWith(properties, ftp).upload(FtpUploadClient.OUTPUT_PATTERN, utf8(XML)))
                 .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining(key);
+                .hasMessageContaining(key)
+                .satisfies(thrown -> assertNoUploadDetail(thrown, properties));
 
         verifyNoInteractions(ftp);
         assertThat(fileSystem.exists(UPLOADED_FILE)).isFalse();
     }
 
-    /** Host and user must not be blank; only an absent or empty password counts as missing. */
+    /**
+     * Host and user must not be blank; only an absent or empty password counts as missing; the port must be one the
+     * JDK accepts, whose own rejection would quote it.
+     */
     static Stream<Arguments> unconfiguredSettings() {
         return Stream.of(
                 Arguments.of("ftp.host", (Consumer<FtpProperties>) p -> p.setHost(null)),
@@ -270,7 +417,9 @@ class FtpUploadClientTest {
                 Arguments.of("ftp.user", (Consumer<FtpProperties>) p -> p.setUser(null)),
                 Arguments.of("ftp.user", (Consumer<FtpProperties>) p -> p.setUser("")),
                 Arguments.of("ftp.password", (Consumer<FtpProperties>) p -> p.setPassword(null)),
-                Arguments.of("ftp.password", (Consumer<FtpProperties>) p -> p.setPassword("")));
+                Arguments.of("ftp.password", (Consumer<FtpProperties>) p -> p.setPassword("")),
+                Arguments.of("ftp.port", (Consumer<FtpProperties>) p -> p.setPort(-1)),
+                Arguments.of("ftp.port", (Consumer<FtpProperties>) p -> p.setPort(65_536)));
     }
 
     /** Settings of the fake server on {@code localhost} with the original demo user and the given values. */
@@ -282,6 +431,21 @@ class FtpUploadClientTest {
         properties.setUser(USER);
         properties.setPassword(password);
         return properties;
+    }
+
+    /** Settings of the fake server with the marker login, which this method adds to the server. */
+    private FtpProperties markerProps() {
+        server.addUserAccount(new UserAccount(MARKER_USER, MARKER_PASSWORD, "/"));
+        FtpProperties properties = props(port, UPLOAD_PATH, MARKER_PASSWORD);
+        properties.setUser(MARKER_USER);
+        return properties;
+    }
+
+    /** A one-line reply text quoting the marker and every detail of {@code properties} that a message must omit. */
+    private static String markerReply(FtpProperties properties) {
+        return MARKER_TEXT + " pw=" + properties.getPassword() + " user=" + properties.getUser() + " at "
+                + properties.getHost() + ":" + properties.getPort() + " in " + properties.getPath()
+                + FtpUploadClient.OUTPUT_PATTERN;
     }
 
     /** A client whose single upload runs on {@code ftp}, so the test can observe the protocol calls. */
@@ -321,6 +485,22 @@ class FtpUploadClientTest {
             assertThat(String.valueOf(c.getMessage())).doesNotContain(secret);
             assertThat(c.toString()).doesNotContain(secret);
         }
+    }
+
+    /**
+     * The failure's message and string form, the text the 500 body and the error log can carry, quote neither the
+     * marker nor any configured detail: host, port, directory, file name, user or password. Its causes keep their
+     * own text for diagnosis and are not checked.
+     */
+    private static void assertNoUploadDetail(Throwable thrown, FtpProperties properties) {
+        List<String> details = new ArrayList<>(List.of(MARKER_TEXT, FtpUploadClient.OUTPUT_PATTERN,
+                String.valueOf(properties.getPort())));
+        Stream.of(properties.getHost(), properties.getPath(), properties.getUser(), properties.getPassword())
+                .filter(value -> value != null && !value.isBlank())
+                .forEach(details::add);
+        String[] forbidden = details.toArray(new String[0]);
+        assertThat(String.valueOf(thrown.getMessage())).doesNotContain(forbidden);
+        assertThat(thrown.toString()).doesNotContain(forbidden);
     }
 
     /**

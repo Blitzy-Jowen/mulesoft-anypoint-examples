@@ -23,7 +23,6 @@ public class Address {
 	public String postalCode;
 
 	public Address(){
-		//no argument default constructor
 	}
 	
 	public Address(String name, String line1, String line2, String city, String stateOrProvinceCode, String countryCode, String postalCode){

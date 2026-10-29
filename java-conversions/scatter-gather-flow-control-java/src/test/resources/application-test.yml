@@ -1,6 +1,6 @@
 # Spring profile "test", activated with @ActiveProfiles("test"); tests only.
 # Points the original smtp.* and mail.* placeholders of scatter-gather.xml:64 at the in-process GreenMail SMTP
-# server the tests start (user scatter@localhost / secret) instead of Gmail.
+# server the tests start (its user is the smtp.user and smtp.password below) instead of Gmail.
 # These are GreenMail test values, not credentials. Real values come from the environment variables behind the
 # placeholders of src/main/resources/application.yml (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, MAIL_FROM,
 # MAIL_TO, MAIL_SUBJECT). mail.subject is not set here, so tests receive its default, the flow's subject literal.
@@ -22,7 +22,10 @@ mail:
 spring:
   mail:
     properties:
-      # GreenMail's plain SMTP listener offers no STARTTLS; only these entries are replaced, so the inherited
-      # authentication flags and 10000 ms timeouts of the main configuration still apply.
+      # GreenMail's plain SMTP listener offers no STARTTLS, so the STARTTLS the main configuration requires is turned
+      # off here, in test configuration only; only these entries are replaced, so the inherited authentication flags
+      # and 10000 ms timeouts of the main configuration still apply.
       "[mail.smtp.starttls.enable]": false
+      "[mail.smtp.starttls.required]": false
       "[mail.smtps.starttls.enable]": false
+      "[mail.smtps.starttls.required]": false

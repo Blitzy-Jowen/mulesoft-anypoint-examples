@@ -64,7 +64,7 @@ class SendingACsvFileThroughEmailUsingSmtpTest {
 
     private static final String SUBJECT = "Mule flow completed!";
 
-    /** The original test's 12000 ms sleep, now an upper bound. */
+    /** Longest wait for GreenMail to receive the mail sent for the polled {@code input.csv}. */
     private static final Duration MAIL_WAIT_LIMIT = Duration.ofSeconds(12);
 
     private static final Duration DISPOSAL_WAIT_LIMIT = Duration.ofSeconds(5);

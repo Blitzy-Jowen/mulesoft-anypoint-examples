@@ -61,10 +61,9 @@ import com.mulesoft.examples.mule_component_bindings.support.PortInUseRetryingCo
 import twitter4j.QueryResult;
 
 /**
- * Ported from {@code MuleComponentBindingsIT} of the original example {@code mule-component-bindings}: a GET of
- * {@code /api/stockStats?stock=AAPL&date=2012-10-26} on the stock-statistics listener (the original's
- * {@code localhost:8180}, SC-10's additional listener here) must answer a payload that contains the committed
- * {@code reply.json}, a JSON prefix ending at {@code "tweetsLoaded"}.
+ * A GET of {@code /api/stockStats?stock=AAPL&date=2012-10-26} on the stock-statistics listener (SC-10's additional
+ * listener, {@code localhost:8180} by default) answers a payload that contains the committed {@code reply.json}, a
+ * JSON prefix ending at {@code "tweetsLoaded"}.
  *
  * <p>The original ran the Mule application with {@code mule.test.properties} credentials, replaced the
  * collaborators of bean {@code stackStatsResource} with Mockito mocks and waited five seconds after the call. Here

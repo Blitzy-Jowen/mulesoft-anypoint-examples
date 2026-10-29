@@ -47,7 +47,7 @@ public class ContactMergeAggregationStrategy {
 			throw new IllegalStateException("Data from at least one source was not able to be obtained correctly.");
 		}
 		
-		// events are ordered so the event index corresponds to the index of each route
+		// both routes succeeded and the filter keeps route order, so index 0 is route A and index 1 is route B
 		List<Map<String, String>> listA = getContactsList(resultsWithoutException, 0);
 		List<Map<String, String>> listB = getContactsList(resultsWithoutException, 1);
 

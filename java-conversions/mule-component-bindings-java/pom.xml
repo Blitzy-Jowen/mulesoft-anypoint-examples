@@ -64,7 +64,7 @@
             <groupId>org.apache.httpcomponents.client5</groupId>
             <artifactId>httpclient5</artifactId>
         </dependency>
-        <!-- Replaces the Mule Twitter connector and its twitter4j 3.0.3; this artefact has no runtime dependencies. -->
+        <!-- Twitter v1.1 search library of client/TwitterSearchClient; this artefact has no runtime dependencies. -->
         <dependency>
             <groupId>org.twitter4j</groupId>
             <artifactId>twitter4j-core</artifactId>

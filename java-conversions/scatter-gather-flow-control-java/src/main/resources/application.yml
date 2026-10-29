@@ -28,10 +28,13 @@ spring:
     password: ${smtp.password}
     default-encoding: UTF-8
     properties:
-      # smtp:gmail-connector (scatter-gather.xml:3): STARTTLS and authentication for smtp and smtps
+      # smtp:gmail-connector (scatter-gather.xml:3): STARTTLS and authentication for smtp and smtps. STARTTLS is
+      # required, so a server that does not offer it fails the send before AUTH or any mail data.
       "[mail.smtp.starttls.enable]": true
+      "[mail.smtp.starttls.required]": true
       "[mail.smtp.auth]": true
       "[mail.smtps.starttls.enable]": true
+      "[mail.smtps.starttls.required]": true
       "[mail.smtps.auth]": true
       # smtp:outbound-endpoint responseTimeout="10000" (scatter-gather.xml:64)
       "[mail.smtp.connectiontimeout]": 10000

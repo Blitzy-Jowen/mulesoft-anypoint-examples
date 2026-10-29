@@ -11,11 +11,18 @@ package com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.client;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.Objects;
 
+import org.apache.commons.net.MalformedServerReplyException;
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
+import org.apache.commons.net.ftp.FTPConnectionClosedException;
 import org.apache.commons.net.ftp.FTPReply;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,8 +45,16 @@ import com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.config.F
  * <p>Each call opens a new connection and closes it before returning; no client is pooled or shared, and
  * nothing is retried. Host, port, directory and credentials are read from the {@code ftp.*} keys bound by
  * {@link FtpProperties} at call time, so the application starts with them unset; this class holds no literal
- * host or credential. Failures propagate to the caller with messages that never contain the password, since
- * the platform-default error handler exposes them in the response body.
+ * host or credential.
+ *
+ * <p>Failures propagate to the caller with fixed messages, because the platform-default error handler writes
+ * the message into the anonymous 500 body. A message names only the operation that failed ({@code connect},
+ * {@code login}, {@code set binary file type}, {@code change working directory} or {@code store}) and
+ * either the server's numeric reply code, as in {@code FTP login failed: server replied 530}, or a category
+ * chosen by the type of the I/O failure, as in {@code FTP connect failed: timed out}. No message carries the
+ * host, the port, the directory, the file name, the credentials, the server's reply text or an I/O
+ * exception's own message; the I/O exception is kept as the cause, of which the error handler logs only the
+ * class name.
  */
 @Component
 public class FtpUploadClient {
@@ -66,6 +81,18 @@ public class FtpUploadClient {
 
     private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
 
+    /** Highest TCP port; the JDK rejects a larger one with a message that quotes it. */
+    private static final int MAX_PORT = 0xFFFF;
+
+    /** Number of causes after the I/O failure itself that {@link #category} inspects. */
+    private static final int CAUSE_LIMIT = 10;
+
+    private static final String CONNECT = "connect";
+    private static final String LOGIN = "login";
+    private static final String SET_FILE_TYPE = "set binary file type";
+    private static final String CHANGE_DIRECTORY = "change working directory";
+    private static final String STORE = "store";
+
     private final FtpProperties properties;
 
     public FtpUploadClient(FtpProperties properties) {
@@ -77,11 +104,17 @@ public class FtpUploadClient {
      *
      * @param fileName name of the remote file, normally {@link #OUTPUT_PATTERN}
      * @param content  bytes to store, transferred unchanged in binary mode
-     * @throws IllegalStateException if the host, user or password is not configured or the server rejects
-     *                               the greeting, the login, the file type, the directory change or the
-     *                               store
-     * @throws UncheckedIOException  if the connection or transfer fails (refused, unknown host, timeout,
-     *                               reset)
+     * @throws IllegalStateException if the host, user or password is not configured or the port lies outside
+     *                               0-65535, each named by its key alone, or the server rejects the
+     *                               greeting, the login, the file type, the directory change or the store,
+     *                               reported as {@code FTP <operation> failed: server replied <code>}
+     * @throws UncheckedIOException  if the connection or transfer fails, reported as
+     *                               {@code FTP <operation> failed: <category>}, where the category is
+     *                               {@code connection closed by the server}, {@code malformed server reply},
+     *                               {@code timed out}, {@code unknown host},
+     *                               {@code connection refused or timed out}, {@code host unreachable},
+     *                               {@code connection error} or {@code I/O error}; the cause is the
+     *                               {@link IOException}
      */
     public void upload(String fileName, byte[] content) {
         Objects.requireNonNull(fileName, "fileName");
@@ -104,41 +137,47 @@ public class FtpUploadClient {
         if (password == null || password.isEmpty()) {
             throw new IllegalStateException("FTP password is not configured (ftp.password)");
         }
+        if (port < 0 || port > MAX_PORT) {
+            throw new IllegalStateException("FTP port is not valid (ftp.port)");
+        }
+        // Written only to the DEBUG cleanup log below, never into an exception message.
         String target = host + ":" + port;
 
         FTPClient ftp = createClient();
         boolean loggedIn = false;
+        String operation = CONNECT;
         try {
             ftp.setConnectTimeout(TIMEOUT_MILLIS);
             ftp.setDefaultTimeout(TIMEOUT_MILLIS);
             ftp.connect(host, port);
             if (!FTPReply.isPositiveCompletion(ftp.getReplyCode())) {
-                throw new IllegalStateException("FTP connect to " + target + " failed: " + reply(ftp));
+                throw new IllegalStateException(rejection(CONNECT, ftp));
             }
             ftp.setSoTimeout(TIMEOUT_MILLIS);
             ftp.setDataTimeout(Duration.ofMillis(TIMEOUT_MILLIS));
 
+            operation = LOGIN;
             if (!ftp.login(user, password)) {
-                throw new IllegalStateException("FTP login to " + target + " failed: " + reply(ftp));
+                throw new IllegalStateException(rejection(LOGIN, ftp));
             }
             loggedIn = true;
 
+            operation = SET_FILE_TYPE;
             if (!ftp.setFileType(FTP.BINARY_FILE_TYPE)) {
-                throw new IllegalStateException(
-                        "FTP set binary file type on " + target + " failed: " + reply(ftp));
+                throw new IllegalStateException(rejection(SET_FILE_TYPE, ftp));
             }
             ftp.enterLocalPassiveMode();
 
+            operation = CHANGE_DIRECTORY;
             if (!ftp.changeWorkingDirectory(path)) {
-                throw new IllegalStateException("FTP change working directory to " + path + " on " + target
-                        + " failed: " + reply(ftp));
+                throw new IllegalStateException(rejection(CHANGE_DIRECTORY, ftp));
             }
+            operation = STORE;
             if (!ftp.storeFile(fileName, new ByteArrayInputStream(content))) {
-                throw new IllegalStateException("FTP store " + fileName + " in " + path + " on " + target
-                        + " failed: " + reply(ftp));
+                throw new IllegalStateException(rejection(STORE, ftp));
             }
         } catch (IOException e) {
-            throw new UncheckedIOException("FTP upload to " + target + " failed: " + e.getMessage(), e);
+            throw new UncheckedIOException(failed(operation, category(e)), e);
         } finally {
             // Cleanup failures are logged only: they must neither mask the upload's own exception nor turn
             // a completed store into a failure. Only the escaped target and the exception type are logged,
@@ -167,9 +206,54 @@ public class FtpUploadClient {
         return new FTPClient();
     }
 
-    private static String reply(FTPClient ftp) {
-        String replyString = ftp.getReplyString();
-        return replyString == null ? "" : replyString.trim();
+    /**
+     * The message for the failure of {@code operation} after the server answered it with a negative reply,
+     * reported by its numeric reply code alone: the reply text is the server's own and may quote anything, a
+     * credential included. The caller constructs the exception at its own throw statement, so the throw-site
+     * frame the error handler logs is the line of {@link #upload} that names the rejected step.
+     */
+    private static String rejection(String operation, FTPClient ftp) {
+        return failed(operation, "server replied " + ftp.getReplyCode());
+    }
+
+    private static String failed(String operation, String reason) {
+        return "FTP " + operation + " failed: " + reason;
+    }
+
+    /**
+     * Names the kind of {@code failure} from the types of the failure and its first {@link #CAUSE_LIMIT}
+     * causes, the first one with a category deciding, so that a transfer failure commons-net wraps, such as
+     * a data-connection timeout, keeps its category; the limit ends a circular chain. No exception text is
+     * read.
+     */
+    private static String category(IOException failure) {
+        Throwable current = failure;
+        for (int depth = 0; current != null && depth <= CAUSE_LIMIT; depth++) {
+            if (current instanceof FTPConnectionClosedException) {
+                return "connection closed by the server";
+            }
+            if (current instanceof MalformedServerReplyException) {
+                return "malformed server reply";
+            }
+            if (current instanceof SocketTimeoutException) {
+                return "timed out";
+            }
+            if (current instanceof UnknownHostException) {
+                return "unknown host";
+            }
+            if (current instanceof ConnectException) {
+                // The JDK raises it when the peer refuses the connection or TCP gives up waiting for it.
+                return "connection refused or timed out";
+            }
+            if (current instanceof NoRouteToHostException) {
+                return "host unreachable";
+            }
+            if (current instanceof SocketException) {
+                return "connection error";
+            }
+            current = current.getCause();
+        }
+        return "I/O error";
     }
 
     /**

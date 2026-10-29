@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.UnknownHostException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -33,11 +34,13 @@ import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuil
 import org.apache.hc.client5.http.impl.routing.SystemDefaultRoutePlanner;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.protocol.RedirectLocations;
+import org.apache.hc.client5.http.utils.URIUtils;
 import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpRequest;
 import org.apache.hc.core5.http.HttpResponse;
 import org.apache.hc.core5.http.Method;
 import org.apache.hc.core5.http.ProtocolException;
+import org.apache.hc.core5.http.URIScheme;
 import org.apache.hc.core5.http.io.EofSensorInputStream;
 import org.apache.hc.core5.http.protocol.HttpContext;
 import org.apache.hc.core5.io.CloseMode;
@@ -75,9 +78,10 @@ import com.mulesoft.examples.mule_component_bindings.service.StockService;
  * with a timeout, a refused, reset or early-closed connection or an error status. RestClient sends through Apache
  * httpclient5 with its automatic retries switched off, because the JDK {@link java.net.HttpURLConnection} under
  * Spring's default request factory re-sends a bodiless request, as this GET is, once when its connection is reset
- * or closes before a response arrives, and has no setting to stop it. Apart from that re-send,
- * {@link #buildHttpClient(Timeout)} keeps every behaviour of the {@code HttpURLConnection} transport. The service
- * owns a connection pool, which {@link #close()} releases when the application context shuts down.
+ * or closes before a response arrives, and has no setting to stop it. Apart from that re-send, and from following a
+ * redirect only on the origin of the configured Stocklytics URL, {@link #buildHttpClient(Timeout)} keeps every
+ * behaviour of the {@code HttpURLConnection} transport. The service owns a connection pool, which {@link #close()}
+ * releases when the application context shuts down.
  */
 @Component
 public class StocklyticsStockService implements StockService, AutoCloseable {
@@ -166,9 +170,12 @@ public class StocklyticsStockService implements StockService, AutoCloseable {
 	 *
 	 * <p>Everything else is as {@code HttpURLConnection} did it. {@code timeout} bounds the TCP connect and every
 	 * wait for response bytes, the TLS handshake included, each wait on its own. Redirects are followed as
-	 * {@link HttpUrlConnectionRedirectStrategy} describes, with the same request headers. An HTTP proxy is used where
-	 * the JVM's default {@link java.net.ProxySelector}, read for every route, names one, and {@code https} connects
-	 * with the JSSE default context, protocols and cipher suites ({@code https.protocols}, {@code https.cipherSuites}).
+	 * {@link HttpUrlConnectionRedirectStrategy} describes, with the same request headers, but only on the origin of
+	 * the configured Stocklytics URL, where {@code HttpURLConnection} followed a same-scheme one to any host: a
+	 * redirect to another host, port or scheme is returned as received, so the API key and the request data are never
+	 * sent there. An HTTP proxy is used where the JVM's default {@link java.net.ProxySelector}, read for every route,
+	 * names one, and {@code https} connects with the JSSE default context, protocols and cipher suites
+	 * ({@code https.protocols}, {@code https.cipherSuites}).
 	 * Content compression is off, so no {@code Accept-Encoding} is sent and the body is read as sent; there is no
 	 * cookie store, auth cache or connection state, and authentication challenges are not answered. The pool has no
 	 * size limit, as {@code HttpURLConnection} had none, so no request waits for another's connection.
@@ -311,13 +318,27 @@ public class StocklyticsStockService implements StockService, AutoCloseable {
 
 	/**
 	 * Follows a redirect only where {@code HttpURLConnection}, as {@code SimpleClientHttpRequestFactory} set it up,
-	 * followed one: the request is a GET, the status is 300, 301, 302, 303 or 307 with a {@code Location}, and that
-	 * location keeps the scheme of the URL that answered, which a relative one always does. Any other redirect, a
-	 * 308 or a {@code 305 Use Proxy} among them, is returned as received, and nothing is sent to its location.
+	 * followed one, and only on the configured Stocklytics origin: the request is a GET, the status is 300, 301,
+	 * 302, 303 or 307 with a {@code Location}, that location keeps the scheme of the URL that answered, which a
+	 * relative one always does, and it is on the origin of the original request, the
+	 * {@code stockstats.stocklytics-base-url} one. Two URLs share an origin when their schemes and hosts are equal,
+	 * each compared case-insensitively, and so are their ports, a URL without one counting 80 for {@code http} and 443
+	 * for {@code https}. A relative location is first resolved against the URL that answered, as httpclient5 then
+	 * resolves it, so a network-path one such as {@code //host/path} names its own host.
+	 *
+	 * <p>Any other redirect, a 308, a {@code 305 Use Proxy} or one to another host, port or scheme among them, is
+	 * returned as received, and nothing is sent to its location. httpclient5 sends a followed redirect with every
+	 * header of the original request, so following one off the configured origin would hand that location the
+	 * {@code api_key} and the request data; {@code HttpURLConnection} followed a same-scheme redirect to any host with
+	 * them. A redirect on the configured origin is followed with all of them, as before.
 	 */
 	private static final class HttpUrlConnectionRedirectStrategy extends DefaultRedirectStrategy {
 
 		private static final Set<Integer> FOLLOWED_STATUSES = Set.of(300, 301, 302, 303, 307);
+
+		private static final int HTTP_DEFAULT_PORT = 80;
+
+		private static final int HTTPS_DEFAULT_PORT = 443;
 
 		@Override
 		public boolean isRedirected(HttpRequest request, HttpResponse response, HttpContext context)
@@ -327,19 +348,55 @@ public class StocklyticsStockService implements StockService, AutoCloseable {
 					|| !FOLLOWED_STATUSES.contains(response.getCode())) {
 				return false;
 			}
-			String targetScheme = createLocationURI(location.getValue()).getScheme();
-			return targetScheme == null || targetScheme.equalsIgnoreCase(answeredScheme(request, context));
+			URI configured = uriOf(request);
+			URI answered = answeredUri(configured, context);
+			URI target = createLocationURI(location.getValue());
+			if (!target.isAbsolute()) {
+				target = URIUtils.resolve(answered, target);
+			}
+			return sameText(target.getScheme(), answered.getScheme()) && sameOrigin(target, configured);
 		}
 
 		/**
-		 * The scheme of the URL that answered with the redirect. httpclient5 passes the original request on every
-		 * hop, so that URL is the last redirect location followed, or the original request's before any has been.
+		 * The URL of the original request, the configured Stocklytics one: httpclient5 passes the original request
+		 * to every redirect decision of the exchange.
 		 */
-		private static String answeredScheme(HttpRequest original, HttpContext context) {
+		private static URI uriOf(HttpRequest original) throws ProtocolException {
+			try {
+				return original.getUri();
+			} catch (URISyntaxException ex) {
+				throw new ProtocolException("Invalid request URI: " + ex.getMessage(), ex);
+			}
+		}
+
+		/**
+		 * The URL that answered with the redirect: the last redirect location followed, or the original request's
+		 * before any has been.
+		 */
+		private static URI answeredUri(URI original, HttpContext context) {
 			RedirectLocations followed = HttpClientContext.adapt(context).getRedirectLocations();
-			return followed == null || followed.size() == 0
-					? original.getScheme()
-					: followed.get(followed.size() - 1).getScheme();
+			return followed == null || followed.size() == 0 ? original : followed.get(followed.size() - 1);
+		}
+
+		private static boolean sameOrigin(URI first, URI second) {
+			return sameText(first.getScheme(), second.getScheme()) && sameText(first.getHost(), second.getHost())
+					&& effectivePort(first) == effectivePort(second);
+		}
+
+		/** Whether both are present and equal ignoring case; a missing scheme or host matches nothing. */
+		private static boolean sameText(String first, String second) {
+			return first != null && first.equalsIgnoreCase(second);
+		}
+
+		/** The URL's port, or without one the default port of its scheme; -1 for a scheme that has none. */
+		private static int effectivePort(URI uri) {
+			if (uri.getPort() >= 0) {
+				return uri.getPort();
+			}
+			if (URIScheme.HTTP.same(uri.getScheme())) {
+				return HTTP_DEFAULT_PORT;
+			}
+			return URIScheme.HTTPS.same(uri.getScheme()) ? HTTPS_DEFAULT_PORT : -1;
 		}
 	}
 

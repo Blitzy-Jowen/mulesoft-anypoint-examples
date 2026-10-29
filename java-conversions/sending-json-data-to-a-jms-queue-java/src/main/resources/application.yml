@@ -20,25 +20,21 @@ spring:
   artemis:
     # The activemq-connector declares no brokerURL, so Mule ran ActiveMQ's in-VM, non-persistent broker
     # (vm://localhost?broker.persistent=false); an embedded, non-persistent Artemis server takes its place.
+    # To send to an external Artemis broker instead (the original README points at tcp://localhost:61616), override
+    # three keys: spring.artemis.mode=native, spring.artemis.embedded.enabled=false (Boot starts the in-VM broker
+    # whenever embedded.enabled is true, whatever the mode) and spring.artemis.broker-url, whose optional
+    # ?callTimeout=<ms> overrides jms.call-timeout. persistent and queues configure only the in-VM broker. On the
+    # command line:
+    #   --spring.artemis.mode=native --spring.artemis.embedded.enabled=false
+    #   --spring.artemis.broker-url=tcp://localhost:61616
+    # or as environment variables SPRING_ARTEMIS_MODE, SPRING_ARTEMIS_EMBEDDED_ENABLED and SPRING_ARTEMIS_BROKER_URL.
+    # Broker credentials come only from the environment: SPRING_ARTEMIS_USER and SPRING_ARTEMIS_PASSWORD, which Boot
+    # binds to spring.artemis.user and spring.artemis.password.
     mode: embedded
     embedded:
-      enabled: true       # starts the in-VM broker in any mode: set it to false together with mode: native (below)
+      enabled: true       # starts the in-VM broker in any mode: set it to false when switching to native mode
       persistent: false
       queues: sales
-    # To send to an external Artemis broker instead (the original README points at tcp://localhost:61616), replace the
-    # mode and embedded entries above (persistent and queues configure only the in-VM broker) with the settings below.
-    # Boot starts the in-VM broker whenever embedded.enabled is true, whatever the mode, so without enabled: false an
-    # unused in-VM broker would also start:
-    #   mode: native
-    #   embedded:
-    #     enabled: false
-    #   broker-url: tcp://localhost:61616   # an optional ?callTimeout=<ms> overrides jms.call-timeout
-    #   user: ${ARTEMIS_USER:}          # TODO: supply broker user
-    #   password: ${ARTEMIS_PASSWORD:}  # TODO: supply broker password
-    # The same switch without editing this file, on the command line:
-    #   --spring.artemis.mode=native --spring.artemis.embedded.enabled=false --spring.artemis.broker-url=tcp://localhost:61616
-    # or as environment variables: SPRING_ARTEMIS_MODE=native SPRING_ARTEMIS_EMBEDDED_ENABLED=false
-    # SPRING_ARTEMIS_BROKER_URL=tcp://localhost:61616 (broker credentials as in the user and password lines above).
   jms:
     pub-sub-domain: false   # jms:outbound-endpoint queue= is point-to-point
     template:

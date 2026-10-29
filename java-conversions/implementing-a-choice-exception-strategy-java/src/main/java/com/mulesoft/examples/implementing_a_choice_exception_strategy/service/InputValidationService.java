@@ -13,7 +13,6 @@ import java.io.UncheckedIOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
-import java.util.regex.Pattern;
 
 import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -43,6 +42,12 @@ import org.springframework.stereotype.Service;
  * name internal types, with a fixed text: {@code Payload is not valid JSON} or {@code JSON payload is not an
  * object}.
  *
+ * <p>The email {@code regex-filter} is a scan that returns, for every text, what {@code Matcher.find()} returns
+ * for the line-13 pattern, in time linear in the text's length. The pattern's own backtracking search takes time
+ * quadratic in the length of a text holding no address and overflows its stack on a long dotted local part, such
+ * as {@code a.} repeated a few thousand times before {@code a@b.c}; the scan gives such a text the pattern's
+ * answer too.
+ *
  * <p>The payload is a real {@link HashMap}, the type the original transformer produced, because its
  * {@code toString()} reaches callers through the error bodies {@code Missing input data: #[payload]} and
  * {@code Invalid input data: #[payload]}. On JDK 17 a {@code HashMap} holding the sample keys iterates
@@ -61,11 +66,11 @@ public class InputValidationService {
     public static final String SUCCESS_MESSAGE = "Input data validation passed.";
 
     /**
-     * The {@code regex-filter} pattern of line 13 with {@code &amp;} decoded; the two spaces before the hyphen
-     * in the last character class are the original's. No flags: Mule's filter matched case-sensitively.
+     * The characters other than {@code a-z} and {@code 0-9} in the local-part class
+     * {@code [a-z0-9!#$%&'*+/=?^_`{|}~-]} of the line-13 {@code regex-filter} pattern ({@code &amp;} decoded);
+     * {@code .} and {@code @} are not among them.
      */
-    private static final Pattern EMAIL_PATTERN = Pattern.compile(
-            "[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9  -]*[a-z0-9])?");
+    private static final String LOCAL_PART_SPECIALS = "!#$%&'*+/=?^_`{|}~-";
 
     /** How Mule rendered a null payload when the {@code regex-filter} read it as a string. */
     private static final String NULL_PAYLOAD_TEXT = "{NullPayload}";
@@ -154,11 +159,72 @@ public class InputValidationService {
 
         Object email = payload.get("email");
         String tested = email == null ? NULL_PAYLOAD_TEXT : String.valueOf(email);
-        // Mule's RegExFilter accepted a match anywhere in the text: find(), not matches().
-        if (!EMAIL_PATTERN.matcher(tested).find()) {
+        // Mule's RegExFilter accepted a match anywhere in the text (find(), not matches()), and so does the scan.
+        if (!containsEmailAddress(tested)) {
             return Optional.empty();
         }
 
         return Optional.of(SUCCESS_MESSAGE);
+    }
+
+    /**
+     * Returns what {@code Matcher.find()} returns for the line-13 {@code regex-filter} pattern
+     * {@code C+(?:\.C+)*@(?:L\.)+A(?:[a-z0-9  -]*A)?} on {@code text}, where {@code C} is the local-part class,
+     * {@code A} is {@code [a-z0-9]} and {@code L} is the label {@code A(?:[a-z0-9-]*A)?}. It reads the text in one
+     * left-to-right pass, without recursion and without a length limit. Every class is ASCII and case-sensitive, as
+     * the pattern has no flags.
+     *
+     * <p>The text contains a match exactly when, at some {@code @} at index {@code i >= 1}, the character at
+     * {@code i-1} is in {@code C} and the text after the {@code @} starts with an {@code L}, a {@code .} and an
+     * {@code A}. Every match has that shape: its local part ends in a {@code C} character just before its
+     * {@code @}, and its domain starts with a label, its dot and an {@code A}, the first character of the next
+     * label or the final {@code A}. That shape is itself a match: a one-character local part, one label with its
+     * dot, and the final {@code A} with the optional tail omitted. The tail class {@code [a-z0-9  -]}, with its two
+     * spaces, only lengthens a match that already exists, so it never changes the result.
+     *
+     * <p>{@code .} is not in {@code [a-z0-9-]}, so the label before the dot is the whole maximal run of
+     * {@code [a-z0-9-]} characters starting at {@code i+1}: the run must start and end with an {@code A}, and be
+     * followed by a {@code .} and an {@code A}. {@code @} is not in that class either, so the runs after distinct
+     * {@code @}s are disjoint, and the scan reads each character a bounded number of times.
+     *
+     * @param text the email value as the filter read it
+     * @return {@code true} when the pattern occurs anywhere in {@code text}
+     */
+    private static boolean containsEmailAddress(String text) {
+        int length = text.length();
+        int at = text.indexOf('@', 1);
+        while (at >= 0) {
+            int runEnd = at + 1;
+            while (runEnd < length && isLabelChar(text.charAt(runEnd))) {
+                runEnd++;
+            }
+            if (isLocalPartChar(text.charAt(at - 1))
+                    && runEnd > at + 1
+                    && isAlphanumeric(text.charAt(at + 1))
+                    && isAlphanumeric(text.charAt(runEnd - 1))
+                    && runEnd + 1 < length
+                    && text.charAt(runEnd) == '.'
+                    && isAlphanumeric(text.charAt(runEnd + 1))) {
+                return true;
+            }
+            // The run holds no '@', so the next one is at runEnd or beyond.
+            at = text.indexOf('@', runEnd);
+        }
+        return false;
+    }
+
+    /** The pattern's local-part class {@code C}. */
+    private static boolean isLocalPartChar(char c) {
+        return isAlphanumeric(c) || LOCAL_PART_SPECIALS.indexOf(c) >= 0;
+    }
+
+    /** The pattern's label-body class {@code [a-z0-9-]}. */
+    private static boolean isLabelChar(char c) {
+        return isAlphanumeric(c) || c == '-';
+    }
+
+    /** The pattern's class {@code [a-z0-9]}, with which every label and the domain's last part start and end. */
+    private static boolean isAlphanumeric(char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
     }
 }

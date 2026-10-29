@@ -306,6 +306,7 @@ class AggregationReportMailerTest {
         Properties properties = new Properties();
         properties.setProperty("mail.smtp.auth", "true");
         properties.setProperty("mail.smtp.starttls.enable", "false");
+        properties.setProperty("mail.smtp.starttls.required", "false");
         // responseTimeout="10000" of the original endpoint; also keeps a failing send from hanging the build.
         properties.setProperty("mail.smtp.connectiontimeout", "10000");
         properties.setProperty("mail.smtp.timeout", "10000");

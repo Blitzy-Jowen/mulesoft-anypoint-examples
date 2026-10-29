@@ -13,6 +13,11 @@ pop3:
 orders:
   output-dir: src/test/resources/output   # file:outbound-endpoint path (original value)
   output-file-name: orders.xml            # outputPattern
+# The original logs only the orders XML it builds from the attachment ("Received: <xml>", AttachmentImportService):
+# a root DEBUG/TRACE override, or --debug/--trace, must not reach the Angus Mail category, which below INFO writes
+# every polled mail. A logger's own level outranks logging.level.root and the --debug/--trace groups; Angus Mail logs
+# through java.util.logging, which Spring Boot bridges and holds at the same level.
 logging:
   level:
     com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connector: INFO
+    org.eclipse.angus.mail: INFO   # .pop3.protocol TRACE writes the whole POP3 dialogue: every RETR reply, with the message's headers (Return-Path, From, To, Subject) and the attachment's content

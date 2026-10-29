@@ -46,8 +46,9 @@ import com.mulesoft.examples.import_leads_into_salesforce.service.BatchJobRunner
  * <p>The flow declares no exception strategy, so nothing is caught here. A Salesforce failure inside a step fails the
  * record, or the whole commit group, through the runner and reaches {@value #LOG_FAILURES_STEP}; the SC-9 executor
  * inside {@link SalesforcePartnerClient} has already classified it, re-logged in and retried once on a rejected
- * session, and logged a rate limit, timeout or connectivity failure at ERROR without retrying it, so a {@code Lead}
- * create is never submitted twice. A failure of the input phase propagates unchanged to the file poller.
+ * session, which Salesforce refused before processing, and logged a rate limit, timeout or connectivity failure at
+ * ERROR without retrying it, so a {@code Lead} create Salesforce may already have processed is never submitted
+ * again. A failure of the input phase propagates unchanged to the file poller.
  *
  * <p>The job definition is built once and is immutable, and every run keeps its state inside the runner, so one
  * instance serves concurrent callers.

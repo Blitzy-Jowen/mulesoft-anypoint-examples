@@ -173,9 +173,7 @@ class WsdlQueryPublisherTest {
             %s</xsd:schema>
             """;
 
-    // ---------------------------------------------------------------------------------------------------------------
     // The publisher on a temporary classpath
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void registrationHoldsTheWsdlPatternsAndTransitiveSchemaClosure(@TempDir Path root) throws Exception {
@@ -407,9 +405,7 @@ class WsdlQueryPublisherTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // The consumer's own registrations
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Boots the consuming application, found by package scan, and serves every WSDL and schema its
@@ -457,9 +453,7 @@ class WsdlQueryPublisherTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Helpers
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * The fixture documents written under a temporary directory and an isolated loader over it, so the publisher's

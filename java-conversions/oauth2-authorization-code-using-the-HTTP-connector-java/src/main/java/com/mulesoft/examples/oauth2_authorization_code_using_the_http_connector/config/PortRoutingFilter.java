@@ -28,8 +28,10 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * Scopes every request to the routes of the listener that received it, so each port answers only for the paths its
  * Mule {@code http:listener} served.
  *
- * <p>{@link ListenerPorts} creates the instance and registers it ahead of every other filter for request dispatches
- * only; this class is deliberately not a Spring component. For each request:
+ * <p>{@link ListenerPorts} creates the instance and registers it for request dispatches only, at the highest
+ * precedence an ordinary {@link org.springframework.core.Ordered} registration can take, so only a
+ * {@link org.springframework.core.PriorityOrdered} registration, or another of the same order value that Spring Boot
+ * lists first, runs ahead of it; this class is deliberately not a Spring component. For each request:
  * <ol>
  *   <li>The routes are those of the additional listener whose port equals {@code ServletRequest.getLocalPort()}; a
  *       request on any other port, the main listener's included, is judged against the main routes.</li>

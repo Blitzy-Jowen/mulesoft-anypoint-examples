@@ -70,3 +70,18 @@ ajax:
   # Bayeux maxInterval: "The max client side poll timeout in milliseconds (default 30000)", same AjaxConnector.java:80-83;
   # the connector sets none. AjaxChannelBroker removes a client not heard from for this long.
   max-interval-ms: 30000
+
+logging:
+  level:
+    # websphere-mq.xml declares no logger: its only log line is the test:component's, which service/MqProcessingService
+    # writes at INFO with the text ("Message Received in service: MessageProcessor. Content is: <text>"). Below INFO
+    # these loggers write the texts sent through the page. A logger's own level outranks logging.level.root and the
+    # --debug and --trace logger groups, so neither reaches them.
+    org.springframework.web.servlet.DispatcherServlet: WARN   # request line with the query: a GET to /ajax/cometd carries the published text in its message parameter. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments: the Bayeux message holding the published text, posted or queried
+    org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter: INFO   # TRACE writes the async result a held /meta/connect resumes with: the processed text delivered on the dequeue channel
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # TRACE writes the response body: the same Bayeux delivery
+    org.springframework.jms.core.JmsTemplate: INFO   # DEBUG "Sending created message:" renders each message sent to queues in and out, whose IBM MQ toString() holds the text
+    org.springframework.jms.listener.adapter.MessagingMessageListenerAdapter: INFO   # DEBUG "Processing [...]" renders each message the in and out listeners receive, whose IBM MQ toString() holds the text
+    org.springframework.messaging.handler.HandlerMethod: INFO   # TRACE writes the @JmsListener arguments: each received text, before and after " - processed"
+    io.undertow.request.io: INFO   # DEBUG "Failed to parse request" carries the query Undertow cannot decode: the message parameter of a GET to /ajax/cometd with a malformed percent escape

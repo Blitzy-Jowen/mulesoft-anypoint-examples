@@ -41,6 +41,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -74,8 +75,10 @@ import com.mulesoft.examples.mule_component_bindings.model.StockStats;
  * key without text fails naming {@code stockstats.stocklyticsApiKey} before any request is sent, and
  * through the timed transport an upstream that never answers, or that sends its headers and stalls its body, fails
  * once with a {@link SocketTimeoutException} cause within the timeout; a connection fault fails the call after one
- * request; redirects are followed as {@code HttpURLConnection} followed them; the constructor accepts only a
- * timeout the transport can enforce.
+ * request; redirects are followed as {@code HttpURLConnection} followed them, but only on the configured origin: a
+ * redirect to another host, port or scheme, at once or after a followed one, fails with its status, and a second
+ * WireMock server standing for that origin receives no request, so neither the API key nor the request data reach
+ * it; the constructor accepts only a timeout the transport can enforce.
  */
 class StocklyticsStockServiceTest {
 
@@ -84,14 +87,28 @@ class StocklyticsStockServiceTest {
     /** Where the redirect cases move the historical prices. */
     private static final String MOVED_HISTORICAL_PRICES = "/moved/historicalPrices/1.0";
 
+    /** The prices served where a redirect case moved them. */
+    private static final String MOVED_PRICES = "{\"2012-10-26\":{\"open\":1.0,\"close\":2.0,\"high\":3.0,\"low\":0.5,"
+            + "\"volume\":7}}";
+
+    /** The API key of the origin cases, distinct from every other test value, so its arrival anywhere is its own. */
+    private static final String MARKER_API_KEY = "marker-stocklytics-api-key";
+
     @RegisterExtension
     static WireMockExtension wm = WireMockExtension.newInstance()
+            .options(wireMockConfig().dynamicPort())
+            .build();
+
+    /** Another origin, on its own port: where a hostile or misconfigured Stocklytics would redirect the GET. */
+    @RegisterExtension
+    static WireMockExtension foreign = WireMockExtension.newInstance()
             .options(wireMockConfig().dynamicPort())
             .build();
 
     @BeforeEach
     void setUp() {
         wm.resetAll();
+        foreign.resetAll();
     }
 
     @Test
@@ -276,6 +293,106 @@ class StocklyticsStockServiceTest {
         assertThat(wm.getAllServeEvents()).hasSize(1);
     }
 
+    /**
+     * Each followed status with an absolute location on the foreign origin, and a 302 to each other way off the
+     * configured origin. The origin is a format pattern: {@code %1$d} is the configured port, {@code %2$d} the
+     * foreign one.
+     */
+    static Stream<Arguments> crossOriginRedirects() {
+        Stream<Arguments> everyFollowedStatus = IntStream.of(300, 301, 302, 303, 307).mapToObj(status ->
+                Arguments.of(status, Named.of("the foreign origin", "http://localhost:%2$d")));
+        Stream<Arguments> otherOrigins = Stream.of(
+                Arguments.of(302, Named.of("a network-path reference to the foreign origin", "//localhost:%2$d")),
+                Arguments.of(302, Named.of("another host on the configured port", "http://127.0.0.1:%1$d")),
+                Arguments.of(302, Named.of("the configured host without a port, so on port 80", "http://localhost")));
+        return Stream.concat(everyFollowedStatus, otherOrigins);
+    }
+
+    /**
+     * A redirect off the configured origin is returned as received, so its status fails the call with the original
+     * message after the one request to the configured origin, and nothing is sent to its location: the foreign
+     * origin receives no request, so neither the marker API key nor the request data reach it. Both servers serve
+     * prices at the location, so a followed redirect would make the call succeed, or on port 80 fail to connect.
+     */
+    @ParameterizedTest
+    @MethodSource("crossOriginRedirects")
+    void crossOriginRedirectIsReturnedAsReceivedAndSendsNothingThere(int status, String origin) {
+        wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(aResponse()
+                .withStatus(status)
+                .withHeader("Location", String.format(origin, wm.getPort(), foreign.getPort())
+                        + MOVED_HISTORICAL_PRICES)));
+        wm.stubFor(get(urlPathEqualTo(MOVED_HISTORICAL_PRICES)).willReturn(okJson(MOVED_PRICES)));
+        foreign.stubFor(get(anyUrl()).willReturn(okJson(MOVED_PRICES)));
+        StocklyticsStockService service = markerKeyService();
+
+        assertThatThrownBy(() -> service.getHistoricalPrices("AAPL", date("2012-10-26")))
+                .isExactlyInstanceOf(RuntimeException.class)
+                .hasMessage("Stockylitics returned status " + status);
+        wm.verify(1, getRequestedFor(urlEqualTo(HISTORICAL_PRICES)).withHeader("api_key", equalTo(MARKER_API_KEY)));
+        assertThat(wm.getAllServeEvents()).hasSize(1);
+        foreign.verify(0, anyRequestedFor(anyUrl()));
+        assertThat(foreign.getAllServeEvents()).isEmpty();
+    }
+
+    /**
+     * A redirect followed on the configured origin to a location that redirects to the foreign origin stops at the
+     * second redirect, which fails the call with its status: the configured origin receives both requests, each with
+     * the marker API key, and the foreign origin none.
+     */
+    @Test
+    void sameOriginHopThenCrossOriginRedirectStopsThere() {
+        wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(aResponse()
+                .withStatus(302)
+                .withHeader("Location", MOVED_HISTORICAL_PRICES)));
+        wm.stubFor(get(urlPathEqualTo(MOVED_HISTORICAL_PRICES)).willReturn(aResponse()
+                .withStatus(302)
+                .withHeader("Location", foreign.baseUrl() + HISTORICAL_PRICES)));
+        foreign.stubFor(get(anyUrl()).willReturn(okJson(MOVED_PRICES)));
+        StocklyticsStockService service = markerKeyService();
+
+        assertThatThrownBy(() -> service.getHistoricalPrices("AAPL", date("2012-10-26")))
+                .isExactlyInstanceOf(RuntimeException.class)
+                .hasMessage("Stockylitics returned status 302");
+        wm.verify(1, getRequestedFor(urlEqualTo(HISTORICAL_PRICES)).withHeader("api_key", equalTo(MARKER_API_KEY)));
+        wm.verify(1, getRequestedFor(urlEqualTo(MOVED_HISTORICAL_PRICES))
+                .withHeader("api_key", equalTo(MARKER_API_KEY)));
+        assertThat(wm.getAllServeEvents()).hasSize(2);
+        foreign.verify(0, anyRequestedFor(anyUrl()));
+        assertThat(foreign.getAllServeEvents()).isEmpty();
+    }
+
+    static Stream<Arguments> sameOriginAbsoluteLocations() {
+        return Stream.of(
+                Arguments.of(Named.of("as configured", "http://localhost:%d")),
+                Arguments.of(Named.of("with the host upper-cased", "http://LOCALHOST:%d")),
+                Arguments.of(Named.of("with the scheme and the host in mixed case", "HTTP://LocalHost:%d")));
+    }
+
+    /**
+     * An absolute location on the configured origin, its scheme and host in any letter case, is followed with the
+     * marker API key and every request-data header of the original GET.
+     */
+    @ParameterizedTest
+    @MethodSource("sameOriginAbsoluteLocations")
+    void absoluteSameOriginRedirectIsFollowedWithTheOriginalHeaders(String origin) throws Exception {
+        wm.stubFor(get(urlPathEqualTo(HISTORICAL_PRICES)).willReturn(aResponse()
+                .withStatus(302)
+                .withHeader("Location", String.format(origin, wm.getPort()) + MOVED_HISTORICAL_PRICES)));
+        wm.stubFor(get(urlPathEqualTo(MOVED_HISTORICAL_PRICES)).willReturn(okJson(MOVED_PRICES)));
+
+        StockStats stats = markerKeyService().getHistoricalPrices("AAPL", date("2012-10-26"));
+
+        assertPrices(stats.getFinancialStats(), 1.0, 2.0, 3.0, 0.5, 7L);
+        wm.verify(1, getRequestedFor(urlEqualTo(MOVED_HISTORICAL_PRICES))
+                .withHeader("api_key", equalTo(MARKER_API_KEY))
+                .withHeader("format", equalTo("JSON"))
+                .withHeader("stock", equalTo("AAPL"))
+                .withHeader("start", equalTo("2012-10-26"))
+                .withHeader("end", equalTo("2012-10-26"))
+                .withHeader("Accept", equalTo("application/json")));
+        assertThat(wm.getAllServeEvents()).hasSize(2);
+    }
+
     static Stream<Arguments> silentUpstreams() {
         return Stream.of(
                 Arguments.of(Named.of("no response at all", new byte[0])),
@@ -450,6 +567,14 @@ class StocklyticsStockServiceTest {
     /** The service as the application builds it, with every upstream on WireMock. */
     private static StocklyticsStockService newService() {
         return new StocklyticsStockService(RestClient.builder(), properties());
+    }
+
+    /** The service as the application builds it, with every upstream on WireMock and the API key the marker. */
+    private static StocklyticsStockService markerKeyService() {
+        return new StocklyticsStockService(RestClient.builder(),
+                new StockStatsProperties("test-access-key", "test-access-secret", "test-api-key", "test-api-secret",
+                        wm.baseUrl() + "/1.1/", MARKER_API_KEY, wm.baseUrl() + "/", "test-sentiment140-key",
+                        wm.baseUrl() + "/"));
     }
 
     /** The {@code application-test.yml} values, with every upstream on WireMock. */

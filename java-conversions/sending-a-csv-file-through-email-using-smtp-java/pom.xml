@@ -38,7 +38,7 @@
     </properties>
 
     <dependencies>
-        <!-- JavaMailSender over Angus Mail replaces the Mule SMTP transport's Gmail connector. It is the only runtime
+        <!-- JavaMailSender over Angus Mail sends the order lines as plain-text SMTP mail. It is the only runtime
              starter: the original flow has no HTTP listener (spring.main.web-application-type: none). -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

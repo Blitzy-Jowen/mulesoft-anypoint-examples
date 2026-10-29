@@ -205,9 +205,7 @@ class SalesforcePartnerClientTest {
         wm.stop();
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Login mode
-    // ---------------------------------------------------------------------------------------------------------
 
     @Test
     void logsInOnceWithUsernameAndPasswordFollowedBySecurityToken() throws Exception {
@@ -748,9 +746,7 @@ class SalesforcePartnerClientTest {
         assertThat(defaults.getAuthEndpoint()).isEqualTo("https://login.salesforce.com/services/Soap/u/65.0");
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Session mode
-    // ---------------------------------------------------------------------------------------------------------
 
     @Test
     void sessionModeUsesTheSuppliedSessionWithoutLoggingIn() throws Exception {
@@ -868,9 +864,7 @@ class SalesforcePartnerClientTest {
         assertUserRecord(third.get(0), USER_B);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Timeout configuration
-    // ---------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest(name = "{0} = {2}")
     @MethodSource("timeoutsShorterThanOneMillisecond")
@@ -929,9 +923,7 @@ class SalesforcePartnerClientTest {
                         Integer.MAX_VALUE, Integer.MAX_VALUE));
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Clients, stubs and request journal
-    // ---------------------------------------------------------------------------------------------------------
 
     /** A call of one public client operation, for the cases every operation must satisfy alike. */
     @FunctionalInterface
@@ -1200,9 +1192,7 @@ class SalesforcePartnerClientTest {
         return chain;
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Records and assertions
-    // ---------------------------------------------------------------------------------------------------------
 
     private static Map<String, Object> contact() {
         Map<String, Object> contact = new LinkedHashMap<>();
@@ -1233,9 +1223,7 @@ class SalesforcePartnerClientTest {
         assertThat(record.toString()).contains("Email=" + user[2], "Id=" + user[0], "Name=" + user[1]);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // SOAP responses
-    // ---------------------------------------------------------------------------------------------------------
 
     private static ResponseDefinitionBuilder soap(String envelope) {
         return aResponse().withStatus(200).withHeader("Content-Type", TEXT_XML).withBody(envelope);

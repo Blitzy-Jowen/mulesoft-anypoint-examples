@@ -40,7 +40,7 @@
     </properties>
 
     <dependencies>
-        <!-- Tomcat 10.1 does not send reason phrases; Undertow writes the status line the original listener wrote. -->
+        <!-- Tomcat 10.1 does not send custom reason phrases; Undertow writes the status line the original listener wrote. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>

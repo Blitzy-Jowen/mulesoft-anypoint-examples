@@ -129,9 +129,7 @@ class RestProxyControllerTest {
         return new HttpTestClient(LOOPBACK, port);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Happy paths: method, path, query and bytes forwarded; the upstream answer returned unparsed
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void getFolderIsForwardedAndBytesReturned() {
@@ -282,9 +280,7 @@ class RestProxyControllerTest {
                         "{\"name\": \"mule-proxy-test\", \"parent\": {\"id\": \"0\"}}".getBytes(UTF_8))));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Header copying (SC-13): Host, Content-Length, Connection, Transfer-Encoding, http.* and MULE_* removed
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void outboundHeadersAreFilteredAndAuthorizationForwarded() {
@@ -334,9 +330,7 @@ class RestProxyControllerTest {
         assertThat(response.bodyAsString()).isEqualTo("{\"id\":\"0\"}");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Errors: the flow declares no exception strategy, so every failure is SC-1's platform-default 500
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void upstream404Becomes500Json() {
@@ -410,8 +404,6 @@ class RestProxyControllerTest {
                 .untilAsserted(() -> upstream.verify(exactly(1), getRequestedFor(urlEqualTo("/2.0/folders/slow"))));
         assertThat(upstream.getAllServeEvents()).as("upstream calls").hasSize(1);
     }
-
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * A socket bound to a free port on every local address that never listens or connects: a connection to its port

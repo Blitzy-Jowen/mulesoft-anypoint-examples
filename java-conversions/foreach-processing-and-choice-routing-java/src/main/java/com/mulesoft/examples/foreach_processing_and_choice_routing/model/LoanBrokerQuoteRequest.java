@@ -27,9 +27,6 @@ public class LoanBrokerQuoteRequest implements Serializable
     /** credit profile for the customer */
     private CreditProfile creditProfile;
 
-    /** A list of lenders for this request */
-    //private Bank[] lenders;
-
     /** A loan quote from a bank */
     private LoanQuote loanQuote;
 

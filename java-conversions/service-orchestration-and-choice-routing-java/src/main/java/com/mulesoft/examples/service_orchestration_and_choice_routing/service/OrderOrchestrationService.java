@@ -86,6 +86,8 @@ public class OrderOrchestrationService implements IProcessOrder {
 	/** Number of causes named after the outermost exception before the logged chain is cut short. */
 	private static final int CAUSE_LOG_LIMIT = 10;
 
+	private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
 	private final SamsungOrderService samsungOrderService;
 
 	private final JmsTemplate inHouseRequestJmsTemplate;
@@ -204,13 +206,16 @@ public class OrderOrchestrationService implements IProcessOrder {
 	}
 
 	/**
-	 * The {@code defaultErrorHandler} sub-flow: logs {@code Error occurred: #[payload]} at INFO. {@code AuditService}
-	 * and {@code InHouseOrderService} reach it lazily through an {@code ObjectProvider}.
+	 * The {@code defaultErrorHandler} sub-flow: logs {@code Error occurred: #[payload]} at INFO, with the control
+	 * characters of the payload's text written as escapes ({@link #loggable(String)}) so that a payload cannot add or
+	 * disguise log lines. {@code AuditService} and {@code InHouseOrderService} reach it lazily through an
+	 * {@code ObjectProvider}.
 	 *
-	 * @param payload the message payload when the error occurred; {@code null} is logged as {@code "null"}
+	 * @param payload the message payload when the error occurred, logged as its {@code toString()}; {@code null} is
+	 *                logged as {@code "null"}
 	 */
 	public void logError(Object payload) {
-		LOG.info("Error occurred: {}", String.valueOf(payload));
+		LOG.info("Error occurred: {}", loggable(String.valueOf(payload)));
 	}
 
 	/**
@@ -254,6 +259,59 @@ public class OrderOrchestrationService implements IProcessOrder {
 			causes++;
 		}
 		return out.toString();
+	}
+
+	/**
+	 * Keeps a logged payload's text on one log line. Applied to the logged text only; the payload is unchanged.
+	 *
+	 * <p>ISO control characters (C0, DEL and C1, so CR, LF, TAB, NUL and NEL included), line and paragraph
+	 * separators, format characters (bidirectional overrides and isolates, zero-width characters, the byte order
+	 * mark) and unpaired surrogates are each written as {@code \}{@code u} and four lower-case hex digits per UTF-16
+	 * unit. Every other character, a valid surrogate pair and the reverse solidus included, is copied unchanged, and
+	 * nothing is cut. The reverse solidus is not escaped because the original logger wrote this text verbatim: ordinary
+	 * text, backslashes included, is logged exactly as it was, and the escapes only keep the entry on one line.
+	 *
+	 * @param text the text to log; never {@code null}
+	 * @return {@code text} with every such character escaped
+	 */
+	private static String loggable(String text) {
+		StringBuilder out = new StringBuilder(text.length());
+		int i = 0;
+		while (i < text.length()) {
+			int codePoint = text.codePointAt(i);
+			int units = Character.charCount(codePoint);
+			boolean escape = mustEscape(codePoint);
+			for (int unit = i; unit < i + units; unit++) {
+				if (escape) {
+					appendUnicodeEscape(out, text.charAt(unit));
+				} else {
+					out.append(text.charAt(unit));
+				}
+			}
+			i += units;
+		}
+		return out.toString();
+	}
+
+	/** Whether {@link #loggable(String)} writes a code point as escapes rather than copying it. */
+	private static boolean mustEscape(int codePoint) {
+		if (Character.isISOControl(codePoint)) {
+			return true;
+		}
+		int type = Character.getType(codePoint);
+		return type == Character.LINE_SEPARATOR
+				|| type == Character.PARAGRAPH_SEPARATOR
+				|| type == Character.FORMAT
+				|| type == Character.SURROGATE;
+	}
+
+	/** Appends {@code \}{@code u} and the four lower-case hex digits of one UTF-16 unit. */
+	private static void appendUnicodeEscape(StringBuilder out, char c) {
+		out.append("\\u")
+				.append(HEX_DIGITS[(c >> 12) & 0xF])
+				.append(HEX_DIGITS[(c >> 8) & 0xF])
+				.append(HEX_DIGITS[(c >> 4) & 0xF])
+				.append(HEX_DIGITS[c & 0xF]);
 	}
 
 }

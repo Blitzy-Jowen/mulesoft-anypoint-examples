@@ -59,7 +59,7 @@
                 </exclusion>
             </exclusions>
         </dependency>
-        <!-- FTP client for the STOR of muleExample.xml that replaces the Mule ftp:outbound-endpoint. -->
+        <!-- FTP client for the STOR of muleExample.xml into the ftp.path directory (client/FtpUploadClient). -->
         <dependency>
             <groupId>commons-net</groupId>
             <artifactId>commons-net</artifactId>

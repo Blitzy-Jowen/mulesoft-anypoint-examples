@@ -43,7 +43,7 @@ class DwCsvReaderTest {
 
     private final DwCsvReader reader = new DwCsvReader();
 
-    // ---------------------------------------------------------------- line ends
+    // line ends
 
     @Test
     @DisplayName("LF record ends: one map per data record, keyed by the header")
@@ -98,7 +98,7 @@ class DwCsvReaderTest {
                 "firstname", "Jane", "surname", "Doe", "phone", "091558780", "email", "jane.doe@texasComp.com");
     }
 
-    // ---------------------------------------------------------------- quoting
+    // quoting
 
     @Test
     @DisplayName("A separator inside quotes is content")
@@ -167,7 +167,7 @@ class DwCsvReaderTest {
         assertRow(rows.get(0), "a", "1", "b", "2\\");
     }
 
-    // ---------------------------------------------------------------- empty input
+    // empty input
 
     @Test
     @DisplayName("An empty middle cell reads as an empty string under its key")
@@ -222,7 +222,7 @@ class DwCsvReaderTest {
         }
     }
 
-    // ---------------------------------------------------------------- values and keys
+    // values and keys
 
     @Test
     @DisplayName("Leading zeros and decimals stay the strings written, never coerced")
@@ -272,7 +272,7 @@ class DwCsvReaderTest {
         assertRow(rows.get(0), "a", "1", "b", "2", "column_2", "3");
     }
 
-    // ---------------------------------------------------------------- entry points
+    // entry points
 
     @Test
     @DisplayName("read(byte[]) decodes UTF-8")
@@ -316,7 +316,7 @@ class DwCsvReaderTest {
         assertThrows(NullPointerException.class, () -> reader.read(new byte[0], null));
     }
 
-    // ---------------------------------------------------------------- helpers
+    // helpers
 
     /** Asserts the two records {@code {a=1, b=2}} and {@code {a=3, b=4}} shared by the line-end cases. */
     private static void assertAbRows(List<Map<String, String>> rows) {

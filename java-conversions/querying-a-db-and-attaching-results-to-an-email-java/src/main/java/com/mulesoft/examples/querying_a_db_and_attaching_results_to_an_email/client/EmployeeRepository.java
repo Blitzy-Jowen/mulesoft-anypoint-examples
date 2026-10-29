@@ -29,8 +29,9 @@ import org.springframework.stereotype.Repository;
  *
  * <p>The original built its query by interpolating both names into double-quoted literals, which MySQL's default
  * {@code sql_mode} reads as string literals. Here each name is a bind parameter: the comparison runs under the same
- * column collation, so every legitimate input returns the same rows, while input that would have broken out of a
- * literal now matches nothing. This is the only intentional difference from the original.
+ * column collation, so every legitimate input returns the same rows, while each name is compared literally, as data:
+ * input that would have broken out of a literal can no longer alter the query's structure. This is the only intentional
+ * difference from the original.
  *
  * <p>Failures are not caught: the original flow declares no exception strategy, so every
  * {@link org.springframework.dao.DataAccessException} reaches the platform-default 500 of the global exception

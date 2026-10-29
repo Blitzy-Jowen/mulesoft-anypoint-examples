@@ -45,8 +45,9 @@ public record UpstreamFailureKind(Category category, String retryAfter) {
         RATE_LIMIT,
 
         /**
-         * A timeout or connectivity failure: never retried, so no write is ever submitted twice; the executor
-         * raises an {@code UpstreamUnavailableException} (503).
+         * A timeout or connectivity failure: never retried, because the vendor may already have processed the
+         * request and repeating it could submit a write twice; the executor raises an
+         * {@code UpstreamUnavailableException} (503).
          */
         UNAVAILABLE,
 

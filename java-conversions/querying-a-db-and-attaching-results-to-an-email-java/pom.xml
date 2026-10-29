@@ -59,12 +59,12 @@
                 </exclusion>
             </exclusions>
         </dependency>
-        <!-- JdbcTemplate over HikariCP replaces the Mule DB connector's generic MySQL configuration. -->
+        <!-- JdbcTemplate over HikariCP for the employees select against MySQL (client/EmployeeRepository). -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
-        <!-- JavaMailSender over Angus Mail replaces the Mule SMTP transport's Gmail connector. -->
+        <!-- JavaMailSender over Angus Mail sends the query result as the SMTP attachment employees.csv. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-mail</artifactId>

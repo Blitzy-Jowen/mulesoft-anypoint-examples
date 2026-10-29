@@ -18,8 +18,18 @@ import org.springframework.beans.factory.config.ConfigurableBeanFactory;
 import org.springframework.context.annotation.Scope;
 import org.springframework.stereotype.Service;
 
-// Prototype scope gives every call a fresh instance, as Mule's <component class="..."/> did,
-// so concurrent SOAP requests never share the per-call public fields.
+/**
+ * The {@link IFulfillment} implementation, ported from the original {@code org.ordermgmt.FulfillmentImpl} with its
+ * logic unchanged: each call builds the {@link ShippingOrder} and its {@link ShippingOrderConfirmation}, keeps both
+ * in the public fields and returns the confirmation.
+ *
+ * <p>A failure while building them is not propagated. Where the original printed the stack trace, only the
+ * exception's type and throw site are logged, because its text can carry request values, and the confirmation
+ * field is returned as it stands: {@code null} on a fresh instance.
+ *
+ * <p>Prototype scope gives every call a fresh instance, as Mule's {@code <component class="..."/>} did, so
+ * concurrent SOAP requests never share the per-call public fields.
+ */
 @Service
 @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
 public class FulfillmentService implements IFulfillment{

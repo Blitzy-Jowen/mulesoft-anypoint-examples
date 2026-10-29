@@ -32,9 +32,13 @@ import java.io.IOException;
 import java.net.ConnectException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.ProxySelector;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketAddress;
 import java.net.SocketTimeoutException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -53,8 +57,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.HttpServerErrorException;
@@ -154,6 +160,18 @@ class CmisAtomPubClientTest {
     static WireMockExtension wm = WireMockExtension.newInstance()
             .options(WireMockConfiguration.options().dynamicPort())
             .build();
+
+    /**
+     * A second origin ({@code http://localhost:<another port>}) that the repository's responses may name: it must
+     * receive nothing, and above all not the service account, unless {@code cmis.trusted-origins} lists it.
+     */
+    @RegisterExtension
+    static WireMockExtension foreign = WireMockExtension.newInstance()
+            .options(WireMockConfiguration.options().dynamicPort())
+            .build();
+
+    /** A host name that resolves nowhere, reached only through the HTTP proxy {@link #routeToWireMock} installs. */
+    private static final String PROXIED_HOST = "repo.invalid";
 
     private CmisProperties props;
 
@@ -608,6 +626,176 @@ class CmisAtomPubClientTest {
         wm.verify(0, anyRequestedFor(anyUrl()));
     }
 
+    /**
+     * Repository-supplied URLs off the trusted origins, each with the step that would request it: the folder entry
+     * the objectbypath template names, or the create-document POST to the children link. The second element is
+     * the start of that URL, which the stubbed response completes with the usual path and query.
+     */
+    static Stream<Arguments> untrustedRepositoryUrls() {
+        String sameServer = "localhost:" + wm.getPort();
+        return Stream.of(
+                Arguments.of(FOLDER_ENTRY, Named.of("template on another port", foreign.baseUrl())),
+                Arguments.of(FOLDER_ENTRY, Named.of("template on another host name of the same server",
+                        "http://127.0.0.1:" + wm.getPort())),
+                Arguments.of(FOLDER_ENTRY, Named.of("template on https", "https://" + sameServer)),
+                Arguments.of(FOLDER_ENTRY, Named.of("template on ftp", "ftp://" + sameServer)),
+                Arguments.of(FOLDER_ENTRY, Named.of("template on a port above 65535", "http://localhost:99999")),
+                Arguments.of(FOLDER_ENTRY, Named.of("relative template", "")),
+                Arguments.of(FOLDER_ENTRY, Named.of("template that does not parse", wm.baseUrl() + "/bad path")),
+                Arguments.of(CREATE_DOCUMENT, Named.of("children link on another port", foreign.baseUrl())),
+                Arguments.of(CREATE_DOCUMENT, Named.of("network-path children link to another host name",
+                        "//127.0.0.1:" + wm.getPort())),
+                Arguments.of(CREATE_DOCUMENT, Named.of("children link on ftp", "ftp://" + sameServer)),
+                Arguments.of(CREATE_DOCUMENT, Named.of("children link that does not parse",
+                        wm.baseUrl() + "/bad path")));
+    }
+
+    /**
+     * A URL the repository's responses name is requested only on the origin of {@code cmis.base-url}: one on another
+     * origin, without an {@code http} or {@code https} scheme and host, or unparseable fails its step with a fixed
+     * message naming neither the URL nor its host, before anything, the service account included, is sent to it.
+     * The foreign origin receives nothing, and the repository only the steps before.
+     */
+    @ParameterizedTest(name = "{0}: {1}")
+    @MethodSource("untrustedRepositoryUrls")
+    void repositoryUrlOffTheTrustedOriginsIsRefusedBeforeAnyRequestToIt(String step, String base) {
+        boolean template = FOLDER_ENTRY.equals(step);
+        stubServiceDocument(template ? base : wm.baseUrl());
+        stubFolderEntry(wm, template ? wm.baseUrl() : base);
+        stubCreate(wm);
+        stubFolderEntry(foreign, foreign.baseUrl());
+        stubCreate(foreign);
+
+        IllegalStateException e = assertThrows(IllegalStateException.class, () -> createDocument(client));
+
+        assertEquals("CMIS " + step + " URL is not on a trusted repository origin (cmis.base-url, cmis.trusted-origins)",
+                e.getMessage());
+        foreign.verify(0, anyRequestedFor(anyUrl()));
+        verifyRequestsThrough(STEPS.get(STEPS.indexOf(step) - 1));
+    }
+
+    /** Spellings of the foreign origin in {@code cmis.trusted-origins}: scheme and host case, a "/" path, padding. */
+    static Stream<String> trustedForeignOrigins() {
+        return Stream.of(foreign.baseUrl(), foreign.baseUrl() + "/", "HTTP://LOCALHOST:" + foreign.getPort(),
+                " " + foreign.baseUrl() + " ");
+    }
+
+    /**
+     * A repository that legitimately serves its folder entry and children feed on another origin works once that
+     * origin is listed in {@code cmis.trusted-origins}: both requests go there, with the service account.
+     */
+    @ParameterizedTest
+    @MethodSource("trustedForeignOrigins")
+    void repositoryUrlsOnAListedTrustedOriginAreRequestedWithTheServiceAccount(String trustedOrigin) {
+        props.setTrustedOrigins(List.of("https://unrelated.example", trustedOrigin));
+        CmisAtomPubClient trusting = new CmisAtomPubClient(props);
+        stubServiceDocument(foreign.baseUrl());
+        stubFolderEntry(foreign, foreign.baseUrl());
+        stubCreate(foreign);
+
+        assertEquals(OBJECT_ID, createDocument(trusting));
+
+        wm.verify(1, getRequestedFor(urlPathEqualTo(BASE_PATH)).withHeader("Authorization", equalTo(EXPECTED_AUTH)));
+        wm.verify(1, anyRequestedFor(anyUrl()));
+        foreign.verify(1, getRequestedFor(urlPathEqualTo(OBJECT_BY_PATH))
+                .withQueryParam("path", equalTo(FOLDER))
+                .withHeader("Authorization", equalTo(EXPECTED_AUTH)));
+        foreign.verify(1, postRequestedFor(urlPathEqualTo(CHILDREN))
+                .withQueryParam("versioningState", equalTo("none"))
+                .withHeader("Authorization", equalTo(EXPECTED_AUTH)));
+        foreign.verify(2, anyRequestedFor(anyUrl()));
+    }
+
+    /**
+     * Spellings of the {@code cmis.base-url} origin a repository may use for its template and children link, each
+     * the same origin: scheme and host in another case, a relative or a network-path children link.
+     */
+    static Stream<Arguments> sameOriginSpellings() {
+        String port = String.valueOf(wm.getPort());
+        return Stream.of(
+                Arguments.of(Named.of("upper-case host", "http://LOCALHOST:" + port), wm.baseUrl()),
+                Arguments.of(Named.of("upper-case scheme", "HTTP://localhost:" + port), "HTTP://localhost:" + port),
+                Arguments.of(Named.of("relative children link", wm.baseUrl()), ""),
+                Arguments.of(Named.of("network-path children link", wm.baseUrl()), "//LOCALHOST:" + port));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("sameOriginSpellings")
+    void sameOriginSpelledDifferentlyIsTrusted(String templateBase, String childrenBase) {
+        stubServiceDocument(templateBase);
+        stubFolderEntry(wm, childrenBase);
+        stubCreate(wm);
+
+        assertEquals(OBJECT_ID, createDocument(client));
+
+        verifyRequestsThrough(CREATE_DOCUMENT);
+        wm.verify(3, anyRequestedFor(anyUrl()).withHeader("Authorization", equalTo(EXPECTED_AUTH)));
+        foreign.verify(0, anyRequestedFor(anyUrl()));
+    }
+
+    /**
+     * An explicit default port names the same origin as none: with {@code cmis.base-url} on
+     * {@code http://repo.invalid} and its links on {@code http://repo.invalid:80}, or the other way round, every link
+     * is requested. The host resolves nowhere, so the JVM's default proxy selector, which the client consults for
+     * every route, sends it to WireMock as an HTTP proxy.
+     */
+    @ParameterizedTest(name = "cmis.base-url port \"{0}\", link port \"{1}\"")
+    @CsvSource({"'',:80", ":80,''"})
+    void explicitDefaultPortIsTheSameOrigin(String baseUrlPort, String linkPort) {
+        props.setBaseUrl("http://" + PROXIED_HOST + baseUrlPort + BASE_PATH);
+        CmisAtomPubClient proxied = new CmisAtomPubClient(props);
+        stubServiceDocument("http://" + PROXIED_HOST + linkPort);
+        stubFolderEntry(wm, "http://" + PROXIED_HOST + linkPort);
+        stubCreate(wm);
+
+        ProxySelector previous = ProxySelector.getDefault();
+        ProxySelector.setDefault(routeToWireMock());
+        try {
+            assertEquals(OBJECT_ID, createDocument(proxied));
+        } finally {
+            ProxySelector.setDefault(previous);
+        }
+
+        verifyRequestsThrough(CREATE_DOCUMENT);
+        wm.verify(3, anyRequestedFor(anyUrl()).withHeader("Authorization", equalTo(EXPECTED_AUTH)));
+    }
+
+    /**
+     * Entries that are not an {@code http} or {@code https} origin: no scheme, another scheme, a path, a query, a
+     * fragment, user information, no host, a port out of range, a host that does not parse, and blank. Each fails
+     * construction naming the key and the entry's index, never its value.
+     */
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"   ", "repo.example.com", "//repo.example.com", "repo.example.com:8443",
+            "ftp://repo.example.com", "https://repo.example.com/cmis", "https://repo.example.com/?a=b",
+            "https://repo.example.com#top", "https://user:secret@repo.example.com", "http:///cmis",
+            "http://repo.example.com:0", "http://repo.example.com:65536", "https://repo example.com"})
+    void invalidTrustedOriginFailsConstruction(String entry) {
+        props.setTrustedOrigins(Arrays.asList("https://repo.example.com:8443/", entry));
+
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () -> new CmisAtomPubClient(props));
+
+        assertEquals("cmis.trusted-origins[1] is not an http or https origin (scheme://host[:port])", e.getMessage());
+    }
+
+    /** Routes {@link #PROXIED_HOST} through WireMock as an HTTP proxy and every other host directly. */
+    private static ProxySelector routeToWireMock() {
+        return new ProxySelector() {
+            @Override
+            public List<Proxy> select(URI uri) {
+                return PROXIED_HOST.equalsIgnoreCase(uri.getHost())
+                        ? List.of(new Proxy(Proxy.Type.HTTP, new InetSocketAddress("localhost", wm.getPort())))
+                        : List.of(Proxy.NO_PROXY);
+            }
+
+            @Override
+            public void connectFailed(URI uri, SocketAddress address, IOException failure) {
+                // Nothing to record: a failed connect fails the request, which the test reports.
+            }
+        };
+    }
+
     private static String createDocument(CmisAtomPubClient cmisClient) {
         return cmisClient.createDocumentByPath(FOLDER, NAME, MIME_TYPE, OBJECT_TYPE, VERSIONING_STATE, CONTENT);
     }
@@ -690,6 +878,28 @@ class CmisAtomPubClientTest {
                         .withBody(createdEntry(withObjectId))));
     }
 
+    /** Serves at {@link #BASE_PATH} a service document whose objectbypath template starts with {@code base}. */
+    private static void stubServiceDocument(String base) {
+        wm.stubFor(get(urlPathEqualTo(BASE_PATH))
+                .willReturn(okForContentType(SERVICE_DOCUMENT_TYPE + ";charset=UTF-8", serviceDocument(base, true))));
+    }
+
+    /** Serves on {@code server} the folder entry whose children link starts with {@code base}. */
+    private static void stubFolderEntry(WireMockExtension server, String base) {
+        server.stubFor(get(urlPathEqualTo(OBJECT_BY_PATH))
+                .withQueryParam("path", equalTo(FOLDER))
+                .willReturn(okForContentType(ENTRY_TYPE + ";charset=UTF-8", folderEntry(base, true))));
+    }
+
+    /** Accepts on {@code server} the posted entry and answers with the created entry. */
+    private static void stubCreate(WireMockExtension server) {
+        server.stubFor(post(urlPathEqualTo(CHILDREN))
+                .willReturn(aResponse()
+                        .withStatus(201)
+                        .withHeader("Content-Type", ENTRY_TYPE + ";charset=UTF-8")
+                        .withBody(createdEntry(true))));
+    }
+
     /** The service document of {@link #stubServiceDocument}, served at the redirect target {@link #MOVED}. */
     private static void stubMovedServiceDocument() {
         wm.stubFor(get(urlPathEqualTo(MOVED))
@@ -734,7 +944,11 @@ class CmisAtomPubClientTest {
      * template, or only a query template when {@code withObjectByPath} is false.
      */
     private static String serviceDocument(boolean withObjectByPath) {
-        String base = wm.baseUrl();
+        return serviceDocument(wm.baseUrl(), withObjectByPath);
+    }
+
+    /** {@link #serviceDocument(boolean)} with its template URL starting with {@code base} instead of WireMock's. */
+    private static String serviceDocument(String base, boolean withObjectByPath) {
         String uriTemplate = withObjectByPath
                 ? "<cmisra:uritemplate>"
                         + "<cmisra:template>" + base + OBJECT_BY_PATH + "?path={path}"
@@ -770,7 +984,11 @@ class CmisAtomPubClientTest {
      * {@code rel="down"} link by type; without {@code withFeedLink} only the descendants link remains.
      */
     private static String folderEntry(boolean withFeedLink) {
-        String base = wm.baseUrl();
+        return folderEntry(wm.baseUrl(), withFeedLink);
+    }
+
+    /** {@link #folderEntry(boolean)} with its link URLs starting with {@code base} instead of WireMock's. */
+    private static String folderEntry(String base, boolean withFeedLink) {
         return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
                 + "<atom:entry xmlns:atom=\"" + ATOM + "\" xmlns:cmis=\"" + CMIS + "\" xmlns:cmisra=\"" + CMISRA
                 + "\">"

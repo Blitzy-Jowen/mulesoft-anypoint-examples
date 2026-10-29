@@ -57,15 +57,21 @@ public class ParseTemplateRenderer {
         this(ParseTemplateRenderer.class.getClassLoader());
     }
 
-    /** Reads templates through {@code classLoader}. */
+    /**
+     * Reads templates through {@code classLoader}.
+     *
+     * @param classLoader class loader every template is read through; must not be {@code null}
+     * @throws NullPointerException if {@code classLoader} is {@code null}
+     */
     public ParseTemplateRenderer(ClassLoader classLoader) {
         this.classLoader = Objects.requireNonNull(classLoader, "classLoader");
     }
 
     /**
-     * Renders a template that holds no expression, returning the cached text itself.
+     * Renders a template that holds no expression.
      *
      * @param location classpath location such as {@code login/index.html}; one leading {@code /} is ignored
+     * @return the cached template text itself
      */
     public String render(String location) {
         return render(location, Map.of());
@@ -76,6 +82,8 @@ public class ParseTemplateRenderer {
      *
      * @param location         classpath location; one leading {@code /} is ignored
      * @param expressionValues value per literal expression text, such as {@code #[payload.username]}
+     * @return the template text with every supplied expression replaced; the cached text itself when no value is
+     *         supplied and the template holds no expression
      */
     public String render(String location, Map<String, ?> expressionValues) {
         Objects.requireNonNull(location, "location");

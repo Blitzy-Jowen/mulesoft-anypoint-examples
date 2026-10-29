@@ -33,9 +33,6 @@ public class SAMLCustomValidator extends SamlAssertionValidator
     public Credential validate(Credential credential, RequestData data) throws WSSecurityException
     {
         Credential returnedCredential = super.validate(credential, data);
-        //
-        // Do some custom validation on the assertion
-        //
         SamlAssertionWrapper assertion = credential.getSamlAssertion();
         if (!"self".equals(assertion.getIssuerString()))
         {

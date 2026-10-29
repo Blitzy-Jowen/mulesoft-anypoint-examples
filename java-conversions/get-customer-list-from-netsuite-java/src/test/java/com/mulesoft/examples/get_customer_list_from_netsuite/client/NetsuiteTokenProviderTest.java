@@ -157,7 +157,7 @@ class NetsuiteTokenProviderTest {
         wm.stop();
     }
 
-    // ------------------------------------------------------------------------------------------ token request
+    // token request
 
     @Test
     void requestsTokenWithClientCredentialsAndJwtAssertion() {
@@ -202,7 +202,7 @@ class NetsuiteTokenProviderTest {
         wm.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
     }
 
-    // ------------------------------------------------------------------------------------------------- JWT
+    // JWT
 
     @Test
     void clientAssertionIsPs256SignedJwtWithNetsuiteClaims() throws ParseException, JOSEException {
@@ -228,7 +228,7 @@ class NetsuiteTokenProviderTest {
         wm.verify(0, anyRequestedFor(anyUrl()));
     }
 
-    // --------------------------------------------------------------------------------------------- caching
+    // caching
 
     @Test
     void cachesTokenAcrossCalls() {
@@ -399,7 +399,7 @@ class NetsuiteTokenProviderTest {
         wm.verify(2, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
     }
 
-    // ------------------------------------------------------------------------------------------ rejections
+    // rejections
 
     @Test
     void rejectsPkcs1PrivateKeyWithOpensslHint() throws IOException {
@@ -529,7 +529,7 @@ class NetsuiteTokenProviderTest {
         });
     }
 
-    // ----------------------------------------------------------------------------------------- derivations
+    // derivations
 
     @Test
     void accountHostLowerCasesAndReplacesUnderscore() {
@@ -565,7 +565,7 @@ class NetsuiteTokenProviderTest {
                 .isEqualTo(props.resolvedBaseUrl() + TOKEN_PATH);
     }
 
-    // ------------------------------------------------------------------------------------------------ helpers
+    // helpers
 
     private NetsuiteTokenProvider provider() {
         return new NetsuiteTokenProvider(props, WebClient.builder());

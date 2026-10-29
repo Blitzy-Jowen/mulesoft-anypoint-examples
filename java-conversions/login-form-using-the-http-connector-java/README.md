@@ -13,7 +13,7 @@ One listener, Undertow on `0.0.0.0`, port `http.port` (default `8081`). Methods 
 | Method | Path | Behaviour | Response |
 |---|---|---|---|
 | `GET` | `/login` | `GetLoginPageFlow` (`login-form-using-the-http-connector.xml:7-12`): the login page | `200 OK`, no `Content-Type` (the flow sets none), body `login/index.html` byte for byte |
-| `POST` | `/login` | `DoLoginFlow` (`xml:14-31`): logs `User <username> is trying to login` at INFO, then accepts only `username` = `login.username` and `password` = `login.password` | `200 OK`, `Content-Type: text/html; charset=UTF-8`, `login/loginSuccessful.html` with the username: `User mule has been logged successfully!` |
+| `POST` | `/login` | `DoLoginFlow` (`xml:14-31`): logs `User <username> is trying to login` at INFO (control characters in the username are written as `\uXXXX` escapes, root `DECISIONS.md`, section 8), then accepts only `username` = `login.username` and `password` = `login.password` | `200 OK`, `Content-Type: text/html; charset=UTF-8`, `login/loginSuccessful.html` with the username: `User mule has been logged successfully!` |
 | `POST` | `/login` | the catch branch (`xml:27-30`): wrong or missing credentials, a body that is not a form, or credentials not configured | `HTTP/1.1 403 ` (empty reason phrase: the branch sets `http.status` without a reason), `login/loginFailure.html`: `Wrong password for username <username>`. `Content-Type` is the request's media type with `; charset=<request charset, else UTF-8>` (`application/x-www-form-urlencoded; charset=UTF-8` for a form post), and none when the request sent none |
 | `POST` | `/login` | a form body with a malformed percent escape (`username=%ZZ`); the flow does not run | `400 Bad Request`, no `Content-Type`, body `Cannot decode x-www-form-urlencoded payload` (the Mule listener's answer) |
 | any other (`PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `TRACE`, …) | `/login` | neither original listener accepts it (`allowedMethods="GET"`, `"POST"`) | `405 Method Not Allowed`, `text/plain`, `Method not allowed for endpoint: /login`, no `Allow` header |
@@ -167,13 +167,13 @@ The scenarios are listed in [`src/test/resources/fixtures/SCENARIOS.md`](src/tes
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| login-form-using-the-http-connector-java | login-form-using-the-http-connector | General | PASS | PASS | 95.5% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+| login-form-using-the-http-connector-java | login-form-using-the-http-connector | General | PASS | PASS | 96.8% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
 The root [`SUMMARY.md`](../../SUMMARY.md) carries the same row for this project. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 287 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 287 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 85 of 89 lines (`service/LoginService` 40 of 40, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 94.6% (434 of 459 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 328 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 328 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 121 of 125 lines (`service/LoginService` 76 of 76, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 94.9% (470 of 495 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=4`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

@@ -16,5 +16,6 @@ sfdc:
   username:        # TODO: supply the Salesforce sandbox username
   password:        # TODO: supply the Salesforce password, without the security token
   securityToken:   # TODO: supply the Salesforce security token
-  # Optional, for sandbox orgs (default https://login.salesforce.com/services/Soap/u/65.0):
-  # auth-endpoint: https://test.salesforce.com/services/Soap/u/65.0
+  # Optional, for a sandbox org, whose users log in at test.salesforce.com: add auth-endpoint to this sfdc block
+  # with the value https://test.salesforce.com/services/Soap/u/65.0. Without it, the default from
+  # src/main/resources/application.yml applies, https://login.salesforce.com/services/Soap/u/65.0.

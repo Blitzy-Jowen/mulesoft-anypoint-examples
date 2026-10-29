@@ -99,7 +99,7 @@ class AttachmentImportServiceTest {
             + "\t</order>\n"
             + "</orders>";
 
-    /** SHA-256 of the UTF-8 bytes of {@link #EXPECTED}, fixed when the plan was verified. */
+    /** SHA-256 of the UTF-8 bytes of {@link #EXPECTED}, the digest the written file must match. */
     private static final String EXPECTED_SHA256 = "c5d9c000e8caa4640d880c08c0f9b75ab2010991b8cf3a93840760af55a906ee";
 
     /** A one-record attachment that replaces the first document in the overwrite case. */
@@ -116,7 +116,7 @@ class AttachmentImportServiceTest {
             + "\t</order>\n"
             + "</orders>";
 
-    /** SHA-256 of the UTF-8 bytes of {@link #EXPECTED_ONE_ORDER}, fixed when the plan was verified. */
+    /** SHA-256 of the UTF-8 bytes of {@link #EXPECTED_ONE_ORDER}, the digest the written file must match. */
     private static final String EXPECTED_ONE_ORDER_SHA256 =
             "10d31ef6be36de02b482fe984307df98710c22d4b92d58fcfd92385818ac86f8";
 

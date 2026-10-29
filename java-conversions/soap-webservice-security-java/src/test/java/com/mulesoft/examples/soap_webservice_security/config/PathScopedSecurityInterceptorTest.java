@@ -9,18 +9,32 @@
 package com.mulesoft.examples.soap_webservice_security.config;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -30,6 +44,10 @@ import javax.security.auth.callback.CallbackHandler;
 import javax.xml.namespace.QName;
 import javax.xml.transform.TransformerFactory;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.apache.wss4j.common.WSS4JConstants;
 import org.apache.wss4j.common.crypto.Crypto;
 import org.apache.wss4j.common.ext.WSPasswordCallback;
@@ -40,7 +58,9 @@ import org.junit.jupiter.api.function.ThrowingSupplier;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -64,6 +84,7 @@ import org.springframework.ws.transport.http.HttpServletConnection;
 import org.springframework.xml.transform.StringSource;
 import org.springframework.xml.transform.TransformerFactoryUtils;
 
+import com.mulesoft.examples.soap_webservice_security.config.PathScopedSecurityInterceptor.BoundedReplayCache;
 import com.mulesoft.examples.soap_webservice_security.config.PathScopedSecurityInterceptor.PathPolicy;
 import com.mulesoft.examples.soap_webservice_security.model.soap.Greet;
 
@@ -85,7 +106,8 @@ import com.mulesoft.examples.soap_webservice_security.model.soap.Greet;
  * <p>The cases cover each path's required action set of the original {@code mule-config.xml}, the success cases of
  * the original {@code SoapWebserviceSecurityIT} and its three negatives ({@code testUsernameTokenWrongPasswordError},
  * {@code testUsernameTokenUnsignedError}, {@code testSamlTokenWrongIssuer}), the original {@code samlTokenSigned}
- * client path, the any-order match and the fail-closed rules.
+ * client path, the any-order match, the fail-closed rules, and the per-path replay detection with its
+ * {@link BoundedReplayCache}.
  */
 class PathScopedSecurityInterceptorTest {
 
@@ -134,6 +156,19 @@ class PathScopedSecurityInterceptorTest {
 
     private static final TransformerFactory TRANSFORMER_FACTORY = TransformerFactoryUtils.newInstance();
 
+    /** Identical copies of one request received at once. */
+    private static final int CONCURRENT_COPIES = 8;
+
+    /** Longest wait for a thread of a concurrent case. */
+    private static final long TIMEOUT_SECONDS = 30;
+
+    /** Retentions of the unit-tested caches: the production defaults, so expiries read as they do in production. */
+    private static final Duration MIN_RETENTION = Duration.ofSeconds(360);
+    private static final Duration MAX_RETENTION = Duration.ofSeconds(3600);
+
+    /** Name of the unit-tested caches, as the saturation warning shows it. */
+    private static final String CACHE_NAME = "/services/test nonce";
+
     private static SaajSoapMessageFactory messageFactory;
     private static PathScopedSecurityInterceptor interceptor;
     private static Map<String, PathPolicy> pathPolicies;
@@ -150,15 +185,13 @@ class PathScopedSecurityInterceptorTest {
 
     /**
      * Builds the production WS-Security beans once. None of them holds a resource the closed context would release,
-     * so they serve every test after the runner has closed its context.
+     * so they serve every test after the runner has closed its context; closing it only emptied the interceptor's
+     * replay caches.
      */
     @BeforeAll
     @SuppressWarnings("unchecked")
     static void createProductionBeans() {
-        new ApplicationContextRunner()
-                .withInitializer(new ConfigDataApplicationContextInitializer())
-                .withPropertyValues("spring.profiles.active=test")
-                .withUserConfiguration(PropertiesConfig.class, WsSecurityConfig.class)
+        productionContext()
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     interceptor = context.getBean(PathScopedSecurityInterceptor.class);
@@ -174,14 +207,20 @@ class PathScopedSecurityInterceptorTest {
         messageFactory.afterPropertiesSet();
     }
 
+    /** A runner of {@code WsSecurityConfig} bound from the {@code test} profile, as the application binds it. */
+    private static ApplicationContextRunner productionContext() {
+        return new ApplicationContextRunner()
+                .withInitializer(new ConfigDataApplicationContextInitializer())
+                .withPropertyValues("spring.profiles.active=test")
+                .withUserConfiguration(PropertiesConfig.class, WsSecurityConfig.class);
+    }
+
     @AfterEach
     void clearTransportContext() {
         TransportContextHolder.setTransportContext(null);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Policy table
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void policyTableServesExactlyTheSixGreeterPaths() {
@@ -210,9 +249,7 @@ class PathScopedSecurityInterceptorTest {
         assertThat(actionTokens(policy.requiredActions())).isEqualTo(actionTokens(originalActions));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Accepted requests
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Path, the securing client, and whether the request carries a {@code BinarySecurityToken}: a token result the
@@ -295,9 +332,7 @@ class PathScopedSecurityInterceptorTest {
         assertThat(serialize((SoapMessage) outcome.context().getRequest())).isEqualTo(before);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Rejected requests
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** Fails closed: a secured path rejects a request without any {@code wsse:Security} header. */
     @ParameterizedTest(name = "{0}")
@@ -381,9 +416,7 @@ class PathScopedSecurityInterceptorTest {
         assertRejected(receive(requestUri, request), INVALID_SECURITY, INVALID_SECURITY_TEXT);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // understands
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * A secured path understands the {@code wsse:Security} header it processes; the unsecure path declines it, so a
@@ -420,9 +453,277 @@ class PathScopedSecurityInterceptorTest {
         assertThat(interceptor.understands(security)).as("security header without a transport context").isFalse();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // Replay detection
+
+    /** The UsernameToken paths, each with the client of its original success case. */
+    static Stream<Arguments> nonceCheckedRequests() {
+        return Stream.of(
+                Arguments.of(USERNAME,
+                        securer(() -> Securer.actions("UsernameToken Timestamp").user(JOE).build())),
+                Arguments.of(SIGNED,
+                        securer(() -> Securer.actions("UsernameToken Signature Timestamp").user(JOE).crypto()
+                                .build())),
+                Arguments.of(ENCRYPTED,
+                        securer(() -> Securer.actions("UsernameToken Timestamp Encrypt").user(JOE).crypto()
+                                .encryptionUser(JOE).build())));
+    }
+
+    /**
+     * A captured request presented again is refused as a replay, as the original's recipient nonce cache refused it,
+     * while a request the same client secures anew, with a new nonce, is accepted.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("nonceCheckedRequests")
+    void replayedRequestIsRejectedWhileAFreshlySecuredOneIsAccepted(String path,
+            ThrowingSupplier<Wss4jSecurityInterceptor> securer) throws Throwable {
+        Wss4jSecurityInterceptor client = securer.get();
+        byte[] captured = securedBytes(client);
+
+        assertAccepted(receive(path, parse(captured)));
+        assertRejected(receive(path, parse(captured)), INVALID_SECURITY, INVALID_SECURITY_TEXT);
+        assertAccepted(receive(path, secure(client)));
+    }
+
+    /** Identical copies of one request received at once: exactly one is accepted, every other is a replay. */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("nonceCheckedRequests")
+    void concurrentCopiesOfOneRequestAreAcceptedExactlyOnce(String path,
+            ThrowingSupplier<Wss4jSecurityInterceptor> securer) throws Throwable {
+        byte[] captured = securedBytes(securer.get());
+        List<Callable<Outcome>> receipts = new ArrayList<>();
+        for (int i = 0; i < CONCURRENT_COPIES; i++) {
+            SoapMessage copy = parse(captured);
+            receipts.add(() -> {
+                try {
+                    return receive(path, copy);
+                }
+                finally {
+                    TransportContextHolder.setTransportContext(null);
+                }
+            });
+        }
+
+        List<Outcome> outcomes = concurrently(receipts);
+
+        List<Outcome> accepted = outcomes.stream().filter(Outcome::proceed).toList();
+        List<Outcome> rejected = outcomes.stream().filter(outcome -> !outcome.proceed()).toList();
+        assertThat(accepted).as("accepted copies").hasSize(1);
+        assertAccepted(accepted.get(0));
+        assertThat(rejected).as("rejected copies").hasSize(CONCURRENT_COPIES - 1);
+        rejected.forEach(outcome -> assertRejected(outcome, INVALID_SECURITY, INVALID_SECURITY_TEXT));
+    }
+
+    /** The SAML paths, each with the client of its original success case. */
+    static Stream<Arguments> samlRequests() {
+        return Stream.of(
+                Arguments.of(SAML,
+                        securer(() -> Securer.actions("SAMLTokenUnsigned Timestamp").saml(samlCallbackHandler)
+                                .build())),
+                Arguments.of(SIGNED_SAML,
+                        securer(() -> Securer.actions("SAMLTokenSigned").user(JOE).crypto()
+                                .keyIdentifier(DIRECT_REFERENCE).saml(samlCallbackHandler).build())));
+    }
+
+    /**
+     * A repeated SAML request is accepted again, as the original accepted it: it carries no nonce and no signature
+     * with a Timestamp, and its assertion has no {@code OneTimeUse} condition, so no replay cache of the path holds it.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("samlRequests")
+    void repeatedSamlRequestIsAcceptedAgain(String path, ThrowingSupplier<Wss4jSecurityInterceptor> securer)
+            throws Throwable {
+        byte[] captured = securedBytes(securer.get());
+
+        assertAccepted(receive(path, parse(captured)));
+        assertAccepted(receive(path, parse(captured)));
+    }
+
+    /** Closing the application context closes the interceptor, which empties its replay caches and stays usable. */
+    @Test
+    void closingTheContextEmptiesTheReplayCaches() throws Exception {
+        byte[] captured = securedBytes(Securer.actions("UsernameToken Timestamp").user(JOE).build());
+        AtomicReference<PathScopedSecurityInterceptor> closed = new AtomicReference<>();
+
+        productionContext().run(context -> {
+            PathScopedSecurityInterceptor open = context.getBean(PathScopedSecurityInterceptor.class);
+            assertAccepted(receive(open, USERNAME, parse(captured)));
+            assertRejected(receive(open, USERNAME, parse(captured)), INVALID_SECURITY, INVALID_SECURITY_TEXT);
+            closed.set(open);
+        });
+
+        assertThat(closed.get()).as("interceptor of the closed context").isNotNull();
+        assertAccepted(receive(closed.get(), USERNAME, parse(captured)));
+    }
+
+    @Test
+    void productionCachesUseWss4jsLimits() {
+        assertThat(BoundedReplayCache.DEFAULT_MIN_RETENTION).as("longest acceptance under WSS4J's default TTLs")
+                .isEqualTo(MIN_RETENTION);
+        assertThat(BoundedReplayCache.DEFAULT_MAX_RETENTION).as("MemoryReplayCache.MAX_TTL").isEqualTo(MAX_RETENTION);
+        assertThat(BoundedReplayCache.DEFAULT_MAX_ENTRIES).isEqualTo(50_000);
+    }
+
+    @Test
+    void firstSightingIsReservedAndTheNextIsAReplay() {
+        BoundedReplayCache cache = cache(10, new MutableClock());
+
+        assertThat(cache.contains("nonce-1")).as("first sighting").isFalse();
+        assertThat(cache.contains("nonce-1")).as("second sighting").isTrue();
+        assertThat(cache.contains("nonce-2")).as("another identifier").isFalse();
+    }
+
+    @Test
+    void identifierIsForgottenAfterTheMinimumRetention() {
+        MutableClock clock = new MutableClock();
+        BoundedReplayCache cache = cache(10, clock);
+        assertThat(cache.contains("nonce-1")).isFalse();
+
+        clock.advance(MIN_RETENTION.minusSeconds(1));
+        assertThat(cache.contains("nonce-1")).as("a second before its expiry").isTrue();
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(cache.contains("nonce-1")).as("at its expiry").isFalse();
+        assertThat(cache.contains("nonce-1")).as("after it was admitted again").isTrue();
+    }
+
+    /**
+     * {@code add} keeps the later of an entry's expiries, raised to the minimum and clamped to the maximum retention;
+     * the SAML check's {@code add(id, notOnOrAfter)} followed by {@code add(id)} keeps the assertion's lifetime.
+     */
+    @Test
+    void addKeepsTheLaterExpiryWithinTheRetentions() {
+        MutableClock clock = new MutableClock();
+        Instant start = clock.instant();
+        BoundedReplayCache cache = cache(10, clock);
+
+        assertThat(cache.contains("extended")).isFalse();
+        cache.add("extended", start.plus(MIN_RETENTION).plusSeconds(100));
+        cache.add("extended");
+        cache.add("raised", start.plusSeconds(10));
+        cache.add("clamped", start.plus(MAX_RETENTION).plusSeconds(3600));
+
+        clock.set(start.plus(MIN_RETENTION).minusSeconds(1));
+        assertThat(cache.contains("raised")).as("raised, before the minimum retention").isTrue();
+        clock.set(start.plus(MIN_RETENTION));
+        assertThat(cache.contains("raised")).as("raised, at the minimum retention").isFalse();
+        assertThat(cache.contains("extended")).as("extended, at the minimum retention").isTrue();
+        clock.set(start.plus(MIN_RETENTION).plusSeconds(100));
+        assertThat(cache.contains("extended")).as("extended, at its expiry").isFalse();
+        clock.set(start.plus(MAX_RETENTION).minusSeconds(1));
+        assertThat(cache.contains("clamped")).as("clamped, before the maximum retention").isTrue();
+        clock.set(start.plus(MAX_RETENTION));
+        assertThat(cache.contains("clamped")).as("clamped, at the maximum retention").isFalse();
+    }
+
+    /**
+     * A full cache refuses new identifiers, failing closed, until its entries expire, and warns once per saturation
+     * without naming an identifier.
+     */
+    @Test
+    void fullCacheRefusesNewIdentifiersUntilEntriesExpire() {
+        MutableClock clock = new MutableClock();
+        BoundedReplayCache cache = cache(3, clock);
+        List<String> warnings;
+        ListAppender<ILoggingEvent> events = captureInterceptorLog();
+        try {
+            for (String kept : List.of("nonce-1", "nonce-2", "nonce-3")) {
+                assertThat(cache.contains(kept)).as("%s while there is room", kept).isFalse();
+            }
+            assertThat(cache.contains("nonce-4")).as("new identifier while full").isTrue();
+            assertThat(cache.contains("nonce-5")).as("another new identifier while full").isTrue();
+            assertThat(cache.contains("nonce-1")).as("kept identifier while full").isTrue();
+
+            clock.advance(MIN_RETENTION);
+            assertThat(cache.contains("nonce-4")).as("refused identifier once the entries expired").isFalse();
+            assertThat(cache.contains("nonce-5")).isFalse();
+            assertThat(cache.contains("nonce-6")).isFalse();
+            assertThat(cache.contains("nonce-7")).as("new identifier while full again").isTrue();
+        }
+        finally {
+            stopCapturing(events);
+        }
+        synchronized (events) {
+            warnings = events.list.stream()
+                    .filter(event -> event.getLevel() == Level.WARN)
+                    .map(ILoggingEvent::getFormattedMessage)
+                    .toList();
+        }
+
+        assertThat(warnings).as("one warning per saturation").containsExactly(
+                "WS-Security replay cache " + CACHE_NAME + " holds its bound of 3 identifiers: requests with a new"
+                        + " identifier are refused until entries expire",
+                "WS-Security replay cache " + CACHE_NAME + " holds its bound of 3 identifiers: requests with a new"
+                        + " identifier are refused until entries expire");
+        assertThat(warnings).noneMatch(warning -> warning.contains("nonce-"));
+    }
+
+    @Test
+    void closeForgetsEveryIdentifierAndLeavesTheCacheUsable() {
+        BoundedReplayCache cache = cache(1, new MutableClock());
+        assertThat(cache.contains("nonce-1")).isFalse();
+        assertThat(cache.contains("nonce-2")).as("new identifier while full").isTrue();
+
+        cache.close();
+
+        assertThat(cache.contains("nonce-2")).as("new identifier after close").isFalse();
+        assertThat(cache.contains("nonce-2")).as("its second sighting").isTrue();
+        assertThat(cache.contains("nonce-1")).as("forgotten identifier, while full again").isTrue();
+        cache.close();
+        assertThat(cache.contains("nonce-1")).as("forgotten identifier after close").isFalse();
+    }
+
+    /** As in WSS4J's {@code MemoryReplayCache}, a missing identifier is never a replay and is never kept. */
+    @ParameterizedTest(name = "[{0}]")
+    @NullAndEmptySource
+    void nullOrEmptyIdentifierIsNeverAReplay(String identifier) {
+        BoundedReplayCache cache = cache(1, new MutableClock());
+
+        cache.add(identifier);
+        cache.add(identifier, Instant.MAX);
+
+        assertThat(cache.contains(identifier)).isFalse();
+        assertThat(cache.contains(identifier)).isFalse();
+        assertThat(cache.contains("nonce-1")).as("an identifier, which only an empty cache admits").isFalse();
+    }
+
+    /** Threads sighting the same identifiers at once: for each identifier exactly one thread sees it first. */
+    @Test
+    void ofConcurrentSightingsOfAnIdentifierExactlyOneIsTheFirst() throws Exception {
+        int identifiers = 200;
+        BoundedReplayCache cache = cache(1_000, new MutableClock());
+        List<Callable<List<Boolean>>> threads = Collections.nCopies(16, () -> {
+            List<Boolean> replays = new ArrayList<>();
+            for (int i = 0; i < identifiers; i++) {
+                replays.add(cache.contains("nonce-" + i));
+            }
+            return replays;
+        });
+
+        List<List<Boolean>> answers = concurrently(threads);
+
+        for (int i = 0; i < identifiers; i++) {
+            int index = i;
+            assertThat(answers).as("threads that saw nonce-%d first", i)
+                    .filteredOn(replays -> !replays.get(index))
+                    .hasSize(1);
+        }
+    }
+
+    static Stream<Arguments> invalidCacheSettings() {
+        return Stream.of(
+                Arguments.of(0, MIN_RETENTION, MAX_RETENTION),
+                Arguments.of(1, Duration.ZERO, MAX_RETENTION),
+                Arguments.of(1, Duration.ofSeconds(-1), MAX_RETENTION),
+                Arguments.of(1, MAX_RETENTION, MIN_RETENTION));
+    }
+
+    @ParameterizedTest(name = "{0} entries, retention {1} to {2}")
+    @MethodSource("invalidCacheSettings")
+    void cacheRejectsAnInvalidBoundOrRetention(int maxEntries, Duration minRetention, Duration maxRetention) {
+        assertThatThrownBy(() -> new BoundedReplayCache(CACHE_NAME, maxEntries, minRetention, maxRetention,
+                new MutableClock())).isInstanceOf(IllegalArgumentException.class);
+    }
+
     // Harness
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** Types a case's client factory, so that argument lists can hold lambdas. */
     private static ThrowingSupplier<Wss4jSecurityInterceptor> securer(
@@ -481,11 +782,78 @@ class PathScopedSecurityInterceptorTest {
         return out.toString(StandardCharsets.UTF_8);
     }
 
+    /** The bytes of a new {@code greet} request secured by {@code client}, as a captured request holds them. */
+    private static byte[] securedBytes(Wss4jSecurityInterceptor client) throws Exception {
+        return serialize(secure(client)).getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** Parses {@code bytes} with a text/xml content type, as a received request. */
+    private static SoapMessage parse(byte[] bytes) throws IOException {
+        return messageFactory.createWebServiceMessage(new XmlTransportInputStream(bytes));
+    }
+
+    /**
+     * Runs each task on a thread of its own, releasing all of them together once every thread is ready, and returns
+     * their results in task order.
+     */
+    private static <T> List<T> concurrently(List<Callable<T>> tasks) throws Exception {
+        ExecutorService executor = Executors.newFixedThreadPool(tasks.size());
+        try {
+            CountDownLatch ready = new CountDownLatch(tasks.size());
+            CountDownLatch release = new CountDownLatch(1);
+            List<Future<T>> futures = new ArrayList<>();
+            for (Callable<T> task : tasks) {
+                futures.add(executor.submit(() -> {
+                    ready.countDown();
+                    if (!release.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("not released within " + TIMEOUT_SECONDS + " s");
+                    }
+                    return task.call();
+                }));
+            }
+            assertThat(ready.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).as("every thread ready").isTrue();
+            release.countDown();
+            List<T> results = new ArrayList<>();
+            for (Future<T> future : futures) {
+                results.add(future.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+            }
+            return results;
+        }
+        finally {
+            executor.shutdownNow();
+        }
+    }
+
+    /** A cache of the production retentions with room for {@code maxEntries} identifiers, on {@code clock}. */
+    private static BoundedReplayCache cache(int maxEntries, Clock clock) {
+        return new BoundedReplayCache(CACHE_NAME, maxEntries, MIN_RETENTION, MAX_RETENTION, clock);
+    }
+
+    /** Starts capturing the interceptor's log events, which include the caches' saturation warnings. */
+    private static ListAppender<ILoggingEvent> captureInterceptorLog() {
+        Logger logger = (Logger) LoggerFactory.getLogger(PathScopedSecurityInterceptor.class);
+        ListAppender<ILoggingEvent> events = new ListAppender<>();
+        events.setContext(logger.getLoggerContext());
+        events.start();
+        logger.addAppender(events);
+        return events;
+    }
+
+    private static void stopCapturing(ListAppender<ILoggingEvent> events) {
+        ((Logger) LoggerFactory.getLogger(PathScopedSecurityInterceptor.class)).detachAppender(events);
+        events.stop();
+    }
+
     /** Runs the interceptor on {@code request} received on {@code requestUri}. */
     private static Outcome receive(String requestUri, SoapMessage request) {
+        return receive(interceptor, requestUri, request);
+    }
+
+    /** Runs {@code receiver} on {@code request} received on {@code requestUri}. */
+    private static Outcome receive(PathScopedSecurityInterceptor receiver, String requestUri, SoapMessage request) {
         bindTransport(requestUri);
         MessageContext context = new DefaultMessageContext(request, messageFactory);
-        boolean proceed = interceptor.handleRequest(context, ENDPOINT);
+        boolean proceed = receiver.handleRequest(context, ENDPOINT);
         return new Outcome(proceed, context);
     }
 
@@ -630,6 +998,46 @@ class PathScopedSecurityInterceptorTest {
         Wss4jSecurityInterceptor build() throws Exception {
             interceptor.afterPropertiesSet();
             return interceptor;
+        }
+    }
+
+    /** A clock the cache tests move by hand; clocks derived by {@link #withZone} move with it. */
+    private static final class MutableClock extends Clock {
+
+        private final AtomicReference<Instant> now;
+
+        private final ZoneId zone;
+
+        MutableClock() {
+            this(new AtomicReference<>(Instant.parse("2026-01-01T00:00:00Z")), ZoneOffset.UTC);
+        }
+
+        private MutableClock(AtomicReference<Instant> now, ZoneId zone) {
+            this.now = now;
+            this.zone = zone;
+        }
+
+        void advance(Duration duration) {
+            now.updateAndGet(instant -> instant.plus(duration));
+        }
+
+        void set(Instant instant) {
+            now.set(instant);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return zone;
+        }
+
+        @Override
+        public Clock withZone(ZoneId newZone) {
+            return new MutableClock(now, newZone);
+        }
+
+        @Override
+        public Instant instant() {
+            return now.get();
         }
     }
 

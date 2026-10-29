@@ -22,3 +22,13 @@ spring:
 greeting:
   # file:outbound-endpoint path of greet3..greet6 (greeting.xml:35,57,69,81); relative to the working directory, as in Mule
   output-dir: Path_of_your_choice
+# greeting.xml declares no logger, so neither the callers' names and ages nor the bodies they post are logged at any
+# level: a root DEBUG/TRACE override, or --debug/--trace, must not reach these categories, which below INFO write
+# them. A logger's own level outranks logging.level.root and the --debug/--trace groups.
+logging:
+  level:
+    org.springframework.web.servlet.DispatcherServlet: WARN   # DEBUG/TRACE write the request line with its ?username=<name>&age=<age> query string. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, among them the failure SC-1 handles, whose message quotes a non-numeric age or the text the XML or JSON parser quotes from a posted body
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # DEBUG writes the handled exception's message: the non-numeric age, or the posted body text the parser quotes
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # DEBUG/TRACE write the response body: SC-1's 500 JSON carrying that message
+    io.undertow.request.io: INFO   # DEBUG writes request-parse failures quoting a query value that does not decode: the caller's name or age

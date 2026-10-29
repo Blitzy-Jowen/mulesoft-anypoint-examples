@@ -30,7 +30,7 @@ jdbc:
 smtp:
   host: localhost
   port: 3025              # GreenMail's conventional SMTP port; replaced by the dynamic port in every test
-  # GreenMail user the tests register with withUser("test@localhost", "secret"), as a plain address
+  # GreenMail user the tests register with this smtp.user and smtp.password, as a plain address
   # (the original's %40-encoded smtp.user_enc was a Mule endpoint-URI artefact).
   user: test@localhost
   password: secret

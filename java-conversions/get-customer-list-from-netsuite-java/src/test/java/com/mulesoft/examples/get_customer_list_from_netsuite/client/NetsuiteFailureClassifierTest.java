@@ -153,9 +153,7 @@ class NetsuiteFailureClassifierTest {
         executor = new UpstreamCallExecutor(List.of(classifier));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // system()
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void servesNetsuite() {
@@ -163,9 +161,7 @@ class NetsuiteFailureClassifierTest {
         assertThat(classifier.system().displayName()).isEqualTo("NetSuite");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // HTTP status: 401 → authentication, 429 → rate limit
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void unauthorizedIsAuthentication() {
@@ -231,9 +227,7 @@ class NetsuiteFailureClassifierTest {
         assertThat(reauths).hasValue(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Timeouts and connectivity failures → unavailable, never retried
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Every timeout and connectivity cause, the closed-connection failures Reactor Netty and Netty raise beneath
@@ -300,9 +294,7 @@ class NetsuiteFailureClassifierTest {
         assertThat(reauths).hasValue(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Everything else → OTHER, rethrown unchanged
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Throwable>> otherFailures() {
         return Stream.of(
@@ -357,9 +349,7 @@ class NetsuiteFailureClassifierTest {
         });
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // upstreamMessage: NetSuite's own error text, else a status or neutral description, never a WebClient message
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> bodiesWithErrorText() {
         String type = "\"type\":\"https://www.rfc-editor.org/rfc/rfc9110.html#section-15.5.1\"";
@@ -493,9 +483,7 @@ class NetsuiteFailureClassifierTest {
         assertThatNullPointerException().isThrownBy(() -> classifier.upstreamMessage(null));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Fixtures
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Runs a NetSuite call that fails with {@code failure} on every attempt through the executor, counting the

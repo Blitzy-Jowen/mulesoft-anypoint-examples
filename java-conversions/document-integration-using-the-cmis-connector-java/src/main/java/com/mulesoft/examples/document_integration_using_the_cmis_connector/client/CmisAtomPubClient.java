@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.SocketTimeoutException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
@@ -99,18 +100,32 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.confi
  * <p>OpenCMIS is not used: its client bindings declare a compile dependency on
  * {@code org.apache.cxf:cxf-rt-frontend-jaxws}, which the project's JAX-WS/CXF dependency ban rejects.
  *
- * <p>Repository URL, repository ID, service account and timeouts come only from {@link CmisProperties}. Every
- * request authenticates with HTTP Basic as that service account, so both {@code cmis.username} and
- * {@code cmis.password} are required: when either is blank, {@link #createDocumentByPath} fails with an
- * {@link IllegalStateException} naming the key before any request is made. Construction accepts blank values, so
- * the application starts with the credentials unset. Request failures carry fixed messages naming the step
- * ({@code service document}, {@code folder entry} or {@code create-document}), because the caller's 500 body
- * reports a message verbatim: an error status raises Spring's {@code HttpClientErrorException} (4xx) or
- * {@code HttpServerErrorException} (5xx) with {@code CMIS <step> request failed with HTTP status <code>}; a
- * transport or body-read failure raises {@code ResourceAccessException} with {@code CMIS <step> request timed out}
- * or {@code CMIS <step> request failed with an I/O error}; missing protocol elements, an unparseable Content-Type
- * and unreadable XML raise {@link IllegalStateException}. Upstream bodies, reason phrases and header text, request
- * URLs and Java type names are never copied into a message.
+ * <p>Repository URL, repository ID, service account, trusted origins and timeouts come only from
+ * {@link CmisProperties}. Every request authenticates with HTTP Basic as that service account, so both
+ * {@code cmis.username} and {@code cmis.password} are required: when either is blank, {@link #createDocumentByPath}
+ * fails with an {@link IllegalStateException} naming the key before any request is made. Construction accepts blank
+ * values, so the application starts with the credentials unset.
+ *
+ * <p>Requests go only to a trusted repository origin: the scheme, host and port, an absent port counting as the
+ * scheme's default, of {@code cmis.base-url} or of an entry of {@code cmis.trusted-origins}, scheme and host
+ * compared case-insensitively. The service document is read from {@code cmis.base-url} itself. The folder-entry
+ * URL the {@code objectbypath} template yields and the create-document URL the children link yields are checked
+ * before they are requested: one that does not parse, lacks a scheme or host, has a scheme other than {@code http}
+ * or {@code https}, or is on any other origin fails the step with an {@link IllegalStateException}
+ * {@code CMIS <step> URL is not on a trusted repository origin (cmis.base-url, cmis.trusted-origins)}, so nothing
+ * is sent to it and the service account never reaches a host the repository's responses name. A service document
+ * reached through a redirect to another origin therefore yields links that are refused unless that origin is
+ * listed in {@code cmis.trusted-origins}. Construction fails with an {@link IllegalArgumentException} naming
+ * {@code cmis.trusted-origins} and the index of an entry that is not an {@code http} or {@code https} origin.
+ *
+ * <p>Failures carry fixed messages naming the step ({@code service document}, {@code folder entry} or
+ * {@code create-document}), because the caller's 500 body reports a message verbatim: an error status raises
+ * Spring's {@code HttpClientErrorException} (4xx) or {@code HttpServerErrorException} (5xx) with
+ * {@code CMIS <step> request failed with HTTP status <code>}; a transport or body-read failure raises
+ * {@code ResourceAccessException} with {@code CMIS <step> request timed out} or
+ * {@code CMIS <step> request failed with an I/O error}; missing protocol elements, an untrusted URL, an unparseable
+ * Content-Type and unreadable XML raise {@link IllegalStateException}. Upstream bodies, reason phrases and header
+ * text, request URLs and Java type names are never copied into a message.
  *
  * <p>No call is retried, neither here nor by the transport, so each request is sent once, whether it fails with a
  * timeout, a refused, reset or early-closed connection or an error status. RestClient sends through Apache
@@ -186,7 +201,13 @@ public class CmisAtomPubClient implements AutoCloseable {
     /** Configuration key of the service-account password. */
     private static final String PASSWORD_KEY = "cmis.password";
 
+    /** Configuration key of the repository origins trusted besides that of {@code cmis.base-url}. */
+    private static final String TRUSTED_ORIGINS_KEY = "cmis.trusted-origins";
+
     private final CmisProperties properties;
+
+    /** The origins {@code cmis.trusted-origins} lists, trusted besides the origin of {@code cmis.base-url}. */
+    private final List<Origin> trustedOrigins;
 
     private final CloseableHttpClient httpClient;
 
@@ -197,13 +218,16 @@ public class CmisAtomPubClient implements AutoCloseable {
 
     /**
      * Builds the HTTP client and its connection pool from the connection settings; makes no request. An unset
-     * service account is accepted here, so the application starts without it, and is rejected by
-     * {@link #createDocumentByPath} instead.
+     * service account or {@code cmis.base-url} is accepted here, so the application starts without it, and is
+     * rejected by {@link #createDocumentByPath} instead.
      *
-     * @param properties repository URL, repository ID, service account and timeouts
+     * @param properties repository URL, repository ID, service account, trusted origins and timeouts
+     * @throws IllegalArgumentException when an entry of {@code cmis.trusted-origins} is not an {@code http} or
+     *                                  {@code https} origin, before the connection pool is built
      */
     public CmisAtomPubClient(CmisProperties properties) {
         this.properties = Objects.requireNonNull(properties, "properties");
+        this.trustedOrigins = trustedOrigins(properties.getTrustedOrigins());
         this.httpClient = buildHttpClient(timeout(properties.getConnectTimeout()),
                 timeout(properties.getReadTimeout()));
         // No factory timeout is set, so the client's own configuration governs every exchange.
@@ -234,7 +258,9 @@ public class CmisAtomPubClient implements AutoCloseable {
      * @param content         document bytes
      * @return the {@code cmis:objectId} the repository assigned to the new document
      * @throws IllegalStateException when {@code cmis.username} or {@code cmis.password} is not configured, before
-     *                               any request is made
+     *                               any request is made, or when the folder-entry or create-document URL the
+     *                               repository supplies is not on a trusted repository origin, before it is
+     *                               requested
      */
     public String createDocumentByPath(String folderPath, String name, String mimeType, String objectTypeId,
             String versioningState, byte[] content) {
@@ -246,12 +272,18 @@ public class CmisAtomPubClient implements AutoCloseable {
         requireServiceAccount();
 
         String repositoryId = properties.getRepositoryId();
-        Document serviceDocument = get(serviceDocumentUri(), SERVICE_DOCUMENT_TYPE, "service document");
+        URI serviceDocumentUri = serviceDocumentUri();
+        Origin repositoryOrigin = Origin.of(serviceDocumentUri);
+        Document serviceDocument = get(serviceDocumentUri, SERVICE_DOCUMENT_TYPE, "service document");
         String template = objectByPathTemplate(serviceDocument, repositoryId);
 
-        URI folderEntryUri = URI.create(expandObjectByPathTemplate(template, folderPath));
+        URI folderEntryUri = requireTrustedOrigin(
+                discoveredUri(expandObjectByPathTemplate(template, folderPath), "folder entry"),
+                repositoryOrigin, "folder entry");
         Document folderEntry = get(folderEntryUri, ENTRY_TYPE, "folder entry");
-        URI createUri = withVersioningState(childrenFeedUri(folderEntry, folderEntryUri, folderPath), versioningState);
+        URI createUri = requireTrustedOrigin(
+                withVersioningState(childrenFeedUri(folderEntry, folderEntryUri, folderPath), versioningState),
+                repositoryOrigin, "create-document");
 
         byte[] created = send(restClient.post()
                 .uri(createUri)
@@ -357,20 +389,12 @@ public class CmisAtomPubClient implements AutoCloseable {
     }
 
     /**
-     * Whether both requests go to the same scheme, host (case-insensitively) and port, an absent port counting as
-     * the scheme's default, as {@code HttpURLConnection} compared destinations.
+     * Whether both requests go to the same {@link Origin}: scheme, host (case-insensitively) and port, an absent
+     * port counting as the scheme's default, as {@code HttpURLConnection} compared destinations.
      */
     private static boolean sameDestination(ClassicHttpRequest a, ClassicHttpRequest b) {
-        URIAuthority authorityA = a.getAuthority();
-        URIAuthority authorityB = b.getAuthority();
-        String schemeA = a.getScheme();
-        String schemeB = b.getScheme();
-        if (authorityA == null || authorityB == null || schemeA == null || schemeB == null) {
-            return false;
-        }
-        return schemeA.equalsIgnoreCase(schemeB)
-                && authorityA.getHostName().equalsIgnoreCase(authorityB.getHostName())
-                && effectivePort(schemeA, authorityA.getPort()) == effectivePort(schemeB, authorityB.getPort());
+        Origin originA = Origin.of(a);
+        return originA != null && originA.sameAs(Origin.of(b));
     }
 
     private static int effectivePort(String scheme, int port) {
@@ -378,6 +402,85 @@ public class CmisAtomPubClient implements AutoCloseable {
             return port;
         }
         return "https".equalsIgnoreCase(scheme) ? 443 : 80;
+    }
+
+    /**
+     * The origins {@code configured} lists, in order; null lists none. Each entry, trimmed, must be an absolute
+     * {@code http} or {@code https} URI with a host, an optional port from 1 to 65535 and nothing else
+     * but an optional {@code /} path: no user information, query or fragment. Any other entry fails construction
+     * with an {@link IllegalArgumentException} naming the key and the entry's index but not its value, which a
+     * mistaken entry could fill with credentials.
+     */
+    private static List<Origin> trustedOrigins(List<String> configured) {
+        if (configured == null) {
+            return List.of();
+        }
+        List<Origin> origins = new ArrayList<>(configured.size());
+        for (int index = 0; index < configured.size(); index++) {
+            Origin origin = trustedOrigin(configured.get(index));
+            if (origin == null) {
+                throw new IllegalArgumentException(TRUSTED_ORIGINS_KEY + "[" + index
+                        + "] is not an http or https origin (scheme://host[:port])");
+            }
+            origins.add(origin);
+        }
+        return List.copyOf(origins);
+    }
+
+    /** The origin {@code entry} names, or null when it is not one as {@link #trustedOrigins} defines it. */
+    private static Origin trustedOrigin(String entry) {
+        if (entry == null) {
+            return null;
+        }
+        URI uri;
+        try {
+            uri = new URI(entry.trim());
+        } catch (URISyntaxException e) {
+            return null;
+        }
+        String authority = uri.getRawAuthority();
+        String path = uri.getRawPath();
+        if (authority == null || authority.indexOf('@') >= 0 || uri.getRawQuery() != null
+                || uri.getRawFragment() != null || !(path == null || path.isEmpty() || "/".equals(path))) {
+            return null;
+        }
+        Origin origin = Origin.of(uri);
+        return origin != null && origin.isHttp() && origin.port > 0 ? origin : null;
+    }
+
+    /**
+     * Returns {@code target} when it is an {@code http} or {@code https} URI on the origin of {@code cmis.base-url},
+     * {@code repository} (null when that URL names none), or on one of {@link #trustedOrigins}. Otherwise the step
+     * {@code what} fails with {@link #untrustedUrl} before anything is sent to {@code target}, so the service
+     * account's credentials never leave for an origin the repository's responses chose.
+     */
+    private URI requireTrustedOrigin(URI target, Origin repository, String what) {
+        Origin origin = Origin.of(target);
+        if (origin == null || !origin.isHttp()
+                || !(origin.sameAs(repository) || trustedOrigins.stream().anyMatch(origin::sameAs))) {
+            throw untrustedUrl(what, null);
+        }
+        return target;
+    }
+
+    /**
+     * {@code url}, a URL the repository supplied for the step {@code what}, as a URI; a URL that does not parse
+     * fails the step as one on no trusted origin, so the parser's message, which repeats the URL, stays out of the
+     * caller's 500 body.
+     */
+    private static URI discoveredUri(String url, String what) {
+        try {
+            return new URI(url);
+        } catch (URISyntaxException e) {
+            throw untrustedUrl(what, e);
+        }
+    }
+
+    /** The fixed failure of a step whose repository-supplied URL is refused; it names neither the URL nor its host. */
+    private static IllegalStateException untrustedUrl(String what, URISyntaxException cause) {
+        return new IllegalStateException(
+                "CMIS " + what + " URL is not on a trusted repository origin (cmis.base-url, cmis.trusted-origins)",
+                cause);
     }
 
     /** Fails the operation, naming the first unset service-account key, before any repository request. */
@@ -527,7 +630,11 @@ public class CmisAtomPubClient implements AutoCloseable {
         return expanded.toString();
     }
 
-    /** The children feed ({@code rel=down}, Atom feed), not the {@code application/cmistree+xml} descendants. */
+    /**
+     * The children feed ({@code rel=down}, Atom feed), not the {@code application/cmistree+xml} descendants,
+     * resolved against the folder entry's URL; an {@code href} that does not parse fails as
+     * {@link #discoveredUri} describes.
+     */
     private static URI childrenFeedUri(Document folderEntry, URI folderEntryUri, String folderPath) {
         Element entry = folderEntry.getDocumentElement();
         if (isElement(entry, ATOM, "entry")) {
@@ -536,7 +643,7 @@ public class CmisAtomPubClient implements AutoCloseable {
                 if ("down".equals(link.getAttribute("rel").trim())
                         && FEED_TYPE.equalsIgnoreCase(StringUtils.trimAllWhitespace(link.getAttribute("type")))
                         && !href.isEmpty()) {
-                    return folderEntryUri.resolve(href);
+                    return folderEntryUri.resolve(discoveredUri(href, "create-document"));
                 }
             }
         }
@@ -662,6 +769,73 @@ public class CmisAtomPubClient implements AutoCloseable {
     private static String childText(Element parent, String namespace, String localName) {
         List<Element> matches = children(parent, namespace, localName);
         return matches.isEmpty() ? null : matches.get(0).getTextContent().trim();
+    }
+
+    /**
+     * Where a request goes: its scheme, host and port, an absent port counting as the scheme's default. Two origins
+     * are the same when scheme and host match case-insensitively and the ports are equal, as
+     * {@code HttpURLConnection} compared destinations. The client's single notion of origin: it decides which
+     * redirect hop leaves the original destination ({@link #sameDestination}) and which repository-supplied URL may
+     * be requested ({@link #requireTrustedOrigin}).
+     */
+    private static final class Origin {
+
+        private final String scheme;
+
+        private final String host;
+
+        private final int port;
+
+        private Origin(String scheme, String host, int port) {
+            this.scheme = scheme;
+            this.host = host;
+            this.port = port;
+        }
+
+        /** The origin of a request as httpclient5 sends it, or null when it names no scheme or host. */
+        static Origin of(HttpRequest request) {
+            return of(request.getScheme(), request.getAuthority());
+        }
+
+        /**
+         * The origin of {@code uri}, its authority read as httpclient5 reads a request URI: the parsed host and port,
+         * or else the raw authority, so a host name such as {@code my_host} that {@link URI} leaves unparsed is the
+         * host the transport connects to. Null when {@code uri} names no scheme or host, or a port above 65535,
+         * which the transport would refuse to send to.
+         */
+        static Origin of(URI uri) {
+            URIAuthority authority;
+            try {
+                if (uri.getHost() != null) {
+                    authority = new URIAuthority(uri.getHost(), uri.getPort());
+                } else if (uri.getRawAuthority() != null) {
+                    authority = URIAuthority.create(uri.getRawAuthority());
+                } else {
+                    return null;
+                }
+            } catch (URISyntaxException | IllegalArgumentException e) {
+                return null;
+            }
+            return of(uri.getScheme(), authority);
+        }
+
+        private static Origin of(String scheme, URIAuthority authority) {
+            if (scheme == null || authority == null || !StringUtils.hasLength(authority.getHostName())) {
+                return null;
+            }
+            return new Origin(scheme, authority.getHostName(), effectivePort(scheme, authority.getPort()));
+        }
+
+        /** Whether the scheme is {@code http} or {@code https}, the only ones a repository URL may use. */
+        boolean isHttp() {
+            return "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+        }
+
+        /** Whether {@code other} is the same origin; never for null. */
+        boolean sameAs(Origin other) {
+            return other != null && scheme.equalsIgnoreCase(other.scheme) && host.equalsIgnoreCase(other.host)
+                    && port == other.port;
+        }
     }
 
     /**

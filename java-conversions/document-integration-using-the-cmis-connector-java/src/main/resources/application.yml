@@ -26,6 +26,7 @@ cmis:
   password: ${CMIS_PASSWORD:}
   connect-timeout: 10s  # Mule default response timeout (AAP 0.4.8)
   read-timeout: 10s
+  trusted-origins: []   # further http(s) origins (scheme://host[:port]) the repository's links may name; the cmis.base-url origin is always trusted
 logging:
   level:
     # Below INFO the Apache httpclient5 transport under CmisAtomPubClient (RestClient over

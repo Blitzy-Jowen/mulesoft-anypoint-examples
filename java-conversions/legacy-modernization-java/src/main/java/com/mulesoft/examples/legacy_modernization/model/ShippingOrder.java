@@ -23,7 +23,6 @@ public class ShippingOrder {
 	public Order order;
 	
 	public ShippingOrder(){
-		// default no-argument constructor
 	}
 	
 	public ShippingOrder(String shippingId, Address billingAddress, Address shippingAddress, Order order){

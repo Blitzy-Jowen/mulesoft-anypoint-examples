@@ -122,6 +122,9 @@ Status values:
 | `orders.output-file-name` | `String` | `orders.xml` | — | none: `outputPattern` (l.28) | default | output file name |
 | `spring.main.web-application-type` | `WebApplicationType` | `none` | — | none | fixed | no HTTP listener, as in the original |
 | `logging.level.com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connector` | `LogLevel` | `INFO` | — | none | fixed | the project's log level; keeps the `Received:` INFO line of the flow's `logger level="INFO"` (l.27) and the poller's WARN and ERROR lines visible |
+| `logging.level.org.eclipse.angus.mail` | `LogLevel` | `INFO` | — | none | fixed | Angus Mail's `.pop3.protocol` `TRACE` writes the whole POP3 dialogue: every `RETR` reply, with the message's headers (`Return-Path`, `From`, `To`, `Subject`) and the attachment's content. Angus Mail logs through `java.util.logging`, which Spring Boot bridges and holds at the same level |
+
+The `org.eclipse.angus.mail` key keeps the polled mail out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`: a logger's own level outranks them. The original logs only the orders XML built from the attachment (`Received: <xml>`), which stays. `config/SensitiveLogLevelsTest` asserts this.
 
 Original-to-new key map:
 
@@ -213,6 +216,7 @@ Usage, following the original README steps 3 to 6:
 | `mapper/DwCsvReaderTest` | SC-4, copied with its class: header row, `,` separator, `"` quoting with the `""` and backslash escapes, LF, CRLF and lone-CR record ends, skipped empty lines, untrimmed string values. |
 | `mapper/DwXmlWriterTest` | SC-4, copied with its class: the single-quoted declaration, tab layout, LF line ends and nothing after the root end tag. |
 | `service/FileOutboundWriterTest` | SC-6, copied with its class: directory creation, whole-file replacement, bytes written exactly and text as UTF-8, concurrent writers, symbolic links, permissions, and every failed write reported as `Streaming failed. Could not get output stream`. |
+| `config/SensitiveLogLevelsTest` | The `logging.level` keys bound from `application.yml` as Spring Boot binds them. With the root at `TRACE` and those levels applied through Spring Boot's logging system, one `pollOnce()` against GreenMail imports a mail whose mailbox, password, sender, subject and attachment order are sentinels: `orders.xml` holds the order and the original `Received:` line is logged at INFO with it, while no sentinel is written through any logger outside `com.mulesoft.examples` and the stand-in server. A control with the levels cleared shows exactly Angus Mail's `.pop3.protocol` logger writing them. |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured. |
 
 Coverage: the JaCoCo `check` at `prepare-package` fails the build below 80% LINE coverage over `service/**` and `mapper/**`.
@@ -241,8 +245,8 @@ No scenario is `unreachable` or `nondeterministic`: the flow has one path and re
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 218 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 218 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; 222 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 222 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 374 of 397 lines. The `mapper` package is fully covered (256 of 256 lines); `service` has 118 of 141 (`AttachmentImportService` 24 of 24, `FileOutboundWriter` 94 of 117). Total project LINE coverage: 93.7% (507 of 541 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=1`, `failed=0`.
 

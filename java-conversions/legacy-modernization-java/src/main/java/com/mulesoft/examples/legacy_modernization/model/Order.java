@@ -21,7 +21,6 @@ public class Order {
 	public List<OrderItem> orderItemList;
 	
 	public Order(){
-		//default no-argument constructor
 	}
 	
 	public Order(List<OrderItem> orderItemList){

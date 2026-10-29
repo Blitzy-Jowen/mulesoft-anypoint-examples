@@ -16,9 +16,11 @@ spring:
     protocol: smtp
     default-encoding: UTF-8
     properties:
-      # smtp:gmail-connector preset: authenticated STARTTLS on port 587.
+      # smtp:gmail-connector preset: authenticated STARTTLS on port 587, here required, so a
+      # server that does not offer STARTTLS fails the send before AUTH or any mail data.
       "[mail.smtp.auth]": true
       "[mail.smtp.starttls.enable]": true
+      "[mail.smtp.starttls.required]": true
       # responseTimeout="10000" of the original SMTP endpoint.
       "[mail.smtp.connectiontimeout]": 10000
       "[mail.smtp.timeout]": 10000
@@ -49,3 +51,16 @@ csv-email:
   input-dir: src/main/resources/input
   # Mule 3.8 default pollingFrequency (ms); the original declares none.
   polling-frequency: 1000
+
+# The original logs only the order lines it mails ("Processing objects: <payload>",
+# service/CsvEmailService). A root DEBUG/TRACE override, or --debug/--trace, must not
+# reach the Angus Mail category, which below INFO writes the SMTP account and the mail.
+# A logger's own level outranks logging.level.root and the --debug/--trace groups;
+# Angus Mail logs through java.util.logging, which Spring Boot bridges and holds at the
+# same level.
+logging:
+  level:
+    # .smtp DEBUG writes the SMTP account and the recipient addresses; .smtp.protocol
+    # TRACE the whole SMTP dialogue: MAIL FROM, RCPT TO, the headers and the order lines
+    # read from the CSV file.
+    org.eclipse.angus.mail: INFO

@@ -21,8 +21,8 @@ import twitter4j.Status;
 
 /**
  * Transforms the Twitter search response ({@link QueryResult}) into the {@code TwitterService.search}
- * response type ({@code List<Tweet>}). Replaces the Mule custom processor {@code TwitterResponseProcessor},
- * which ended both the {@code "/"} listener flow and the {@code TwitterFlow} behind the component binding.
+ * response type ({@code List<Tweet>}). It produces the result of both the {@code "/"} listener's search and the
+ * {@code TwitterService.search} binding, which {@code service.TwitterSearchService} runs through it.
  */
 @Component
 public class TwitterResponseMapper {

@@ -31,7 +31,7 @@ import com.mulesoft.examples.mule_component_bindings.model.Tweet;
 
 /**
  * The stock stats resource implementation: combines the financial stats of a stock on a date with the tweets
- * about it, classified by sentiment. Ported from {@code StockStatsResourceImpl}.
+ * about it, classified by sentiment.
  *
  * <p>Failures are {@link ResponseStatusException}s whose reason is the plain-text body the original
  * {@code WebApplicationException} carried: 400 for invalid input, 500 with the failure's own message otherwise. A
@@ -67,7 +67,6 @@ public class StockStatsService {
 
 	public StockStats search(String stock, String dateStr) {
 		try {
-			// Validation
 			if (StringUtils.isBlank(stock)) {
 				throw createResponseStatusException(HttpStatus.BAD_REQUEST, "stock is required");
 			}
@@ -87,7 +86,6 @@ public class StockStatsService {
 				throw createResponseStatusException(HttpStatus.BAD_REQUEST, "date format must be YYYY-MM-DD");
 			}
 			
-			// Fetch the stock price
 			StockStats stockStats = null;
 			try {
 				stockStats = stockService.getHistoricalPrices(stock, date);
@@ -95,7 +93,6 @@ public class StockStatsService {
 				throw createResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid stock symbol " + stock);
 			}
 			
-			// Fetch tweets
 			List<Tweet> tweets = new ArrayList<Tweet>();
 			int maxResults = 1000;
 			int pageSize = 100;
@@ -119,12 +116,10 @@ public class StockStatsService {
 				page++;
 			}
 			
-			// Make sure that we have no more that 1000 tweets
 			while (tweets.size() > maxResults) {
 				tweets.remove(maxResults);
 			}
 			
-			// Classify the tweets
 			sentimentService.classify(tweets);
 			
 			for (Tweet tweet: tweets) {

@@ -21,11 +21,9 @@ public class ShippingOrderConfirmation {
 	public boolean orderReceivedStatus;
 	
 	public ShippingOrderConfirmation(){
-		// default no-argument constructor
 	}
 	
 	public ShippingOrderConfirmation(ShippingOrder order, boolean status){
-		// initialize ShippingOrderConfirmation
 		setShippingOrder(order);
 		setOrderReceivedStatus(status);		
 	}

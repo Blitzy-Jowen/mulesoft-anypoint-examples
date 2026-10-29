@@ -75,7 +75,7 @@ class OrdersXmlMapperTest {
             + "\t</order>\n"
             + "</orders>";
 
-    /** SHA-256 of the UTF-8 bytes of {@link #EXPECTED_TWO_ORDERS}, fixed when the plan was verified. */
+    /** SHA-256 of the UTF-8 bytes of {@link #EXPECTED_TWO_ORDERS}, the digest the mapper's output must match. */
     private static final String EXPECTED_TWO_ORDERS_SHA256 =
             "c5d9c000e8caa4640d880c08c0f9b75ab2010991b8cf3a93840760af55a906ee";
 

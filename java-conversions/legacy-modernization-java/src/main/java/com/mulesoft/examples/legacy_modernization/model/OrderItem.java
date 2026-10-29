@@ -18,7 +18,6 @@ public class OrderItem {
 	public int quantity;
 
 	public OrderItem(){
-		//default no-arg constructor
 	}
 	
 	public OrderItem(String merchantSKU, int quantity){

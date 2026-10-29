@@ -25,6 +25,11 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.UnaryOperator;
 import java.util.stream.Stream;
@@ -75,7 +80,9 @@ import org.springframework.test.context.NestedTestConfiguration;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.util.TestSocketUtils;
 import org.springframework.ws.client.core.WebServiceTemplate;
+import org.springframework.ws.WebServiceMessage;
 import org.springframework.ws.client.support.interceptor.ClientInterceptor;
+import org.springframework.ws.context.DefaultMessageContext;
 import org.springframework.ws.context.MessageContext;
 import org.springframework.ws.server.endpoint.adapter.DefaultMethodEndpointAdapter;
 import org.springframework.ws.soap.SoapMessage;
@@ -125,9 +132,10 @@ import com.mulesoft.examples.soap_webservice_security.support.PortInUseRetryingC
  * </ul>
  * The test covers every original success and negative request, a second configured user, reordered action sets, the
  * {@code BinarySecurityToken} results of {@code DirectReference} signatures that the check ignores, missing and extra
- * actions, a missing security header on every secured path, the MustUnderstand fault of the unsecured path, the
- * published WSDL and the CXF response envelope. The nested {@link UnderRootTrace} run covers the logger levels
- * {@code application.yml} pins for the server's side of each secured request.
+ * actions, a missing security header on every secured path, the MustUnderstand fault of the unsecured path, replayed
+ * and concurrent copies of one request on each secured path, the published WSDL and the CXF response envelope. The
+ * nested {@link UnderRootTrace} run covers the logger levels {@code application.yml} pins for the server's side of each
+ * secured request.
  *
  * <p>Requests travel over HTTP to the running application: through {@link SecureGreeterClient} for the original
  * client profiles, through {@link WebServiceTemplate}s built here when the wire request or the HTTP status is asserted,
@@ -179,6 +187,9 @@ class GreeterEndpointTest {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
+    /** Copies of one secured request posted at once, each over a connection of its own. */
+    private static final int CONCURRENT_POSTS = 6;
+
     /**
      * The {@code /client} listener port drawn for this class's latest context load attempt, which the
      * {@link LoggedSecuredRequests} context keeps clear of while this class's context stays open; 0 before any.
@@ -223,9 +234,7 @@ class GreeterEndpointTest {
         registry.add("soap-security.client.host", () -> "localhost");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Original success requests (SoapWebserviceSecurityIT), each answered "Hello Mule"
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void unsecurePathGreetsARequestWithoutSecurityHeader() {
@@ -268,9 +277,7 @@ class GreeterEndpointTest {
         assertThat(client.samlTokenSigned("Mule")).isEqualTo("Hello Mule");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Further accepted requests: second user, any action order, ignored token results, decryption before dispatch
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void usernamePathAcceptsTheSecondConfiguredUser() throws Exception {
@@ -335,11 +342,9 @@ class GreeterEndpointTest {
         assertThat(bodyRoot(capture.request())).isEqualTo(new QName(XENC_NS, "EncryptedData"));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Rejected requests: SOAP 1.1 faults over HTTP 500. SecureGreeterClient keeps WebServiceTemplate's default
     // checkConnectionForFault, so a SoapFaultClientException from it means the connection reported HTTP 500 with an
     // XML body; test-built templates record the status themselves.
-    // ---------------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest(name = "POST /services/{0} without wsse:Security")
     @ValueSource(strings = { "username", "signed", "encrypted", "saml", "signedsaml" })
@@ -485,9 +490,99 @@ class GreeterEndpointTest {
                 .isEqualTo("MustUnderstand headers: [{" + WSSE_NS + "}Security] are not understood.");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // Replay detection over HTTP
+
+    /** The UsernameToken paths with the action sets of their original clients. */
+    static Stream<Arguments> nonceCheckedPaths() {
+        return Stream.of(
+                Arguments.of("username", "UsernameToken Timestamp"),
+                Arguments.of("signed", "UsernameToken Signature Timestamp"),
+                Arguments.of("encrypted", "UsernameToken Timestamp Encrypt"));
+    }
+
+    /** A greeted request posted again byte for byte is refused as a replay, as the original refused it. */
+    @ParameterizedTest(name = "/services/{0} with [{1}]")
+    @MethodSource("nonceCheckedPaths")
+    void replayedRequestIsAnsweredWithInvalidSecurity(String path, String actions) throws Exception {
+        Capture capture = new Capture();
+        WebServiceTemplate template = template(securement(actions, JOE, null, null), capture);
+        assertThat(greetVia(template, uri(path), "Mule")).isEqualTo("Hello Mule");
+        assertThat(capture.status).isEqualTo(200);
+
+        HttpTestClient.Response replay = postEnvelope(http(), "/services/" + path, capture.requestBytes);
+
+        assertInvalidSecurityResponse(replay);
+    }
+
+    /** Copies of one secured request posted at once over separate connections: exactly one is greeted. */
+    @ParameterizedTest(name = "/services/{0} with [{1}]")
+    @MethodSource("nonceCheckedPaths")
+    void concurrentCopiesOfOneRequestAreGreetedExactlyOnce(String path, String actions) throws Exception {
+        byte[] envelope = securedGreet(securement(actions, JOE, null, null));
+        List<HttpTestClient.Response> responses = new ArrayList<>();
+        ExecutorService executor = Executors.newFixedThreadPool(CONCURRENT_POSTS);
+        try {
+            CountDownLatch ready = new CountDownLatch(CONCURRENT_POSTS);
+            CountDownLatch release = new CountDownLatch(1);
+            List<Future<HttpTestClient.Response>> posts = new ArrayList<>();
+            for (int i = 0; i < CONCURRENT_POSTS; i++) {
+                posts.add(executor.submit(() -> {
+                    HttpTestClient http = HttpTestClient.localhost(port);
+                    ready.countDown();
+                    if (!release.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("not released within " + TIMEOUT);
+                    }
+                    return postEnvelope(http, "/services/" + path, envelope);
+                }));
+            }
+            assertThat(ready.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS)).as("every poster ready").isTrue();
+            release.countDown();
+            for (Future<HttpTestClient.Response> post : posts) {
+                responses.add(post.get(TIMEOUT.toSeconds() * 3, TimeUnit.SECONDS));
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+
+        List<HttpTestClient.Response> greeted = responses.stream().filter(response -> response.status() == 200)
+                .toList();
+        List<HttpTestClient.Response> refused = responses.stream().filter(response -> response.status() != 200)
+                .toList();
+        assertThat(greeted).as("greeted copies").hasSize(1);
+        assertThat(greeted.get(0).bodyAsString()).contains("<name>Hello Mule</name>");
+        assertThat(refused).as("refused copies").hasSize(CONCURRENT_POSTS - 1);
+        for (HttpTestClient.Response response : refused) {
+            assertInvalidSecurityResponse(response);
+        }
+    }
+
+    /** The SAML paths with the action sets and key identifiers of their original clients. */
+    static Stream<Arguments> samlPaths() {
+        return Stream.of(
+                Arguments.of("saml", "SAMLTokenUnsigned Timestamp", null),
+                Arguments.of("signedsaml", "SAMLTokenSigned", DIRECT_REFERENCE));
+    }
+
+    /**
+     * A greeted SAML request posted again byte for byte is greeted again, as the original greeted it: it carries no
+     * nonce and no signature with a Timestamp, and its assertion has no {@code OneTimeUse} condition.
+     */
+    @ParameterizedTest(name = "/services/{0} with [{1}]")
+    @MethodSource("samlPaths")
+    void repeatedSamlRequestIsGreetedAgain(String path, String actions, String keyIdentifier) throws Exception {
+        Capture capture = new Capture();
+        WebServiceTemplate template =
+                template(securement(actions, JOE, keyIdentifier, samlCallbackHandler), capture);
+        assertThat(greetVia(template, uri(path), "Mule")).isEqualTo("Hello Mule");
+        assertThat(capture.status).isEqualTo(200);
+
+        HttpTestClient.Response repeat = postEnvelope(http(), "/services/" + path, capture.requestBytes);
+
+        assertThat(repeat.status()).as(repeat.toString()).isEqualTo(200);
+        assertThat(repeat.bodyAsString()).contains("<name>Hello Mule</name>");
+    }
+
     // SC-11: published WSDL, CXF envelope style and the listener boundary
-    // ---------------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest(name = "GET /services/{0}?wsdl")
     @ValueSource(strings = { "unsecure", "username", "signed", "encrypted", "saml", "signedsaml" })
@@ -560,9 +655,7 @@ class GreeterEndpointTest {
         assertThat(fault.text()).isNotBlank();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Logger levels: no security header, secret or greeted name in the log under a root TRACE level
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** The secured requests of {@link LoggedSecuredRequests} under {@code logging.level.root=TRACE}. */
     @Nested
@@ -819,9 +912,7 @@ class GreeterEndpointTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Helpers
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** The Greeter path {@code /services/<path>} on the SOAP listener. */
     private URI uri(String path) {
@@ -834,10 +925,40 @@ class GreeterEndpointTest {
 
     /** A POST of {@code envelope} with the headers the CXF clients sent. */
     private HttpTestClient.Response postEnvelope(String path, String envelope) {
+        return postEnvelope(http(), path, envelope.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** A POST of the {@code envelope} bytes through {@code http} with the headers the CXF clients sent. */
+    private static HttpTestClient.Response postEnvelope(HttpTestClient http, String path, byte[] envelope) {
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("Content-Type", "text/xml; charset=UTF-8");
         headers.put("SOAPAction", "\"\"");
-        return http().send("POST", path, headers, envelope.getBytes(StandardCharsets.UTF_8));
+        return http.send("POST", path, headers, envelope);
+    }
+
+    /**
+     * A {@code greet("Mule")} request over the application's message factory, secured by {@code securer} and
+     * serialized as a client sends it, without sending it.
+     */
+    private byte[] securedGreet(Wss4jSecurityInterceptor securer) throws Exception {
+        WebServiceMessage request = messageFactory.createWebServiceMessage();
+        marshaller.marshal(new Greet("Mule"), request.getPayloadResult());
+        MessageContext context = new DefaultMessageContext(request, messageFactory);
+        assertThat(securer.handleRequest(context)).as("request secured").isTrue();
+        securer.afterCompletion(context, null);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        context.getRequest().writeTo(bytes);
+        return bytes.toByteArray();
+    }
+
+    /** A WS-Security rejection on the wire: HTTP 500, text/xml, {@code wsse:InvalidSecurity}, and no greeting. */
+    private static void assertInvalidSecurityResponse(HttpTestClient.Response response) throws Exception {
+        assertThat(response.status()).as(response.toString()).isEqualTo(500);
+        assertThat(response.header("Content-Type")).startsWith("text/xml");
+        Fault fault = rawFault(response);
+        assertThat(fault.code()).isEqualTo(new QName(WSSE_NS, "InvalidSecurity"));
+        assertThat(fault.text()).isEqualTo(INVALID_SECURITY_TEXT);
+        assertThat(response.bodyAsString()).doesNotContain("Hello");
     }
 
     /** A SOAP 1.1 template over the application's message factory and Greeter marshaller, built for one test. */

@@ -118,7 +118,8 @@ public class WsSecurityConfig {
 
     /**
      * Inbound enforcement of {@link #pathPolicies}; run once per request, before endpoint selection, by the message
-     * receiver of {@code WebServiceConfig}.
+     * receiver of {@code WebServiceConfig}. Its {@code close()}, the bean's inferred destroy method, empties the
+     * per-path replay caches when the context closes.
      */
     @Bean
     public PathScopedSecurityInterceptor pathScopedSecurityInterceptor(

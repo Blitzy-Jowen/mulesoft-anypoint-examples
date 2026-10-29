@@ -24,6 +24,9 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.http.HttpTimeoutException;
 import java.util.List;
 import java.util.stream.Stream;
 
@@ -64,7 +67,10 @@ import ch.qos.logback.core.read.ListAppender;
  * <p>{@link SharepointRestClient} is a Mockito mock, so no request leaves the JVM and no credential is needed. The
  * original declares no exception strategy, so a failure at any step must reach the caller unchanged, skip every
  * later step and suppress the success line. Before it is rethrown, the failure is logged once at ERROR, on one line,
- * with the step, its target and a reason that carries no response body, cookie, form digest or password.
+ * without a throwable, naming only the step, the HTTP status code and the class names of the exception and its
+ * causes; the configuration check's message, which names keys alone, is the one exception text logged. Distinctive
+ * markers in OData error bodies, reason phrases, SOAP fault reasons, request URLs, exception messages and causes,
+ * and in the folder path, must never reach the line.
  */
 @ExtendWith(MockitoExtension.class)
 class SharepointImportServiceTest {
@@ -91,14 +97,37 @@ class SharepointImportServiceTest {
     private static final SharepointRestClient.SharepointSession SECRET_SESSION = new SharepointRestClient.SharepointSession(
             "rtFa=" + RTFA_VALUE + "; FedAuth=" + FEDAUTH_VALUE, FORM_DIGEST);
 
-    /** The reason prefix of the client's own failures of type {@link IllegalStateException}. */
-    private static final String ISE = "IllegalStateException: ";
+    /** Upstream-controlled text that must never be logged. */
+    private static final String MARKER = "MARKER-UPSTREAM-SECRET-61f0";
+
+    /** The personal data an OData error message may quote. */
+    private static final String CUSTOMER_EMAIL = "customer@example.com";
+
+    /** An OData error message quoting a federation cookie and a customer's address, as the finding's input does. */
+    private static final String ODATA_MARKER_MESSAGE =
+            "FedAuth=" + FEDAUTH_VALUE + "; " + CUSTOMER_EMAIL + " " + MARKER;
+
+    /** A request URL as Spring quotes it in a {@code ResourceAccessException} message. */
+    private static final String MARKER_URL = "http://127.0.0.1:9/_api/contextinfo?" + MARKER;
+
+    private static final String ISE = "java.lang.IllegalStateException";
+
+    /** The configuration check's exception, the one type whose message the ERROR line carries. */
+    private static final String INVALID_CONFIGURATION =
+            "com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.config.SharepointProperties"
+                    + "$InvalidConfigurationException";
+
+    /** Every value that must never appear in an ERROR line, whichever step fails and however. */
+    private static final String[] NEVER_LOGGED = {
+        PASSWORD, RTFA_VALUE, FEDAUTH_VALUE, FORM_DIGEST, MARKER, CUSTOMER_EMAIL, "FedAuth=", "127.0.0.1",
+        "Shared Documents", "test-folder", "contacts.csv"
+    };
 
     /** The step that fails, and the start of the ERROR line the service logs for it. */
     enum Step {
         SIGN_IN("SharePoint step 'sign-in' failed: "),
-        FOLDER_CREATE("SharePoint step 'folder create' failed for " + FOLDER + ": "),
-        FILE_ADD("SharePoint step 'file add' failed for " + FILE + ": ");
+        FOLDER_CREATE("SharePoint step 'folder create' failed: "),
+        FILE_ADD("SharePoint step 'file add' failed: ");
 
         private final String linePrefix;
 
@@ -265,7 +294,8 @@ class SharepointImportServiceTest {
         assertThat(event.getLevel()).isEqualTo(Level.ERROR);
         assertThat(event.getFormattedMessage()).isEqualTo(step.linePrefix + expectedReason);
         assertThat(event.getThrowableProxy()).isNull();
-        assertThat(event.getFormattedMessage()).doesNotContain(PASSWORD, RTFA_VALUE, FEDAUTH_VALUE, FORM_DIGEST);
+        assertThat(event.getArgumentArray()).noneMatch(Throwable.class::isInstance);
+        assertThat(event.getFormattedMessage()).doesNotContain(NEVER_LOGGED).doesNotContain("\r", "\n");
 
         InOrder order = inOrder(client);
         order.verify(client).signIn();
@@ -279,142 +309,147 @@ class SharepointImportServiceTest {
     }
 
     @Test
-    void folderTargetIsLoggedOnOneLineWhileTheClientGetsItUnchanged() {
-        String folder = "/Shared Documents/evil\r\nERROR forged\tline";
-        service = serviceFor("evil\r\nERROR forged\tline");
+    void folderPathIsNeverLoggedWhileTheClientGetsItUnchanged() {
+        String folderName = "evil\r\nERROR forged\tline " + MARKER;
+        service = serviceFor(folderName);
         IllegalStateException failure = new IllegalStateException("folder failed");
         givenSignInSucceeds();
-        doThrow(failure).when(client).createFolder(SESSION, folder);
+        doThrow(failure).when(client).createFolder(SESSION, "/Shared Documents/" + folderName);
 
         assertSame(failure, assertThrows(RuntimeException.class, () -> service.importFile(bytes)));
 
         assertThat(appender.list)
                 .extracting(ILoggingEvent::getFormattedMessage)
-                .containsExactly("SharePoint step 'folder create' failed for /Shared Documents/evil  ERROR forged line: "
-                        + ISE + "folder failed");
+                .containsExactly("SharePoint step 'folder create' failed: " + ISE);
         verify(client, never()).addFile(any(), anyString(), any(), anyBoolean());
     }
 
     /**
      * One row per failing step and reason: the step, a scenario label, the exception the client throws and the reason
-     * the ERROR line must end with.
+     * the ERROR line must end with. Every row also runs the {@link #NEVER_LOGGED} check, so the marker rows prove that
+     * upstream text, exception messages and causes' messages are dropped while the status code and class names stay.
      */
     static Stream<Arguments> stepFailures() {
         IllegalStateException missingConfiguration = assertThrows(IllegalStateException.class,
                 new SharepointProperties("user@example.onmicrosoft.com", "", "http://127.0.0.1:9", "",
                         "http://127.0.0.1:9/extSTS.srf")::requireValid);
-        IllegalStateException anonymousType = new IllegalStateException("anonymous failure") {
+        IllegalStateException invalidSiteUrl = assertThrows(IllegalStateException.class,
+                new SharepointProperties("user@example.onmicrosoft.com", PASSWORD,
+                        "https://" + CUSTOMER_EMAIL + ":" + MARKER + "@127.0.0.1:9/?" + MARKER, "test-folder",
+                        "http://127.0.0.1:9/extSTS.srf")::requireValid);
+        IllegalStateException anonymousType = new IllegalStateException("anonymous failure " + MARKER) {
             private static final long serialVersionUID = 1L;
         };
-        String addFileUrl = "http://127.0.0.1:9/_api/web/GetFolderByServerRelativeUrl('/Shared%20Documents/test-folder')"
-                + "/Files/add(url='contacts.csv',overwrite=true)";
+        IllegalStateException circular = new IllegalStateException(MARKER);
+        IOException circularCause = new IOException(MARKER, circular);
+        circular.initCause(circularCause);
+        RuntimeException deepCause = new IllegalStateException(MARKER);
+        for (int depth = 0; depth < 5; depth++) {
+            deepCause = new RuntimeException(MARKER + depth, deepCause);
+        }
+        String odataVerbose = "{\"error\":{\"code\":\"-2130575214, Microsoft.SharePoint.SPException\",\"message\":"
+                + "{\"lang\":\"en-US\",\"value\":\"" + ODATA_MARKER_MESSAGE + "\"}}}";
+        String odataLight = "{\"odata.error\":{\"code\":\"-1, Microsoft.SharePoint.SPException\",\"message\":"
+                + "{\"lang\":\"en-US\",\"value\":\"" + ODATA_MARKER_MESSAGE + "\"}}}";
+        String odataV4 = "{\"error\":{\"code\":\"itemNotFound\",\"message\":\"" + ODATA_MARKER_MESSAGE + "\"}}";
         return Stream.of(
-                Arguments.of(Step.SIGN_IN, "missing configuration", missingConfiguration,
-                        ISE + "Missing required SharePoint configuration: Sharepoint.Password (SHAREPOINT_PASSWORD),"
-                                + " csvImportFolder (CSVIMPORTFOLDER)."
+                Arguments.of(Step.SIGN_IN, "missing configuration: the key names are logged", missingConfiguration,
+                        INVALID_CONFIGURATION + ": Missing required SharePoint configuration: Sharepoint.Password"
+                                + " (SHAREPOINT_PASSWORD), csvImportFolder (CSVIMPORTFOLDER)."
                                 + " # TODO: supply them in application.yml or as environment variables."),
-                Arguments.of(Step.SIGN_IN, "security token service fault reason",
+                Arguments.of(Step.FILE_ADD, "invalid site URL holding markers: the key name is logged, not the value",
+                        invalidSiteUrl,
+                        INVALID_CONFIGURATION + ": Invalid SharePoint configuration: Sharepoint.SiteUrl"
+                                + " (SHAREPOINT_SITEURL) must be an absolute http or https URL with a host and without"
+                                + " user info, query or fragment."
+                                + " # TODO: supply them in application.yml or as environment variables."),
+                Arguments.of(Step.SIGN_IN, "configuration text in an ordinary IllegalStateException",
+                        new IllegalStateException("Missing required SharePoint configuration: " + MARKER), ISE),
+                Arguments.of(Step.SIGN_IN, "security token service fault reason holding a marker",
                         new IllegalStateException("SharePoint Online sign-in failed: AADSTS50126: Error validating"
-                                + " credentials due to invalid username or password."),
-                        ISE + "SharePoint Online sign-in failed: AADSTS50126: Error validating credentials due to"
-                                + " invalid username or password."),
+                                + " credentials due to invalid username or password. " + MARKER + " FedAuth="
+                                + FEDAUTH_VALUE),
+                        ISE),
                 Arguments.of(Step.SIGN_IN, "missing federation cookie",
-                        new IllegalStateException("SharePoint Online sign-in failed: missing cookie(s) FedAuth"),
-                        ISE + "SharePoint Online sign-in failed: missing cookie(s) FedAuth"),
-                Arguments.of(Step.SIGN_IN, "security token service error status, body withheld by the client",
-                        HttpServerErrorException.create(HttpStatus.SERVICE_UNAVAILABLE, "Service Unavailable",
-                                new HttpHeaders(), null, null),
-                        "HTTP 503 Service Unavailable"),
+                        new IllegalStateException("SharePoint Online sign-in failed: missing cookie(s) FedAuth"), ISE),
+                Arguments.of(Step.SIGN_IN, "security token service error status with a marker reason phrase",
+                        HttpServerErrorException.create(HttpStatus.SERVICE_UNAVAILABLE, MARKER, new HttpHeaders(),
+                                null, null),
+                        "HTTP 503 (org.springframework.web.client.HttpServerErrorException$ServiceUnavailable)"),
                 Arguments.of(Step.SIGN_IN, "contextinfo 403 with an OData verbose error",
-                        httpError(HttpStatus.FORBIDDEN, "{\"error\":{\"code\":\"-2147024891, System.UnauthorizedAccess"
-                                + "Exception\",\"message\":{\"lang\":\"en-US\",\"value\":\"Access denied.\"}}}"),
-                        "HTTP 403 Forbidden: Access denied."),
-                Arguments.of(Step.SIGN_IN, "contextinfo timeout",
-                        new ResourceAccessException("I/O error on POST request for \"http://127.0.0.1:9/_api/contextinfo"
-                                + "\": SharePoint response not received in full within 10000 ms"),
-                        "ResourceAccessException: I/O error on POST request for \"http://127.0.0.1:9/_api/contextinfo"
-                                + "\": SharePoint response not received in full within 10000 ms"),
+                        httpError(HttpStatus.FORBIDDEN, MARKER, odataVerbose),
+                        "HTTP 403 (org.springframework.web.client.HttpClientErrorException$Forbidden)"),
+                Arguments.of(Step.SIGN_IN, "contextinfo timeout with a marker URL",
+                        new ResourceAccessException("I/O error on POST request for \"" + MARKER_URL
+                                + "\": SharePoint response not received in full within 10000 ms",
+                                new HttpTimeoutException(MARKER)),
+                        "org.springframework.web.client.ResourceAccessException <- java.net.http.HttpTimeoutException"),
+                Arguments.of(Step.SIGN_IN, "cause whose message holds a marker",
+                        new IllegalStateException("sign-in failed", new IOException(MARKER + " " + PASSWORD)),
+                        ISE + " <- java.io.IOException"),
                 Arguments.of(Step.SIGN_IN, "anonymous exception type", anonymousType,
-                        anonymousType.getClass().getName() + ": anonymous failure"),
+                        anonymousType.getClass().getName()),
                 Arguments.of(Step.SIGN_IN, "exception whose message cannot be read", new UnreadableFailure(),
                         UnreadableFailure.class.getName()),
-                Arguments.of(Step.FOLDER_CREATE, "500 with an OData verbose error",
-                        httpError(HttpStatus.INTERNAL_SERVER_ERROR,
-                                "{\"error\":{\"message\":{\"lang\":\"en-US\",\"value\":\"QA simulated folder failure\"}}}"),
-                        "HTTP 500 Internal Server Error: QA simulated folder failure"),
-                Arguments.of(Step.FOLDER_CREATE, "500 with an OData JSON light error",
-                        httpError(HttpStatus.INTERNAL_SERVER_ERROR, "{\"odata.error\":{\"code\":\"-1, Microsoft.Share"
-                                + "Point.SPException\",\"message\":{\"lang\":\"en-US\",\"value\":\"QA light failure\"}}}"),
-                        "HTTP 500 Internal Server Error: QA light failure"),
-                Arguments.of(Step.FOLDER_CREATE, "404 with an OData v4 error",
-                        httpError(HttpStatus.NOT_FOUND,
-                                "{\"error\":{\"code\":\"itemNotFound\",\"message\":\"QA v4 failure\"}}"),
-                        "HTTP 404 Not Found: QA v4 failure"),
-                Arguments.of(Step.FOLDER_CREATE, "OData error message holding CR LF",
-                        httpError(HttpStatus.INTERNAL_SERVER_ERROR,
-                                "{\"error\":{\"message\":{\"value\":\"first line\\r\\nERROR forged line\"}}}"),
-                        "HTTP 500 Internal Server Error: first line  ERROR forged line"),
-                Arguments.of(Step.FOLDER_CREATE, "unexpected exception type",
-                        new UnsupportedOperationException("do-not-log-me " + PASSWORD),
+                Arguments.of(Step.SIGN_IN, "exception whose cause cannot be read", new UnreadableCause(),
+                        UnreadableCause.class.getName() + " <- [unavailable]"),
+                Arguments.of(Step.FOLDER_CREATE, "400 with an OData verbose error and a marker reason phrase",
+                        httpError(HttpStatus.BAD_REQUEST, MARKER, odataVerbose),
+                        "HTTP 400 (org.springframework.web.client.HttpClientErrorException$BadRequest)"),
+                Arguments.of(Step.FOLDER_CREATE, "500 with an OData JSON light error and a marker reason phrase",
+                        httpError(HttpStatus.INTERNAL_SERVER_ERROR, MARKER, odataLight),
+                        "HTTP 500 (org.springframework.web.client.HttpServerErrorException$InternalServerError)"),
+                Arguments.of(Step.FOLDER_CREATE, "unexpected exception type with a marker",
+                        new UnsupportedOperationException(MARKER + " " + PASSWORD),
                         "java.lang.UnsupportedOperationException"),
-                Arguments.of(Step.FOLDER_CREATE, "message holding control characters and line and paragraph separators",
-                        new IllegalStateException("line one\r\nline two\ttabbed\u2028separated\u2029end"),
-                        ISE + "line one  line two tabbed separated end"),
+                Arguments.of(Step.FOLDER_CREATE, "message holding a forged line and a marker",
+                        new IllegalStateException("line one\r\nERROR forged\tline\u2028" + MARKER), ISE),
+                Arguments.of(Step.FOLDER_CREATE, "circular cause chain",
+                        circular, ISE + " <- java.io.IOException <- [circular]"),
+                Arguments.of(Step.FOLDER_CREATE, "cause chain longer than the limit", deepCause,
+                        "java.lang.RuntimeException <- java.lang.RuntimeException <- java.lang.RuntimeException"
+                                + " <- java.lang.RuntimeException <- java.lang.RuntimeException <- ..."),
+                Arguments.of(Step.FILE_ADD, "404 with an OData v4 error and a marker reason phrase",
+                        httpError(HttpStatus.NOT_FOUND, MARKER, odataV4),
+                        "HTTP 404 (org.springframework.web.client.HttpClientErrorException$NotFound)"),
                 Arguments.of(Step.FILE_ADD, "500 with an HTML body",
-                        httpError(HttpStatus.INTERNAL_SERVER_ERROR, "<html>secret-body " + FORM_DIGEST + "</html>"),
-                        "HTTP 500 Internal Server Error"),
+                        httpError(HttpStatus.INTERNAL_SERVER_ERROR, "Internal Server Error",
+                                "<html>secret-body " + FORM_DIGEST + " " + MARKER + "</html>"),
+                        "HTTP 500 (org.springframework.web.client.HttpServerErrorException$InternalServerError)"),
                 Arguments.of(Step.FILE_ADD, "500 without a body",
-                        httpError(HttpStatus.INTERNAL_SERVER_ERROR, null),
-                        "HTTP 500 Internal Server Error"),
-                Arguments.of(Step.FILE_ADD, "OData error whose message is not a string",
-                        httpError(HttpStatus.INTERNAL_SERVER_ERROR,
-                                "{\"error\":{\"code\":\"-1\",\"message\":{\"lang\":\"en-US\",\"value\":42}}}"),
-                        "HTTP 500 Internal Server Error"),
-                Arguments.of(Step.FILE_ADD, "OData error with a blank message",
-                        httpError(HttpStatus.INTERNAL_SERVER_ERROR, "{\"error\":{\"message\":{\"value\":\"  \"}}}"),
-                        "HTTP 500 Internal Server Error"),
-                Arguments.of(Step.FILE_ADD, "status with an empty reason phrase",
+                        httpError(HttpStatus.INTERNAL_SERVER_ERROR, "Internal Server Error", null),
+                        "HTTP 500 (org.springframework.web.client.HttpServerErrorException$InternalServerError)"),
+                Arguments.of(Step.FILE_ADD, "status outside the known codes without a reason phrase",
                         HttpServerErrorException.create(HttpStatusCode.valueOf(599), "", new HttpHeaders(), null, null),
-                        "HTTP 599"),
-                Arguments.of(Step.FILE_ADD, "status without a reason phrase",
-                        HttpServerErrorException.create(HttpStatus.BAD_GATEWAY, null, new HttpHeaders(), null, null),
-                        "HTTP 502"),
-                Arguments.of(Step.FILE_ADD, "connection refused",
-                        new ResourceAccessException("I/O error on POST request for \"" + addFileUrl
-                                + "\": Connection refused"),
-                        "ResourceAccessException: I/O error on POST request for \"" + addFileUrl
-                                + "\": Connection refused"),
+                        "HTTP 599 (org.springframework.web.client.HttpServerErrorException)"),
+                Arguments.of(Step.FILE_ADD, "status code that cannot be read", new UnreadableStatus(),
+                        "HTTP [unavailable] (" + UnreadableStatus.class.getName() + ")"),
+                Arguments.of(Step.FILE_ADD, "connection refused with a marker URL",
+                        new ResourceAccessException("I/O error on POST request for \"" + MARKER_URL
+                                + "\": Connection refused", new ConnectException(MARKER)),
+                        "org.springframework.web.client.ResourceAccessException <- java.net.ConnectException"),
                 Arguments.of(Step.FILE_ADD, "response that cannot be extracted",
-                        new RestClientException("Error while extracting response for type [byte[]]"),
-                        "RestClientException: Error while extracting response for type [byte[]]"),
-                Arguments.of(Step.FILE_ADD, "malformed file URL",
-                        new IllegalArgumentException("fileServerRelativeUrl must be <folder>/<name>: contacts.csv"),
-                        "IllegalArgumentException: fileServerRelativeUrl must be <folder>/<name>: contacts.csv"),
-                Arguments.of(Step.FILE_ADD, "client failure without a message", new IllegalStateException(),
-                        "IllegalStateException"),
-                Arguments.of(Step.FILE_ADD, "message longer than the limit",
-                        new IllegalStateException("x".repeat(1200)),
-                        ISE + "x".repeat(1000 - ISE.length()) + "...[truncated]"),
-                Arguments.of(Step.FILE_ADD, "surrogate pair across the limit",
-                        new IllegalStateException("x".repeat(999 - ISE.length()) + "\uD83D\uDE00 tail"),
-                        ISE + "x".repeat(999 - ISE.length()) + "...[truncated]"));
+                        new RestClientException("Error while extracting response for type [byte[]] " + MARKER),
+                        "org.springframework.web.client.RestClientException"),
+                Arguments.of(Step.FILE_ADD, "malformed file URL holding a marker",
+                        new IllegalArgumentException("fileServerRelativeUrl must be <folder>/<name>: " + MARKER),
+                        "java.lang.IllegalArgumentException"),
+                Arguments.of(Step.FILE_ADD, "client failure without a message", new IllegalStateException(), ISE));
     }
 
     /**
-     * An HTTP error status as RestClient's default handler raises it: the message quotes the whole body, which the
-     * service must never log.
+     * An HTTP error status as RestClient's default handler raises it: the message quotes the status text and the
+     * whole body, neither of which the service may log.
      */
-    private static RestClientResponseException httpError(HttpStatus status, String body) {
+    private static RestClientResponseException httpError(HttpStatus status, String statusText, String body) {
         byte[] content = body == null ? null : body.getBytes(UTF_8);
-        String message = status.value() + " " + status.getReasonPhrase() + (body == null ? "" : ": \"" + body + "\"");
+        String message = status.value() + " " + statusText + (body == null ? "" : ": \"" + body + "\"");
         return status.is4xxClientError()
-                ? HttpClientErrorException.create(message, status, status.getReasonPhrase(), new HttpHeaders(), content,
-                        UTF_8)
-                : HttpServerErrorException.create(message, status, status.getReasonPhrase(), new HttpHeaders(), content,
-                        UTF_8);
+                ? HttpClientErrorException.create(message, status, statusText, new HttpHeaders(), content, UTF_8)
+                : HttpServerErrorException.create(message, status, statusText, new HttpHeaders(), content, UTF_8);
     }
 
-    /** A client failure whose message accessor itself fails. */
+    /** A client failure whose message accessor itself fails, which the service must never call. */
     private static final class UnreadableFailure extends IllegalStateException {
 
         private static final long serialVersionUID = 1L;
@@ -422,6 +457,36 @@ class SharepointImportServiceTest {
         @Override
         public String getMessage() {
             throw new UnsupportedOperationException("message unavailable");
+        }
+    }
+
+    /** A client failure whose cause accessor fails. */
+    private static final class UnreadableCause extends IllegalStateException {
+
+        private static final long serialVersionUID = 1L;
+
+        UnreadableCause() {
+            super(MARKER);
+        }
+
+        @Override
+        public synchronized Throwable getCause() {
+            throw new UnsupportedOperationException("cause unavailable");
+        }
+    }
+
+    /** An HTTP error whose status code accessor fails. */
+    private static final class UnreadableStatus extends HttpServerErrorException {
+
+        private static final long serialVersionUID = 1L;
+
+        UnreadableStatus() {
+            super(HttpStatus.INTERNAL_SERVER_ERROR, MARKER);
+        }
+
+        @Override
+        public HttpStatusCode getStatusCode() {
+            throw new UnsupportedOperationException("status unavailable");
         }
     }
 

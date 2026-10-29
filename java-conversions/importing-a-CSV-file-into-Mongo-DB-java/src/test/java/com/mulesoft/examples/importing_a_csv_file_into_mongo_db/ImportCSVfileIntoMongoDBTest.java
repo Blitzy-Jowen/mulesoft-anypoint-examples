@@ -83,7 +83,7 @@ public class ImportCSVfileIntoMongoDBTest {
     /** The name the original dispatched the file under ({@code outputPattern} {@code input.csv}). */
     private static final String INPUT_CSV = "input.csv";
 
-    /** The original's {@code Thread.sleep(5000)}, now the upper bound of the wait for the import. */
+    /** Longest wait for the polled {@code input.csv} to be deleted and one document to be in {@code customers}. */
     private static final Duration AWAIT_LIMIT = Duration.ofSeconds(5);
 
     /** Bound before the context starts, because {@link #properties} reads its port. */

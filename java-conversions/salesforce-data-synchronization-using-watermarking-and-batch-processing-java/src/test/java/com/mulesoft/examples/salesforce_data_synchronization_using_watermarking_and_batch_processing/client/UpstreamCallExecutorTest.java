@@ -165,9 +165,7 @@ class UpstreamCallExecutorTest {
         Thread.interrupted();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Retry semantics: one re-authentication and one retry after an authentication rejection
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void authenticationRejectionReauthenticatesOnceAndReturnsTheRetrysValue() throws Exception {
@@ -263,9 +261,7 @@ class UpstreamCallExecutorTest {
         assertEquals(1, classifier.classifyCalls.get());
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // No-retry semantics: rate limits, timeouts and connectivity failures are never retried
-    // ---------------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest
     @NullSource
@@ -351,9 +347,7 @@ class UpstreamCallExecutorTest {
         assertEquals(List.of(), appender.list);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Mechanics
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * An {@link Error} or an upstream exception a nested executor raised is classified like any other failure, and
@@ -594,9 +588,7 @@ class UpstreamCallExecutorTest {
         assertEquals(List.of(), journal);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // UpstreamFailureClassifier.isUnavailable
-    // ---------------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest
     @MethodSource("unavailableCauses")
@@ -808,9 +800,7 @@ class UpstreamCallExecutorTest {
         });
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // UpstreamFailureClassifier.upstreamMessage (default)
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Without a message anywhere in the chain, the description names the upstream and never a class. Guarded by
@@ -866,9 +856,7 @@ class UpstreamCallExecutorTest {
                 () -> classifier.upstreamMessage(null)).getMessage());
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // ERROR line: upstream, category and types only; the vendor's text stays with the caller
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * A vendor failure whose message repeats a sentinel and forges a log line, with a sentinel-bearing cause and
@@ -988,9 +976,7 @@ class UpstreamCallExecutorTest {
                 Arguments.of(chainOf(CAUSE_LOG_LIMIT + 2), io.repeat(CAUSE_LOG_LIMIT) + " <- ..."));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Fakes and helpers
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** Where a scripted failure is injected, with the journal the executor must leave behind. */
     private enum Stage {

@@ -359,6 +359,7 @@ class CsvMailSenderTest {
         Properties properties = new Properties();
         properties.setProperty("mail.smtp.auth", "true");
         properties.setProperty("mail.smtp.starttls.enable", "false");
+        properties.setProperty("mail.smtp.starttls.required", "false");
         // Short timeouts keep a failing send from hanging the build.
         properties.setProperty("mail.smtp.connectiontimeout", "5000");
         properties.setProperty("mail.smtp.timeout", "5000");

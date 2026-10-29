@@ -29,7 +29,9 @@ import java.util.Set;
  * 429 or 503 without any retry, or rethrow the original throwable unchanged.
  *
  * <p>Timeouts and connectivity failures are classified identically for every vendor, by {@link #isUnavailable},
- * so no vendor can retry them and no write is ever submitted twice.
+ * so no vendor can retry them: a request that timed out or lost its connection may already have been processed,
+ * and it is never submitted again. The only resubmission is the executor's single retry after an authentication
+ * rejection, a request the vendor refused before processing it.
  *
  * <p>The interface depends on the JDK and its SC-9 siblings alone so that every connector project can copy it with
  * only its {@code package} line changed. In particular it has no Netty or Reactor Netty dependency: the read timeout

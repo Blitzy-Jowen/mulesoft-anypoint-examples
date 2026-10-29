@@ -348,14 +348,20 @@ class OrderOrchestrationServiceTest {
         });
     }
 
+    /**
+     * {@code defaultErrorHandler} writes one INFO line per call: ordinary payload text exactly as the original logger
+     * wrote it, backslashes and non-ASCII text included, and every character that could end or disguise the line as a
+     * six-character escape, so a payload cannot forge log entries.
+     */
     @ParameterizedTest
-    @NullSource
-    @ValueSource(strings = "payload-x")
-    void logErrorWritesInfoLine(String payload) {
+    @MethodSource("loggedPayloads")
+    void logErrorWritesOneInfoLineWithControlCharactersEscaped(String payload, String expectedLogged) {
         service.logError(payload);
 
         assertThat(log.events()).extracting(ILoggingEvent::getLevel, ILoggingEvent::getFormattedMessage)
-                .containsExactly(tuple(Level.INFO, "Error occurred: " + payload));
+                .containsExactly(tuple(Level.INFO, "Error occurred: " + expectedLogged));
+        assertThat(log.events().get(0).getFormattedMessage())
+                .doesNotContain("\r", "\n", "\u0085", "\u2028", "\u2029");
     }
 
     @Test
@@ -528,6 +534,28 @@ class OrderOrchestrationServiceTest {
                 Arguments.of(Named.of("circular causes", circular),
                         "java.lang.IllegalStateException <- java.lang.IllegalArgumentException <- [circular]"),
                 Arguments.of(Named.of("eleven causes", deep), deepChain.append(" <- ...").toString()));
+    }
+
+    static Stream<Arguments> loggedPayloads() {
+        return Stream.of(
+                Arguments.of(Named.of("forged line after CR LF", "bad\r\nINFO forged-order-audit"),
+                        "bad\\u000d\\u000aINFO forged-order-audit"),
+                Arguments.of(Named.of("lone LF", "a\nb"), "a\\u000ab"),
+                Arguments.of(Named.of("lone CR", "a\rb"), "a\\u000db"),
+                Arguments.of(Named.of("next line NEL", "a\u0085b"), "a\\u0085b"),
+                Arguments.of(Named.of("line separator", "a\u2028b"), "a\\u2028b"),
+                Arguments.of(Named.of("paragraph separator", "a\u2029b"), "a\\u2029b"),
+                Arguments.of(Named.of("right-to-left override", "a\u202eb"), "a\\u202eb"),
+                Arguments.of(Named.of("tab", "a\tb"), "a\\u0009b"),
+                Arguments.of(Named.of("NUL", "a\u0000b"), "a\\u0000b"),
+                Arguments.of(Named.of("escape", "a\u001b[31mb"), "a\\u001b[31mb"),
+                Arguments.of(Named.of("unpaired surrogate", "a\ud800b"), "a\\ud800b"),
+                Arguments.of(Named.of("plain text", "payload-x"), "payload-x"),
+                Arguments.of(Named.of("backslashes", "C:\\orders\\in"), "C:\\orders\\in"),
+                Arguments.of(Named.of("non-ASCII text", "Größe café 東京"), "Größe café 東京"),
+                Arguments.of(Named.of("surrogate pair", "order \ud83d\ude00"), "order \ud83d\ude00"),
+                Arguments.of(Named.of("literal escape text", "\\u000d"), "\\u000d"),
+                Arguments.of(Named.of("null", null), "null"));
     }
 
     static Stream<Arguments> failingDdl() {

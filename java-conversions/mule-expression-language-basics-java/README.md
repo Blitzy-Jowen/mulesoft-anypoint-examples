@@ -71,7 +71,13 @@ Status: `default` — a non-secret value the original fixed, overridable; `fixed
 | `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` runs the flow like every other method, instead of the servlet's `message/http` echo |
 | `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | a form body on `PUT`, `PATCH` or `DELETE` reaches the controller unparsed, as on `POST` |
 | `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
+| `logging.level.org.springframework.web.servlet.DispatcherServlet` | `LogLevel` | `WARN` | none | fixed | its `DEBUG` and `TRACE` write the request line with its `?username=<name>&age=<age>` query string. `WARN`, not `INFO`: its only `INFO` lines are the servlet start-up pair, which a root `WARN` must silence |
+| `logging.level.org.springframework.web.method.HandlerMethod` | `LogLevel` | `INFO` | none | fixed | its `TRACE` writes handler arguments, among them the failure SC-1 handles, whose message quotes a non-numeric age or the text the XML or JSON parser quotes from a posted body |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver` | `LogLevel` | `INFO` | none | fixed | its `DEBUG` writes the handled exception's message: the non-numeric age, or the posted body text the parser quotes |
+| `logging.level.org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor` | `LogLevel` | `INFO` | none | fixed | its `DEBUG` and `TRACE` write the response body: SC-1's `500` JSON carrying that message |
+| `logging.level.io.undertow.request.io` | `LogLevel` | `INFO` | none | fixed | its `DEBUG` writes request-parse failures quoting a query value that does not decode: the caller's name or age |
 
+- The five `logging.level` keys keep the callers' names, ages and posted bodies out of the log under a root `DEBUG` or `TRACE` level and under `--debug` or `--trace`: a logger's own level outranks them. The original declares no logger, so it logged none of them. `config/SensitiveLogLevelsTest` asserts this.
 - There are no secrets, credentials, hosts or tenant identifiers, so the configuration has no TODO placeholder. The project therefore has no `src/test/resources/application-test.yml` and no `application-it.yml`.
 - A relative `greeting.output-dir` resolves against the process's working directory, as Mule resolved the relative `path`. Run from this directory with the default, the files land in `java-conversions/mule-expression-language-basics-java/Path_of_your_choice/`, which git does not ignore; point the key under `target/` or elsewhere to keep the checkout clean.
 - Override either key on the command line or through the environment (relaxed binding maps `HTTP_PORT` to `http.port` and `GREETING_OUTPUT_DIR` to `greeting.output-dir`):
@@ -195,6 +201,7 @@ No listener for endpoint: /greet7
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes; `ErrorResponse` JSON escaping; escaped, length-bounded ERROR log lines |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
 | `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to each of `/greet1` … `/greet6` runs the flow exactly as a plain `OPTIONS` request does (`200 Hello Mule`, no `Content-Type`, no `Access-Control-*` or `Vary`, one file for `greet3` … `greet6`); a pre-flight to an unserved path, `/greet7` or `/greet3;x=1?username=Mule&age=1`, gets the no-listener 404 and writes no file |
+| `config/SensitiveLogLevelsTest` | the five `logging.level` keys bound from `application.yml` as Spring Boot binds them; with the root at `TRACE` and those levels applied through Spring Boot's logging system, `GET` `/greet1` … `/greet4` with a marker `username` and `age`, `/greet3` with a non-numeric marker `age` (the JSON `500`), and `POST` `/greet5` and `/greet6` with well-formed bodies, a truncated XML document, XML naming the marker as an undeclared entity and truncated JSON answer with their documented status line, `Content-Type`, body bytes and file, and write no marker, as text or as logged body bytes, through any logger outside `com.mulesoft.examples`, in a message, an argument or a throwable's chain; a control with the levels cleared shows exactly `DispatcherServlet` writing the query, and `HandlerMethod`, `ExceptionHandlerExceptionResolver` and `HttpEntityMethodProcessor` writing each failure's message, and no logger writing the well-formed bodies or the truncated XML, whose parser message quotes no text. A marker `username` with an undecodable `%ZZ` escape, sent raw, is answered `400 Bad Request` with an empty body, writes no file and is written by no such logger; the control shows exactly `io.undertow.request.io` writing it |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes.
@@ -240,8 +247,8 @@ The twelve `nondeterministic` rows are the requests that write a file: each prod
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 609 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 609 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; 636 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 636 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 266 of 291 lines of `service/GreetingService`, `service/FileOutboundWriter`, `mapper/GreetingCsvMapper` and `mapper/DwCsvWriter`. Total project LINE coverage: 94.2% (504 of 535 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=22`, `failed=0`.
 

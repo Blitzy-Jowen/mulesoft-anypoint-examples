@@ -245,6 +245,12 @@ public class ListenerPorts {
     /**
      * Host an additional listener binds: its own {@code host}, else {@code listeners.host}, else
      * {@value #DEFAULT_HOST}.
+     *
+     * @param entry      the additional listener; {@code null}, or a blank {@code host}, falls back to
+     *                   {@code properties}
+     * @param properties the {@code listeners} block; {@code null}, or a blank {@code host}, falls back to
+     *                   {@value #DEFAULT_HOST}
+     * @return the first of the two hosts that is not blank, trimmed, else {@value #DEFAULT_HOST}
      */
     public static String effectiveHost(Additional entry, Properties properties) {
         if (entry != null && StringUtils.hasText(entry.host())) {
@@ -278,6 +284,11 @@ public class ListenerPorts {
      * The returned customizer is a {@link DisposableBean}: when the context closes it stops the context's web server,
      * if one is still running, and then every worker it created.
      *
+     * @param properties     the {@code listeners} block: the additional entries, their default host and the
+     *                       disallowed methods
+     * @param resourceLoader loads the key and trust stores of the HTTPS entries
+     * @param environment    supplies the Undertow thread settings, and the configured values read for the
+     *                       placeholder keys an empty-password start-up failure names
      * @return the customizer that adds the additional listeners and the method restriction to the Undertow server
      * @throws IllegalStateException naming the entry when a port is invalid or repeated, or a TLS context cannot be
      *                               built
@@ -291,9 +302,14 @@ public class ListenerPorts {
     }
 
     /**
-     * Registers {@link PortRoutingFilter} ahead of every other filter, for request dispatches only, so a forward it
-     * issues is not routed a second time.
+     * Registers {@link PortRoutingFilter} at {@link Ordered#HIGHEST_PRECEDENCE}, the highest precedence an ordinary
+     * {@link Ordered} registration can take: only a registration that implements
+     * {@link org.springframework.core.PriorityOrdered}, or another of the same order value that Spring Boot lists
+     * first, runs ahead of it. The filter is registered for request dispatches only, so a forward it issues is not
+     * routed a second time.
      *
+     * @param properties the {@code listeners} block whose main and additional routes the filter applies
+     * @return the registration, named {@code portRoutingFilter} and mapped to {@code /*}
      * @throws IllegalStateException naming the entry when a port is invalid or repeated
      */
     @Bean

@@ -109,7 +109,7 @@ class ImportingAnEmailAttachmentUsingTheIMAPConnectorTest {
     private static final String OUTPUT_FILE_NAME = "orders.xml";
     private static final long DELIVERY_WAIT_MS = 5000;
     private static final int MAIL_TIMEOUT_MS = 10000;
-    /** The original test's fixed sleep before its assertion, now the longest wait. */
+    /** Longest wait for {@code orders.xml} to be written, and for the read mail to be expunged from the inbox. */
     private static final Duration ORIGINAL_WAIT = Duration.ofSeconds(10);
     /** The original {@code <imaps:connector checkFrequency="100"/>}, also the await poll interval. */
     private static final Duration CHECK_FREQUENCY = Duration.ofMillis(100);

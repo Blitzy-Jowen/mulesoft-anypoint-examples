@@ -230,9 +230,7 @@ class SecureGreeterClientTest {
                         .withBody(GREET_RESPONSE)));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // SecurityClients choice and the otherwise literal
-    // ---------------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest(name = "{0} -> /services/{1}")
     @CsvSource({
@@ -295,9 +293,7 @@ class SecureGreeterClientTest {
         assertThat(client.endpoint("/" + path)).isEqualTo(expected);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Security header of each client type, as captured on the wire
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void unsecureSendsNoSecurityHeader() throws Exception {
@@ -404,9 +400,7 @@ class SecureGreeterClientTest {
         assertThat(nonces).doesNotContain("").doesNotHaveDuplicates();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Profile factories: the request shapes of the original negative tests (SoapWebserviceSecurityIT)
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void usernameTokenProfileOnTheSignedPathCarriesNoSignature() throws Exception {
@@ -460,9 +454,7 @@ class SecureGreeterClientTest {
                 .isNotEqualTo(digestOf(envelope, configuredPassword()));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Failures propagate: the client catches nothing (the catch branch is GreeterClientExceptionHandler)
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void soapFaultOfTheUnsecurePathPropagates() {
@@ -651,9 +643,7 @@ class SecureGreeterClientTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Logger levels: no security header, secret or greeted name in the log under a root TRACE level
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** The client calls of {@link LoggedClientCalls} under {@code logging.level.root=TRACE}. */
     @Nested
@@ -892,9 +882,7 @@ class SecureGreeterClientTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Response timeout: a positive number of milliseconds, never the indefinite wait of zero
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void responseTimeoutDefaultsToTheMuleDefaultResponseTimeout() {
@@ -949,9 +937,7 @@ class SecureGreeterClientTest {
         WIREMOCK.verify(0, anyRequestedFor(anyUrl()));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Assertions shared by several client types
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** A {@code PasswordDigest} UsernameToken of the client user whose digest was computed from {@code password}. */
     private static void assertUsernameTokenDigest(Document envelope, String password) throws Exception {
@@ -1014,9 +1000,7 @@ class SecureGreeterClientTest {
         assertThat(text(envelope, GREET_NAME)).isEqualTo(NAME);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Helpers
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** The client user's password of the {@code test} profile ({@code soap-security.users.joe}). */
     private String configuredPassword() {

@@ -9,6 +9,8 @@
 package com.mulesoft.examples.document_integration_using_the_cmis_connector.config;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -29,6 +31,11 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * naming the missing key, before it makes any request.
  *
  * <p>The connect and read timeouts default to 10 seconds, the Mule default response timeout.
+ *
+ * <p>{@code cmis.trusted-origins} has no counterpart in the original. The client sends a request, and with it
+ * the service account, only to the origin of {@code cmis.base-url} or to one listed here, so a deployment whose
+ * repository advertises its links on another host, for example behind a proxy, lists that origin. It is empty by
+ * default and comes only from configuration.
  *
  * <p>Registered by {@code @EnableConfigurationProperties(CmisProperties.class)} on the application
  * class. It carries no stereotype annotation, because one would register a second bean of this type.
@@ -55,6 +62,12 @@ public class CmisProperties {
 
     /** Read timeout of every repository request. */
     private Duration readTimeout = MULE_DEFAULT_RESPONSE_TIMEOUT;
+
+    /**
+     * Repository origins ({@code scheme://host[:port]}, {@code http} or {@code https}) trusted besides that of
+     * {@link #baseUrl}; the client refuses to request a URL the repository's responses name on any other origin.
+     */
+    private List<String> trustedOrigins = new ArrayList<>();
 
     public String getBaseUrl() {
         return baseUrl;
@@ -104,12 +117,21 @@ public class CmisProperties {
         this.readTimeout = readTimeout;
     }
 
+    public List<String> getTrustedOrigins() {
+        return trustedOrigins;
+    }
+
+    public void setTrustedOrigins(List<String> trustedOrigins) {
+        this.trustedOrigins = trustedOrigins;
+    }
+
     /** Renders every setting except the password, which appears only as a mask when it is set. */
     @Override
     public String toString() {
         String maskedPassword = (password == null || password.isEmpty()) ? password : "****";
         return "CmisProperties{baseUrl='" + baseUrl + "', repositoryId='" + repositoryId
                 + "', username='" + username + "', password='" + maskedPassword
-                + "', connectTimeout=" + connectTimeout + ", readTimeout=" + readTimeout + '}';
+                + "', connectTimeout=" + connectTimeout + ", readTimeout=" + readTimeout
+                + ", trustedOrigins=" + trustedOrigins + '}';
     }
 }

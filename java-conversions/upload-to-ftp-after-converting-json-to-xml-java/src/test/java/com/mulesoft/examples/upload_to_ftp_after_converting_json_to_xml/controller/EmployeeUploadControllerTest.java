@@ -27,8 +27,11 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockftpserver.core.MockFtpServerException;
+import org.mockftpserver.core.command.CommandHandler;
+import org.mockftpserver.core.command.StaticReplyCommandHandler;
 import org.mockftpserver.fake.FakeFtpServer;
 import org.mockftpserver.fake.UserAccount;
 import org.mockftpserver.fake.filesystem.DirectoryEntry;
@@ -62,8 +65,9 @@ import com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.support.
  *
  * <p>The happy path covers every method, because the original listener declares no {@code allowedMethods}. The error
  * cases are the failures the flow does not handle, each answered with the platform-default 500 of SC-1 (malformed
- * JSON, no body, a rejected FTP login, a missing remote directory), and the no-listener 404 for a path the flow does
- * not serve. Every test starts from the same seeded FTP server, so the order of the tests does not matter.
+ * JSON, no body, a rejected FTP login, a missing remote directory, a hostile FTP reply), and the no-listener 404 for a
+ * path the flow does not serve. Every test starts from the same seeded FTP server, so the order of the tests does not
+ * matter.
  *
  * <p>The original {@code UploadToFtpAfterConvertingJsonToXmlIT} assertion is ported separately in
  * {@code UploadToFtpAfterConvertingJsonToXmlTest}.
@@ -90,6 +94,9 @@ class EmployeeUploadControllerTest {
     private static final String ROOT = "/";
     private static final String CONTENT_TYPE = "Content-Type";
     private static final String ERROR_BODY_PREFIX = "{ \"message\": ";
+
+    /** Text a hostile FTP server puts into its reply. */
+    private static final String HOSTILE_REPLY_MARKER = "MARKER-REPLY-SECRET";
 
     /**
      * The XML the original flow returns and uploads for {@code message.json}: the DataWeave XML writer's single-quoted
@@ -211,7 +218,10 @@ class EmployeeUploadControllerTest {
         assertNothingUploaded();
     }
 
-    /** Scenario {@code post-root-ftp-unavailable}, here with the server refusing the configured login. */
+    /**
+     * Scenario {@code post-root-ftp-unavailable}, here with the server refusing the configured login: the message
+     * names the operation and the reply code only.
+     */
     @Test
     void ftpLoginRejectedReturns500() {
         FTP.getUserAccount(FTP_USER).setPassword("not-the-configured-password");
@@ -220,11 +230,42 @@ class EmployeeUploadControllerTest {
 
         assertPlatform500(response);
         assertThat(response.bodyAsString()).as("%s", response)
-                .contains("FTP login to localhost:" + FTP.getServerControlPort() + " failed");
+                .isEqualTo("{ \"message\": \"FTP login failed: server replied 530\" }");
+        assertNoFtpDetail(response);
         assertNothingUploaded();
     }
 
-    /** Like the original endpoint, the client never creates the remote directory, so the upload fails. */
+    /**
+     * A hostile server's reply text, quoting a marker, the configured login and the target, never reaches the
+     * anonymous 500 body: a negative reply is reported by its code, a 421 as the connection the server closed.
+     */
+    @ParameterizedTest(name = "[{index}] {0} {1}")
+    @CsvSource({
+            "CONNECT, 421, FTP connect failed: connection closed by the server",
+            "PASS, 530, FTP login failed: server replied 530",
+            "STOR, 553, FTP store failed: server replied 553"})
+    void hostileFtpReplyTextStaysOutOfThe500Body(String command, int replyCode, String message) {
+        CommandHandler original = FTP.getCommandHandler(command);
+        FTP.setCommandHandler(command, new StaticReplyCommandHandler(replyCode, HOSTILE_REPLY_MARKER + " pw="
+                + FTP_PASSWORD + " user=" + FTP_USER + " at localhost:" + FTP.getServerControlPort() + " in "
+                + UPLOAD_DIR + "/" + UPLOADED_FILE_NAME));
+        try {
+            HttpTestClient.Response response = sendEmployees("POST");
+
+            assertPlatform500(response);
+            assertThat(response.bodyAsString()).as("%s", response).isEqualTo("{ \"message\": \"" + message + "\" }");
+            assertThat(response.bodyAsString()).doesNotContain(HOSTILE_REPLY_MARKER);
+            assertNoFtpDetail(response);
+            assertNothingUploaded();
+        } finally {
+            FTP.setCommandHandler(command, original);
+        }
+    }
+
+    /**
+     * Like the original endpoint, the client never creates the remote directory, so the upload fails; the message
+     * names the operation and the reply code, not the directory.
+     */
     @Test
     void missingUploadDirectoryReturns500AndCreatesNoDirectory() {
         FTP.setFileSystem(fileSystemWithoutUploadDir());
@@ -233,7 +274,8 @@ class EmployeeUploadControllerTest {
 
         assertPlatform500(response);
         assertThat(response.bodyAsString()).as("%s", response)
-                .contains("FTP change working directory to " + UPLOAD_DIR + "/");
+                .isEqualTo("{ \"message\": \"FTP change working directory failed: server replied 550\" }");
+        assertNoFtpDetail(response);
         assertThat(FTP.getFileSystem().exists(UPLOAD_DIR)).isFalse();
         assertThat(FTP.getFileSystem().exists(FTP_HOME + UPLOADED_FILE_NAME)).isFalse();
         assertThat(uploadedFileExists()).isFalse();
@@ -285,6 +327,12 @@ class EmployeeUploadControllerTest {
         assertThat(response.statusLine()).as("%s", response).isEqualTo("HTTP/1.1 500 Internal Server Error");
         assertThat(response.headers(CONTENT_TYPE)).as("%s", response).containsExactly("application/json");
         assertThat(response.bodyAsString()).startsWith(ERROR_BODY_PREFIX).endsWith("\" }");
+    }
+
+    /** The anonymous 500 body names none of the FTP settings: host, port, directory, file name or login. */
+    private static void assertNoFtpDetail(HttpTestClient.Response response) {
+        assertThat(response.bodyAsString()).as("%s", response).doesNotContain("localhost",
+                String.valueOf(FTP.getServerControlPort()), UPLOAD_DIR, UPLOADED_FILE_NAME, FTP_USER, FTP_PASSWORD);
     }
 
     private static void assertNothingUploaded() {

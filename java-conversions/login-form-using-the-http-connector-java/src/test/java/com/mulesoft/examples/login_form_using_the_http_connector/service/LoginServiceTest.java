@@ -62,7 +62,8 @@ import com.mulesoft.examples.login_form_using_the_http_connector.service.LoginSe
  * {@code login-form-using-the-http-connector.xml}, with {@link LoginRequesterClient} mocked and the real SC-14
  * {@link ParseTemplateRenderer} reading the carried {@code login/*.html} pages.
  *
- * <p>It covers {@code GetLoginPageFlow}'s page byte for byte; {@code DoLoginFlow}'s INFO log line, its credential
+ * <p>It covers {@code GetLoginPageFlow}'s page byte for byte; {@code DoLoginFlow}'s INFO log line (an ordinary
+ * username verbatim, a character that could start or forge a line escaped), its credential
  * filter (exact, case-sensitive equality with the configured values, failing closed when they are empty, blank
  * or unset, with one WARN naming only the blank keys) and its catch strategy, reached by a filter rejection and
  * by a rendering failure alike; and
@@ -144,7 +145,18 @@ class LoginServiceTest {
                 Arguments.of("submit button field posted with the credentials", DEMO,
                         form("username", "mule", "password", "mule", "Submit", "Submit"), "mule"),
                 Arguments.of("configured credentials other than the demo values", ALICE,
-                        form("username", "alice", "password", "s3cret"), "alice"));
+                        form("username", "alice", "password", "s3cret"), "alice"),
+                // The log line escapes these characters; the check and the page still use the submitted value.
+                Arguments.of("configured username holding characters the log line escapes",
+                        new LoginProperties("ali\tce\u200B", "s3cret", "localhost"),
+                        form("username", "ali\tce\u200B", "password", "s3cret"), "ali\tce\u200B"),
+                Arguments.of("configured credentials with non-ASCII letters and a surrogate pair",
+                        new LoginProperties("Jos\u00E9\uD83D\uDE00", "p\u00E4ss\u65E5\u672C\uD83D\uDE00", "localhost"),
+                        form("username", "Jos\u00E9\uD83D\uDE00", "password", "p\u00E4ss\u65E5\u672C\uD83D\uDE00"),
+                        "Jos\u00E9\uD83D\uDE00"),
+                Arguments.of("configured credentials ending in an unpaired surrogate, submitted exactly",
+                        new LoginProperties("mule\uD800", "mule\uD800", "localhost"),
+                        form("username", "mule\uD800", "password", "mule\uD800"), "mule\uD800"));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -163,7 +175,28 @@ class LoginServiceTest {
     static Stream<Arguments> rejectedLogins() {
         LoginProperties empty = new LoginProperties("", "", "localhost");
         LoginProperties unset = new LoginProperties(null, null, "localhost");
+        // UTF-8 writes every unpaired surrogate as '?', so these values must still be told apart.
+        LoginProperties unpaired = new LoginProperties("mule\uD800", "mule\uD800", "localhost");
         return Stream.of(
+                Arguments.of("prefix of the configured username", DEMO, form("username", "mul", "password", "mule")),
+                Arguments.of("prefix of the configured password", DEMO, form("username", "mule", "password", "mul")),
+                Arguments.of("configured username plus a suffix", DEMO,
+                        form("username", "mulex", "password", "mule")),
+                Arguments.of("configured password plus a suffix", DEMO,
+                        form("username", "mule", "password", "mulex")),
+                Arguments.of("username of the same length differing in its last character", DEMO,
+                        form("username", "mula", "password", "mule")),
+                Arguments.of("password of the same length differing in its last character", DEMO,
+                        form("username", "mule", "password", "mula")),
+                Arguments.of("empty values submitted", DEMO, form("username", "", "password", "")),
+                Arguments.of("other unpaired surrogate in the username", unpaired,
+                        form("username", "mule\uD801", "password", "mule\uD800")),
+                Arguments.of("question mark for the unpaired surrogate in the username", unpaired,
+                        form("username", "mule?", "password", "mule\uD800")),
+                Arguments.of("other unpaired surrogate in the password", unpaired,
+                        form("username", "mule\uD800", "password", "mule\uD801")),
+                Arguments.of("question mark for the unpaired surrogate in the password", unpaired,
+                        form("username", "mule\uD800", "password", "mule?")),
                 Arguments.of("wrong password", DEMO, form("username", "mule", "password", "wrong-pw")),
                 Arguments.of("username differing only in case", DEMO, form("username", "Mule", "password", "mule")),
                 Arguments.of("password differing only in case", DEMO, form("username", "mule", "password", "MULE")),
@@ -348,6 +381,58 @@ class LoginServiceTest {
             assertThat(event.getMessage()).doesNotContain("wrong-pw");
             assertThat(Arrays.deepToString(event.getArgumentArray())).doesNotContain("wrong-pw");
         });
+    }
+
+    /** Usernames that could start or forge a log line: scenario, submitted value, its text in the log line. */
+    static Stream<Arguments> hostileUsernames() {
+        return Stream.of(
+                Arguments.of("CR LF followed by a forged entry", "guest\r\nINFO forged-audit-entry",
+                        "guest\\u000d\\u000aINFO forged-audit-entry"),
+                Arguments.of("lone LF", "guest\nforged", "guest\\u000aforged"),
+                Arguments.of("lone CR", "guest\rforged", "guest\\u000dforged"),
+                Arguments.of("next line (NEL)", "guest\u0085forged", "guest\\u0085forged"),
+                Arguments.of("line separator", "guest\u2028forged", "guest\\u2028forged"),
+                Arguments.of("paragraph separator", "guest\u2029forged", "guest\\u2029forged"),
+                Arguments.of("right-to-left override", "guest\u202Eforged", "guest\\u202eforged"),
+                Arguments.of("tab", "guest\tforged", "guest\\u0009forged"),
+                Arguments.of("NUL", "guest\0forged", "guest\\u0000forged"),
+                Arguments.of("ESC of a terminal colour sequence", "guest\u001B[31mforged", "guest\\u001b[31mforged"),
+                Arguments.of("DEL", "guest\u007Fforged", "guest\\u007fforged"),
+                Arguments.of("zero-width space", "gu\u200Best", "gu\\u200best"),
+                Arguments.of("byte order mark", "\uFEFFguest", "\\ufeffguest"),
+                Arguments.of("unpaired high surrogate", "guest\uD800forged", "guest\\ud800forged"),
+                Arguments.of("unpaired low surrogate", "guest\uDC00forged", "guest\\udc00forged"),
+                Arguments.of("high surrogate ending the value", "guest\uD83D", "guest\\ud83d"),
+                Arguments.of("surrogates in reverse order", "guest\uDE00\uD83D", "guest\\ude00\\ud83d"),
+                Arguments.of("supplementary format character, one escape per UTF-16 unit", "guest\uDB40\uDC01",
+                        "guest\\udb40\\udc01"));
+    }
+
+    /** Usernames the original logger already wrote on one line: scenario, submitted value, the same value. */
+    static Stream<Arguments> ordinaryUsernames() {
+        return Stream.of("mule", "Jos\u00E9", "DOMAIN\\user", "\u65E5\u672C", "mule\uD83D\uDE00", "guest\\u000d",
+                        " mule user ", "mule\u00A0user", "")
+                .map(username -> Arguments.of("'" + username + "'", username, username));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource({"hostileUsernames", "ordinaryUsernames"})
+    void attemptLogsTheUsernameOnOneLineWhileTheCheckAndTheFailureKeepTheSubmittedValue(String scenario,
+            String username, String loggedUsername) {
+        Map<String, String> form = form("username", username, "password", "s3cret");
+
+        LoginFailedException failure = catchThrowableOfType(
+                () -> service(ALICE, new ParseTemplateRenderer()).login(form), LoginFailedException.class);
+
+        assertThat(failure).isNotNull().hasMessage(FILTER_REJECTION).hasNoCause();
+        assertThat(failure.form()).isEqualTo(form).containsEntry("username", username);
+        assertThat(appender.list).singleElement().satisfies(event -> {
+            assertThat(event.getLevel()).isEqualTo(Level.INFO);
+            assertThat(event.getFormattedMessage())
+                    .isEqualTo("User " + loggedUsername + " is trying to login")
+                    .doesNotContain("\r", "\n", "\u0085", "\u2028", "\u2029");
+        });
+        verifyNoInteractions(client);
     }
 
     static Stream<Arguments> requesterCredentials() {

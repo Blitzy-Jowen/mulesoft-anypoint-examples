@@ -68,6 +68,8 @@ public class InHouseOrderListener {
 	/** Message property in which the broker counts deliveries: 1 for the first, incremented on each redelivery. */
 	static final String DELIVERY_COUNT_PROPERTY = "JMSXDeliveryCount";
 
+	private static final char[] HEX_DIGITS = "0123456789abcdef".toCharArray();
+
 	private final InHouseOrderService inHouseOrderService;
 
 	private final OrderOrchestrationService orderOrchestrationService;
@@ -109,12 +111,13 @@ public class InHouseOrderListener {
 			payload = payloadOf(message);
 		} catch (JMSException e) {
 			// An unreadable body (for example a class that cannot be deserialized) fails the flow before it starts, so
-			// it is bounded by the redelivery limit like any other failure instead of returning forever.
+			// it is bounded by the redelivery limit like any other failure instead of returning forever. The message
+			// stands in for the payload; its text carries the producer's properties, so it is logged escaped.
 			if (inHouseOrderService.isRedeliveryExhausted(deliveryCount)) {
 				orderOrchestrationService.logError(message);
 				return;
 			}
-			log.info("{}", message);
+			log.info("{}", loggable(String.valueOf(message)));
 			throw e;
 		}
 
@@ -145,15 +148,16 @@ public class InHouseOrderListener {
 
 	/**
 	 * A body the flow cannot process: the original failed at {@code payload.productId}. Within the redelivery limit the
-	 * rollback strategy logs the payload and the delivery rolls back; once exhausted, {@code defaultErrorHandler} runs
-	 * and the delivery commits without a reply.
+	 * rollback strategy logs the payload's {@code toString()} at INFO, its control characters escaped by
+	 * {@link #loggable(String)}, and the delivery rolls back; once exhausted, {@code defaultErrorHandler} runs and the
+	 * delivery commits without a reply.
 	 */
 	private void rejectUnexpectedPayload(Message message, Object payload, int deliveryCount) throws JMSException {
 		if (inHouseOrderService.isRedeliveryExhausted(deliveryCount)) {
 			orderOrchestrationService.logError(payload);
 			return;
 		}
-		log.info("{}", payload);
+		log.info("{}", loggable(String.valueOf(payload)));
 		String typeName = payload == null ? "null" : payload.getClass().getName();
 		throw new MessageConversionException("Expected an OrderItem ObjectMessage body on "
 				+ message.getJMSDestination() + " but received " + typeName);
@@ -181,6 +185,59 @@ public class InHouseOrderListener {
 		} finally {
 			producer.close();
 		}
+	}
+
+	/**
+	 * Keeps a logged payload's text on one log line. Applied to the logged text only; the payload is unchanged.
+	 *
+	 * <p>ISO control characters (C0, DEL and C1, so CR, LF, TAB, NUL and NEL included), line and paragraph
+	 * separators, format characters (bidirectional overrides and isolates, zero-width characters, the byte order
+	 * mark) and unpaired surrogates are each written as {@code \}{@code u} and four lower-case hex digits per UTF-16
+	 * unit. Every other character, a valid surrogate pair and the reverse solidus included, is copied unchanged, and
+	 * nothing is cut. The reverse solidus is not escaped because the original logger wrote this text verbatim: ordinary
+	 * text, backslashes included, is logged exactly as it was, and the escapes only keep the entry on one line.
+	 *
+	 * @param text the text to log; never {@code null}
+	 * @return {@code text} with every such character escaped
+	 */
+	private static String loggable(String text) {
+		StringBuilder out = new StringBuilder(text.length());
+		int i = 0;
+		while (i < text.length()) {
+			int codePoint = text.codePointAt(i);
+			int units = Character.charCount(codePoint);
+			boolean escape = mustEscape(codePoint);
+			for (int unit = i; unit < i + units; unit++) {
+				if (escape) {
+					appendUnicodeEscape(out, text.charAt(unit));
+				} else {
+					out.append(text.charAt(unit));
+				}
+			}
+			i += units;
+		}
+		return out.toString();
+	}
+
+	/** Whether {@link #loggable(String)} writes a code point as escapes rather than copying it. */
+	private static boolean mustEscape(int codePoint) {
+		if (Character.isISOControl(codePoint)) {
+			return true;
+		}
+		int type = Character.getType(codePoint);
+		return type == Character.LINE_SEPARATOR
+				|| type == Character.PARAGRAPH_SEPARATOR
+				|| type == Character.FORMAT
+				|| type == Character.SURROGATE;
+	}
+
+	/** Appends {@code \}{@code u} and the four lower-case hex digits of one UTF-16 unit. */
+	private static void appendUnicodeEscape(StringBuilder out, char c) {
+		out.append("\\u")
+				.append(HEX_DIGITS[(c >> 12) & 0xF])
+				.append(HEX_DIGITS[(c >> 8) & 0xF])
+				.append(HEX_DIGITS[(c >> 4) & 0xF])
+				.append(HEX_DIGITS[c & 0xF]);
 	}
 
 }

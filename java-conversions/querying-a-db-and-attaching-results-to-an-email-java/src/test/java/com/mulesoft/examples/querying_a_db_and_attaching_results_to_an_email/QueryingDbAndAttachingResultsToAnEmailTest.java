@@ -73,7 +73,7 @@ class QueryingDbAndAttachingResultsToAnEmailTest {
             + "Quentin,Puckett,F,1971-10-21,2008-09-15\n"
             + "Mona,Sosa,M,1950-09-26,2007-11-27\n";
 
-    /** The original's limit on the wait for the mail, here an upper bound rather than a fixed sleep. */
+    /** Longest wait, in milliseconds, for GreenMail to receive the report mail. */
     private static final long MAIL_TIMEOUT_MILLIS = 15000;
 
     // A dynamic port instead of GreenMail's fixed 3025, so concurrent builds and the project's other GreenMail

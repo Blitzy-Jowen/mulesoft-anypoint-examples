@@ -75,7 +75,7 @@ import twitter4j.conf.Configuration;
 import twitter4j.conf.ConfigurationBuilder;
 
 /**
- * The contract of {@link TwitterSearchClient}, which replaces the Mule Twitter connector's {@code twitter:search},
+ * The contract of {@link TwitterSearchClient}
  * against a WireMock stand-in for the Twitter v1.1 REST API: the search sends the query and date bounds signed
  * with the configured OAuth credentials and returns the parsed statuses, and sends no date bound it is not given;
  * the twitter4j instance is built on the first search, so construction needs no credentials, and is reused

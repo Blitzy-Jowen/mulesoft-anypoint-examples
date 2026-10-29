@@ -27,5 +27,5 @@ wday:
   reason:
     id:         # TODO: supply the WID of a Reason for Customer Status Change
   # wday.endpoint is derived as https://<hostname>/ccx/service/<tenant>/Revenue_Management/v25.0
-  # (src/main/resources/application.yml). Optional, only if your tenant uses a different service URL:
-  # endpoint: https://<host>/ccx/service/<tenant>/Revenue_Management/v25.0
+  # (src/main/resources/application.yml). Optional, only if your tenant uses a different service URL: add
+  # endpoint to this wday block with that URL as its value, which then replaces the derived one.

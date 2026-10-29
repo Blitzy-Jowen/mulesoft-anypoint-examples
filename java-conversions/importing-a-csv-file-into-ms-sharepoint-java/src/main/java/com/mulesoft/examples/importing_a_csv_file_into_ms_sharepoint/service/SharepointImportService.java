@@ -8,18 +8,15 @@
 
 package com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.service;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.Optional;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.client.SharepointRestClient;
 import com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.config.SharepointProperties;
 
@@ -33,29 +30,33 @@ import com.mulesoft.examples.importing_a_csv_file_into_ms_sharepoint.config.Shar
  * {@link SharepointRestClient}.
  *
  * <p>The original declares no exception strategy, so no failure is handled here. A failing step is logged once at
- * ERROR with the step ({@code sign-in}, {@code folder create} or {@code file add}), its target URL, the HTTP status
- * and SharePoint's or the client's secret-free reason, as Mule's default exception strategy logged the failing
- * processor and its message. The same exception is then rethrown unchanged to the file trigger, whose default
- * handling logs it again and still consumes the file, and every later step is skipped. The logged reason carries
- * no raw response body, cookie, form digest or password, the exception is never handed to the logger, and the line
- * stays single and bounded.
+ * ERROR, as Mule's default exception strategy logged the failing processor, with the step ({@code sign-in},
+ * {@code folder create} or {@code file add}), the HTTP status code of an error response and the class names of the
+ * exception and its causes. The same exception is then rethrown unchanged to the file trigger, whose default handling
+ * logs it again and still consumes the file, and every later step is skipped.
+ *
+ * <p>The ERROR line carries no text SharePoint, the security token service or an exception supplies: no reason
+ * phrase, response body, OData error message, SOAP fault reason, request URL, folder or file path, cookie, form digest
+ * or password, and no exception message other than that of the configuration check
+ * ({@link SharepointProperties.InvalidConfigurationException}), which names only configuration keys and their
+ * environment variables. The exception is never handed to the logger, so no stack trace or message reaches the log
+ * through it either, and the line stays single and bounded.
  */
 @Service
 public class SharepointImportService {
 
     private static final Logger log = LoggerFactory.getLogger(SharepointImportService.class);
 
-    /** Longest logged reason or target, in characters, before {@link #TRUNCATION_MARKER} is appended. */
-    private static final int LOG_TEXT_LIMIT = 1000;
+    /** The most causes named after the failure itself; further causes are marked {@link #MORE_CAUSES_MARKER}. */
+    private static final int CAUSE_LOG_LIMIT = 4;
 
-    private static final String TRUNCATION_MARKER = "...[truncated]";
+    private static final String CAUSE_SEPARATOR = " <- ";
 
-    private static final int LINE_SEPARATOR = 0x2028;
+    private static final String MORE_CAUSES_MARKER = "...";
 
-    private static final int PARAGRAPH_SEPARATOR = 0x2029;
+    private static final String CIRCULAR_CAUSE_MARKER = "[circular]";
 
-    /** Reads SharePoint's OData error bodies; never used to log or rethrow what it parses. */
-    private static final ObjectMapper ODATA_ERROR_READER = new ObjectMapper();
+    private static final String UNAVAILABLE_MARKER = "[unavailable]";
 
     /** The library prefix of both server-relative URLs (l.10 and l.12). */
     public static final String SHARED_DOCUMENTS = "/Shared Documents/";
@@ -85,12 +86,12 @@ public class SharepointImportService {
      * polls. {@code content} is the flow variable {@code fileContent} of l.8 and is sent as is, so SharePoint receives
      * the local file byte for byte.
      *
-     * <p>When a step fails, one ERROR line names the step, its target ({@code /Shared Documents/<csvImportFolder>}
-     * for {@code folder create}, {@code .../contacts.csv} for {@code file add}) and the reason: for an HTTP error
-     * status, the status code, its reason phrase and SharePoint's OData error message; for the client's own
-     * failures, their secret-free message; for any other exception, its class name alone. The exception is then
-     * rethrown as the same instance, so the later steps and the success line are skipped and the file trigger
-     * still logs the failure and consumes the file.
+     * <p>When a step fails, one ERROR line {@code SharePoint step '<step>' failed: <reason>} names the step
+     * ({@code sign-in}, {@code folder create} or {@code file add}) and a reason made of the HTTP status code of an
+     * error response and the class names of the exception and its causes, plus the message of the configuration check
+     * alone, as the class description sets out; no folder or file path is logged. The exception is then rethrown as
+     * the same instance, so the later steps and the success line are skipped and the file trigger still logs the
+     * failure and consumes the file.
      *
      * @param content the bytes read from the polled file
      * @throws RuntimeException the failure of the first step that failed, unchanged
@@ -111,119 +112,91 @@ public class SharepointImportService {
         try {
             client.createFolder(session, folder);
         } catch (RuntimeException e) {
-            log.error("SharePoint step 'folder create' failed for {}: {}", oneBoundedLine(folder), describe(e));
+            log.error("SharePoint step 'folder create' failed: {}", describe(e));
             throw e;
         }
         try {
             client.addFile(session, file, content, true);
         } catch (RuntimeException e) {
-            log.error("SharePoint step 'file add' failed for {}: {}", oneBoundedLine(file), describe(e));
+            log.error("SharePoint step 'file add' failed: {}", describe(e));
             throw e;
         }
         log.info("Input file stored in the specified folder under the 'Shared Documents' folder");
     }
 
     /**
-     * The loggable reason of a failed step, on one bounded line.
+     * The loggable reason of a failed step, built from the step's exception without reading any text it carries other
+     * than the configuration check's message.
      *
      * <ul>
-     *   <li>An HTTP error status ({@link RestClientResponseException}): {@code HTTP <code> <reason phrase>}, followed
-     *       by {@code : <text>} when the response body is SharePoint's OData error. Neither the exception's message
-     *       nor the body is used otherwise, since Spring quotes the whole body in that message.</li>
-     *   <li>{@link IllegalStateException}, {@link IllegalArgumentException} and any other {@link RestClientException},
-     *       a timeout or connectivity failure included: {@code <type>: <message>}, or the type alone without a
-     *       message. {@code SharepointRestClient} and {@code SharepointProperties} keep these messages free of
-     *       secrets: they name the failing sign-in step or SOAP fault reason, the missing configuration keys, or the
-     *       request URL without its query and the I/O failure.</li>
-     *   <li>Any other exception: its fully qualified class name, as its message is not known to be free of
-     *       secrets.</li>
+     *   <li>An HTTP error status ({@link RestClientResponseException}): {@code HTTP <code> (<types>)}, for example
+     *       {@code HTTP 400 (org.springframework.web.client.HttpClientErrorException$BadRequest)}. The numeric status
+     *       code is the only part of the response used; its reason phrase, headers and body, which Spring also quotes
+     *       in the exception's message, are left out.</li>
+     *   <li>The configuration check ({@link SharepointProperties.InvalidConfigurationException}):
+     *       {@code <types>: <message>}, because only {@link SharepointProperties#requireValid()} creates it, with a
+     *       message naming the offending keys and their environment variables and no configured value.</li>
+     *   <li>Any other exception, the client's own sign-in, timeout and connectivity failures included: {@code <types>}
+     *       alone, because its message can quote a SOAP fault reason, a request URL or other upstream text.</li>
      * </ul>
      *
-     * <p>Describing a failure never throws, so the step's own exception is always the one rethrown.
+     * <p>{@code <types>} is the exception's fully qualified class name followed by that of each cause, separated by
+     * {@code " <- "}, for example {@code org.springframework.web.client.ResourceAccessException <-
+     * java.net.ConnectException}. The walk stops at a cause already named, marked {@code [circular]}, and after
+     * {@value #CAUSE_LOG_LIMIT} causes, marked {@code ...}; a status code or cause that cannot be read is written
+     * {@code [unavailable]}. Every part is fixed text, a status number or a class name, so the line stays single and
+     * bounded. Describing a failure never throws, so the step's own exception is always the one rethrown.
      */
     private static String describe(RuntimeException failure) {
-        String className = failure.getClass().getName();
+        String types = typeNames(failure);
+        if (failure instanceof RestClientResponseException response) {
+            return "HTTP " + statusCode(response) + " (" + types + ")";
+        }
+        if (failure instanceof SharepointProperties.InvalidConfigurationException invalidConfiguration) {
+            return types + ": " + invalidConfiguration.getMessage();
+        }
+        return types;
+    }
+
+    /** The numeric status code of an error response, or {@code [unavailable]} when it cannot be read. */
+    private static String statusCode(RestClientResponseException failure) {
         try {
-            if (failure instanceof RestClientResponseException response) {
-                return oneBoundedLine(httpReason(response));
-            }
-            if (failure instanceof IllegalStateException || failure instanceof IllegalArgumentException
-                    || failure instanceof RestClientException) {
-                String message = failure.getMessage();
-                String type = typeName(failure);
-                return oneBoundedLine(message == null ? type : type + ": " + message);
-            }
-            return oneBoundedLine(className);
+            return Integer.toString(failure.getStatusCode().value());
         } catch (RuntimeException unreadable) {
-            // An overridden accessor of the failure threw; the failure is then named by its class alone.
-            return oneBoundedLine(className);
+            // An overridden accessor threw or returned null; the code is left out rather than guessed.
+            return UNAVAILABLE_MARKER;
         }
-    }
-
-    /** {@code HTTP <code> [<reason phrase>][: <OData error message>]}. */
-    private static String httpReason(RestClientResponseException failure) {
-        StringBuilder reason = new StringBuilder("HTTP ").append(failure.getStatusCode().value());
-        String statusText = failure.getStatusText();
-        if (statusText != null && !statusText.isBlank()) {
-            reason.append(' ').append(statusText.strip());
-        }
-        odataErrorMessage(failure.getResponseBodyAsByteArray()).ifPresent(text -> reason.append(": ").append(text));
-        return reason.toString();
     }
 
     /**
-     * The message of a SharePoint OData error body: {@code error.message.value} (verbose JSON),
-     * {@code odata.error.message.value} (JSON light) or {@code error.message} (OData v4). Only a non-blank JSON string
-     * counts. An empty body, a body that is not JSON or JSON without such a message yields nothing; the parser's own
-     * message is dropped, as it can quote the body.
+     * The class name of {@code failure}, then the class name of each cause, separated by {@link #CAUSE_SEPARATOR}.
+     * Only {@link Throwable#getCause()} is called on any exception, and each exception is tracked by identity, so an
+     * overridden {@code equals} or {@code hashCode} is never run either.
      */
-    private static Optional<String> odataErrorMessage(byte[] body) {
-        JsonNode root;
-        try {
-            // An empty or blank body reads as a missing node, never as null; a null body is rejected as an argument.
-            root = ODATA_ERROR_READER.readTree(body);
-        } catch (IOException | RuntimeException notJson) {
-            return Optional.empty();
-        }
-        List<JsonNode> candidates = List.of(
-                root.path("error").path("message").path("value"),
-                root.path("odata.error").path("message").path("value"),
-                root.path("error").path("message"));
-        for (JsonNode candidate : candidates) {
-            if (candidate.isTextual() && !candidate.textValue().isBlank()) {
-                return Optional.of(candidate.textValue().strip());
+    private static String typeNames(Throwable failure) {
+        StringBuilder out = new StringBuilder(failure.getClass().getName());
+        Set<Throwable> named = Collections.newSetFromMap(new IdentityHashMap<>());
+        named.add(failure);
+        Throwable current = failure;
+        for (int causes = 0; ; causes++) {
+            Throwable cause;
+            try {
+                cause = current.getCause();
+            } catch (RuntimeException unreadable) {
+                return out.append(CAUSE_SEPARATOR).append(UNAVAILABLE_MARKER).toString();
             }
-        }
-        return Optional.empty();
-    }
-
-    /** The simple class name, or the full name for an anonymous class, which has no simple name. */
-    private static String typeName(Throwable failure) {
-        String simpleName = failure.getClass().getSimpleName();
-        return simpleName.isEmpty() ? failure.getClass().getName() : simpleName;
-    }
-
-    /**
-     * Writes every ISO control character (CR, LF, TAB and the rest) and the Unicode line and paragraph separators as a
-     * space, so the text cannot break or forge a log line, and cuts it after {@value #LOG_TEXT_LIMIT} characters,
-     * never inside a surrogate pair, with {@value #TRUNCATION_MARKER} appended.
-     */
-    private static String oneBoundedLine(String text) {
-        StringBuilder out = new StringBuilder(Math.min(text.length(), LOG_TEXT_LIMIT) + TRUNCATION_MARKER.length());
-        int i = 0;
-        while (i < text.length()) {
-            int codePoint = text.codePointAt(i);
-            int units = Character.charCount(codePoint);
-            if (out.length() + units > LOG_TEXT_LIMIT) {
-                return out.append(TRUNCATION_MARKER).toString();
+            if (cause == null) {
+                return out.toString();
             }
-            if (Character.isISOControl(codePoint) || codePoint == LINE_SEPARATOR || codePoint == PARAGRAPH_SEPARATOR) {
-                out.append(' ');
-            } else {
-                out.appendCodePoint(codePoint);
+            out.append(CAUSE_SEPARATOR);
+            if (causes == CAUSE_LOG_LIMIT) {
+                return out.append(MORE_CAUSES_MARKER).toString();
             }
-            i += units;
+            if (!named.add(cause)) {
+                return out.append(CIRCULAR_CAUSE_MARKER).toString();
+            }
+            out.append(cause.getClass().getName());
+            current = cause;
         }
-        return out.toString();
     }
 }

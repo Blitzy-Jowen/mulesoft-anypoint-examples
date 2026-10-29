@@ -106,9 +106,7 @@ class SalesforceFailureClassifierTest {
 
     private final UpstreamCallExecutor executor = new UpstreamCallExecutor(List.of(new SalesforceFailureClassifier()));
 
-    // ---------------------------------------------------------------------------------------------------------------
     // system() and null
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void servesSalesforce() {
@@ -120,9 +118,7 @@ class SalesforceFailureClassifierTest {
         assertThat(classifier.classify(null)).isEqualTo(UpstreamFailureKind.OTHER);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // INVALID_SESSION_ID → authentication: re-login, then one retry
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Exception>> sessionRejections() {
         return Stream.concat(
@@ -185,9 +181,7 @@ class SalesforceFailureClassifierTest {
         assertThat(outcome.reauths()).isEqualTo(1);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // REQUEST_LIMIT_EXCEEDED → rate limit without Retry-After, never retried
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Exception>> requestLimits() {
         return signalShapes(ExceptionCode.REQUEST_LIMIT_EXCEEDED, REQUEST_LIMIT_MESSAGE);
@@ -218,9 +212,7 @@ class SalesforceFailureClassifierTest {
         assertThat(outcome.reauths()).isEqualTo(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Timeout or connectivity failure → unavailable, never retried
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Exception>> unavailableCausesAlone() {
         return unavailableCauses().stream().map(cause -> named(cause.getName(), cause.getPayload().get()));
@@ -245,9 +237,7 @@ class SalesforceFailureClassifierTest {
         assertUnavailableWithoutRetry(failure);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // A Salesforce signal and an unavailable cause in one chain, in either order → unavailable, never retried
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Exception>> mixedChains() {
         return unavailableCauses().stream()
@@ -270,9 +260,7 @@ class SalesforceFailureClassifierTest {
         assertUnavailableWithoutRetry(failure);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Everything else → OTHER, rethrown unchanged
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Exception>> otherFailures() {
         return Stream.of(
@@ -320,9 +308,7 @@ class SalesforceFailureClassifierTest {
         assertThat(outcome.reauths()).isEqualTo(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // upstreamMessage
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> upstreamMessages() {
         ApiFault blankMessageFault = fault(new ApiFault(), ExceptionCode.INVALID_SESSION_ID, " ");
@@ -372,9 +358,7 @@ class SalesforceFailureClassifierTest {
         assertThatNullPointerException().isThrownBy(() -> classifier.upstreamMessage(null));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Case factories
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * The shapes in which a Salesforce signal reaches the classifier without any timeout or connectivity failure:
@@ -515,9 +499,7 @@ class SalesforceFailureClassifierTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Executor runs
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * What one {@link UpstreamCallExecutor#call} run produced and how often each callback ran.

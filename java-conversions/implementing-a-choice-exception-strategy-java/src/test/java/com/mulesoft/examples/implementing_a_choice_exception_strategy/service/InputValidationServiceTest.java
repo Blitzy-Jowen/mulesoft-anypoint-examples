@@ -15,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.Mockito.verify;
@@ -25,9 +26,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
+import java.util.Random;
+import java.util.function.IntFunction;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 import com.fasterxml.jackson.core.JsonParseException;
@@ -61,6 +66,10 @@ import org.mockito.junit.jupiter.MockitoExtension;
  * fixed text: bodies carrying a marker show that no request bytes and no Java or Jackson type name reach it, and
  * that the parser location chained as its cause quotes none of the body.
  *
+ * <p>The email check must give the answer of the original pattern, {@code ORIGINAL_EMAIL_PATTERN}, on every text:
+ * it is compared with that pattern on every short text over one character of each kind, on seeded random texts,
+ * and on short instances of the long texts, which it must answer within a bound the original search exceeds.
+ *
  * <p>JUnit 5 and Mockito with no Spring context: {@link #realService()} wires the ported validator, so the filter
  * chain runs as the flow ran it, and the mocked {@link InputDataValidator} isolates the service's own decisions.
  */
@@ -73,6 +82,47 @@ class InputValidationServiceTest {
     private static final String NOT_AN_OBJECT = "JSON payload is not an object";
 
     private static final String NOT_VALID_JSON = "Payload is not valid JSON";
+
+    /**
+     * The line-13 {@code regex-filter} pattern verbatim, with {@code &amp;} decoded and the two spaces of its last
+     * class: the reference the service's email check must agree with. Only short texts reach it, because its
+     * unanchored search is quadratic and overflows the stack on a long dotted local part.
+     */
+    private static final Pattern ORIGINAL_EMAIL_PATTERN = Pattern.compile(
+            "[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z0-9](?:[a-z0-9  -]*[a-z0-9])?");
+
+    /**
+     * One character of each kind the pattern tells apart: in every class ({@code a}, {@code 0}), in the local-part
+     * and label classes but unable to start or end a label ({@code -}), the separators ({@code .}, {@code @}), in
+     * the local-part class only ({@code !}), in the tail class only (space) and in no class ({@code A}).
+     */
+    private static final char[] CLASS_ALPHABET = {'a', '0', '-', '.', '@', '!', ' ', 'A'};
+
+    /**
+     * Tokens of the random texts: every local-part special, letters, digits, the separators, a space, upper case,
+     * the address punctuation outside every class, a non-ASCII letter and a surrogate pair.
+     */
+    private static final String[] RANDOM_TOKENS = {
+            "!", "#", "$", "%", "&", "'", "*", "+", "/", "=", "?", "^", "_", "`", "{", "|", "}", "~", "-",
+            "a", "b", "m", "z", "0", "5", "9", ".", "@", " ", "A", "Z",
+            "\"", "(", ")", ",", ":", ";", "<", ">", "[", "\\", "]", "\u00e9", "\uD83D\uDE00"};
+
+    /** The characters an address is built from, drawn for half the random tokens so that addresses occur. */
+    private static final String[] ADDRESS_TOKENS = {"a", "0", "-", ".", "@"};
+
+    private static final int RANDOM_SAMPLES = 100_000;
+
+    /** Most tokens in one random text: short enough that the original pattern never overflows its stack. */
+    private static final int RANDOM_MAX_TOKENS = 40;
+
+    /** Repetitions of a long text's unit, giving at least 1,000,000 characters. */
+    private static final int LONG_REPETITIONS = 1_000_000;
+
+    /** Repetitions at which the original pattern still answers at once, to settle each long text's answer. */
+    private static final int SHORT_REPETITIONS = 100;
+
+    /** Generous for a linear scan of a few million characters, which takes milliseconds. */
+    private static final Duration LONG_TEXT_BOUND = Duration.ofSeconds(5);
 
     @Mock
     private InputDataValidator inputDataValidator;
@@ -159,6 +209,98 @@ class InputValidationServiceTest {
         assertEquals(Optional.empty(), realService().validate(payload));
     }
 
+    @ParameterizedTest(name = "length {0}")
+    @ValueSource(ints = {0, 1, 2, 3, 4, 5, 6})
+    void everyShortTextOverTheClassAlphabetGetsTheOriginalPatternsAnswer(int length) {
+        InputValidationService service = realService();
+        HashMap<String, Object> payload = validMap();
+        int texts = 1;
+        for (int position = 0; position < length; position++) {
+            texts *= CLASS_ALPHABET.length;
+        }
+        char[] text = new char[length];
+        int accepted = 0;
+        for (int index = 0; index < texts; index++) {
+            int rest = index;
+            for (int position = 0; position < length; position++) {
+                text[position] = CLASS_ALPHABET[rest % CLASS_ALPHABET.length];
+                rest /= CLASS_ALPHABET.length;
+            }
+            if (assertAgreesWithOriginalPattern(service, payload, new String(text))) {
+                accepted++;
+            }
+        }
+        // The shortest address, a@a.a, has five characters; the enumeration reaches it from length five on.
+        assertEquals(length >= 5, accepted > 0, "accepted " + accepted + " of " + texts);
+    }
+
+    @Test
+    void seededRandomTextsGetTheOriginalPatternsAnswer() {
+        Random random = new Random(20141028L);
+        InputValidationService service = realService();
+        HashMap<String, Object> payload = validMap();
+        StringBuilder text = new StringBuilder();
+        int accepted = 0;
+        for (int sample = 0; sample < RANDOM_SAMPLES; sample++) {
+            text.setLength(0);
+            int tokens = random.nextInt(RANDOM_MAX_TOKENS + 1);
+            for (int token = 0; token < tokens; token++) {
+                String[] pool = random.nextBoolean() ? ADDRESS_TOKENS : RANDOM_TOKENS;
+                text.append(pool[random.nextInt(pool.length)]);
+            }
+            if (assertAgreesWithOriginalPattern(service, payload, text.toString())) {
+                accepted++;
+            }
+        }
+        // Both answers occur, so agreement cannot come from always giving one of them.
+        String counts = "accepted " + accepted + " of " + RANDOM_SAMPLES;
+        assertTrue(accepted > 0 && accepted < RANDOM_SAMPLES, counts);
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("longTexts")
+    void longTextIsAnsweredWithinTheTimeBound(String shape, IntFunction<String> text, boolean accepted) {
+        // The original pattern settles the expected answer on a short text of the same shape.
+        assertEquals(accepted, ORIGINAL_EMAIL_PATTERN.matcher(text.apply(SHORT_REPETITIONS)).find(), shape);
+        String email = text.apply(LONG_REPETITIONS);
+        assertTrue(email.length() >= 1_000_000, () -> shape + " has " + email.length() + " characters");
+        HashMap<String, Object> payload = validMap();
+        payload.put("email", email);
+        InputValidationService service = realService();
+
+        Optional<String> result = assertTimeoutPreemptively(LONG_TEXT_BOUND, () -> service.validate(payload), shape);
+
+        assertEquals(accepted ? Optional.of(InputValidationService.SUCCESS_MESSAGE) : Optional.empty(), result);
+    }
+
+    /**
+     * Texts of at least 1,000,000 characters, built from {@code n} repetitions of a unit: near misses on which the
+     * original search backtracked for hours or overflowed its stack, and addresses after or inside such text.
+     */
+    static Stream<Arguments> longTexts() {
+        return Stream.of(
+                longText("a{n}", n -> "a".repeat(n), false),
+                longText("a@a{n}", n -> "a@" + "a".repeat(n), false),
+                longText("a@(a-){n}", n -> "a@" + "a-".repeat(n), false),
+                longText("@{n}", n -> "@".repeat(n), false),
+                longText("(a@){n}", n -> "a@".repeat(n), false),
+                longText("(a.){n}", n -> "a.".repeat(n), false),
+                longText("(a@a-.){n}", n -> "a@a-.".repeat(n), false),
+                longText("(a@-a.a){n}", n -> "a@-a.a".repeat(n), false),
+                longText("(a@a.-){n}", n -> "a@a.-".repeat(n), false),
+                longText("(.@a.a){n}", n -> ".@a.a".repeat(n), false),
+                // The original search overflowed its stack on this address.
+                longText("(a.){n}a@b.c", n -> "a.".repeat(n) + "a@b.c", true),
+                longText("a{n}@a.a", n -> "a".repeat(n) + "@a.a", true),
+                longText("a@a{n}.a", n -> "a@" + "a".repeat(n) + ".a", true),
+                longText("(a@a-.){n}a@b.c", n -> "a@a-.".repeat(n) + "a@b.c", true));
+    }
+
+    /** One long text: its shape as the display name, its builder from the repetition count, its expected answer. */
+    private static Arguments longText(String shape, IntFunction<String> text, boolean accepted) {
+        return Arguments.of(shape, text, accepted);
+    }
+
     @Test
     void missingEmailThrowsNullPointerException() {
         HashMap<String, Object> payload = validMap();
@@ -224,6 +366,21 @@ class InputValidationServiceTest {
                 new NullPointerException("email is missing"),
                 new IllegalArgumentException("item units is negative"),
                 new NumberFormatException("For input string: \"1.5\""));
+    }
+
+    /**
+     * Asserts that {@code validate} answers {@code email} as the original filter did: the success message when the
+     * original pattern occurs in it, otherwise empty.
+     *
+     * @return whether the original pattern occurs in {@code email}
+     */
+    private static boolean assertAgreesWithOriginalPattern(InputValidationService service,
+            HashMap<String, Object> payload, String email) {
+        boolean found = ORIGINAL_EMAIL_PATTERN.matcher(email).find();
+        payload.put("email", email);
+        Optional<String> expected = found ? Optional.of(InputValidationService.SUCCESS_MESSAGE) : Optional.empty();
+        assertEquals(expected, service.validate(payload), () -> "email [" + email + "]");
+        return found;
     }
 
     /** Asserts that a message the 500 body returns quotes no request bytes and names no Java or Jackson type. */

@@ -26,8 +26,9 @@ import org.springframework.stereotype.Repository;
  * <p>The original built its query by interpolating the {@code lastname} query parameter into a
  * double-quoted literal, which MySQL reads as a string literal. Here the value is a bind parameter:
  * the comparison runs under the same column collation, so every legitimate input returns the same
- * rows, while input that would have broken out of the literal now matches nothing. This is the only
- * intentional difference from the original.
+ * rows, while the bound value is compared literally, as data: input that would have broken out of
+ * the literal can no longer alter the query's structure. This is the only intentional difference
+ * from the original.
  *
  * <p>Failures are not caught: the original flow declares no exception strategy, so they reach the
  * platform-default 500 of the global exception handler.

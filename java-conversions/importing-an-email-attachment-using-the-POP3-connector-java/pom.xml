@@ -38,7 +38,7 @@
     </properties>
 
     <dependencies>
-        <!-- Jakarta Mail over Angus Mail: the pop3s Store the poller opens replaces the Mule POP3S transport.
+        <!-- Jakarta Mail over Angus Mail: the pop3s Store the poller (trigger/Pop3MailPoller) opens.
              No web starter: the original flow has no HTTP listener (spring.main.web-application-type: none). -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
