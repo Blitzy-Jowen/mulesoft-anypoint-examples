@@ -38,6 +38,7 @@ The rows of `foreach-processing-and-choice-routing-java`, `legacy-modernization-
 The rows of `legacy-modernization-java` and `service-orchestration-and-choice-routing-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B -ntp clean verify` on the tree that turns off Spring Boot's form content filter (`spring.mvc.formcontent.filter.enabled: false`), so that a `PUT`, `PATCH` or `DELETE` form body gets the listener's 405 unread, and adds the wire tests of that 405; `legacy-modernization-java` gained 3 tests and `service-orchestration-and-choice-routing-java` 15, and neither project's coverage cells changed.
 The rows of `websphere-mq-java`, `filtering-a-message-java`, `sending-json-data-to-a-amqp-queue-java`, `login-form-using-the-http-connector-java`, `http-multipart-request-java`, `munit-short-tutorial-java` and `exposing-a-restful-resource-using-the-HTTP-connector-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` and `mvn -B test` on the tree that disables Boot's form-content filter (`spring.mvc.formcontent.filter.enabled: false`) and adds the large-form `PUT`/`PATCH`/`DELETE` wire tests; only their test counts changed.
 The rows of `http-oauth-provider-java`, `mule-component-bindings-java`, `salesforce-data-retrieval-java`, `sending-json-data-to-a-jms-queue-java` and `adding-a-new-customer-to-workday-revenue-management-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` and `mvn -B test` on the tree that disables Boot's form-content filter (`spring.mvc.formcontent.filter.enabled: false`) and adds the large-form `PUT`/`PATCH`/`DELETE` wire tests; only their test counts changed.
+The rows of the four RAML projects (`rest-api-with-apikit-java`, `testing-apikit-with-munit-java`, `processing-orders-with-dataweave-and-APIkit-java`, `netsuite-data-retrieval-java`), and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean package` and `mvn -B test` on the tree that adds `config/ApiKitPathParameterConfig`, under which a `;` in the request path is segment content as it was to the APIkit router, with its tests; only their test counts and total LINE coverage changed.
 
 ## Status
 
@@ -146,7 +147,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 28,044 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 28,346 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 86.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -157,9 +158,9 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 
 | Project | mvn -B test: run / failures / errors / skipped | Service + mapper lines covered | Total LINE coverage (generated classes excluded) | Failsafe *IT (mvn -B verify) |
 |---|---|---|---|---|
-| rest-api-with-apikit-java | 663 / 0 / 0 / 0 | 131 of 131 | 89.7% (1204 of 1342) | — |
-| testing-apikit-with-munit-java | 443 / 0 / 0 / 0 | 13 of 13 | 83.3% (686 of 824) | — |
-| processing-orders-with-dataweave-and-APIkit-java | 900 / 0 / 0 / 0 | 670 of 747 | 88.3% (1736 of 1965) | — |
+| rest-api-with-apikit-java | 764 / 0 / 0 / 0 | 131 of 131 | 89.8% (1220 of 1358) | — |
+| testing-apikit-with-munit-java | 509 / 0 / 0 / 0 | 13 of 13 | 83.6% (702 of 840) | — |
+| processing-orders-with-dataweave-and-APIkit-java | 961 / 0 / 0 / 0 | 670 of 747 | 88.4% (1752 of 1981) | — |
 | web-service-consumer-java | 749 / 0 / 0 / 1 | 503 of 513 | 97.6% (868 of 889) | — |
 | xml-only-soap-webservice-java | 620 / 0 / 0 / 1 | 700 of 713 | 91.9% (1519 of 1652) | — |
 | service-orchestration-and-choice-routing-java | 1313 / 0 / 0 / 1 | 1481 of 1494 | 93.8% (3412 of 3636) | — |
@@ -171,7 +172,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | import-leads-into-salesforce-java | 881 / 0 / 0 / 1 | 341 of 346 | 94.0% (1173 of 1248) | 1 run, 1 skipped, 0 failed, 0 errors |
 | authenticating-salesforce-using-oauth2-java | 959 / 0 / 0 / 1 | 156 of 156 | 96.6% (990 of 1025) | 1 run, 1 skipped, 0 failed, 0 errors |
 | get-customer-list-from-netsuite-java | 916 / 0 / 0 / 1 | 313 of 317 | 95.8% (1376 of 1437) | 1 run, 1 skipped, 0 failed, 0 errors |
-| netsuite-data-retrieval-java | 1525 / 0 / 0 / 0 | 438 of 441 | 93.3% (2053 of 2201) | 3 run, 3 skipped, 0 failed, 0 errors |
+| netsuite-data-retrieval-java | 1599 / 0 / 0 / 0 | 438 of 441 | 93.3% (2069 of 2217) | 3 run, 3 skipped, 0 failed, 0 errors |
 | salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 766 / 0 / 0 / 1 | 339 of 350 | 96.6% (932 of 965) | 1 run, 1 skipped, 0 failed, 0 errors |
 | salesforce-to-MySQL-DB-using-Batch-Processing-java | 818 / 0 / 0 / 1 | 363 of 374 | 96.7% (1007 of 1041) | 1 run, 1 skipped, 0 failed, 0 errors |
 | adding-a-new-customer-to-workday-revenue-management-java | 586 / 0 / 0 / 1 | 73 of 73 | 96.4% (675 of 700) | 1 run, 1 skipped, 0 failed, 0 errors |
