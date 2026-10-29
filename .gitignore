@@ -1,4 +1,6 @@
+# ------------------------------------------------------------------------------ #
 # Java defaults (https://github.com/github/gitignore/blob/master/Java.gitignore) #
+# ------------------------------------------------------------------------------ #
 *.class
 
 # Package Files #
@@ -6,7 +8,9 @@
 *.war
 *.ear
 
+# ------------------------------------------------------------------------------------------- #
 # Eclipse-specific (https://github.com/github/gitignore/blob/master/Global/Eclipse.gitignore) #
+# ------------------------------------------------------------------------------------------- #
 **/*.pydevproject
 **/.metadata
 **/bin/**
@@ -35,20 +39,28 @@
 # PDT-specific
 **/.buildpath
 
+# --------------- #
 # Studio-specific #
+# --------------- #
 **/.studio/
 **/./flows/
 **/target/
 **/*.mflow
 
+# --------------- #
 # MAC-specific #
+# --------------- #
 **/.DS_Store
 
 
+# --------------- #
 # Mule-specific #
+# --------------- #
 **/.mule/
 
+# --------------------------------------- #
 # Test credentials to be use locally only #
+# --------------------------------------- #
 **/src/test/resources/mule.test.properties
 **/src/test/resources/application-it.yml
 **/pom.xml.releaseBackup
