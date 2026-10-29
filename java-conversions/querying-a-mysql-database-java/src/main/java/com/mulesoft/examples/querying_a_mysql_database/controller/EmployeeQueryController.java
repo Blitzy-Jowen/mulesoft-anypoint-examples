@@ -15,6 +15,7 @@ import jakarta.servlet.http.HttpServletRequest;
 
 import com.mulesoft.examples.querying_a_mysql_database.service.EmployeeQueryService;
 
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -50,8 +51,14 @@ public class EmployeeQueryController {
      * Answers {@code /} for every method except {@code OPTIONS}; a {@code HEAD} response carries the headers
      * without the body.
      *
+     * <p>The reply lists employee names, so it carries {@code Cache-Control: no-store}, keeping clients and caches
+     * from retaining it, and {@code X-Content-Type-Options: nosniff}, keeping browsers from treating it as a type
+     * other than the JSON it declares. Neither changes its status, {@code Content-Type} or body; the error replies
+     * of {@code GlobalExceptionHandler} carry no such header.
+     *
      * @param request the inbound request, whose URL query string alone supplies {@code lastname}
-     * @return 200 {@code application/json} with the matching first names, {@code []} when none match
+     * @return 200 {@code application/json} with the matching first names, {@code []} when none match, and the
+     *         two headers above
      */
     @RequestMapping("/")
     public ResponseEntity<String> query(HttpServletRequest request) {
@@ -59,6 +66,8 @@ public class EmployeeQueryController {
         // Preset Content-Type: Spring writes the string as is, without consulting Accept, so never a 406.
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
+                .cacheControl(CacheControl.noStore())
+                .header("X-Content-Type-Options", "nosniff")
                 .body(employeeQueryService.findFirstNamesAsJson(lastname));
     }
 
@@ -84,8 +93,10 @@ public class EmployeeQueryController {
      * and value are URL-decoded as UTF-8 ({@code +} is a space). The name matches case-sensitively. A pair
      * without {@code =} yields {@code null}, {@code lastname=} yields the empty string, and when the name occurs
      * more than once the last occurrence wins, as Mule's {@code ParameterMap.get} returned it. A malformed
-     * escape raises {@link IllegalArgumentException} from {@link URLDecoder}, deliberately not caught: the
-     * flow has no exception strategy, so the global handler's 500 answers it.
+     * escape makes {@link URLDecoder} raise {@link IllegalArgumentException}, which this helper deliberately does
+     * not catch, so it would propagate to the global handler's 500, the flow having no exception strategy. On
+     * the deployed listener the helper never sees one: Undertow answers a request whose query holds a malformed
+     * percent escape with an empty 400 before this controller runs.
      *
      * @param rawQuery the undecoded query string, {@code null} when the request URL has none
      * @return the decoded value of the last {@code lastname} pair, or {@code null} when there is none

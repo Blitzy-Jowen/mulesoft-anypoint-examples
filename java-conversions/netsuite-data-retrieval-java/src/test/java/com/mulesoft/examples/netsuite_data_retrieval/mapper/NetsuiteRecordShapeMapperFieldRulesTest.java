@@ -283,9 +283,7 @@ class NetsuiteRecordShapeMapperFieldRulesTest {
             ]
             """;
 
-    // ---------------------------------------------------------------------------------------------------------
     // Whole records against the committed examples
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * The committed customer, byte for byte: catalog-declared fields only, references, enumerations, dates in
@@ -353,9 +351,7 @@ class NetsuiteRecordShapeMapperFieldRulesTest {
         assertThat(mapped).containsOnlyKeys("item");
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Body fields
-    // ---------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> restIds() {
         return Stream.of(RecordKind.values()).flatMap(kind -> Stream.of(
@@ -559,9 +555,7 @@ class NetsuiteRecordShapeMapperFieldRulesTest {
                 .isEqualTo(Map.of("internalId", "1"));
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Opportunity addresses
-    // ---------------------------------------------------------------------------------------------------------
 
     /** An opportunity address is the fixed 15-key object in committed order, absent values kept as null. */
     @ParameterizedTest
@@ -609,9 +603,7 @@ class NetsuiteRecordShapeMapperFieldRulesTest {
         assertThat(rest).isEqualTo(before);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Custom fields
-    // ---------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> customScalars() {
         return Stream.of(
@@ -803,9 +795,7 @@ class NetsuiteRecordShapeMapperFieldRulesTest {
         assertThat(select).containsEntry("internalId", "2570").containsEntry("typeId", "-30");
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Select script IDs
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * The select and multi-select custom script IDs that hold a value in at least one record, sorted; scalar
@@ -850,9 +840,7 @@ class NetsuiteRecordShapeMapperFieldRulesTest {
                 .containsExactly("custentity_size", "custentity_tags");
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Account time zone
-    // ---------------------------------------------------------------------------------------------------------
 
     /** The Spring constructor renders dates in {@code netsuite.time-zone}, {@code America/Los_Angeles} by default. */
     @ParameterizedTest
@@ -878,9 +866,7 @@ class NetsuiteRecordShapeMapperFieldRulesTest {
         assertThat(mapped).containsEntry("startDate", date).containsEntry("lastModifiedDate", dateTime);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Catalogs and helpers
-    // ---------------------------------------------------------------------------------------------------------
 
     /** The customer catalog: every field of {@link #REST_CUSTOMER} but {@code balance}, typed as REST types it. */
     private static Map<String, Object> customerCatalog() {

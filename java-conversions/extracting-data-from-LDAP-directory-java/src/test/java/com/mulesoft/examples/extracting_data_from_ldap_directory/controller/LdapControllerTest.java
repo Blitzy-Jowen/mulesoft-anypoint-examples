@@ -42,7 +42,8 @@ import org.springframework.http.MediaType;
  * asserted exactly as the listener writes them. The happy-path cases cover every method, because the original
  * listener declares no {@code allowedMethods}; the flow has no exception strategy, so the error cases are the
  * listener-level platform defaults of SC-1: the no-listener 404 for paths the flow does not serve and the JSON 500
- * for a directory failure.
+ * for a directory failure. Every search reply, the empty one included, carries exactly
+ * {@code Cache-Control: no-store} and {@code X-Content-Type-Options: nosniff}; the error replies carry neither.
  *
  * <p>{@link LdapSearchService} is mocked, so the test needs no directory server, credential or profile and
  * connects to nothing but its own listener on {@code localhost}. The assertions of the original
@@ -77,6 +78,7 @@ class LdapControllerTest {
 
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
         assertUntypedWithLength(response, LDIF.getBytes(StandardCharsets.UTF_8).length);
+        assertCacheProtectionHeaders(response);
         assertEquals(LDIF, response.bodyAsString(), response::toString);
         assertArrayEquals(LDIF.getBytes(StandardCharsets.UTF_8), response.body(), response::toString);
         verify(searchService, times(1)).searchPeople();
@@ -101,6 +103,7 @@ class LdapControllerTest {
         assertEquals(200, response.status(), response::toString);
         assertEquals("OK", response.reason(), response::toString);
         assertUntypedWithLength(response, LDIF.getBytes(StandardCharsets.UTF_8).length);
+        assertCacheProtectionHeaders(response);
         assertArrayEquals(LDIF.getBytes(StandardCharsets.UTF_8), response.body(), response::toString);
         verify(searchService, times(1)).searchPeople();
     }
@@ -118,6 +121,7 @@ class LdapControllerTest {
 
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
         assertUntypedWithLength(response, LDIF.getBytes(StandardCharsets.UTF_8).length);
+        assertCacheProtectionHeaders(response);
         assertArrayEquals(new byte[0], response.body(), response::toString);
         verify(searchService, times(1)).searchPeople();
     }
@@ -130,6 +134,7 @@ class LdapControllerTest {
         assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
         assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
         assertEquals("No listener for endpoint: /unknown", response.bodyAsString(), response::toString);
+        assertNoCacheProtectionHeaders(response);
         verifyNoInteractions(searchService);
     }
 
@@ -150,6 +155,7 @@ class LdapControllerTest {
         assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         assertEquals("{ \"message\": \"" + ex.getMessage() + "\" }", response.bodyAsString(), response::toString);
         assertEquals(ErrorResponse.json(ex.getMessage()), response.bodyAsString(), response::toString);
+        assertNoCacheProtectionHeaders(response);
         verify(searchService, times(1)).searchPeople();
     }
 
@@ -162,6 +168,7 @@ class LdapControllerTest {
 
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
         assertUntypedWithLength(response, 0);
+        assertCacheProtectionHeaders(response);
         assertEquals(0, response.body().length, response::toString);
         verify(searchService, times(1)).searchPeople();
     }
@@ -181,5 +188,20 @@ class LdapControllerTest {
     private static void assertUntypedWithLength(HttpTestClient.Response response, int bodyBytes) {
         assertEquals(List.of(), response.headers("Content-Type"), response::toString);
         assertEquals(List.of(Integer.toString(bodyBytes)), response.headers("Content-Length"), response::toString);
+    }
+
+    /**
+     * Every search reply, the empty result's included, represents the directory's people, so it carries exactly one
+     * {@code Cache-Control: no-store} and one {@code X-Content-Type-Options: nosniff}.
+     */
+    private static void assertCacheProtectionHeaders(HttpTestClient.Response response) {
+        assertEquals(List.of("no-store"), response.headers("Cache-Control"), response::toString);
+        assertEquals(List.of("nosniff"), response.headers("X-Content-Type-Options"), response::toString);
+    }
+
+    /** The SC-1 error replies hold no directory data and carry neither header. */
+    private static void assertNoCacheProtectionHeaders(HttpTestClient.Response response) {
+        assertEquals(List.of(), response.headers("Cache-Control"), response::toString);
+        assertEquals(List.of(), response.headers("X-Content-Type-Options"), response::toString);
     }
 }

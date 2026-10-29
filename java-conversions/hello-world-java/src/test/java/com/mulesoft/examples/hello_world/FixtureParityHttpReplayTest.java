@@ -70,7 +70,7 @@ class FixtureParityHttpReplayTest {
     private static final Duration NO_TIMELY_REPLY = Duration.ofSeconds(5);
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    // ----- ST-1's read budget ---------------------------------------------------------------------------------
+    // ST-1's read budget
 
     @Test
     void theDefaultReadBudgetIsTheConnectTimeout() {
@@ -133,7 +133,7 @@ class FixtureParityHttpReplayTest {
         }
     }
 
-    // ----- request.readTimeoutMillis --------------------------------------------------------------------------
+    // request.readTimeoutMillis
 
     @ParameterizedTest(name = "{0} -> {1}")
     @CsvSource(nullValues = "null", value = {
@@ -158,7 +158,7 @@ class FixtureParityHttpReplayTest {
         assertEquals(REQUEST + ".readTimeoutMillis must be a positive whole number", failure.getMessage());
     }
 
-    // ----- state.clearCaches ----------------------------------------------------------------------------------
+    // state.clearCaches
 
     @ParameterizedTest(name = "{0} -> {1}")
     @CsvSource({
@@ -211,7 +211,7 @@ class FixtureParityHttpReplayTest {
         }
     }
 
-    // ----- state.requests -------------------------------------------------------------------------------------
+    // state.requests
 
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {"{}", "{\"requests\": null}", "{\"requests\": []}"})
@@ -281,7 +281,7 @@ class FixtureParityHttpReplayTest {
         assertEquals(PRIOR_REQUESTS + problem, failure.getMessage());
     }
 
-    // ----- request.tls ----------------------------------------------------------------------------------------
+    // request.tls
 
     @ParameterizedTest(name = "{0}")
     @ValueSource(strings = {"{}", "{\"tls\": null}"})
@@ -405,7 +405,7 @@ class FixtureParityHttpReplayTest {
         assertEquals(presentsClientKeys, FixtureParityTest.Replay.presentsClientKeys(clientClass));
     }
 
-    // ----- helpers --------------------------------------------------------------------------------------------
+    // helpers
 
     /** The call fails on a read timeout well before the server would have answered. */
     private static void assertGivesUpBeforeTheReply(Executable call) {

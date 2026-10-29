@@ -25,10 +25,10 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.ImportAutoConfiguration;
 import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration;
 import org.springframework.boot.autoconfigure.http.HttpMessageConvertersAutoConfiguration;
@@ -55,10 +55,11 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.suppo
  * original listener declares no {@code allowedMethods} and applies no CORS policy
  * (document-integration-using-the-cmis-connector/src/main/app/cmis-document-integration.xml:6).
  *
- * <p>The cases run the real controller and SC-1 handler on Undertow ({@link WireConfig}, random port) and send
- * requests through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the listener
- * writes them. {@link CmisDocumentService}, which calls the CMIS repository, is a mock returning a document ID of the
- * form the original test expects; each request's single call to it shows that the flow ran.
+ * <p>The cases run the real controller, {@link ListenerPathConfig} and SC-1 handler on Undertow ({@link WireConfig},
+ * random port) and send requests through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are
+ * asserted as the listener writes them. {@link CmisDocumentService}, which calls the CMIS repository, is a mock
+ * returning a document ID of the form the original test expects; each request's single call to it shows that the
+ * flow ran.
  */
 @SpringBootTest(classes = PreflightDispatchListenerTest.WireConfig.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -67,8 +68,8 @@ class PreflightDispatchListenerTest {
     private static final String PATH = "/cmis";
 
     /**
-     * The service's reply for a created document, starting with {@code {"id":"/okm:root/pic} as the original test
-     * expects (DocumentIntegrationUsingTheCmisConnectorIT.java:48-50).
+     * The service's reply for a created document, starting with <code>&#123;"id":"/okm:root/pic</code> as the
+     * original test expects (DocumentIntegrationUsingTheCmisConnectorIT.java:48-50).
      */
     private static final String CREATED_JSON = "{\"id\":\"/okm:root/pic1414000000000.jpg\"}";
 
@@ -115,18 +116,26 @@ class PreflightDispatchListenerTest {
         assertNoCorsHeaders(preflight);
     }
 
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() {
+    /**
+     * A path no listener serves, and the listener's path with {@code ;} segment parameters, which
+     * {@link ListenerPathConfig} refuses after the pre-flight has selected the {@code OPTIONS} handler; neither
+     * creates a document.
+     *
+     * @param path the unserved request path
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"/unknown", PATH + ";x=1"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String path) {
         HttpTestClient client = HttpTestClient.localhost(port);
-        HttpTestClient.Response plain = client.send("OPTIONS", "/unknown", null, null);
+        HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
 
-        HttpTestClient.Response preflight = client.send("OPTIONS", "/unknown", preflightHeaders("POST", null), null);
+        HttpTestClient.Response preflight = client.send("OPTIONS", path, preflightHeaders("POST", null), null);
 
         verifyNoInteractions(cmisDocumentService);
         assertSameResponse(plain, preflight);
         assertEquals("HTTP/1.1 404 Not Found", preflight.statusLine(), preflight::toString);
         assertEquals("text/plain", preflight.header("Content-Type"), preflight::toString);
-        assertArrayEquals("No listener for endpoint: /unknown".getBytes(StandardCharsets.UTF_8), preflight.body(),
+        assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), preflight.body(),
                 preflight::toString);
         assertNoCorsHeaders(preflight);
     }
@@ -165,8 +174,9 @@ class PreflightDispatchListenerTest {
     }
 
     /**
-     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig} and the
-     * listener's own beans, with the test's mock {@link CmisDocumentService} in place of the repository-backed service.
+     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig},
+     * {@link ListenerPathConfig} and the listener's own beans, with the test's mock {@link CmisDocumentService} in
+     * place of the repository-backed service.
      *
      * <p>It names the web auto-configurations rather than enabling auto-configuration and scans nothing, so the
      * context holds the listener and nothing else, no CMIS client included; and it is not a
@@ -174,7 +184,8 @@ class PreflightDispatchListenerTest {
      * application class.
      */
     @Configuration(proxyBeanMethods = false)
-    @Import({PreflightDispatchConfig.class, CmisController.class, GlobalExceptionHandler.class})
+    @Import({PreflightDispatchConfig.class, ListenerPathConfig.class, CmisController.class,
+            GlobalExceptionHandler.class})
     @ImportAutoConfiguration({
             PropertyPlaceholderAutoConfiguration.class,
             ServletWebServerFactoryAutoConfiguration.class,

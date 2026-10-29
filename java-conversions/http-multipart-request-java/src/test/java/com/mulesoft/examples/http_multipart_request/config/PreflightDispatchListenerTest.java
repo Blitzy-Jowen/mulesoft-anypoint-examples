@@ -28,6 +28,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.ImportAutoConfiguration;
 import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration;
 import org.springframework.boot.autoconfigure.http.HttpMessageConvertersAutoConfiguration;
@@ -56,9 +57,10 @@ import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
  * method it asks for, because the original listeners apply no CORS policy
  * (http-multipart-request/src/main/app/http-multipart-request.xml:8,15).
  *
- * <p>The cases run the real controller and SC-1 handler on Undertow ({@link WireConfig}, random port) with
- * {@link UploadService} mocked, so any form rendering or upload would be recorded, and send requests through ST-1
- * {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the listener writes them.
+ * <p>The cases run the real controller, {@link ListenerPathConfig} and SC-1 handler on Undertow ({@link WireConfig},
+ * random port) with {@link UploadService} mocked, so any form rendering or upload would be recorded, and send requests
+ * through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the listener writes
+ * them.
  */
 @SpringBootTest(classes = PreflightDispatchListenerTest.WireConfig.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -152,18 +154,25 @@ class PreflightDispatchListenerTest {
         verifyNoMoreInteractions(uploadService);
     }
 
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() {
+    /**
+     * A path no listener serves, and the listeners' path with {@code ;} segment parameters, which
+     * {@link ListenerPathConfig} refuses after the pre-flight has selected the {@code OPTIONS} handler.
+     *
+     * @param path the unserved request path
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"/unknown", PATH + ";x=1"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String path) {
         HttpTestClient client = HttpTestClient.localhost(port);
-        HttpTestClient.Response plain = client.send("OPTIONS", "/unknown", null, null);
+        HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
 
-        HttpTestClient.Response preflight = client.send("OPTIONS", "/unknown",
+        HttpTestClient.Response preflight = client.send("OPTIONS", path,
                 preflightHeaders(ORIGIN, "POST", null), null);
 
         assertSameResponse(plain, preflight);
         assertEquals("HTTP/1.1 404 Not Found", preflight.statusLine(), preflight::toString);
         assertEquals("text/plain", preflight.header("Content-Type"), preflight::toString);
-        assertArrayEquals("No listener for endpoint: /unknown".getBytes(StandardCharsets.UTF_8), preflight.body(),
+        assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), preflight.body(),
                 preflight::toString);
         assertNoCorsHeaders(preflight);
         verifyNoInteractions(uploadService);
@@ -205,15 +214,16 @@ class PreflightDispatchListenerTest {
 
     /**
      * The test's whole context: Spring Boot's servlet web stack on Undertow with multipart support,
-     * {@link PreflightDispatchConfig} and the listener's own beans, with {@link UploadService} supplied by the test as
-     * a mock.
+     * {@link PreflightDispatchConfig}, {@link ListenerPathConfig} and the listener's own beans, with
+     * {@link UploadService} supplied by the test as a mock.
      *
      * <p>It names the web auto-configurations rather than enabling auto-configuration and scans nothing, so the
      * context holds the listener alone; and it is not a {@code @SpringBootConfiguration}, so the project's other
      * {@code @SpringBootTest} classes still find exactly one application class.
      */
     @Configuration(proxyBeanMethods = false)
-    @Import({PreflightDispatchConfig.class, UploadController.class, GlobalExceptionHandler.class})
+    @Import({PreflightDispatchConfig.class, ListenerPathConfig.class, UploadController.class,
+            GlobalExceptionHandler.class})
     @ImportAutoConfiguration({
             PropertyPlaceholderAutoConfiguration.class,
             ServletWebServerFactoryAutoConfiguration.class,

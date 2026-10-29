@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -49,7 +50,8 @@ import com.mulesoft.examples.login_form_using_the_http_connector.support.HttpTes
  *       success page of its own {@code POST /login};</li>
  *   <li>{@code /login}, whose two listeners accept {@code GET} and {@code POST} only, answers with the listener's
  *       405 {@code text/plain} {@code Method not allowed for endpoint: /login}, and neither flow runs;</li>
- *   <li>an unserved path answers with the no-listener 404.</li>
+ *   <li>an unserved path, either listener's path with {@code ;} segment parameters included, answers with the
+ *       no-listener 404, and no flow runs.</li>
  * </ul>
  * A cross-origin {@code GET} or {@code POST} that is not a pre-flight still renders the page or logs in.
  *
@@ -157,19 +159,25 @@ class PreflightDispatchListenerTest {
         verifyNoInteractions(loginService);
     }
 
-    /** A pre-flight to a path no listener serves gets the no-listener 404, as a plain {@code OPTIONS} request does. */
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() {
+    /**
+     * A pre-flight to a path no listener serves gets the no-listener 404, as a plain {@code OPTIONS} request does, and
+     * no flow runs: an unknown path, and each listener's path with {@code ;} segment parameters, which
+     * {@link ListenerPathConfig} refuses after the pre-flight has selected the {@code OPTIONS} handler.
+     *
+     * @param path the unserved request path
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"/unknown", LOGIN_PATH + ";x=1", REQUESTER_LOGIN_PATH + ";x=1"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String path) {
         HttpTestClient client = HttpTestClient.localhost(port);
-        HttpTestClient.Response plain = client.send("OPTIONS", "/unknown", null, null);
+        HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
 
-        HttpTestClient.Response preflight = client.send("OPTIONS", "/unknown",
-                preflightHeaders(ORIGIN, "POST", null), null);
+        HttpTestClient.Response preflight = client.send("OPTIONS", path, preflightHeaders(ORIGIN, "POST", null), null);
 
         assertSameResponse(plain, preflight);
         assertEquals("HTTP/1.1 404 Not Found", preflight.statusLine(), preflight::toString);
         assertEquals("text/plain", preflight.header("Content-Type"), preflight::toString);
-        assertArrayEquals("No listener for endpoint: /unknown".getBytes(StandardCharsets.UTF_8), preflight.body(),
+        assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), preflight.body(),
                 preflight::toString);
         assertNoCorsHeaders(preflight);
         verifyNoInteractions(loginService);

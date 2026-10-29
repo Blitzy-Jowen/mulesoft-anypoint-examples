@@ -17,6 +17,7 @@ import com.unboundid.ldap.sdk.LDAPException;
 import jakarta.servlet.ServletOutputStream;
 import jakarta.servlet.http.HttpServletResponse;
 
+import org.springframework.http.HttpHeaders;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
@@ -54,7 +55,8 @@ public class LdapController {
      *
      * @param response the response the entries under {@code ou=people} are written to: 200 with their
      *                 {@code [<ldif>, <ldif>, ...]} text as UTF-8 bytes, its {@code Content-Length} and no
-     *                 {@code Content-Type}, or an empty body with {@code Content-Length: 0} when the search finds none
+     *                 {@code Content-Type}, or an empty body with {@code Content-Length: 0} when the search finds none;
+     *                 either way with {@code Cache-Control: no-store} and {@code X-Content-Type-Options: nosniff}
      * @throws LDAPException unchanged from the search, for the 500 of {@code GlobalExceptionHandler}
      * @throws IOException   when writing the response fails
      */
@@ -81,11 +83,18 @@ public class LdapController {
     /**
      * Writes 200 with the search text's UTF-8 bytes and their {@code Content-Length}. The text is obtained before
      * the response is touched, so a directory failure still finds an uncommitted response for the 500 of
-     * {@code GlobalExceptionHandler}.
+     * {@code GlobalExceptionHandler}, which carries neither of the headers below.
+     *
+     * <p>Every search reply, the empty result's included, is the directory's representation of its people, so it
+     * carries {@code Cache-Control: no-store}, keeping clients and caches from retaining it, and
+     * {@code X-Content-Type-Options: nosniff}, keeping browsers from guessing a type for the untyped text. Still no
+     * {@code Content-Type} is sent, and status and body bytes are unchanged.
      */
     private void searchResponse(HttpServletResponse response) throws LDAPException, IOException {
         byte[] bytes = ldapSearchService.searchPeople().getBytes(StandardCharsets.UTF_8);
         response.setStatus(HttpServletResponse.SC_OK);
+        response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+        response.setHeader("X-Content-Type-Options", "nosniff");
         response.setContentLength(bytes.length);
         ServletOutputStream stream = response.getOutputStream();
         stream.write(bytes);

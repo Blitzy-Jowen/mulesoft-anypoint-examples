@@ -52,9 +52,16 @@ import com.mulesoft.examples.exposing_a_restful_resource_using_the_http_connecto
  * negotiation, and the other two flows write their bytes to the servlet response directly, so no message converter
  * runs; none answers 406 or 415. GET and POST in any letter case, which the Mule listener matched
  * ignoring case, reach these mappings through {@code config/ListenerMethodFilter}. Methods outside each listener's
- * {@code allowedMethods} reach SC-1's 405: PUT, DELETE, PATCH and other spellings such as {@code head} or
- * {@code options} through Spring's own method check, HEAD and OPTIONS through the rejecting mappings below, which
- * Spring would otherwise answer itself with 200. A CORS pre-flight is dispatched as the plain OPTIONS it is by
+ * {@code allowedMethods} reach SC-1's 405 through the rejecting mappings below: HEAD and OPTIONS through explicit
+ * ones, which Spring would otherwise answer itself with 200, and PUT, DELETE, PATCH, TRACE and other spellings such
+ * as {@code head} or {@code options} through mappings without a method. Every method therefore selects a handler on
+ * both listener paths, so {@code config/RawPathSegmentConfig} sees each request before its handler runs and answers
+ * a path whose {@code person} segment carries {@code ;} segment parameters, such as {@code /person;x=1}, with the
+ * no-listener 404 for every method, as the Mule listener matched the raw path before the method. The item listener's
+ * handlers map {@link #EMPTY_ID_ITEM_PATH} beside {@link #ITEM_PATH}, so an id segment that is empty before its
+ * {@code ;}, as in {@code /person/;x=1}, selects them as the Mule listener's {@code {personId}} matched it, and
+ * {@code personId} is the whole raw segment: {@code GET} reaches the 500 of {@code Integer.valueOf} and every other
+ * method the 405. A CORS pre-flight is dispatched as the plain OPTIONS it is by
  * {@code config/PreflightDispatchConfig}, so it reaches the rejecting mappings below and gets the 405 too.
  *
  * <p>Content-Types follow the payload each flow ends with. {@code retrieveAllPersonsFlow} ends in an
@@ -77,6 +84,19 @@ public class PersonController {
      * application listens on; it is never derived from the configuration or the request.
      */
     public static final String LOCATION_PREFIX = "http://0.0.0.0:8081/person/";
+
+    /** The path of {@code retrievePersonFlow}'s listener (line 28), mapped by every handler of that listener. */
+    public static final String ITEM_PATH = "/person/{personId}";
+
+    /**
+     * {@link #ITEM_PATH} with its id segment written as {@code *}, mapped beside it by every handler of the listener.
+     * Spring matches a segment by its value before {@code ;} and never captures an empty value into a URI variable,
+     * so an id segment that is empty before its {@code ;}, as in {@code /person/;x=1}, matches only this pattern;
+     * {@code {personId}} outranks it everywhere else. It also matches {@code /person/}, which has no id segment.
+     * {@code config/RawPathSegmentConfig} holds a request that matched it to {@link #ITEM_PATH}: it binds
+     * {@code personId} to the whole raw segment, {@code ;x=1}, and answers {@code /person/} with the no-listener 404.
+     */
+    public static final String EMPTY_ID_ITEM_PATH = "/person/*";
 
     private final PersonService personService;
 
@@ -142,7 +162,7 @@ public class PersonController {
      * @param response the response the stored person is written to once it is found
      * @throws IOException when the stored person cannot be serialized or writing the reply fails
      */
-    @GetMapping("/person/{personId}")
+    @GetMapping({ITEM_PATH, EMPTY_ID_ITEM_PATH})
     public void getPerson(@PathVariable("personId") String personId, HttpServletResponse response)
             throws IOException {
         String person = personService.retrievePersonJson(personId);
@@ -170,8 +190,36 @@ public class PersonController {
      * @param request the rejected request, whose method is reported
      * @throws HttpRequestMethodNotSupportedException always, answered with SC-1's 405
      */
-    @RequestMapping(value = "/person/{personId}", method = {RequestMethod.HEAD, RequestMethod.OPTIONS})
+    @RequestMapping(value = {ITEM_PATH, EMPTY_ID_ITEM_PATH}, method = {RequestMethod.HEAD, RequestMethod.OPTIONS})
     public void rejectPersonMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(request.getMethod(), List.of("GET"));
+    }
+
+    /**
+     * Rejects every other method on {@code /person} ({@code PUT}, {@code DELETE}, {@code PATCH}, {@code TRACE} and
+     * any other token or spelling), outside both listeners' {@code allowedMethods}. A mapping without a method never
+     * matches {@code OPTIONS}, and every mapping that names the request's method outranks it, so {@code GET},
+     * {@code POST}, {@code HEAD} and {@code OPTIONS} keep their handlers. Selecting a handler, rather than leaving
+     * the method to Spring's own check, lets {@code config/RawPathSegmentConfig} answer {@code /person;x=1} with the
+     * no-listener 404 for these methods too.
+     *
+     * @param request the rejected request, whose method is reported
+     * @throws HttpRequestMethodNotSupportedException always, answered with SC-1's 405
+     */
+    @RequestMapping("/person")
+    public void rejectOtherPersonsMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(request.getMethod(), List.of("GET", "POST"));
+    }
+
+    /**
+     * Rejects every other method on {@code /person/{personId}}, {@code POST} included, outside the listener's
+     * {@code allowedMethods}, as {@link #rejectOtherPersonsMethod} does for {@code /person}.
+     *
+     * @param request the rejected request, whose method is reported
+     * @throws HttpRequestMethodNotSupportedException always, answered with SC-1's 405
+     */
+    @RequestMapping({ITEM_PATH, EMPTY_ID_ITEM_PATH})
+    public void rejectOtherPersonMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
         throw new HttpRequestMethodNotSupportedException(request.getMethod(), List.of("GET"));
     }
 

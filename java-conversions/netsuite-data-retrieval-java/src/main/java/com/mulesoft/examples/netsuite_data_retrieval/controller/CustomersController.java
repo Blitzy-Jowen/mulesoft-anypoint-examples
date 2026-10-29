@@ -17,6 +17,7 @@ import com.mulesoft.examples.netsuite_data_retrieval.service.NetsuiteSearchServi
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
@@ -82,7 +83,10 @@ public class CustomersController {
      * @param name    the {@code name} query parameter, the company name prefix; {@code null} when absent
      * @param request the current request, whose method and repeated parameters are checked and whose
      *                {@code Accept} header is negotiated
-     * @return 200, {@code Content-Type: application/json}, with the customers as the service rendered them
+     * @return 200, {@code Content-Type: application/json}, with the customers as the service rendered them, and
+     *         {@code Cache-Control: no-store} and {@code X-Content-Type-Options: nosniff}, so that neither the
+     *         client nor an intermediary keeps a copy of the customer records and no browser reads them as another
+     *         content type; the original declared neither header, and no error reply carries them
      * @throws HttpRequestMethodNotSupportedException for a HEAD request, which the RAML does not declare
      * @throws ConstraintViolationException           when {@code name} is sent more than once
      * @throws HttpMediaTypeNotAcceptableException    when APIkit's negotiation chooses no declared type for the
@@ -104,6 +108,8 @@ public class CustomersController {
         // Tier 2A verification point, settled by a captured fixture.
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
+                .cacheControl(CacheControl.noStore())
+                .header("X-Content-Type-Options", "nosniff")
                 .body(json);
     }
 

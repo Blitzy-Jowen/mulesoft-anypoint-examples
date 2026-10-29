@@ -30,6 +30,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.ImportAutoConfiguration;
 import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration;
 import org.springframework.boot.autoconfigure.http.HttpMessageConvertersAutoConfiguration;
@@ -61,10 +62,11 @@ import com.mulesoft.examples.exposing_a_restful_resource_using_the_http_connecto
  * header, and no flow runs, whatever origin it comes from and whatever method it asks for, because the original
  * listeners apply no CORS policy.
  *
- * <p>The cases run the real controller, {@link PersonService}, {@link PersonExceptionHandler} and SC-1 handler on
- * Undertow ({@link WireConfig}, random port). The service is a Mockito spy, so it keeps its real behaviour while any
- * flow step a request reaches is recorded. Requests go through ST-1 {@link HttpTestClient}, so the status line,
- * headers and body bytes are asserted as the listener writes them.
+ * <p>The cases run the real controller, {@link PersonService}, {@link PersonExceptionHandler},
+ * {@link RawPathSegmentConfig} and SC-1 handler on Undertow ({@link WireConfig}, random port). The service is a
+ * Mockito spy, so it keeps its real behaviour while any flow step a request reaches is recorded. Requests go
+ * through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the listener
+ * writes them.
  */
 @SpringBootTest(classes = PreflightDispatchListenerTest.WireConfig.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
@@ -82,10 +84,11 @@ class PreflightDispatchListenerTest {
 
     /**
      * Path of the pre-flight, its origin, its requested method, then its {@code Access-Control-Request-Headers}, or
-     * {@code null}; every case is sent to each of the two listener paths from each of two origins.
+     * {@code null}; every case is sent to each of the two listener paths from each of two origins, the item listener's
+     * path also with an id segment that is empty before its {@code ;}, which {@link RawPathSegmentConfig} binds whole.
      */
     private static Stream<Arguments> preflights() {
-        return Stream.of("/person", "/person/1").flatMap(path -> Stream.of(ORIGIN, "http://a.example")
+        return Stream.of("/person", "/person/1", "/person/;x=1").flatMap(path -> Stream.of(ORIGIN, "http://a.example")
                 .flatMap(origin -> Stream.of(
                         Arguments.of(path, origin, "GET", null),
                         Arguments.of(path, origin, "POST", null),
@@ -115,18 +118,26 @@ class PreflightDispatchListenerTest {
         verifyNoInteractions(personService);
     }
 
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() {
+    /**
+     * A path no listener serves, and the listener paths with {@code ;} parameters on their literal segment and the
+     * item listener's path without an id segment, which {@link RawPathSegmentConfig} refuses after the pre-flight has
+     * selected the {@code OPTIONS} handler.
+     *
+     * @param path the unserved request path
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"/unknown", "/person;x=1", "/person;x=1/1", "/person/"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String path) {
         HttpTestClient client = HttpTestClient.localhost(port);
-        HttpTestClient.Response plain = client.send("OPTIONS", "/unknown", null, null);
+        HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
 
-        HttpTestClient.Response preflight = client.send("OPTIONS", "/unknown",
+        HttpTestClient.Response preflight = client.send("OPTIONS", path,
                 preflightHeaders(ORIGIN, "POST", null), null);
 
         assertSameResponse(plain, preflight);
         assertEquals("HTTP/1.1 404 Not Found", preflight.statusLine(), preflight::toString);
         assertEquals("text/plain", preflight.header("Content-Type"), preflight::toString);
-        assertArrayEquals("No listener for endpoint: /unknown".getBytes(StandardCharsets.UTF_8), preflight.body(),
+        assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), preflight.body(),
                 preflight::toString);
         assertNoCorsHeaders(preflight);
         verifyNoInteractions(personService);
@@ -222,15 +233,15 @@ class PreflightDispatchListenerTest {
 
     /**
      * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig},
-     * {@link ListenerMethodFilter} and the person resource's own beans.
+     * {@link RawPathSegmentConfig}, {@link ListenerMethodFilter} and the person resource's own beans.
      *
      * <p>It names the web auto-configurations rather than enabling auto-configuration and scans nothing, so the
      * context holds the listeners alone; and it is not a {@code @SpringBootConfiguration}, so the project's other
      * {@code @SpringBootTest} classes still find exactly one application class.
      */
     @Configuration(proxyBeanMethods = false)
-    @Import({PreflightDispatchConfig.class, ListenerMethodFilter.class, PersonController.class, PersonService.class,
-            PersonExceptionHandler.class, GlobalExceptionHandler.class})
+    @Import({PreflightDispatchConfig.class, RawPathSegmentConfig.class, ListenerMethodFilter.class,
+            PersonController.class, PersonService.class, PersonExceptionHandler.class, GlobalExceptionHandler.class})
     @ImportAutoConfiguration({
             PropertyPlaceholderAutoConfiguration.class,
             ServletWebServerFactoryAutoConfiguration.class,

@@ -161,9 +161,7 @@ class NetsuiteSearchServiceTest {
         logger.setLevel(previousLevel);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Search criteria scripts
-    // ---------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> startsWithCriteria() {
         BiFunction<NetsuiteSearchService, String, Map<String, Object>> customer =
@@ -237,9 +235,7 @@ class NetsuiteSearchServiceTest {
         assertEquals(Integer.valueOf(quantity), condition.get("searchValue"));
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // SuiteQL ID queries
-    // ---------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> idQueries() {
         Function<String, String> customer = NetsuiteSearchService::customerIdQuery;
@@ -275,9 +271,7 @@ class NetsuiteSearchServiceTest {
         assertEquals(expected, query.apply(prefix));
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // get:/customers
-    // ---------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> customerSearches() {
         return Stream.of(
@@ -368,9 +362,7 @@ class NetsuiteSearchServiceTest {
         assertTrue(appender.list.isEmpty(), appender.list::toString);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // get:/items
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * Plan 9 has one order line of quantity 10 and no {@code units}; plan 18 has lines of 5 and 25 and
@@ -526,9 +518,7 @@ class NetsuiteSearchServiceTest {
         assertTrue(appender.list.isEmpty(), appender.list::toString);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // get:/oportunities
-    // ---------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> opportunitySearches() {
         return Stream.of(
@@ -573,9 +563,7 @@ class NetsuiteSearchServiceTest {
         assertLoggedOnce(OPPORTUNITIES_LOGGED);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Committed responses, from the REST fixtures of src/test/resources/netsuite
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * REST customer -5 answers the committed customer byte for byte: the SuiteQL row's record is read, the sources
@@ -674,9 +662,7 @@ class NetsuiteSearchServiceTest {
         assertLoggedOnce(OPPORTUNITIES_LOGGED);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Every flow
-    // ---------------------------------------------------------------------------------------------------------
 
     /** The three flows, each with a search that matches nothing. */
     enum Flow {
@@ -863,9 +849,7 @@ class NetsuiteSearchServiceTest {
         assertTrue(appender.list.isEmpty(), appender.list::toString);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Fixtures
-    // ---------------------------------------------------------------------------------------------------------
 
     /** The customer catalog: the body fields and the custom fields of the two customers, typed as REST types them. */
     private static Map<String, Object> customerCatalog() {
@@ -1066,9 +1050,7 @@ class NetsuiteSearchServiceTest {
         return sourceIds;
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Assertions and helpers
-    // ---------------------------------------------------------------------------------------------------------
 
     /** Exactly one event was logged by the service: the given INFO line. */
     private void assertLoggedOnce(String message) {

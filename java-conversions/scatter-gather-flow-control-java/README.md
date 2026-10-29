@@ -28,13 +28,14 @@ Contacts are matched by `Email`: a record in both sources with the same `Email` 
 | Path | Methods | Host | Port | Response | Source |
 |---|---|---|---|---|---|
 | `/scatterGather` | any, `HEAD`, `OPTIONS` and `TRACE` included: the listener declares no `allowedMethods` (AAP 0.4.9) | `0.0.0.0` | `http.port`, default `8081` | `200 OK`, body `Please find attached your Aggregation Report` (44 bytes, UTF-8, no trailing newline), `Content-Length: 44`, no `Content-Type` header; a `HEAD` reply carries the headers without the body. Every request, `HEAD` and `OPTIONS` included, sends one report mail | `scatter-gather.xml:4,7,59,63` |
-| any other path (`/scatterGather/extra` and `/error` included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7); the flow does not run | listener platform default |
+| any other path (`/scatterGather/extra`, `/error` and `/scatterGather` with `;` segment parameters, such as `/scatterGather;x=1`, included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7); the flow does not run | listener platform default |
 | `/scatterGather`, when processing throws | any | `0.0.0.0` | `http.port` | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }`, logged at ERROR on one line (SC-1, AAP 0.4.7) | platform default for an unhandled exception; the flows have no exception strategy |
 
 - Response body: `outboundFlow` sets the payload to `Please find attached your Aggregation Report` (`scatter-gather.xml:63`) before the one-way `smtp:outbound-endpoint`, which passes the event through; `remove-attachment` and the final `set-payload value="#[payload]"` (`scatter-gather.xml:59,65`) keep it. The HTTP reply is that text, not the CSV.
 - The reply carries no `Content-Type`: the final `set-payload` declares no MIME type, and the plan default (AAP 0.4.7) is that the Mule listener then sent none. `ScatterGatherController` writes the bytes straight to the servlet response, so no message converter adds one. This is a Tier 2A verification point.
 - The flow reads no query, header or body, so any `Accept`, `Content-Type` or body is ignored and never answered with 406, 415 or 400. SC-1's 405 (`Method not allowed for endpoint: <path>`) cannot occur, because the listener accepts every method.
 - A CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered like any other `OPTIONS` request: the flow runs and the reply carries no `Access-Control-*` or `Vary` header. The original listener applied no CORS policy (`config/PreflightDispatchConfig`).
+- A path carrying `;` segment parameters (`/scatterGather;x=1`, `/scatterGather;jsessionid=ABC`, `/scatterGather;`) is not `/scatterGather`: every method gets the no-listener 404 naming the path with its parameters, `No listener for endpoint: /scatterGather;x=1`, and the flow does not run, so neither route runs and no report mail is sent. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). A `;` in the query string is not part of the path.
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
 ### Processing sequence
@@ -83,6 +84,7 @@ The source does not settle these platform behaviours. When a captured fixture sh
 - the CSV rendering of the missing `Id` (plan: an empty field);
 - the report mail's MIME part headers: part content types and charsets, `Content-Description`, the attachment's file name and the transfer encodings;
 - the `404` text and its `text/plain` type, and the `500` body shape and message for an SMTP failure (`smtp-unavailable`);
+- the `404` for `/scatterGather` carrying `;` segment parameters;
 - the flow running for `OPTIONS` and for a CORS pre-flight.
 
 ## Configuration keys
@@ -153,7 +155,7 @@ The framework settings that reproduce the original listener, connector and scatt
 | `set-payload value="#[payload]"` (`scatter-gather.xml:59`) | `ScatterGatherService.process()` returning the mailer's result to the controller |
 | Mule 3.8 default threading profile of the scatter-gather pool | Spring Boot's `applicationTaskExecutor`, bounded by `spring.task.execution.pool`; a rejected route runs on the calling thread |
 | Platform default responses (no listener, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| Grizzly listener semantics (no CORS policy) | `config/PreflightDispatchConfig` |
+| Listener semantics (no CORS policy; the raw path, query removed, matched literally, `;` segment parameters included) | `config/PreflightDispatchConfig`, `config/ListenerPathConfig` |
 | `mule-deploy.properties` (loads `scatter-gather.xml`) | `ScatterGatherFlowControlApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` (empty) and the `${...}` placeholders of `scatter-gather.xml` | `src/main/resources/application.yml` |
 | `ScatterGatherFlowControlIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`, Gmail over IMAPS) | `ScatterGatherFlowControlTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)`, ST-1 `support/HttpTestClient`, GreenMail) |
@@ -168,7 +170,7 @@ Shared components, each copied from its reference project with only the `package
 | ST-1 | `src/test/java/.../support/HttpTestClient` | `rest-api-with-apikit-java` | — |
 | ST-2 | `src/test/java/.../FixtureParityTest`, the format of `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` | — (it is the test) |
 
-`config/PreflightDispatchConfig` and its `config/PreflightDispatchConfigTest` are the same classes as in `hello-world-java`; `config/PreflightDispatchListenerTest` is this project's own wire test of them.
+`config/PreflightDispatchConfig` with its `config/PreflightDispatchConfigTest`, and `config/ListenerPathConfig`, are the same classes as in `hello-world-java`, differing only in the `package` line; `config/PreflightDispatchListenerTest` and `controller/ScatterGatherControllerTest` are this project's own wire tests of them.
 
 Not carried (AAP 0.2.2): `catalog/**` (Studio DataSense metadata), `mule-project.xml`, `src/test/resources/log4j2-test.xml`, and `src/test/resources/sample_data/list_listOfMaps.dwl`, the Studio preview input of the DataWeave script. The original test's `src/test/resources/mule.test.properties` was never committed.
 
@@ -213,7 +215,7 @@ Please find attached your Aggregation Report
 |---|---|
 | `ScatterGatherFlowControlTest` | the ported `ScatterGatherFlowControlIT` (`scatter-gather-flow-control/src/test/java/org/mule/examples/ScatterGatherFlowControlIT.java:101-114`), GreenMail in place of Gmail: a `POST /scatterGather` without a body returns a response with a non-empty payload and status 200, and one mail with content is received |
 | `ContactsMergeTest` | the ported `ContactsMergeTest` (`scatter-gather-flow-control/src/test/java/org/mule/examples/ContactsMergeTest.java:31-39`), on JUnit 5: `mergeList` of two generated contact lists equals the expected merged list |
-| `controller/ScatterGatherControllerTest` | on the wire through ST-1, GreenMail as SMTP server: `GET`, `POST`, `PUT`, `DELETE`, `PATCH` and `OPTIONS /scatterGather` → `HTTP/1.1 200 OK`, no `Content-Type`, `Content-Length: 44`, body `Please find attached your Aggregation Report`, one mail with the original subject, the flow run once; a failing mail send → 500 `application/json` `{ "message": "<send failure>" }` and no mail; a failing route → 500 with the aggregation message, both routes run, no mail; `/unknown` and `/scatterGather/extra` → 404 `text/plain` `No listener for endpoint: <path>` without running the flow |
+| `controller/ScatterGatherControllerTest` | on the wire through ST-1, GreenMail as SMTP server: `GET`, `POST`, `PUT`, `DELETE`, `PATCH` and `OPTIONS /scatterGather` → `HTTP/1.1 200 OK`, no `Content-Type`, `Content-Length: 44`, body `Please find attached your Aggregation Report`, one mail with the original subject, the flow run once; a failing mail send → 500 `application/json` `{ "message": "<send failure>" }` and no mail; a failing route → 500 with the aggregation message, both routes run, no mail; `/unknown` and `/scatterGather/extra` → 404 `text/plain` `No listener for endpoint: <path>` without running the flow, and so do `/scatterGather;x=1`, `/scatterGather;jsessionid=ABC` and `/scatterGather;` for `GET`, `POST` with an empty body, `HEAD` (the 404 headers without the body) and `OPTIONS`, with no route run and no mail sent |
 | `service/ScatterGatherServiceTest` | each route builds the original contacts in new mutable collections; `scatter` returns one success per route in route order, runs both routes concurrently on the executor and keeps the order when route B finishes first; a failing route is recorded with its unwrapped exception while the other succeeds; `process` mails the original CSV report and returns the mailer's payload, throws `IllegalStateException` and sends no mail when a route fails, and propagates a mail failure unchanged; a rejected route runs on the calling thread; `application.yml` bounds `applicationTaskExecutor` like Mule 3.8's default threading profile |
 | `service/ContactMergeAggregationStrategyTest` | two successes are merged in result order, a failed result among them skipped; a success count other than two (route A failed, both failed, no results, three successes) → `IllegalStateException` with the original message; the route payloads stay unchanged |
 | `mapper/ContactsCsvMapperTest` | the demo routes' merge → the CSV report above byte for byte; merged contacts are written with a blank `Id` and without `IDInA` and `IDInB`; an `Id` present is written; column order `Id,Name,Email` whatever the input map's order |
@@ -221,7 +223,7 @@ Please find attached your Aggregation Report
 | `mapper/DwCsvWriterTest` | SC-4: the committed `report.csv` bytes, LF line ends with a trailing LF, header handling, empty and null fields, scalar rendering, quoting and escaping, null-argument rejection, concurrent use |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
-| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/scatterGather` gets exactly the plain `OPTIONS` reply (`200`, the flow's payload, no `Content-Type`, no `Access-Control-*` or `Vary`); a pre-flight to an unserved path gets the no-listener 404; cross-origin requests run the flow without CORS headers |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/scatterGather` gets exactly the plain `OPTIONS` reply (`200`, the flow's payload, no `Content-Type`, no `Access-Control-*` or `Vary`); a pre-flight to `/unknown`, `/scatterGather/extra` or `/scatterGather;x=1` gets the no-listener 404 without running the flow; cross-origin requests run the flow without CORS headers |
 | `config/SensitiveLogLevelsTest` | the `logging.level` key bound from `application.yml` as Spring Boot binds it; with the root at `TRACE` and that level applied through Spring Boot's logging system, `POST /scatterGather` answers as usual and mails the report through GreenMail with a sentinel SMTP account, sender and recipient, and neither those values nor the contacts' e-mail addresses are written through any logger outside `com.mulesoft.examples` and the stand-in server; a control with the level cleared shows exactly Angus Mail's `.smtp` and `.smtp.protocol` loggers writing them |
 | `config/StartTlsRequiredTest` | `spring.mail.properties` `[mail.smtp.starttls.required]` and `[mail.smtps.starttls.required]` bound as Spring Boot binds them: `true` in `application.yml`, `false` only in `application-test.yml`. `AggregationReportMailer`, with the `JavaMailSender` Spring Boot builds from `application.yml` without a profile, mails the report to a loopback SMTP peer that advertises `AUTH PLAIN LOGIN` but no STARTTLS: the send fails with Angus Mail's `STARTTLS is required but host does not support STARTTLS`, and the peer receives no `AUTH`, `MAIL`, `RCPT` or `DATA` command. A control with the requirement off shows the same peer receiving the account, the envelope and the report in clear text |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
@@ -259,9 +261,9 @@ Once captured, `scatter-gather-report-mail` and `smtp-unavailable` stay `UNVERIF
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; 230 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 230 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 160 of 163 lines (`service/ScatterGatherService` 50 of 52, `service/ContactMerge` 28 of 29, `service/ContactMergeAggregationStrategy` 15 of 15, `mapper/ContactsCsvMapper` 12 of 12, `mapper/DwCsvWriter` 55 of 55). Total project LINE coverage: 97.1% (409 of 421 lines).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; 243 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 243 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 160 of 163 lines (`service/ScatterGatherService` 50 of 52, `service/ContactMerge` 28 of 29, `service/ContactMergeAggregationStrategy` 15 of 15, `mapper/ContactsCsvMapper` 12 of 12, `mapper/DwCsvWriter` 55 of 55). Total project LINE coverage: 97.2% (418 of 430 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`, with `aggregation-missing-route-result` reported `UNREACHABLE`.
 
 ## Fallback evidence (AAP 0.8.4)

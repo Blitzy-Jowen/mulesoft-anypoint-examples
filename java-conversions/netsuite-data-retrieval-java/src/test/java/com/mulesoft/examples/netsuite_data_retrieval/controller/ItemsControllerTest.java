@@ -116,9 +116,7 @@ class ItemsControllerTest {
         client = HttpTestClient.localhost(port);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Happy path, RAML defaults and parameter binding
-    // ---------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest(name = "GET " + ITEMS + "?quantity=5&operator=LESS_THAN with Accept {0} -> 200 example bytes")
     @NullSource
@@ -180,9 +178,7 @@ class ItemsControllerTest {
         verifyNoMoreInteractions(searchService);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // APIkit mappings (SC-3): the request never reaches the service
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * Each query string APIkit's RAML validation rejected, with the reason. The ST-1 client sends the target as raw
@@ -270,9 +266,7 @@ class ItemsControllerTest {
         verifyNoInteractions(searchService);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Approved upstream failure modes (SC-9) and the unhandled-exception 500 (SC-1)
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * Each upstream failure the service can raise: a label, the exception, the status with Undertow's reason
@@ -332,9 +326,7 @@ class ItemsControllerTest {
         verifyNoMoreInteractions(searchService);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Assertions
-    // ---------------------------------------------------------------------------------------------------------
 
     /** One of APIkit's error mappings, which all answer {@code application/json} with a literal body. */
     private static void assertApiKitError(HttpTestClient.Response response, int status, String reason,

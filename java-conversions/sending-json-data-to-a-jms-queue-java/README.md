@@ -17,6 +17,7 @@ Flow `json-to-jmsFlow` in `src/main/app/json-to-jms.xml` receives JSON sales dat
 - Body decoding (`byte-array-to-string-transformer`, `json-to-jms.xml:8`): with the charset the `Content-Type` names; with the JVM default charset when the header names none, as the Mule listener did; with UTF-8, the original application encoding, when the header is absent, blank, unparseable or names an unusable charset. The response body is the payload encoded back with the same charset, so it equals the request bytes for every body valid in its charset. An empty body is queued as the empty string and answered with an empty `200`.
 - Response `Content-Type`: the request's lower-cased `type/subtype` plus `; charset=<the charset above>`, for example `application/json; charset=UTF-8`; no header when the request has no `Content-Type`, `*/*` or an unparseable type. Plan default, derived from Mule 3.8 carrying the inbound MIME type through the transformer; a Tier 2A verification point where a captured fixture governs.
 - Form bodies: Mule 3.8's listener decoded an `application/x-www-form-urlencoded` entity (what `curl -d` sends) into a parameter map before the flow ran, so the transformer queued that map's text, for example `{QTY=1, ITEM_ID=001, PRICE=20, ITEM_NAME=Shirt}` (Mule's hash order; a `password` value is written `*****`). `SalesQueueService.sendForm` reproduces it. Send JSON with an explicit `Content-Type`, as in the sample below.
+- A path carrying `;` segment parameters (`/sales;x=1`, `/sales;jsessionid=ABC`, `/sales;`) is not `/sales`: every method, `POST` in any letter case included, gets the no-listener 404 naming the path with its parameters, `No listener for endpoint: /sales;x=1`, and nothing is queued. The Mule listener matched the raw path, query removed, literally, and before the method, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). `controller/SalesController` maps every method on `/sales`, so the path is checked before any method is rejected with the 405. A `;` in the query string is not part of the path.
 
 Responses:
 
@@ -24,11 +25,11 @@ Responses:
 |---|---|
 | `POST /sales` | `200 OK`, the payload with its `Content-Length` and the `Content-Type` above |
 | A method other than `POST` on `/sales` (`OPTIONS`, `TRACE` and CORS pre-flights included) | `405 Method Not Allowed`, `text/plain`, `Method not allowed for endpoint: /sales` (SC-1 `exception/GlobalExceptionHandler`, AAP 0.4.7) |
-| Any other path (`/sales/` included) | `404 Not Found`, `text/plain`, `No listener for endpoint: <path>` (SC-1) |
+| Any other path (`/sales/` included, and `/sales` with `;` segment parameters, such as `/sales;x=1`, for every method) | `404 Not Found`, `text/plain`, `No listener for endpoint: <path>` (SC-1), nothing queued |
 | An unhandled failure, such as an unreachable broker | `500 Internal Server Error`, `application/json`, `{ "message": "<exception message>" }` (SC-1), logged at ERROR with the route and exception types only |
 | A form entity the Mule listener rejected before the flow ran (`exception/UndecodableFormException`) | no `Content-Type`, nothing queued: `400 Bad Request` `Cannot decode x-www-form-urlencoded payload` for a malformed percent escape; `400` `Could not parse '<header>'` for an unparseable `Content-Type`; `400` with the lower-cased charset name for an unusable charset; `500` `Server encountered a problem` for two different charsets |
 
-The 404, 405 and 500 bytes are platform defaults and Tier 2A verification points.
+The 404, 405 and 500 bytes are platform defaults and Tier 2A verification points, and so is the 404 for a path carrying `;` segment parameters. When a captured fixture shows different bytes, the fixture governs and the code is changed to match.
 
 ### Sample request
 
@@ -101,7 +102,7 @@ To use an external broker, pass `--spring.artemis.mode=native --spring.artemis.e
 | Mule construct | Java |
 |---|---|
 | `http:listener-config` host `0.0.0.0`, port `${http.port}` | Undertow (Tomcat excluded) with `server.address`, `server.port` |
-| `http:listener` `POST` `sales` | `controller/SalesController`; `config/ListenerMethodFilter` (method ignoring case); `config/PreflightDispatchConfig` (no CORS policy, a pre-flight is a plain `OPTIONS`) |
+| `http:listener` `POST` `sales` | `controller/SalesController`; `config/ListenerMethodFilter` (method ignoring case); `config/PreflightDispatchConfig` (no CORS policy, a pre-flight is a plain `OPTIONS`); `config/ListenerPathConfig` (the raw path, query removed, matched literally, `;` segment parameters included) |
 | listener form decoding and its rejections | `SalesQueueService.sendForm`, `exception/UndecodableFormException` |
 | `byte-array-to-string-transformer` | charset decoding of the raw body in `SalesQueueService.send(byte[], String)` |
 | `jms:outbound-endpoint queue="sales"` (one-way) | `JmsTemplate.convertAndSend` in `SalesQueueService.send(String)` |
@@ -142,11 +143,11 @@ java -jar target/sending-json-data-to-a-jms-queue-java-1.0.0-SNAPSHOT.jar
 | Test class | What it asserts |
 |---|---|
 | `SendingJsonDataToJMSQueueTest` | the ported original assertions (`SendingJsonDataToJMSQueueIT.java:49-55`): `POST /sales` with `message.json` answers, with a non-empty payload and status `200`, and a message with a payload is received from `sales` within 1500 ms |
-| `controller/SalesControllerTest` | on the wire through ST-1: the echoed body equals the sent bytes and the queued `TextMessage` (`NON_PERSISTENT`) equals the sent text; ISO-8859-1 round trip; empty body; no `Content-Type`; form rendering and every listener rejection; `GET` and `OPTIONS` → 405; `/unknown` → 404; broker failure → JSON 500 |
+| `controller/SalesControllerTest` | on the wire through ST-1: the echoed body equals the sent bytes and the queued `TextMessage` (`NON_PERSISTENT`) equals the sent text; ISO-8859-1 round trip; empty body; no `Content-Type`; form rendering and every listener rejection; `GET`, `OPTIONS`, `PUT`, `DELETE`, `PATCH`, `HEAD` and an unknown token → 405; `/unknown` → 404; `/sales;x=1`, `/sales;jsessionid=ABC` and `/sales;` → 404 `No listener for endpoint: <path>` with nothing queued for `POST` (and `post`) with a JSON body, `GET`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `TRACE` and an unknown token; broker failure → JSON 500 |
 | `service/SalesQueueServiceTest` | decoding and encoding per charset, the response `Content-Type`, form detection, decoding, rendering and rejections, one send to the configured queue, the INFO description logged after the send and never the body, failures propagated with nothing logged |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: 404, 405 and 500 status lines, `Content-Type` and body bytes; `ErrorResponse` escaping; one escaped ERROR line per unhandled exception |
 | `config/ListenerMethodFilterTest` | `post`, `Post` and other spellings of `POST` run the flow; every other method keeps the 405 |
-| `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS`: 405 on `/sales`, 404 elsewhere, no `Access-Control-*` headers |
+| `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS`: 405 on `/sales`, 404 elsewhere (`/unknown` and `/sales;x=1`), no `Access-Control-*` headers |
 | `config/ArtemisClientConfigTest` | `jms.call-timeout` bounds the Artemis client in both modes, a broker that never answers fails within it, a non-positive value stops start-up, native mode starts no in-VM broker when it is disabled |
 | `FixtureParityTest` | ST-2 fixture replay of `src/test/resources/fixtures/SCENARIOS.md`; skipped while no fixture is captured |
 
@@ -174,9 +175,9 @@ java -jar target/sending-json-data-to-a-jms-queue-java-1.0.0-SNAPSHOT.jar
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 272 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 272 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 163 of 163 lines of `service/SalesQueueService` and its nested tokenizer (the project has no `mapper` package). Total project LINE coverage: 98.1% (411 of 419 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 308 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 308 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 163 of 163 lines of `service/SalesQueueService` and its nested tokenizer (the project has no `mapper` package). Total project LINE coverage: 98.1% (421 of 429 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=7`, `failed=0`.
 
 Tier 2A is blocked: `Tier 2A blocked: Mule EE licence and EE Maven repository credentials unconfirmed` (root `DECISIONS.md`, section 9). Tier 2B is `N/A`, because the project calls no vendor system.
@@ -187,7 +188,7 @@ No fixture can be captured from the original while Tier 2A is blocked, so parity
 
 - `SendingJsonDataToJMSQueueTest` carries the original committed assertions, and the controller and service tests cover every reachable branch.
 - This evidence is weaker than captured fixtures: it shows the conversion meets the original's own assertions and the plan's reading of the Mule 3.8 listener and platform defaults, not that its bytes equal what the original runtime sent.
-- Behaviours no original assertion covers, tested only by the new tests: the echoed body equalling the sent bytes; the queued text equalling the sent text; the 405 for non-`POST` methods; the 404 for unserved paths; the 500 on broker failure; the response `Content-Type`; the empty body; the form rendering and the listener's form rejections.
+- Behaviours no original assertion covers, tested only by the new tests: the echoed body equalling the sent bytes; the queued text equalling the sent text; the 405 for non-`POST` methods; the 404 for unserved paths, `/sales` with `;` segment parameters included; the 500 on broker failure; the response `Content-Type`; the empty body; the form rendering and the listener's form rejections.
 - Unverified scenarios, until captured: `post-sales-json`, `get-sales-method-not-allowed`, `post-unknown-path`, `post-sales-empty-body`, `post-sales-form`, `post-sales-form-undecodable`, `post-sales-form-unsupported-charset`.
 
 The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed (AAP 0.8.7).

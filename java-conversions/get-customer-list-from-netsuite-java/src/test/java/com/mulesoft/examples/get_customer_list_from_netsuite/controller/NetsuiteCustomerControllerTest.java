@@ -9,6 +9,8 @@
 package com.mulesoft.examples.get_customer_list_from_netsuite.controller;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.anyUrl;
 import static com.github.tomakehurst.wiremock.client.WireMock.containing;
 import static com.github.tomakehurst.wiremock.client.WireMock.equalTo;
 import static com.github.tomakehurst.wiremock.client.WireMock.matchingJsonPath;
@@ -64,7 +66,10 @@ import com.mulesoft.examples.get_customer_list_from_netsuite.support.HttpTestCli
  * key are registered per run, so no credential and no host other than localhost is ever used.
  *
  * <p>Covered: the original's branches (customers found, none found, the expression filter's rejection), every
- * method on the listener, the SuiteQL literal escaping of a quote, the no-listener 404, and the approved connector
+ * method on the listener, the page reply's {@code Cache-Control}, {@code X-Content-Type-Options} and
+ * {@code X-Frame-Options} headers and their absence from the filter rejection, the SuiteQL literal escaping of a
+ * quote, the no-listener 404 ({@code /customers} with {@code ;} segment parameters included, which never reaches
+ * NetSuite), and the approved connector
  * failure modes with their exact upstream call counts (one re-authentication on 401, no retry on 429 or a timeout)
  * next to a failure that keeps the platform default 500. Every expected page is written by hand from the template
  * and the fixture rows, never computed by the code under test.
@@ -80,6 +85,12 @@ class NetsuiteCustomerControllerTest {
     private static final String ACCESS_TOKEN = "test-access-token";
 
     private static final String TEXT_HTML_UTF8 = "text/html;charset=UTF-8";
+
+    /** The headers a page reply carries besides Content-Type, each with its exact value; no other reply sends them. */
+    private static final Map<String, String> PAGE_HEADERS = Map.of(
+            "Cache-Control", "no-store",
+            "X-Content-Type-Options", "nosniff",
+            "X-Frame-Options", "DENY");
 
     /** The SuiteQL page size {@code NetsuiteRestClient} sends as {@code limit} on every page. */
     private static final String PAGE_LIMIT = "1000";
@@ -189,6 +200,7 @@ class NetsuiteCustomerControllerTest {
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.reason()).isEqualTo("OK");
         assertThat(response.header("Content-Type")).isEqualTo(TEXT_HTML_UTF8);
+        assertPageHeaders(response);
         String expected = expectedPage(EXPECTED_TBODY);
         assertThat(response.bodyAsString()).isEqualTo(expected).contains(HEADING);
         assertThat(response.body()).isEqualTo(expected.getBytes(UTF_8));
@@ -217,6 +229,8 @@ class NetsuiteCustomerControllerTest {
         assertThat(other.status()).as(other.toString()).isEqualTo(get.status());
         assertThat(other.reason()).isEqualTo(get.reason());
         assertThat(other.header("Content-Type")).isEqualTo(get.header("Content-Type")).isEqualTo(TEXT_HTML_UTF8);
+        assertPageHeaders(get);
+        assertPageHeaders(other);
         assertThat(other.body()).isEqualTo(get.body());
         WIRE_MOCK.verify(2, postRequestedFor(urlPathEqualTo(SUITEQL_PATH))
                 .withRequestBody(matchingJsonPath("$.q", containing("LIKE LOWER('a%')"))));
@@ -243,6 +257,7 @@ class NetsuiteCustomerControllerTest {
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.reason()).isEqualTo("OK");
         assertThat(response.header("Content-Type")).isNull();
+        assertNoPageHeaders(response);
         assertThat(response.body()).isEmpty();
         WIRE_MOCK.verify(0, postRequestedFor(urlPathEqualTo(SUITEQL_PATH)));
         WIRE_MOCK.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
@@ -300,9 +315,51 @@ class NetsuiteCustomerControllerTest {
         assertThat(response.status()).as(response.toString()).isEqualTo(404);
         assertThat(response.reason()).isEqualTo("Not Found");
         assertMediaType(response, MediaType.TEXT_PLAIN);
+        assertNoPageHeaders(response);
         assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: /unknown");
         WIRE_MOCK.verify(0, postRequestedFor(urlPathEqualTo(SUITEQL_PATH)));
         WIRE_MOCK.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+    }
+
+    /** Request method, then {@code /customers} followed by {@code ;} segment parameters. */
+    static Stream<Arguments> pathParameterRequests() {
+        return Stream.of("GET", "POST", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of("/customers;x=1", "/customers;jsessionid=ABC", "/customers;")
+                        .map(path -> Arguments.of(method, path)));
+    }
+
+    /**
+     * A path carrying {@code ;} segment parameters is not the listener's path: the Mule listener compared the raw
+     * path, query removed, literally, so every method gets the no-listener 404 naming the path with its parameters,
+     * and the flow never runs ({@code config/ListenerPathConfig}). NetSuite, stubbed to answer the search, receives
+     * no request at all, not even for a token. A {@code HEAD} reply carries the headers without the body.
+     *
+     * @param method the request method; {@code POST} carries a {@code text/plain} body
+     * @param path   {@code /customers} followed by its segment parameters, requested with {@code ?lastName=a}
+     */
+    @ParameterizedTest(name = "{0} {1}?lastName=a")
+    @MethodSource("pathParameterRequests")
+    void pathWithSegmentParametersIsTheNoListener404AndNeverReachesNetsuite(String method, String path)
+            throws IOException {
+        stubSuiteQl(okJson("netsuite/suiteql-customers.json"));
+        boolean withBody = "POST".equals(method);
+
+        HttpTestClient.Response response = client().send(method, path + "?lastName=a",
+                withBody ? Map.of("Content-Type", "text/plain") : Map.of(),
+                withBody ? "ping".getBytes(UTF_8) : null);
+
+        byte[] body = ("No listener for endpoint: " + path).getBytes(UTF_8);
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 404 Not Found");
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly("text/plain");
+        assertNoPageHeaders(response);
+        if ("HEAD".equals(method)) {
+            assertThat(response.headers("Content-Length")).as(response.toString())
+                    .containsExactly(String.valueOf(body.length));
+            assertThat(response.body()).as(response.toString()).isEmpty();
+        } else {
+            assertThat(response.body()).as(response.toString()).isEqualTo(body);
+        }
+        WIRE_MOCK.verify(0, anyRequestedFor(anyUrl()));
     }
 
     /** A 401 evicts the token and retries once with a new one; rejected again, the attempt ends in a 502. */
@@ -315,6 +372,7 @@ class NetsuiteCustomerControllerTest {
         assertThat(response.status()).as(response.toString()).isEqualTo(502);
         assertThat(response.reason()).isEqualTo("Bad Gateway");
         assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertNoPageHeaders(response);
         assertThat(response.bodyAsString())
                 .isEqualTo("{ \"message\": \"Invalid login attempt.\", \"upstream\": \"NetSuite\" }");
         WIRE_MOCK.verify(2, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
@@ -331,6 +389,7 @@ class NetsuiteCustomerControllerTest {
         assertThat(response.reason()).isEqualTo("Too Many Requests");
         assertThat(response.header("Retry-After")).isEqualTo("30");
         assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertNoPageHeaders(response);
         assertThat(response.bodyAsString())
                 .isEqualTo("{ \"message\": \"Request limit exceeded.\", \"upstream\": \"NetSuite\" }");
         WIRE_MOCK.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL_PATH)));
@@ -347,6 +406,7 @@ class NetsuiteCustomerControllerTest {
         assertThat(response.status()).as(response.toString()).isEqualTo(503);
         assertThat(response.reason()).isEqualTo("Service Unavailable");
         assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertNoPageHeaders(response);
         assertThat(response.bodyAsString()).startsWith("{ \"message\": \"").contains("\"upstream\": \"NetSuite\"");
         WIRE_MOCK.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL_PATH)));
         WIRE_MOCK.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
@@ -379,6 +439,7 @@ class NetsuiteCustomerControllerTest {
         assertThat(response.status()).as(response.toString()).isEqualTo(500);
         assertThat(response.reason()).isEqualTo("Internal Server Error");
         assertMediaType(response, MediaType.APPLICATION_JSON);
+        assertNoPageHeaders(response);
         assertThat(response.bodyAsString()).isEqualTo("{ \"message\": \"" + message + "\" }")
                 .doesNotContain(WIRE_MOCK.baseUrl(), "/services/rest");
         WIRE_MOCK.verify(1, postRequestedFor(urlPathEqualTo(SUITEQL_PATH)));
@@ -416,6 +477,18 @@ class NetsuiteCustomerControllerTest {
                 .isNotNegative()
                 .isEqualTo(template.lastIndexOf(expression));
         return template.replace(expression, tbody);
+    }
+
+    /** Asserts that every one of {@link #PAGE_HEADERS} is sent exactly once, with its exact value. */
+    private static void assertPageHeaders(HttpTestClient.Response response) {
+        PAGE_HEADERS.forEach((name, value) ->
+                assertThat(response.headers(name)).as("%s of %s", name, response).containsExactly(value));
+    }
+
+    /** Asserts that none of {@link #PAGE_HEADERS} is sent. */
+    private static void assertNoPageHeaders(HttpTestClient.Response response) {
+        PAGE_HEADERS.keySet().forEach(name ->
+                assertThat(response.headers(name)).as("%s of %s", name, response).isEmpty());
     }
 
     /** Compares type and subtype only, since the server may add a charset parameter. */

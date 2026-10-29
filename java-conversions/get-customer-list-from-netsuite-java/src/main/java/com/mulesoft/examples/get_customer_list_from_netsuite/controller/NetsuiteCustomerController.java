@@ -18,6 +18,7 @@ import jakarta.servlet.http.HttpServletResponse;
 
 import com.mulesoft.examples.get_customer_list_from_netsuite.service.NetsuiteCustomerService;
 
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -34,12 +35,14 @@ import org.springframework.web.bind.annotation.RestController;
  * body is never read, and no handler declares {@code produces}, {@code consumes} or parameter conditions: any
  * {@code Accept}, {@code Content-Type} or body the caller sends is ignored rather than rejected with 406, 415 or
  * 400. The match is exact; any other path, {@code /customers/} included, falls through to the no-listener 404 of
- * {@code GlobalExceptionHandler}.
+ * {@code GlobalExceptionHandler}, and so does {@code /customers} with {@code ;} segment parameters, such as
+ * {@code /customers;x=1}, which {@code config/ListenerPathConfig} refuses before either handler runs.
  *
  * <p>The controller only binds input and returns output. The {@code lastName} value the expression filter tests
  * (line 9) is read from the raw URL query alone, as Mule's {@code http.query.params} held it (see
  * {@link #queryParameter}); the filter decision itself is the service's. A rendered page is answered as
- * {@link #TEXT_HTML_UTF8}, the {@code mimeType} of the flow's {@code object-to-string-transformer} (line 34).
+ * {@link #TEXT_HTML_UTF8}, the {@code mimeType} of the flow's {@code object-to-string-transformer} (line 34), with
+ * the cache, sniffing and framing headers {@link #customers} describes.
  *
  * <p>The flow declares no exception strategy, so every exception propagates: the SC-9
  * {@code UpstreamExceptionHandler} answers the approved NetSuite failure modes (502, 429, 503) and the SC-1
@@ -54,6 +57,16 @@ public class NetsuiteCustomerController {
      * UTF-8 charset the page bytes are encoded in.
      */
     static final MediaType TEXT_HTML_UTF8 = MediaType.parseMediaType("text/html;charset=UTF-8");
+
+    /** Header that holds a browser to the page's declared Content-Type instead of a sniffed one. */
+    private static final String CONTENT_TYPE_OPTIONS_HEADER = "X-Content-Type-Options";
+
+    private static final String NO_SNIFF = "nosniff";
+
+    /** Header that keeps the page out of every frame. */
+    private static final String FRAME_OPTIONS_HEADER = "X-Frame-Options";
+
+    private static final String DENY_FRAMING = "DENY";
 
     /** The query parameter the expression filter and the customer query read. */
     private static final String LAST_NAME_PARAMETER = "lastName";
@@ -84,10 +97,20 @@ public class NetsuiteCustomerController {
      * servlet's {@code message/http} echo of the request. A page is returned before anything is written, so every
      * exception of the service still finds an uncommitted response for the project's exception handlers.
      *
+     * <p>A page carries customer records (names and e-mail addresses), so its reply also sends
+     * {@code Cache-Control: no-store}, which keeps clients and shared caches from storing it, and
+     * {@code X-Content-Type-Options: nosniff}, which holds browsers to the declared {@code text/html}; because the
+     * page is an HTML document, it also sends {@code X-Frame-Options: DENY}, which keeps it out of every frame. The
+     * original declared none of these headers. They are a deliberate hardening of the page reply alone, recorded in
+     * the root {@code DECISIONS.md} (section 8): the page's status, reason phrase, Content-Type and body bytes are
+     * unchanged, and the filter-rejection reply, which carries no data, sends none of them. For Tier 2A they are the
+     * expected difference from a captured reply of the original: the fixture replay compares {@code Content-Type}
+     * and {@code Location} only, so it neither confirms nor contradicts them.
+     *
      * @param request  the request, whose raw query string supplies {@code lastName}
      * @param response the response the filter-rejection reply is committed to
-     * @return 200 with the customer list page as {@link #TEXT_HTML_UTF8}, or {@code null} once the filter-rejection
-     *         reply has been committed
+     * @return 200 with the customer list page as {@link #TEXT_HTML_UTF8} and the three headers above, or
+     *         {@code null} once the filter-rejection reply has been committed
      * @throws IOException when committing the filter-rejection reply fails
      */
     @RequestMapping
@@ -104,6 +127,9 @@ public class NetsuiteCustomerController {
         }
         return ResponseEntity.ok()
                 .contentType(TEXT_HTML_UTF8)
+                .cacheControl(CacheControl.noStore())
+                .header(CONTENT_TYPE_OPTIONS_HEADER, NO_SNIFF)
+                .header(FRAME_OPTIONS_HEADER, DENY_FRAMING)
                 .body(page.get().getBytes(StandardCharsets.UTF_8));
     }
 

@@ -48,11 +48,13 @@ import com.mulesoft.examples.get_customer_list_from_netsuite.support.HttpTestCli
  * the flow once and is answered exactly as a plain {@code OPTIONS} request to the same target is, whatever method it
  * asks for: the customer page, the filter rejection's empty 200 without {@code Content-Type}, or the 502, 429, 503 or
  * 500 of a failed NetSuite call; never Spring's 403 {@code Invalid CORS request}, and with no
- * {@code Access-Control-*} or {@code Vary} header. A pre-flight to a path the listener does not serve gets the
- * no-listener 404 of a plain {@code OPTIONS} request and runs no flow.
+ * {@code Access-Control-*} or {@code Vary} header. A pre-flight to a path the listener does not serve,
+ * {@code /customers} with {@code ;} segment parameters included, gets the no-listener 404 of a plain {@code OPTIONS}
+ * request and runs no flow.
  *
- * <p>The cases start the whole application on Undertow at a random port, so {@link PreflightDispatchConfig} is the
- * one component scanning registers, beside the real controller and exception handlers, with
+ * <p>The cases start the whole application on Undertow at a random port, so {@link PreflightDispatchConfig} and
+ * {@link ListenerPathConfig} are the ones component scanning registers, beside the real controller and exception
+ * handlers, with
  * {@link NetsuiteCustomerService} mocked: every flow run is recorded with the {@code lastName} it received and no
  * NetSuite call is made. Requests go through ST-1 {@link HttpTestClient}, so the status line, headers and body
  * bytes are asserted as the listener writes them.
@@ -188,10 +190,15 @@ class PreflightDispatchListenerTest {
         assertNoCorsHeaders(preflight);
     }
 
-    /** Request target the listener does not serve, the path its 404 names, then the requested method. */
+    /**
+     * Request target the listener does not serve, the path its 404 names, then the requested method. The targets
+     * include the listener's path with {@code ;} segment parameters, which {@link ListenerPathConfig} refuses after
+     * the pre-flight has selected the {@code OPTIONS} handler.
+     */
     private static Stream<Arguments> preflightsToUnservedPaths() {
-        return Stream.of("/customers/", "/unknown?lastName=a").flatMap(target -> Stream.of("GET", "POST")
-                .map(method -> Arguments.of(target, target.split("\\?", 2)[0], method)));
+        return Stream.of("/customers/", "/unknown?lastName=a", "/customers;x=1?lastName=a")
+                .flatMap(target -> Stream.of("GET", "POST")
+                        .map(method -> Arguments.of(target, target.split("\\?", 2)[0], method)));
     }
 
     @ParameterizedTest(name = "{0}: Access-Control-Request-Method {2}")

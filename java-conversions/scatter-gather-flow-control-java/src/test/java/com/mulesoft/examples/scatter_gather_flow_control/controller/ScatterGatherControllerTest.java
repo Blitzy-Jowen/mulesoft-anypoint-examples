@@ -21,6 +21,7 @@ import static org.mockito.Mockito.verify;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import com.icegreen.greenmail.configuration.GreenMailConfiguration;
 import com.icegreen.greenmail.junit5.GreenMailExtension;
@@ -35,6 +36,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
@@ -182,22 +185,45 @@ class ScatterGatherControllerTest {
 
     /**
      * The listener serves {@code /scatterGather} exactly, so any other path, a sub-path included, gets the
-     * no-listener default without running the flow.
+     * no-listener default without running the flow; so does {@code /scatterGather} carrying {@code ;} segment
+     * parameters, which the Mule listener compared literally with its path and Spring MVC alone would ignore
+     * ({@code config/ListenerPathConfig}). Neither route runs and no report is mailed, whatever the method; a
+     * {@code HEAD} reply carries the headers of the 404 without its body.
      *
-     * @param path the unserved request path
+     * @param method the request method; {@code POST} carries an empty body, as the original test's request does
+     * @param path   the unserved request path
      */
-    @ParameterizedTest(name = "GET {0}")
-    @ValueSource(strings = {"/unknown", "/scatterGather/extra"})
-    void unservedPathReturnsNoListener404WithoutRunningTheFlow(String path) {
-        HttpTestClient.Response response = client().get(path);
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("unservedRequests")
+    void unservedPathReturnsNoListener404WithoutRunningTheFlow(String method, String path) {
+        byte[] body = METHODS_WITH_EMPTY_BODY.contains(method) ? new byte[0] : null;
+        byte[] noListener = ("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8);
 
-        assertEquals(404, response.status(), response::toString);
-        assertEquals("Not Found", response.reason(), response::toString);
+        HttpTestClient.Response response = client().send(method, path, null, body);
+
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
         assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
-        assertEquals("No listener for endpoint: " + path, response.bodyAsString(), response::toString);
+        assertEquals(List.of(String.valueOf(noListener.length)), response.headers("Content-Length"),
+                response::toString);
+        assertArrayEquals("HEAD".equals(method) ? new byte[0] : noListener, response.body(), response::toString);
         verify(service, never()).process();
         verify(mailer, never()).send(anyString());
         assertEquals(0, greenMail.getReceivedMessages().length);
+    }
+
+    /**
+     * Paths beside the listener's for {@code GET}, then the listener's path with segment parameters per method.
+     *
+     * @return the method and path of each unserved request
+     */
+    private static Stream<Arguments> unservedRequests() {
+        Stream<Arguments> otherPaths = Stream.of("/unknown", SCATTER_GATHER_PATH + "/extra")
+                .map(path -> Arguments.of("GET", path));
+        Stream<Arguments> segmentParameters = Stream.of("GET", "POST", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of(SCATTER_GATHER_PATH + ";x=1", SCATTER_GATHER_PATH + ";jsessionid=ABC",
+                                SCATTER_GATHER_PATH + ";")
+                        .map(path -> Arguments.of(method, path)));
+        return Stream.concat(otherPaths, segmentParameters);
     }
 
     private HttpTestClient client() {

@@ -68,7 +68,9 @@ import org.springframework.test.context.DynamicPropertySource;
  * empty 200 and no mail. The error cases are the platform defaults of SC-1, since the flow declares no exception
  * strategy: the JSON 500 for a one-word employee name, malformed XML and a failed SMTP send (a refused connection and
  * a rejected account each with a fixed message that names no class, host or port), and the no-listener 404 for any
- * other path.
+ * other path. Every report reply carries exactly {@code Cache-Control: no-store} and
+ * {@code X-Content-Type-Options: nosniff}, because it holds employee records; the empty reply and the error replies
+ * carry neither.
  *
  * <p>{@code TRACE}, {@code OPTIONS} and CORS pre-flights run the flow as well and get exactly the {@code POST} reply,
  * complete with its {@code Content-Length}: no {@code message/http} echo of the request headers, its
@@ -177,6 +179,7 @@ class EmployeeReportControllerTest {
 
         assertStatus(response, 200, "OK");
         assertThat(response.body()).as(response::toString).isEmpty();
+        assertNoCacheProtectionHeaders(response);
         assertThat(greenMail.getReceivedMessages()).isEmpty();
     }
 
@@ -190,6 +193,7 @@ class EmployeeReportControllerTest {
         assertContentTypeStartsWith(response, "application/json");
         assertThat(response.bodyAsString()).as(response::toString)
                 .isEqualTo("{ \"message\": \"Index 1 out of bounds for length 1\" }");
+        assertNoCacheProtectionHeaders(response);
         assertThat(greenMail.getReceivedMessages()).isEmpty();
     }
 
@@ -203,6 +207,7 @@ class EmployeeReportControllerTest {
         assertThat(response.bodyAsString()).as(response::toString)
                 .startsWith("{ \"message\": ")
                 .endsWith(" }");
+        assertNoCacheProtectionHeaders(response);
         assertThat(greenMail.getReceivedMessages()).isEmpty();
     }
 
@@ -213,6 +218,7 @@ class EmployeeReportControllerTest {
         assertStatus(response, 404, "Not Found");
         assertContentTypeStartsWith(response, "text/plain");
         assertThat(response.bodyAsString()).as(response::toString).isEqualTo("No listener for endpoint: /other");
+        assertNoCacheProtectionHeaders(response);
     }
 
     /** The send runs last and is never retried, so a failing SMTP server answers the request with the JSON 500. */
@@ -225,6 +231,7 @@ class EmployeeReportControllerTest {
         assertStatus(response, 500, "Internal Server Error");
         assertContentTypeStartsWith(response, "application/json");
         assertThat(response.bodyAsString()).as(response::toString).isEqualTo("{ \"message\": \"SMTP unavailable\" }");
+        assertNoCacheProtectionHeaders(response);
         verify(reportMailSender).send(CSV);
         assertThat(greenMail.getReceivedMessages()).isEmpty();
     }
@@ -316,6 +323,7 @@ class EmployeeReportControllerTest {
         assertThat(response.body()).as(response::toString).isEmpty();
         assertThat(response.header("Content-Length")).as(response::toString).isEqualTo("0");
         assertThat(response.header("Content-Type")).as(response::toString).isNull();
+        assertNoCacheProtectionHeaders(response);
         assertNoServletOrCorsAdditions(response);
         assertThat(greenMail.getReceivedMessages()).isEmpty();
     }
@@ -339,6 +347,7 @@ class EmployeeReportControllerTest {
 
         assertStatus(response, 200, "OK");
         assertThat(response.header("Content-Type")).as(response::toString).matches(MULTIPART_CONTENT_TYPE);
+        assertCacheProtectionHeaders(response);
         assertThat(Long.parseLong(response.header("Content-Length"))).as(response::toString)
                 .isGreaterThan(CSV.length());
         assertThat(response.body()).as(response::toString).isEmpty();
@@ -348,11 +357,13 @@ class EmployeeReportControllerTest {
 
     /**
      * Asserts the 200 {@code multipart/form-data} reply whose single part is the {@code employees.csv} attachment of
-     * the original flow (attachments.xml:35), typed {@code text/plain} and holding exactly {@link #CSV}.
+     * the original flow (attachments.xml:35), typed {@code text/plain} and holding exactly {@link #CSV}, with the
+     * cache and sniffing protection of a reply that holds employee records.
      */
     private static void assertCsvReport(HttpTestClient.Response response) throws MessagingException, IOException {
         assertStatus(response, 200, "OK");
         assertContentTypeStartsWith(response, "multipart/form-data");
+        assertCacheProtectionHeaders(response);
 
         MimeMultipart multipart =
                 new MimeMultipart(new ByteArrayDataSource(response.body(), response.header("Content-Type")));
@@ -375,6 +386,18 @@ class EmployeeReportControllerTest {
 
     private static void assertContentTypeStartsWith(HttpTestClient.Response response, String mediaType) {
         assertThat(response.header("Content-Type")).as(response::toString).isNotNull().startsWith(mediaType);
+    }
+
+    /** Exactly one {@code Cache-Control: no-store} and one {@code X-Content-Type-Options: nosniff}. */
+    private static void assertCacheProtectionHeaders(HttpTestClient.Response response) {
+        assertThat(response.headers("Cache-Control")).as(response::toString).containsExactly("no-store");
+        assertThat(response.headers("X-Content-Type-Options")).as(response::toString).containsExactly("nosniff");
+    }
+
+    /** Neither header: the empty no-employee reply and the SC-1 error replies hold no employee record. */
+    private static void assertNoCacheProtectionHeaders(HttpTestClient.Response response) {
+        assertThat(response.headers("Cache-Control")).as(response::toString).isEmpty();
+        assertThat(response.headers("X-Content-Type-Options")).as(response::toString).isEmpty();
     }
 
     /**

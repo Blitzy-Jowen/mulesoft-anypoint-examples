@@ -19,7 +19,7 @@ One listener, Undertow on `0.0.0.0`, port `http.port` (default `8081`). Methods 
 | any other (`PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `TRACE`, …) | `/login` | neither original listener accepts it (`allowedMethods="GET"`, `"POST"`) | `405 Method Not Allowed`, `text/plain`, `Method not allowed for endpoint: /login`, no `Allow` header |
 | any | `/requesterLogin` | `CallLoginFlowUsingRequester` (`xml:33-43`): ignores the inbound body and posts the configured credentials as a form to this application's own `POST /login` | `200 OK` with the relayed `Content-Type` and body: the success page when the credentials are configured |
 | any | `/requesterLogin` | the self-call answers 400 or more (for example credentials not configured), or cannot connect | `500 Internal Server Error`, `application/json`, `{ "message": "Response code <status> mapped as failure." }` (Mule `http:request`'s default status validation, SC-1 shape), so `{ "message": "Response code 403 mapped as failure." }` with blank credentials; a connection failure reports its own message |
-| any | any other path (`/`, `/login/`, `/error` included) | no listener | `404 Not Found`, `text/plain`, `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) |
+| any | any other path (`/`, `/login/`, `/error` and `/login` or `/requesterLogin` with `;` segment parameters, such as `/login;x=1` and `/requesterLogin;x=1`, included) | no listener | `404 Not Found`, `text/plain`, `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) |
 | any | a served path, on a failure outside the login branch | unhandled exception | `500 Internal Server Error`, `application/json`, `{ "message": "<exception message>" }`, one ERROR log line (SC-1) |
 
 How `POST /login` reads the form, as the Mule 3.8 listener built its payload map:
@@ -27,6 +27,7 @@ How `POST /login` reads the form, as the Mule 3.8 listener built its payload map
 - Only the body counts, and only when its media type is exactly `application/x-www-form-urlencoded`. Credentials in the query string, or a body of any other media type, reach the check as an empty form and get the 403 page with `null` as the username.
 - The body is decoded in the `Content-Type` charset, else UTF-8. Pairs are not trimmed (`password=mule ` is rejected), a repeated name keeps its last value, and extra fields such as the page's `Submit=Submit` are ignored.
 - A CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) is answered like any other `OPTIONS` request: 405 on `/login`, the flow on `/requesterLogin`. No `Access-Control-*` or `Vary` header is added (`config/PreflightDispatchConfig`); the original applied no CORS policy.
+- A path carrying `;` segment parameters (`/login;x=1`, `/login;jsessionid=ABC`, `/login;`, and the same after `/requesterLogin`) is not a listener's path: every method, a CORS pre-flight included, gets the no-listener 404 naming the path with its parameters, `No listener for endpoint: /login;x=1`, before any flow runs, so no credentials are checked and `/requesterLogin` sends no request. On `/login` the 404 also takes the place of the 405 a method other than `GET` or `POST` gets. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). A `;` in the query string is not part of the path.
 
 Examples, against a local test run started with the original example's public demo credentials `mule`/`mule` (`LOGIN_USERNAME=mule LOGIN_PASSWORD=mule mvn spring-boot:run`). Those values are for local testing only, never for a real deployment; a real run supplies its own credentials and posts them in place of `mule`/`mule`. Only the status line, `Content-Type`, `Content-Length` and the body's message line are shown; every page starts with the MuleSoft licence comment of its template:
 
@@ -94,7 +95,7 @@ Fixed framework settings that reproduce the original listener (not keys of the o
 | `catch-exception-strategy`: `http.status` 403 and `loginFailure.html` (`xml:27-30`) | `exception/LoginExceptionHandler` (`@Order(0)`), which claims `LoginFailedException` only |
 | `expression-component` credential map (`xml:38-40`) and `http:request` POST `/login` (`xml:42`) | `service/LoginService.requesterLogin()` (a `HashMap`, as the original's `new HashMap()`) and `client/LoginRequesterClient` (`RestClient`, form-encoded without a charset parameter, 10 s connect and read timeouts, no retry, status of 400 or more mapped as failure) |
 | Platform defaults (no listener, method not allowed, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| Listener with no CORS policy | `config/PreflightDispatchConfig` |
+| Listener semantics (no CORS policy; the raw path, query removed, matched literally, `;` segment parameters included) | `config/PreflightDispatchConfig`, `config/ListenerPathConfig` (the class `hello-world-java` carries, differing in its `package` line alone) |
 | hard-coded `mule`/`mule` | `config/LoginProperties` (`login.*`) |
 | `mule-deploy.properties` (loads the one flow file) | `LoginFormUsingTheHttpConnectorApplication` (`@SpringBootApplication`) |
 
@@ -112,6 +113,7 @@ Each is the conversion's reading of the Mule 3.8 platform, and a captured fixtur
 3. The `/requesterLogin` 500 body `{ "message": "Response code 403 mapped as failure." }`.
 4. A POST whose body is not form-encoded is a form with no fields, so it gets the 403 page.
 5. The 400 `Cannot decode x-www-form-urlencoded payload` for a malformed form body (root `DECISIONS.md`, section 9).
+6. The no-listener `404` for `/login` or `/requesterLogin` carrying `;` segment parameters, whatever the method.
 
 ## Build, run and test
 
@@ -137,13 +139,13 @@ LOGIN_USERNAME=mule LOGIN_PASSWORD=mule mvn spring-boot:run
 | Test class | What it asserts |
 |---|---|
 | `HttpLoginHtmlFormTest` | port of `HttpLoginHtmlFormIT`: `testLogin` (POST `mule`/`mule` contains `User mule has been logged successfully!`), `testLoginPage` (GET `/login` equals `index.html`), `testRequester` (`/requesterLogin` contains the same text) |
-| `controller/LoginControllerTest` | on the wire through ST-1: status lines, `Content-Type` and body bytes of the GET page, success page and 403 page for every method letter case; query-string credentials ignored, repeated fields, untrimmed whitespace, non-form bodies, the malformed-form 400; the 405 for every other method, `HEAD` included; the 404; `/requesterLogin` for every method; with blank credentials, every form rejected, the WARN line and the requester 500 |
+| `controller/LoginControllerTest` | on the wire through ST-1: status lines, `Content-Type` and body bytes of the GET page, success page and 403 page for every method letter case; query-string credentials ignored, repeated fields, untrimmed whitespace, non-form bodies, the malformed-form 400; the 405 for every other method, `HEAD` included; the 404, and the same 404 for `/login` and `/requesterLogin` followed by `;x=1`, `;jsessionid=ABC` or `;` under `GET`, `POST` with the demo form, `PUT`, `HEAD` and `OPTIONS`, with neither the service nor the requester called (spies); `/requesterLogin` for every method; with blank credentials, every form rejected, the WARN line and the requester 500 |
 | `service/LoginServiceTest` | the credential check against configured and blank values, the rendered pages, the INFO and WARN lines (never a password), rendering failures reaching the catch branch, the requester's posted `HashMap` and its unretried failure |
 | `client/LoginRequesterClientTest` | WireMock: the exact form request and body encoding, relayed status, `Content-Type` and bytes, `Response code <n> mapped as failure.` for 400, 403 and 500, no retry on connection failures, the base URL taken from the started server |
 | `exception/LoginExceptionHandlerTest` | the 403 with empty reason phrase, failure page and request-derived `Content-Type` and charset; only `LoginFailedException` claimed, every other exception left to SC-1 |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` and bodies, `ErrorResponse` JSON escaping, the bounded one-line ERROR log |
 | `mapper/ParseTemplateRendererTest` | SC-14: templates byte for byte, expression replacement, `null` rendering, missing templates and unresolved expressions |
-| `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS` request: 405 on `/login`, the flow on `/requesterLogin`, 404 elsewhere, no CORS headers |
+| `config/PreflightDispatchConfigTest`, `config/PreflightDispatchListenerTest` | a CORS pre-flight is dispatched as a plain `OPTIONS` request: 405 on `/login`, the flow on `/requesterLogin`, 404 elsewhere (`/unknown`, `/login;x=1` and `/requesterLogin;x=1` on the wire, with no flow run), no CORS headers |
 | `config/SensitiveLogLevelsTest` | under root `TRACE`, the `web` group at `TRACE` and `spring.mvc.log-request-details`: no sentinel password reaches the log, whether configured, wrong, posted by `/requesterLogin`, undecodable in the form or sent in the query; each exchange still answers as the flow does (200, 403, the relayed 200, 400); both pinned levels hold; `User mule is trying to login` and the unpinned loggers' `TRACE` lines are still written |
 | `FixtureParityTest` | ST-2 fixture replay; skipped (`no Tier 2A fixtures captured`) until fixtures exist |
 
@@ -171,16 +173,16 @@ The scenarios are listed in [`src/test/resources/fixtures/SCENARIOS.md`](src/tes
 
 The root [`SUMMARY.md`](../../SUMMARY.md) carries the same row for this project. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 328 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 328 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 121 of 125 lines (`service/LoginService` 76 of 76, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 94.9% (470 of 495 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 360 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 360 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 121 of 125 lines (`service/LoginService` 76 of 76, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 95.0% (479 of 504 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=4`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)
 
 Tier 2A is blocked: the Mule EE runtime licence and the EE Maven repository credentials are unconfirmed (root [`DECISIONS.md`](../../DECISIONS.md), section 9). Parity therefore rests on the fallback of AAP 0.8.4: the ported original assertions (`HttpLoginHtmlFormTest`) plus the branch tests of the controller, service and handlers. That evidence is weaker than captured fixtures: it shows the conversion meets the original's own assertions and the plan's reading of the platform, not that its bytes equal what the Mule runtime sent. The parity label stays `UNVERIFIED` and never reads PASS on this fallback. Tier 2B is `N/A`: the example calls no vendor system.
 
-- No original assertion covers the 403 failure page, the 405 on other methods, the 404 on unknown paths, the malformed-form 400 or the requester 500: the original IT asserts only the success page, the exact login page and the requester success. Those branches are covered by the new controller, service and handler tests only.
+- No original assertion covers the 403 failure page, the 405 on other methods, the 404 on unknown paths and on listener paths with `;` segment parameters, the malformed-form 400 or the requester 500: the original IT asserts only the success page, the exact login page and the requester success. Those branches are covered by the new controller, service and handler tests only.
 
 ## Licence
 

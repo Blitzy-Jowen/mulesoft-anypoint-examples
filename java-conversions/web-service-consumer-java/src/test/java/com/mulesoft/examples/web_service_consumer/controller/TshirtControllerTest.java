@@ -78,7 +78,8 @@ import com.mulesoft.examples.web_service_consumer.support.HttpTestClient;
  * flow as the caller sent it, and the platform-default 500 for unreadable input, a SOAP fault, a SOAP fault without a
  * readable fault string and a connectivity failure, none of which the flows catch or retry. Each response must carry
  * exactly one {@code Content-Type}, equal to the value the listener writes, and exactly the expected UTF-8 body bytes.
- * Unserved paths get the no-listener 404. The original {@code WebServiceConsumerIT} contains-assertions are ported
+ * Unserved paths get the no-listener 404, and so does each listener path carrying {@code ;} segment parameters,
+ * without any SOAP call. The original {@code WebServiceConsumerIT} contains-assertions are ported
  * separately in {@code WebServiceConsumerTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -414,6 +415,47 @@ class TshirtControllerTest {
         assertThat(response.status()).isEqualTo(404);
         assertThat(response.reason()).isEqualTo("Not Found");
         assertContent(response, TEXT_PLAIN, "No listener for endpoint: " + path);
+        upstream.verify(0, postRequestedFor(anyUrl()));
+    }
+
+    /** Each method, endpoint and listener path followed by {@code ;} segment parameters. */
+    static Stream<Arguments> pathParameterRequests() {
+        return Stream.of("GET", "POST", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of(Endpoint.values()).flatMap(endpoint ->
+                        Stream.of(";x=1", ";jsessionid=ABC", ";").map(parameters ->
+                                Arguments.of(method, endpoint, endpoint.path + parameters))));
+    }
+
+    /**
+     * A listener path carrying {@code ;} segment parameters is not the listener's path: the Mule listener compared
+     * the raw path, query removed, literally, so every method gets the no-listener 404 naming the path with its
+     * parameters, and neither flow calls the T-shirt service ({@code config/ListenerPathConfig}). Each request carries
+     * the body its flow takes and the upstream answers both operations, so only the path keeps the flow from placing
+     * an order or listing the inventory. A {@code HEAD} reply carries the headers of that 404 without its body.
+     *
+     * @param method   the request method
+     * @param endpoint the listener whose path the request extends, which decides the body sent
+     * @param path     the listener's path followed by its segment parameters
+     */
+    @ParameterizedTest(name = "{0} {2}")
+    @MethodSource("pathParameterRequests")
+    void pathWithSegmentParametersGetsTheNoListener404WithoutAnySoapCall(String method, Endpoint endpoint,
+                                                                         String path) {
+        stub(ORDER_ACTION, 200, ORDER_RESPONSE_PREFIXED);
+        stub(INVENTORY_ACTION, 200, INVENTORY_RESPONSE);
+
+        HttpTestClient.Response response = endpoint.sendsOrder
+                ? client().send(method, path, Map.of("Content-Type", JSON), message())
+                : client().send(method, path, Map.of("Content-Type", "text/xml"),
+                        INVENTORY_REQUEST.getBytes(StandardCharsets.UTF_8));
+
+        byte[] noListener = ("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8);
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 404 Not Found");
+        assertThat(response.headers("Content-Type")).as(response.toString()).containsExactly(TEXT_PLAIN);
+        assertThat(response.headers("Content-Length")).as(response.toString())
+                .containsExactly(String.valueOf(noListener.length));
+        assertThat(response.body()).as(response.toString())
+                .isEqualTo("HEAD".equals(method) ? new byte[0] : noListener);
         upstream.verify(0, postRequestedFor(anyUrl()));
     }
 

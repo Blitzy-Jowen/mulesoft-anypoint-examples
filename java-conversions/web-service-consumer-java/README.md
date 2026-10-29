@@ -17,7 +17,7 @@ Neither flow declares a logger or an exception strategy, and the service is the 
 |---|---|---|---|---|---|
 | `/orders` | any, including `HEAD`, `OPTIONS` and `TRACE`: the listener declares no `allowedMethods` | `0.0.0.0` | `http.port`, default `8081` | `200 OK`, `Content-Type: application/json`, the DataWeave JSON of the `OrderTshirt` response | `tshirt-service-consumer.xml:4,7-8,10-32` |
 | `/inventory` | any, as for `/orders` | `0.0.0.0` | `http.port` | `200 OK`, `Content-Type: application/json`, the DataWeave JSON of the `ListInventoryResponse` content | `tshirt-service-consumer.xml:4,35-46` |
-| any other path (`/orders/`, `/orders/1`, `/services/x` and `/error` included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
+| any other path (`/orders/`, `/orders/1`, `/services/x`, `/error`, and `/orders` and `/inventory` with `;` segment parameters, such as `/orders;x=1` and `/inventory;x=1`, included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
 | `/orders` or `/inventory`, when processing fails | any | `0.0.0.0` | `http.port` | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }` (SC-1, AAP 0.4.7) | platform default: neither flow declares an exception strategy |
 
 The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
@@ -74,12 +74,15 @@ Neither flow catches anything, so every failure reaches SC-1's `500` with `{ "me
 
 Neither listener restricts methods or media types, so SC-1's `405` and Spring's `406` and `415` never occur. A CORS pre-flight is answered like a plain `OPTIONS` request, without `Access-Control-*` or `Vary` headers, because the Mule listener applied no CORS policy (`config/PreflightDispatchConfig`). `WebServicesAutoConfiguration` is excluded, so no `MessageDispatcherServlet` serves `/services/*`.
 
+A path carrying `;` segment parameters (`/orders;x=1`, `/orders;jsessionid=ABC`, `/orders;`, and the same for `/inventory`) is not a listener's path: every method, a CORS pre-flight included, gets the no-listener `404` naming the path with its parameters, `No listener for endpoint: /orders;x=1`, and the flow does not run, so no order is placed and the T-shirt service is not called. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). A `;` in the query string is not part of the path.
+
 ### Tier 2A verification points
 
 The original declares no exception strategy, so the `404` and `500` above are platform defaults, read from AAP 0.4.7. These points and the request bytes the client sends are compared against the captured original, and a captured fixture governs where they differ (AAP 0.8.4):
 
 - the response `Content-Type`, `application/json` with no charset parameter;
 - the `500` body for unhandled failures and its message text (`post-orders-malformed-json`), and the `404` text (`get-unknown-path`);
+- the `404` for `/orders` and `/inventory` carrying `;` segment parameters (`config/ListenerPathConfig`);
 - acceptance of methods other than the original test's `POST` (`put-orders`, `get-inventory`);
 - XML writer edge cases (`DwXmlWriter`, which builds the `OrderTshirt` request): null and empty elements, escaping, the trailing line feed it never writes, and the refusal of a JSON member name that is not an XML element name;
 - XML-to-JSON of empty elements (`""`), and the empty `/orders` reply and `null` `/inventory` reply when the service returns no payload;
@@ -176,7 +179,7 @@ Status: `default` — a non-secret value, overridable; `TODO` — no value (`${E
 | DataWeave script at line 41, `payload.ns0#ListInventoryResponse` as JSON | `mapper/ListInventoryResponseMapper`, over the same reader and writer |
 | `ws:consumer-config` (line 3): `serviceAddress`, `wsdlLocation`, `service`, `port` | `config/TshirtServiceProperties` (prefix `tshirt`), bound by `@EnableConfigurationProperties` on the application class; `src/main/resources/tshirt.wsdl` |
 | Platform default responses (no listener, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| Mule listener without a CORS policy | `config/PreflightDispatchConfig` |
+| Listener semantics (no CORS policy; the raw path, query removed, matched literally, `;` segment parameters included) | `config/PreflightDispatchConfig`, `config/ListenerPathConfig` |
 | `mule-deploy.properties` (loads `tshirt-service-consumer.xml`) | `WebServiceConsumerApplication` (`@SpringBootApplication`, `WebServicesAutoConfiguration` excluded because no SOAP endpoint is hosted) |
 | `mule-app.properties` | `src/main/resources/application.yml` |
 | `WebServiceConsumerIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`, the live service) | `WebServiceConsumerTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)`, ST-1 `support/HttpTestClient`, WireMock in place of the service) |
@@ -220,7 +223,7 @@ TSHIRT_API_KEY='<key>' java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT
 | Test class | What it asserts |
 |---|---|
 | `WebServiceConsumerTest` | the ported `WebServiceConsumerIT` (`web-service-consumer/src/test/java/org/mule/examples/WebServiceConsumerIT.java:71-90`), with its substring semantics. `POST /orders` with `Content-Type: application/json` and `message.json` (its `ID` replaced by the epoch seconds, as in the original) returns a non-empty body containing `orderId`. `POST /inventory` with the same `Content-Type` and no body returns a non-empty body containing `"productCode": "1412"`, `"description": "Prueba2"` and `"count": "5"`. WireMock answers with the original sample responses, and each operation is called exactly once. |
-| `controller/TshirtControllerTest` | on the wire through ST-1, end to end against a WireMock `TshirtService`. Asserts the exact DataWeave JSON and `200 OK` `application/json` for both endpoints, and the same `/orders` JSON for an unprefixed upstream root. The `AuthenticationHeader` carries the configured key. `GET`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` are accepted on both paths, and a body sent as `application/x-www-form-urlencoded` reaches the flow unchanged. The `500` cases: an unreadable JSON or XML body, and an order whose member name is not an XML element name, with no SOAP call; a SOAP fault, with its fault string; a fault without a readable fault string, with the fixed message; and a connection reset, after exactly one attempt. `/order`, `/orders/1`, `/orders/`, `/inventory/x` and `/services/x` → `404` `text/plain` `No listener for endpoint: <path>`. |
+| `controller/TshirtControllerTest` | on the wire through ST-1, end to end against a WireMock `TshirtService`. Asserts the exact DataWeave JSON and `200 OK` `application/json` for both endpoints, and the same `/orders` JSON for an unprefixed upstream root. The `AuthenticationHeader` carries the configured key. `GET`, `PUT`, `PATCH`, `DELETE` and `OPTIONS` are accepted on both paths, and a body sent as `application/x-www-form-urlencoded` reaches the flow unchanged. The `500` cases: an unreadable JSON or XML body, and an order whose member name is not an XML element name, with no SOAP call; a SOAP fault, with its fault string; a fault without a readable fault string, with the fixed message; and a connection reset, after exactly one attempt. `/order`, `/orders/1`, `/orders/`, `/inventory/x` and `/services/x` → `404` `text/plain` `No listener for endpoint: <path>`, and so do `/orders;x=1`, `/orders;jsessionid=ABC`, `/orders;`, `/inventory;x=1`, `/inventory;jsessionid=ABC` and `/inventory;` for `GET`, `POST`, `HEAD` (headers only) and `OPTIONS`, each carrying its flow's body, with no SOAP call. |
 | `service/TshirtOrderServiceTest` | both flows with only the SOAP client mocked. An absent or empty inventory body sends the empty `ListInventory` request, and an XML body is sent as it is. A body neither flow can read is rejected before the client is called. Every client failure reaches the caller as the same instance after exactly one call. The original contains-assertions are kept. |
 | `client/TshirtServiceClientTest` | against WireMock: one SOAP 1.1 `POST` per operation with the WSDL's `soapAction`. `OrderTshirt` carries the `AuthenticationHeader` with the configured key and refuses to send without one; `ListInventory` sends no header. No response or an empty Body yields `null`. A SOAP fault, an HTTP error without a fault, a read timeout and a refused connection surface as the Spring WS exceptions, never retried, and a fault without a fault string as the fixed message. Characters outside the BMP are sent as UTF-8 bytes. A connect or read timeout below 1 ms (zero, negative or sub-millisecond) or above `Integer.MAX_VALUE` ms fails construction naming its key; an unset timeout reaches the connection as 10 s. |
 | `mapper/OrderTshirtRequestMapperTest` | script 12: members in body order, a repeated key or array item once per occurrence, `null` as an empty element, decimals with their scale, a scalar or `null` body under the root; empty, malformed and top-level-array bodies, and member names that are not XML element names, rejected; exact bytes in `DwXmlWriter` layout for the original `message.json` |
@@ -229,7 +232,7 @@ TSHIRT_API_KEY='<key>' java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT
 | `mapper/DwXmlWriterTest`, `mapper/DwXmlToJsonTest`, `mapper/DwJsonWriterTest` | SC-4 byte contracts, copied with their classes: declaration, tab layout and no trailing line feed; element, prefix and attribute names that are not XML names refused without echoing them; DataWeave XML reading with repeated keys and a hardened parser; DataWeave JSON layout, values and escaping |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the `404`, `405` and `500` status lines, `Content-Type` headers and body bytes, `ErrorResponse` escaping and the bounded ERROR log line |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing |
-| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/inventory` or `/orders` is answered exactly as a plain `OPTIONS` request, with no `Access-Control-*` or `Vary` header; a pre-flight to an unserved path gets the no-listener `404` |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/inventory` or `/orders` is answered exactly as a plain `OPTIONS` request, with no `Access-Control-*` or `Vary` header; a pre-flight to `/unknown`, `/orders;x=1` or `/inventory;x=1` gets the no-listener `404` |
 | `SensitiveLogLevelsTest` | under a root `TRACE` level and under `--trace`, neither the API key nor the order's personal data reaches the console, for every outcome: accepted order, inventory, SOAP fault, HTTP error, connection reset, unreadable order and missing key |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
@@ -247,7 +250,7 @@ Each shared component is a copy of its reference implementation with only the `p
 | ST-1 | `support/HttpTestClient` (test) | `rest-api-with-apikit-java` |
 | ST-2 | `FixtureParityTest` (test), `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` |
 
-A change to `DwXmlWriter` or `DwXmlToJson` is made here first and then copied to every consumer. `config/PreflightDispatchConfig` is the CORS pre-flight class that 37 HTTP projects carry, this one included (`DECISIONS.md` section 9, verification points).
+A change to `DwXmlWriter` or `DwXmlToJson` is made here first and then copied to every consumer. `config/PreflightDispatchConfig` is the CORS pre-flight class that 37 HTTP projects carry, this one included (`DECISIONS.md` section 9, verification points). `config/ListenerPathConfig` is the class `hello-world-java` carries, differing in the `package` line alone; it has no unit test of its own and is asserted on the wire by `controller/TshirtControllerTest` and `config/PreflightDispatchListenerTest`.
 
 ## Fixture parity (ST-2)
 
@@ -272,9 +275,9 @@ No scenario of this project is `unreachable` or `nondeterministic`.
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-28 with `mvn -B clean verify`, which runs the same surefire tests and JaCoCo check, on the tree whose SC-4 `DwXmlWriter` refuses element, prefix and attribute names that are not XML names:
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 718 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 718 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 503 of 513 lines. `service/TshirtOrderService` covers 13 of 13. The `mapper` package covers 490 of 500: `DwXmlWriter` 226 of 226, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `OrderTshirtRequestMapper` 74 of 80, `OrderTshirtResponseMapper` 7 of 7 and `ListInventoryResponseMapper` 5 of 5. Total project LINE coverage: 97.6% (853 of 874 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 744 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 744 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 503 of 513 lines. `service/TshirtOrderService` covers 13 of 13. The `mapper` package covers 490 of 500: `DwXmlWriter` 226 of 226, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `OrderTshirtRequestMapper` 74 of 80, `OrderTshirtResponseMapper` 7 of 7 and `ListInventoryResponseMapper` 5 of 5. Total project LINE coverage: 97.6% (862 of 883 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)
@@ -289,6 +292,7 @@ Tier 2A is blocked, as `DECISIONS.md` section 9 records: `Tier 2A blocked: Mule 
   - malformed or empty JSON on `/orders`, answered `500` before any call (`post-orders-malformed-json`);
   - an upstream SOAP fault, HTTP error, timeout or connection failure, answered `500` and never retried;
   - an unknown path, answered with the no-listener `404` (`get-unknown-path`);
+  - a listener path carrying `;` segment parameters, answered with the no-listener `404` and no SOAP call;
   - a missing `tshirt.api-key`, which the original could not lack.
 - Unverified scenarios, until captured: `post-orders`, `put-orders`, `post-orders-malformed-json`, `post-inventory-empty-body`, `get-inventory`, `get-unknown-path`.
 

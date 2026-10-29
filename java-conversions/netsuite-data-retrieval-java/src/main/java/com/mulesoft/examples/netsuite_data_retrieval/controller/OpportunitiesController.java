@@ -17,6 +17,7 @@ import com.mulesoft.examples.netsuite_data_retrieval.service.NetsuiteSearchServi
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
 
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
@@ -79,7 +80,10 @@ public class OpportunitiesController {
      * @param title   the {@code title} query parameter: {@code null} when absent, {@code ""} when sent empty
      * @param request the current request, whose method and repeated parameters are checked and whose
      *                {@code Accept} header is negotiated
-     * @return 200, {@code Content-Type: application/json}, with the opportunities as DataWeave JSON
+     * @return 200, {@code Content-Type: application/json}, with the opportunities as DataWeave JSON, and
+     *         {@code Cache-Control: no-store} and {@code X-Content-Type-Options: nosniff}, so that neither the
+     *         client nor an intermediary keeps a copy of the opportunity records and no browser reads them as another
+     *         content type; the original declared neither header, and no error reply carries them
      * @throws HttpRequestMethodNotSupportedException for a HEAD request, which the RAML does not declare
      * @throws ConstraintViolationException           when {@code title} is sent more than once
      * @throws HttpMediaTypeNotAcceptableException    when APIkit's negotiation chooses no declared type for the
@@ -100,6 +104,8 @@ public class OpportunitiesController {
         // The bare media type, without a charset parameter; the body is written as UTF-8 bytes.
         return ResponseEntity.ok()
                 .contentType(MediaType.APPLICATION_JSON)
+                .cacheControl(CacheControl.noStore())
+                .header("X-Content-Type-Options", "nosniff")
                 .body(json);
     }
 

@@ -30,7 +30,8 @@ import com.mulesoft.examples.web_service_consumer.service.TshirtOrderService;
  * <p>Neither listener declares {@code allowedMethods}, so every method runs its flow. No mapping declares
  * {@code consumes}, {@code produces}, parameters or headers, and the response Content-Type is preset, so no request
  * is rejected with 415 or 406. The match is exact: any other path, {@code /orders/} included, falls through to the
- * no-listener 404 of {@code GlobalExceptionHandler}.
+ * no-listener 404 of {@code GlobalExceptionHandler}, and so does a listener path carrying {@code ;} segment
+ * parameters, such as {@code /orders;x=1}, which {@code config.ListenerPathConfig} refuses before either handler runs.
  *
  * <p>The body is read raw from the servlet input stream, for every method and {@code Content-Type}, and handed to
  * the service unchanged; a request without a body hands it an empty array, and the service decides what that means.

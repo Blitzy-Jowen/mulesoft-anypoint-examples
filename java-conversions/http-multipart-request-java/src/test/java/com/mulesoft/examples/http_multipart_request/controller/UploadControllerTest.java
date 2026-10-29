@@ -14,6 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -43,10 +44,12 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
+import com.mulesoft.examples.http_multipart_request.service.UploadService;
 import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
 
 /**
@@ -62,8 +65,9 @@ import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
  * stored with each header byte read as one ISO-8859-1 character, as Mule 3.8's JavaMail parser read it; a file name
  * joined to the upload directory as Mule's file connector joined them, a leading {@code /} included and missing
  * subdirectories created; a second upload under a stored name replacing the file; a failed write answered with the
- * 500 of Mule's streaming failure, which names no path; an unserved path answered with the listeners' 404; and the
- * upload's reason phrase confined to its own exchange. Bodies A and C of {@code fixtures/SCENARIOS.md} are sent byte
+ * 500 of Mule's streaming failure, which names no path; an unserved path answered with the listeners' 404, as is
+ * {@code /uploadFile} with {@code ;} segment parameters before either flow runs; and the upload's reason phrase
+ * confined to its own exchange. Bodies A and C of {@code fixtures/SCENARIOS.md} are sent byte
  * for byte, so the scenarios {@code post-upload-file} and {@code post-upload-file-missing-part} run with the requests
  * their capture sends. Uploads are stored in a {@link TempDir}, never in the {@code /tmp} the original fixed, and the
  * directory is emptied before each case.
@@ -109,6 +113,10 @@ class UploadControllerTest {
 
     @TempDir
     static Path uploadDir;
+
+    /** The real service, spied on so that a case can assert that neither flow ran. */
+    @SpyBean
+    private UploadService uploadService;
 
     @LocalServerPort
     private int port;
@@ -478,6 +486,41 @@ class UploadControllerTest {
         assertContentType(response, "text/plain");
         assertArrayEquals(NO_LISTENER_BODY, response.body(), response::toString);
         assertEquals(List.of(), storedFiles());
+    }
+
+    /**
+     * A path carrying {@code ;} segment parameters is not the listeners' path: the Mule listener compared the raw
+     * path, query removed, literally, so every method gets the no-listener 404 naming the path with its parameters,
+     * neither flow runs and nothing is stored ({@code config/ListenerPathConfig}). The {@code POST} carries a
+     * {@code file} part, which Spring's multipart resolution parses into Undertow's own temporary storage before the
+     * path is checked, never into the upload directory. A {@code HEAD} reply carries the headers of that 404 without
+     * its body.
+     *
+     * @param method the request method; {@code POST} carries a multipart body with a {@code file} part
+     * @param path   {@code /uploadFile} followed by its segment parameters
+     * @throws IOException when the upload directory cannot be listed
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("pathParameterRequests")
+    void pathWithSegmentParametersGetsTheNoListenerNotFound(String method, String path) throws IOException {
+        boolean withBody = "POST".equals(method);
+        byte[] noListener = bytes("No listener for endpoint: " + path);
+
+        HttpTestClient.Response response = client().send(method, path, withBody ? multipartHeaders() : null,
+                withBody ? multipart(new BodyPart("file", "alias.txt", "text/plain", bytes("alias upload"))) : null);
+
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+        assertContentType(response, "text/plain");
+        assertEquals(String.valueOf(noListener.length), response.header("Content-Length"), response::toString);
+        assertArrayEquals("HEAD".equals(method) ? new byte[0] : noListener, response.body(), response::toString);
+        assertEquals(List.of(), storedFiles());
+        verifyNoInteractions(uploadService);
+    }
+
+    private static Stream<Arguments> pathParameterRequests() {
+        return Stream.of("GET", "POST", "PUT", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of(PATH + ";x=1", PATH + ";jsessionid=ABC", PATH + ";")
+                        .map(path -> Arguments.of(method, path)));
     }
 
     /**

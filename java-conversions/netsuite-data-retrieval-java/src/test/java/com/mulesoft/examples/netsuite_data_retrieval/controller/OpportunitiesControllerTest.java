@@ -59,12 +59,14 @@ import org.springframework.test.context.ActiveProfiles;
  * the wire:
  * <ul>
  *   <li>the {@code title} query parameter reaches the service decoded and unchanged ({@code null} when absent,
- *       {@code ""} when empty), and the service's text is returned byte for byte with 200. The committed RAML
+ *       {@code ""} when empty), and the service's text is returned byte for byte with 200,
+ *       {@code Cache-Control: no-store} and {@code X-Content-Type-Options: nosniff}. The committed RAML
  *       example carries raw line breaks inside its {@code addrText} values, so it is not strict JSON and is only
  *       ever compared as bytes;</li>
  *   <li>a repeated {@code title}, a method the RAML does not declare, an {@code Accept} header excluding JSON and
  *       a path no resource serves under {@code /api} get APIkit's 400, 405, 406 and 404 mappings with their
  *       literal bodies (netsuite-api.xml:107-133), and the service is never called;</li>
+ *   <li>no error reply below carries either of the two headers the 200 reply adds;</li>
  *   <li>the three approved upstream failure modes answer 502, 429 and 503 through {@code UpstreamExceptionHandler}
  *       ahead of {@code GlobalExceptionHandler}'s catch-all, whose 500 answers any other service failure.</li>
  * </ul>
@@ -116,9 +118,7 @@ class OpportunitiesControllerTest {
         client = HttpTestClient.localhost(port);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Happy path and parameter binding
-    // ---------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest(name = "GET " + OPPORTUNITIES + "?title=Short%20wave with Accept {0} -> 200 example bytes")
     @NullSource
@@ -137,6 +137,7 @@ class OpportunitiesControllerTest {
 
         assertStatus(response, 200, "OK");
         assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
+        assertRecordHeaders(response);
         assertArrayEquals(expected, response.body(), response::toString);
         verify(searchService).getOpportunities(COMMITTED_TITLE);
         verifyNoMoreInteractions(searchService);
@@ -150,6 +151,7 @@ class OpportunitiesControllerTest {
 
         assertStatus(response, 200, "OK");
         assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
+        assertRecordHeaders(response);
         assertBody(response, "[]");
         verify(searchService).getOpportunities(isNull());
         verifyNoMoreInteractions(searchService);
@@ -175,14 +177,13 @@ class OpportunitiesControllerTest {
 
         assertStatus(response, 200, "OK");
         assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
+        assertRecordHeaders(response);
         assertBody(response, "[]");
         verify(searchService).getOpportunities(expectedTitle);
         verifyNoMoreInteractions(searchService);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // APIkit mappings (SC-3): the request never reaches the service
-    // ---------------------------------------------------------------------------------------------------------
 
     @ParameterizedTest(name = "GET " + OPPORTUNITIES + "?{0} -> APIkit 400")
     @ValueSource(strings = {"title=a&title=b", "title=Short%20wave&title=Short%20wave"})
@@ -254,9 +255,7 @@ class OpportunitiesControllerTest {
         verifyNoInteractions(searchService);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Approved upstream failure modes (SC-9) and the unhandled-exception 500 (SC-1)
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * Each upstream failure the service can raise: a label, the exception, the status with Undertow's reason
@@ -297,6 +296,7 @@ class OpportunitiesControllerTest {
         assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         assertBody(response, body);
         assertEquals(retryAfter, response.headers("Retry-After"), response::toString);
+        assertNoRecordHeaders(response);
         // The executor behind the service owns the single re-authentication retry; the controller adds none.
         verify(searchService, times(1)).getOpportunities(FAILING_TITLE);
         verifyNoMoreInteractions(searchService);
@@ -316,20 +316,38 @@ class OpportunitiesControllerTest {
         assertStatus(response, 500, "Internal Server Error");
         assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         assertBody(response, "{ \"message\": \"No select source ID for custom field custentity8\" }");
+        assertNoRecordHeaders(response);
         verify(searchService, times(1)).getOpportunities(FAILING_TITLE);
         verifyNoMoreInteractions(searchService);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Assertions
-    // ---------------------------------------------------------------------------------------------------------
 
-    /** One of APIkit's error mappings, which all answer {@code application/json} with a literal body. */
+    /**
+     * One of APIkit's error mappings, which all answer {@code application/json} with a literal body and without
+     * the two headers of the 200 reply.
+     */
     private static void assertApiKitError(HttpTestClient.Response response, int status, String reason,
                                           String body) {
         assertStatus(response, status, reason);
         assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
         assertBody(response, body);
+        assertNoRecordHeaders(response);
+    }
+
+    /**
+     * The headers the 200 reply adds to the opportunity records, each exactly once: {@code Cache-Control: no-store},
+     * so no client or intermediary keeps a copy, and {@code X-Content-Type-Options: nosniff}.
+     */
+    private static void assertRecordHeaders(HttpTestClient.Response response) {
+        assertEquals(List.of("no-store"), response.headers("Cache-Control"), response::toString);
+        assertEquals(List.of("nosniff"), response.headers("X-Content-Type-Options"), response::toString);
+    }
+
+    /** Neither header of {@link #assertRecordHeaders}: an error reply keeps the headers its handler writes. */
+    private static void assertNoRecordHeaders(HttpTestClient.Response response) {
+        assertEquals(List.of(), response.headers("Cache-Control"), response::toString);
+        assertEquals(List.of(), response.headers("X-Content-Type-Options"), response::toString);
     }
 
     /** The status code and the reason phrase exactly as the status line carries them. */

@@ -97,9 +97,7 @@ class OAuthProviderServiceTest {
         service = service(properties(CLIENT_ID, CLIENT_SECRET));
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Fixtures and helpers
-    // ---------------------------------------------------------------------------------------------------
 
     /** The original provider configuration (xml lines 16, 26-37, 46) with the given client credentials. */
     static OAuthProviderProperties properties(String clientId, String clientSecret) {
@@ -173,9 +171,7 @@ class OAuthProviderServiceTest {
                 + "&client_secret=myclientsecret&code=" + code + "&redirect_uri=http://localhost:9082/redirect";
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Authorization-code grant
-    // ---------------------------------------------------------------------------------------------------
 
     @Test
     void authorizationCodeFlowGrantsAReusableTokenForTheProtectedResource() {
@@ -330,9 +326,7 @@ class OAuthProviderServiceTest {
         assertThat(service.validateAccessToken("Bearer " + laterToken).value()).isEqualTo(laterToken);
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Authorization requests: response type, client, redirect URI, scopes
-    // ---------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> rejectedAuthorizationRequests() {
         return Stream.of(
@@ -482,9 +476,7 @@ class OAuthProviderServiceTest {
                 Arguments.of(List.of(), false));
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Token requests: grant type, client authentication, code, redirect URI
-    // ---------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> rejectedTokenRequests() {
         String demoBasic = basic(CLIENT_ID + ":" + CLIENT_SECRET);
@@ -605,9 +597,7 @@ class OAuthProviderServiceTest {
                 REDIRECT_URI, "otherclient", null, null)), 401, "invalid_client", "Invalid client credentials", null);
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Fail-closed while the configured client credentials are blank
-    // ---------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> blankConfiguredClientIds() {
         return Stream.of(
@@ -655,9 +645,7 @@ class OAuthProviderServiceTest {
                 wwwAuthenticate);
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Bearer token validation
-    // ---------------------------------------------------------------------------------------------------
 
     @ParameterizedTest
     @NullAndEmptySource
@@ -685,9 +673,7 @@ class OAuthProviderServiceTest {
         assertThat(service.validateAccessToken(String.format(headerFormat, token)).value()).isEqualTo(token);
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Output shapes
-    // ---------------------------------------------------------------------------------------------------
 
     @Test
     void issuedTokenJsonBodyIsTheFlatTokenResponse() throws Exception {

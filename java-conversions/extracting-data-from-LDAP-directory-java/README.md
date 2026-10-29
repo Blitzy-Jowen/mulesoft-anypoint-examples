@@ -10,17 +10,18 @@ The example connects to an LDAP directory, retrieves the users stored under `ou=
 
 | Path | Methods | Host | Port | Response | Source |
 |---|---|---|---|---|---|
-| `/` | any, `HEAD`, `OPTIONS` and `TRACE` included: the listener declares no `allowedMethods` | `0.0.0.0` | `http.port`, default `8081` | `200 OK` with the direct children of `ou=people` rendered as `[<entry 1>, <entry 2>, …]`, as UTF-8 bytes with `Content-Length` and no `Content-Type` header. Each entry is the LDIF text UnboundID `Entry.toLDIFString()` writes, with its DN relative to the URL base DN (`dn: cn=mmc,ou=people`) and its attributes in the order the server returned them. A `HEAD` reply carries the headers without the body. | `ldap.xml:6-15` |
-| `/`, when `ou=people` has no children | any | `0.0.0.0` | `http.port` | `200 OK`, empty body, `Content-Length: 0`; WARN `No LDAP entries found under ou=people` (the splitter yields nothing to aggregate) | `ldap.xml:9-15` |
+| `/` | any, `HEAD`, `OPTIONS` and `TRACE` included: the listener declares no `allowedMethods` | `0.0.0.0` | `http.port`, default `8081` | `200 OK` with the direct children of `ou=people` rendered as `[<entry 1>, <entry 2>, …]`, as UTF-8 bytes with `Content-Length`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and no `Content-Type` header. Each entry is the LDIF text UnboundID `Entry.toLDIFString()` writes, with its DN relative to the URL base DN (`dn: cn=mmc,ou=people`) and its attributes in the order the server returned them. A `HEAD` reply carries the headers without the body. | `ldap.xml:6-15` |
+| `/`, when `ou=people` has no children | any | `0.0.0.0` | `http.port` | `200 OK`, empty body, `Content-Length: 0`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, no `Content-Type`; WARN `No LDAP entries found under ou=people` (the splitter yields nothing to aggregate) | `ldap.xml:9-15` |
 | `/`, when the directory fails: unreachable, bind rejected, search base missing, no answer within 10 s, or `ldap.dn`/`ldap.password` unset | any | `0.0.0.0` | `http.port` | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }` (SC-1, AAP 0.4.7) | platform default: the flow has no exception strategy |
 | any other path (`/unknown` and `/error` included) | any | `0.0.0.0` | `http.port` | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
 
+- Every search reply, the empty result's included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, because it represents the directory's people: clients and caches keep no copy, and browsers do not guess a content type for the untyped text. Neither header changes the status, the absent `Content-Type` or the body bytes, and the `404` and `500` replies carry neither (root `DECISIONS.md` section 8, Response header hardening).
 - The request's query, headers and body are never read, so any `Accept`, `Content-Type` or body is ignored and never answered with 406, 415 or 400. SC-1's 405 (`Method not allowed for endpoint: <path>`) cannot occur, because the listener accepts every method.
 - A CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) runs the search like any other `OPTIONS` request and gets no `Access-Control-*` or `Vary` header. The original listener applied no CORS policy (`config/PreflightDispatchConfig`).
 - A directory failure is logged on two ERROR lines: `LdapDirectoryClient` names the result code, the server and the full search base (for example `LDAP search failed with result code 91 (connect error) on server localhost:389 for base 'ou=people,dc=my-domain,dc=com': …`), and SC-1 names the request method, the route and the exception chain. The bind password is never logged.
 - The application starts without a reachable directory: the connection pool is created on the first request, and a failed creation is retried by the next one.
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
-- The absent `Content-Type` of the `200` reply, the empty-result reply and the bytes of the `404` and `500` defaults are Tier 2A verification points (see [Behaviours stubbed or externalized](#behaviours-stubbed-or-externalized)).
+- The absent `Content-Type` of the `200` reply, its `Cache-Control` and `X-Content-Type-Options` headers, the empty-result reply and the bytes of the `404` and `500` defaults are Tier 2A verification points (see [Behaviours stubbed or externalized](#behaviours-stubbed-or-externalized)).
 
 ## Configuration keys
 
@@ -95,11 +96,13 @@ Nothing is stubbed, mocked at runtime or dropped. The directory is external at r
 
 - Externalized: the connection URL, literal in `ldap.xml:3`, is `ldap.url`; the bind DN and password, which the original README had users type into Studio's LDAP global element, come only from `ldap.dn` and `ldap.password` (AAP 0.4.6).
 - Not carried: the Studio metadata `mule-project.xml` and `src/test/resources/log4j2-test.xml` (AAP 0.2.2). `mule.test.properties` is replaced by `application-test.yml`.
+- Changed, response hardening (root `DECISIONS.md` section 8, Response header hardening): every search reply adds `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, which the original did not declare. Status, reason phrase, `Content-Length` and body bytes are unchanged, no `Content-Type` is added, and the error replies carry neither header.
 
 Tier 2A verification points (AAP 0.4.7 and the "LDAP list rendering" risk of AAP 0.8.9). Each is settled by captured fixtures of the original, never by hand-tuning: when a fixture differs, the Java code changes to match.
 
 - Entry rendering. The original rendered entries through the Mule LDAP connector (JNDI). The original README's sample lists each entry's attributes in JNDI hash order (`uid`, `sn`, `userPassword`, `cn`, `objectClass`) and writes `userPassword` base64-encoded (`userPassword:: …`). UnboundID `Entry.toLDIFString()` writes the attributes in the order the server returned them and a printable value as plain text, so attribute order and the `userPassword` encoding may differ. Entry order and any operational attributes returned for this search are the server's: an UnboundID in-memory directory server, for one, also returns `entryDN`, `entryUUID`, `subschemaSubentry` and the creator and modifier timestamps.
 - The absent `Content-Type` of the `200` reply.
+- The `Cache-Control: no-store` and `X-Content-Type-Options: nosniff` headers of the search replies: the original declared neither, and `FixtureParityTest` compares only `Content-Type` and `Location` among the response headers, so where a capture shows a header contract that they break, the captured contract is kept and the conflict is recorded in root `DECISIONS.md` (section 8, Response header hardening).
 - The empty-result outcome: `200` with an empty body. The original's reply to an empty `ou=people` is unrecorded (`get-root-no-people`).
 - The `500` body text: the message is the UnboundID SDK's, not the JNDI or Mule exception message, and the original's reply to an unreachable directory, or its failed deployment, is unrecorded (`get-root-ldap-unavailable`).
 - The `404` text `No listener for endpoint: <path>` (`get-unknown-path`).
@@ -131,6 +134,8 @@ Expected exchanges with the directory loaded from `ldap.ldif`. The `200` body is
 $ curl -i http://localhost:8081/
 HTTP/1.1 200 OK
 Connection: keep-alive
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
 Content-Length: <body length>
 Date: <current date>
 
@@ -168,7 +173,7 @@ No listener for endpoint: /unknown
 | Test class | What it asserts |
 |---|---|
 | `ExtractingDataFromLdapDirectoryTest` | the ported `ExtractingDataFromLdapDirectoryIT` (`extracting-data-from-LDAP-directory/src/test/java/org/mule/examples/ExtractingDataFromLdapDirectoryIT.java:111-115`), with profile `test` against an UnboundID in-memory directory loaded from `ldap-add.ldif`: `GET /` returns 200 and a non-empty body containing `dn: cn=mmc,ou=people`, `dn: cn=testuser1,ou=people` and `dn: cn=admin,ou=people` |
-| `controller/LdapControllerTest` | on the wire through ST-1, with a mocked `LdapSearchService`: `GET /` → `HTTP/1.1 200 OK`, no `Content-Type`, exact `Content-Length` and body; the same reply for `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS` and `TRACE` with a text body; `HEAD` without body; an empty result → 200 with `Content-Length: 0`; `/unknown` → 404 `text/plain` `No listener for endpoint: /unknown`; a directory failure → 500 `application/json` `{ "message": "<exception message>" }` |
+| `controller/LdapControllerTest` | on the wire through ST-1, with a mocked `LdapSearchService`: `GET /` → `HTTP/1.1 200 OK`, no `Content-Type`, exact `Content-Length` and body; the same reply for `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS` and `TRACE` with a text body; `HEAD` without body; an empty result → 200 with `Content-Length: 0`; every one of these `200` replies with exactly one `Cache-Control: no-store` and one `X-Content-Type-Options: nosniff`; `/unknown` → 404 `text/plain` `No listener for endpoint: /unknown`; a directory failure → 500 `application/json` `{ "message": "<exception message>" }`; neither error reply with either header |
 | `service/LdapSearchServiceTest` | the `[<ldif>, <ldif>]` rendering of several entries in client order and of a single entry; an empty result → empty string; exactly one search of `ou=people` with `(objectClass=*)`; a directory failure propagated unchanged |
 | `client/LdapDirectoryClientTest` | against an in-memory directory: the one-level search returns exactly `cn=mmc`, `cn=testuser1` and `cn=admin` with DNs relative to the URL base, and their attributes; a wrong password → `INVALID_CREDENTIALS`; every failure (wrong password, missing base, nothing listening, `ldap.dn`, `ldap.password` or `ldap.url` unset, invalid URL, URL without host) logged once at ERROR with result code, server and base, then rethrown unchanged; escaped, bounded log values; a message containing the bind password withheld; a failed first connection cached nothing, so the next search succeeds |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path, and carries no stack trace |
@@ -205,7 +210,7 @@ Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
 - `mvn -B clean package`: `BUILD SUCCESS`; 132 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
 - `mvn -B test`: `BUILD SUCCESS`; 132 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 17 of 17 lines of `service/LdapSearchService` (the project has no `mapper` package). Total project LINE coverage: 95.4% (332 of 348 lines).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 17 of 17 lines of `service/LdapSearchService` (the project has no `mapper` package). Total project LINE coverage: 95.4% (334 of 350 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

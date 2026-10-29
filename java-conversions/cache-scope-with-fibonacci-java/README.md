@@ -25,7 +25,7 @@ Responses. Every `200` reply carries `Content-Length` and no `Content-Type`.
 | `n` a non-integer number of at least 2 and below 20 (`n=2.5`) | `500 Internal Server Error` | `Content-Type: application/json` | `{ "message": "Fibonacci key must be an integer: <n>" }` | unhandled exception, SC-1 |
 | `Content-Type` that cannot be parsed (`Content-Type: bogus` with a body) | `500 Internal Server Error` | `Content-Type: application/json` | the parser's message, for example `{ "message": "Invalid mime type \"bogus\": does not contain '/'" }` | unhandled exception, SC-1 |
 | `application/x-www-form-urlencoded` body with a malformed percent escape | `400 Bad Request` | no `Content-Type`, no `cost` | `Cannot decode x-www-form-urlencoded payload` | the Mule listener's own rejection, before the flow runs |
-| any other path (`/favicon.ico`, `/`, `/fibonacci/10`, `/error`) | `404 Not Found` | `Content-Type: text/plain` | `No listener for endpoint: <path>` | no listener, SC-1 (AAP 0.4.7) |
+| any other path (`/favicon.ico`, `/`, `/fibonacci/10`, `/error` and `/fibonacci` with `;` segment parameters, such as `/fibonacci;x=1`, included) | `404 Not Found` | `Content-Type: text/plain` | `No listener for endpoint: <path>` | no listener, SC-1 (AAP 0.4.7) |
 
 Every `500` is also logged by SC-1 as one `ERROR` line that names the method, the route and the exception classes.
 
@@ -34,7 +34,8 @@ How the request is read, as the Mule 3.8 listener read it (`controller/Fibonacci
 - The favicon filter tests the message payload, not the request path. The payload is `null` for a request without a body or with a `multipart` body, the decoded parameter map for a form-urlencoded body, and the body text for any other body, decoded in the charset its `Content-Type` declares (UTF-8 when none is declared). Only a text payload can equal `/favicon.ico`, so the same text sent as a form or multipart body passes the filter and the flow continues. A browser's `GET /favicon.ico` is answered by the no-listener 404, because the listener serves only `/fibonacci`.
 - Query parameters come from the raw query string. When a name repeats, the last occurrence wins, and a bare name without `=` reads as absent, as Mule's `ParameterMap.get` returned it: `?n=5&n=10` computes 10, `?n=5&n` takes the `otherwise` branch.
 - `n` is compared with 20 as a decimal number, but the reply and the cache key use it exactly as sent: `n=05` answers `Fibonacci(05) = 5`.
-- A `HEAD` request runs the flow (the cache included) and gets the headers without the body. A CORS pre-flight is answered like any other `OPTIONS` request, with no `Access-Control-*` or `Vary` header, because the original listener applied no CORS policy (`config/PreflightDispatchConfig`).
+- A path carrying `;` segment parameters (`/fibonacci;x=1`, `/fibonacci;jsessionid=ABC`, `/fibonacci;`) is not `/fibonacci`: every method, `HEAD` and `OPTIONS` included, gets the no-listener 404 naming the path with its parameters and without the query, `No listener for endpoint: /fibonacci;x=1` for `/fibonacci;x=1?n=10`, and the flow does not run, so nothing is calculated or cached and no `cost` header is sent. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). A `;` in the query string is not part of the path.
+- A `HEAD` request to `/fibonacci` runs the flow (the cache included) and gets the headers without the body. A CORS pre-flight is answered like any other `OPTIONS` request, with no `Access-Control-*` or `Vary` header, because the original listener applied no CORS policy (`config/PreflightDispatchConfig`).
 
 Worked example, from the original README and `CacheScopeWithFibonacciIT` (`CacheScopeWithFibonacciIT.java:48-56`), on a freshly started application (the `Date` value varies):
 
@@ -119,7 +120,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `fixed
 | flow payload and outbound property `cost` | `model/FibonacciResult` (value, cost) and `FibonacciService.FibonacciReply` (body, `cost` header) |
 | `logger level="INFO" message="aaa: #[]"` (`cache-scope.xml:64`) | SLF4J `INFO` `aaa: null` in `FibonacciCacheService` |
 | Default exception strategy and listener defaults (no listener, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| Grizzly listener semantics (no CORS policy) | `config/PreflightDispatchConfig` |
+| Grizzly listener semantics (no CORS policy; the raw path, query removed, matched literally, `;` segment parameters included) | `config/PreflightDispatchConfig`, `config/ListenerPathConfig` |
 | `mule-deploy.properties` (loads `cache-scope.xml`) | `CacheScopeWithFibonacciApplication` (`@SpringBootApplication`, `@EnableCaching`) |
 | `mule-app.properties` (empty) | `src/main/resources/application.yml` |
 | `CacheScopeWithFibonacciIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`) | `CacheScopeWithFibonacciTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)` with ST-1 `support/HttpTestClient`) |
@@ -136,7 +137,7 @@ Platform defaults the source does not settle. When a captured fixture shows diff
 - the `cost` response header, which the Mule listener sent from the outbound property `cost`;
 - the empty `200` of the favicon filter rejection;
 - the `500` status and body for a non-numeric `n`, and for a non-integer `n` of 2 or more (`n=2.5`), where MEL's coercion and `Integer.toString` failure are not reproducible from the source;
-- the bytes of the no-listener `404`;
+- the bytes of the no-listener `404`, and the `404` for `/fibonacci` with `;` segment parameters;
 - the store limits of the caching strategy, which declares no object store: the 4000-entry bound, and Caffeine's eviction policy against the in-memory store's oldest-first trim (`DECISIONS.md` section 6.10);
 - whether the caching strategy synchronized access by default, which the Mule 3.8 documentation does not state;
 - the rendering of the `aaa: #[]` log line as `aaa: null`.
@@ -165,13 +166,13 @@ Test classes under `src/test/java/com/mulesoft/examples/cache_scope_with_fibonac
 | Test class | What it asserts |
 |---|---|
 | `CacheScopeWithFibonacciTest` | the ported `CacheScopeWithFibonacciIT` (`cache-scope-with-fibonacci/src/test/java/org/mule/examples/CacheScopeWithFibonacciIT.java:44-57`), with its exact-equality assertions: on an empty cache, `GET /fibonacci?n=10` returns `Fibonacci(10) = 55\nCOST: 11`, then `GET /fibonacci?n=5` returns `Fibonacci(5) = 5\nCOST: 0` |
-| `controller/FibonacciControllerTest` | on the wire through ST-1: status line, `cost`, absent `Content-Type`, `Content-Length` and body bytes for cold calculations (`n` = 10, 19, 1, -3), every method, the cache hit, the raw-string key (`05`), the `nocache` header and query parameter, the `otherwise` branch (`n=20`, `n` absent), the favicon filter on text bodies and its pass-through for form and multipart bodies, the listener's 400 for an undecodable form body, the 500 for an unparseable `Content-Type` and a non-numeric `n`, the no-listener 404 for `/favicon.ico`, `/` and `/fibonacci/10`, and the cache's 4000-entry bound without expiry |
+| `controller/FibonacciControllerTest` | on the wire through ST-1: status line, `cost`, absent `Content-Type`, `Content-Length` and body bytes for cold calculations (`n` = 10, 19, 1, -3), every method, the cache hit, the raw-string key (`05`), the `nocache` header and query parameter, the `otherwise` branch (`n=20`, `n` absent), the favicon filter on text bodies and its pass-through for form and multipart bodies, the listener's 400 for an undecodable form body, the 500 for an unparseable `Content-Type` and a non-numeric `n`, the no-listener 404 for `/favicon.ico`, `/` and `/fibonacci/10`, and for `/fibonacci;x=1`, `/fibonacci;jsessionid=ABC` and `/fibonacci;` with `?n=10` for `GET`, `POST` with a `text/plain` body, `HEAD` (headers only) and `OPTIONS`, each without a `cost` header and with nothing cached, and the cache's 4000-entry bound without expiry |
 | `controller/FibonacciControllerBindingTest` | `OPTIONS` runs the flow (calculation, `otherwise`, favicon filter and the 500) with no `Allow` header; a repeated query parameter takes its last occurrence and a bare name reads as absent, for `n` and for `nocache` |
 | `service/FibonacciServiceTest` | `handle` against `cache-exampleFlow1` with a strict mock of the cache service: the favicon filter (case-sensitive, text payload only), the `n < 20` choice, the raw `n` passed to the cache service with both `nocache` flags, the reply texts, and a non-numeric `n` rejected without touching the cache |
 | `service/FibonacciCacheServiceTest` | `calculate` against `calculateFibonacci` on a real Caffeine cache: 10 then 5, the base case, F(19) costs 20, both bypass modes, raw-string keys, negative and invalid keys, the `aaa: null` log count per computed step, the cost-0 copy of a hit, and per-key synchronization under concurrent requests |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path, carries no exception message except a JDBC driver's escaped, bounded diagnostic, and no stack trace; an `Error` reported with its own message |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
-| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/fibonacci?n=10` gets exactly the plain `OPTIONS` reply (`200`, `Fibonacci(10) = 55\nCOST: 11`, `cost: 11`), never Spring's 403, with no `Access-Control-*` or `Vary` header |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/fibonacci?n=10` gets exactly the plain `OPTIONS` reply (`200`, `Fibonacci(10) = 55\nCOST: 11`, `cost: 11`), never Spring's 403, with no `Access-Control-*` or `Vary` header; a pre-flight to `/unknown` or `/fibonacci;x=1?n=10` gets the no-listener 404 and calculates nothing |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes. Every test that runs the real cache clears the `fibonacci` cache before each case, so expected costs never depend on test order.
@@ -212,9 +213,9 @@ This project's scenarios, exactly as `SCENARIOS.md` names them. All are `http` a
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 186 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 186 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 65 of 65 lines of `service/FibonacciService` and `service/FibonacciCacheService` with their nested types (the project has no `mapper` package). Total project LINE coverage: 97.5% (312 of 320 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 199 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 199 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 65 of 65 lines of `service/FibonacciService` and `service/FibonacciCacheService` with their nested types (the project has no `mapper` package). Total project LINE coverage: 97.6% (321 of 329 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=14`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

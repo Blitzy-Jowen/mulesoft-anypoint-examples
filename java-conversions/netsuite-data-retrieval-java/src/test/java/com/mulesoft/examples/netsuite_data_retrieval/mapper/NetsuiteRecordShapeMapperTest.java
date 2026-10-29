@@ -457,9 +457,7 @@ class NetsuiteRecordShapeMapperTest {
         assertThat(fromProperties).isEqualTo(mapped(RecordKind.CUSTOMER));
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Fixtures
-    // ---------------------------------------------------------------------------------------------------------
 
     /** Maps the fresh REST customer, with the committed source IDs, or the fresh REST opportunity. */
     private Map<String, Object> mapped(RecordKind kind) {
@@ -555,9 +553,7 @@ class NetsuiteRecordShapeMapperTest {
         return file;
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Assertions
-    // ---------------------------------------------------------------------------------------------------------
 
     /** The single {@code customFieldList.customField} element of a mapped record. */
     private static Map<String, Object> customFields(Map<String, Object> record) {

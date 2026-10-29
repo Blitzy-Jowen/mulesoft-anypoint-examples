@@ -28,10 +28,14 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.ArgumentCaptor;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
@@ -62,10 +66,10 @@ import com.mulesoft.examples.document_integration_using_the_cmis_connector.suppo
  * <p>The happy paths cover the original test's empty POST, the README's GET, and PUT and OPTIONS, because the
  * original listener declares no {@code allowedMethods}; each proves the flow ran exactly once with the connector
  * arguments of the original. The error cases are the platform defaults of SC-1: the no-listener 404 for a path the
- * flow does not serve, and the JSON 500 for a repository failure (the repository's 401) and for any other
- * exception escaping the adapter, which the flow, having no exception strategy, leaves unhandled. The original
- * {@code DocumentIntegrationUsingTheCmisConnectorIT} assertion is ported separately in
- * {@code DocumentIntegrationUsingTheCmisConnectorTest}.
+ * flow does not serve, {@code /cmis} with {@code ;} segment parameters included, and the JSON 500 for a repository
+ * failure (the repository's 401) and for any other exception escaping the adapter, which the flow, having no
+ * exception strategy, leaves unhandled. The original {@code DocumentIntegrationUsingTheCmisConnectorIT} assertion
+ * is ported separately in {@code DocumentIntegrationUsingTheCmisConnectorTest}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles("test")
@@ -170,6 +174,38 @@ class CmisControllerTest {
 
         assertWire(response, STATUS_NOT_FOUND, TEXT_PLAIN, "No listener for endpoint: /unknown");
         verifyNoInteractions(cmisClient);
+    }
+
+    /**
+     * A path carrying {@code ;} segment parameters is not the listener's path: the Mule listener compared the raw
+     * path, query removed, literally, so every method gets the no-listener 404 naming the path with its parameters,
+     * and the flow never runs, so no document is created and the repository receives no request
+     * ({@code config/ListenerPathConfig}). A {@code HEAD} reply carries the 404's headers without its body.
+     *
+     * @param method the request method
+     * @param path   {@code /cmis} followed by its segment parameters
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("pathParameterRequests")
+    void pathWithSegmentParametersReturnsNoListener404(String method, String path) {
+        HttpTestClient.Response response = client().send(method, path, Map.of(), EMPTY_BODY);
+
+        String body = "No listener for endpoint: " + path;
+        if ("HEAD".equals(method)) {
+            assertWire(response, STATUS_NOT_FOUND, TEXT_PLAIN, "");
+            assertEquals(List.of(String.valueOf(body.getBytes(StandardCharsets.UTF_8).length)),
+                    response.headers("Content-Length"), response::toString);
+        } else {
+            assertWire(response, STATUS_NOT_FOUND, TEXT_PLAIN, body);
+        }
+        verifyNoInteractions(cmisClient);
+        wm.verify(0, anyRequestedFor(anyUrl()));
+    }
+
+    private static Stream<Arguments> pathParameterRequests() {
+        return Stream.of("GET", "POST", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of(CMIS_PATH + ";x=1", CMIS_PATH + ";jsessionid=ABC", CMIS_PATH + ";")
+                        .map(path -> Arguments.of(method, path)));
     }
 
     /** Any exception escaping the adapter reaches the caller with its own message in the JSON 500. */

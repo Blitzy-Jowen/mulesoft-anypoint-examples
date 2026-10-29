@@ -24,13 +24,14 @@ All rows are served on host `0.0.0.0`, port `http.port` (default `8081`).
 | `/uploadFile` | `POST` without a `file` part, or with a body that is not multipart | the file-name step fails; no exception strategy applies | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "Multipart part 'file' is not present in the request" }` (SC-1, AAP 0.4.7; Tier 2A verification point); no file stored | xml:19-20 |
 | `/uploadFile` | `POST` whose write fails (file name `.`, `..`, empty, or longer than the file system allows) | the `file:outbound-endpoint` write fails; no exception strategy applies | `500`, `application/json`, `{ "message": "Streaming failed. Could not get output stream" }`, Mule's streaming-failure text, which names no path (SC-1, SC-6); no file stored | xml:27 |
 | `/uploadFile` | any other method: `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `TRACE`, in any letter case | rejected before either flow runs | `405 Method Not Allowed`, `Content-Type: text/plain`, body `Method not allowed for endpoint: /uploadFile`, no `Allow` header; a `HEAD` reply carries no body (SC-1, AAP 0.4.7) | xml:8,15 |
-| any other path (`/error` included) | any | no listener serves it | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
+| any other path (`/error` and `/uploadFile` with `;` segment parameters, such as `/uploadFile;x=1`, included) | any | no listener serves it; neither flow runs and no file is stored | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
 
 - File names are stored exactly as the formula yields them: neither unquoted, decoded nor sanitised, and `filename*` is not read. Part headers are decoded as ISO-8859-1, one character per byte, as Mule 3.8's JavaMail parser read them (`config/MultipartHeaderCharsetConfig`): a browser's windows-1252 `café-latin1.txt` is stored under that name and the UTF-8 bytes of `naïve.txt` as `naÃ¯ve.txt`.
 - The name is joined to the upload directory as Mule's file connector joined them: a leading `/` keeps the file under the directory (`/qa/absolute.txt` → `<upload.directory>/qa/absolute.txt`), missing subdirectories are created, and `..` segments are kept as given, so such a name reaches a path outside the directory, as it did in the original.
 - A part without a `Content-Disposition` header, or one too short for the formula's range, fails the request with `500 { "message": "<exception message>" }` (SC-1).
 - Uploads have no size limit (`spring.servlet.multipart.max-file-size` and `max-request-size` are `-1`), as the Mule listener imposed none.
 - A CORS pre-flight is answered like any other `OPTIONS` request, with the 405 above and no `Access-Control-*` or `Vary` header; the original listener applied no CORS policy (`config/PreflightDispatchConfig`).
+- A path carrying `;` segment parameters (`/uploadFile;x=1`, `/uploadFile;jsessionid=ABC`, `/uploadFile;`) is not `/uploadFile`: every method gets the no-listener 404 naming the path with its parameters, `No listener for endpoint: /uploadFile;x=1`, neither flow runs and an upload to it stores no file. The Mule listener matched the raw path, query removed, literally, where Spring MVC ignores segment parameters (`config/ListenerPathConfig`). Spring's multipart resolution parses such an upload before the path is checked, into Undertow's temporary storage, never into `upload.directory`. A `;` in the query string is not part of the path.
 - The reason phrase `File was uploaded.` is confined to the upload's own exchange; the next response on the connection carries its standard phrase.
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
@@ -78,7 +79,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `fixed
 | `set-payload` of the part content (xml:25) | `UploadService#upload` reads the part bytes and returns them as the response body |
 | `file:outbound-endpoint path="/tmp" outputPattern="#[attachmentFileName]"` (xml:27) | SC-6 `service/FileOutboundWriter#write(upload.directory, fileName, content)` |
 | Platform default responses (no listener, method not allowed, unhandled exception) | SC-1 `exception/GlobalExceptionHandler` and `exception/ErrorResponse` |
-| Listener without a CORS policy | `config/PreflightDispatchConfig` |
+| Listener semantics (no CORS policy; the raw path, query removed, matched literally, `;` segment parameters included) | `config/PreflightDispatchConfig`, `config/ListenerPathConfig` |
 | `mule-deploy.properties` (loads `http-multipart-request.xml`) | `HttpMultipartRequestApplication` (`@SpringBootApplication`) |
 | `mule-app.properties` (empty) | `src/main/resources/application.yml` |
 | `HttpMultpartRequestIT` (`FunctionalTestCase`, `MuleClient`, `DynamicPort`, `AttachmentRequest`) | `HttpMultpartRequestTest` (`@SpringBootTest(webEnvironment = RANDOM_PORT)` with ST-1 `support/HttpTestClient`) |
@@ -94,7 +95,7 @@ Shared components, copied from their reference projects with only the `package` 
 | ST-1 | test `support/HttpTestClient` | `rest-api-with-apikit-java` |
 | ST-2 | test `FixtureParityTest`, the table format of `src/test/resources/fixtures/SCENARIOS.md` | `hello-world-java` |
 
-`config/PreflightDispatchConfig` and its tests are the same classes `hello-world-java` carries, apart from the `package` line.
+`config/PreflightDispatchConfig`, its test `config/PreflightDispatchConfigTest` and `config/ListenerPathConfig` are the same classes `hello-world-java` carries, apart from the `package` line.
 
 ## Behaviours stubbed or externalized
 
@@ -138,11 +139,11 @@ The file is then at `<upload.directory>/test.txt`, and the application log holds
 | Test class | What it asserts |
 |---|---|
 | `HttpMultpartRequestTest` | the ported `HttpMultpartRequestIT` (`http-multipart-request/src/test/java/org/mule/examples/HttpMultpartRequestIT.java:57-73`): the body of `GET /uploadFile` contains `uploadFile.html`; a multipart upload of `test.txt` leaves `<upload.directory>/file` |
-| `controller/UploadControllerTest` | on the wire through ST-1: `GET` in four letter cases → `HTTP/1.1 200 OK`, no `Content-Type`, `Content-Length: 348`, the form byte for byte; `POST` in four letter cases and body A of `SCENARIOS.md` (`test.txt`) → `HTTP/1.1 200 File was uploaded.`, no `Content-Type`, the uploaded bytes, the file stored; a second upload under a stored name replaces it; non-ASCII names decoded as ISO-8859-1; the last of several `file` parts stored; absolute, double-slash and nested names stored under the upload directory; `PUT`, `DELETE`, `PATCH`, `TRACE`, `OPTIONS` in several letter cases → 405 `text/plain` `Method not allowed for endpoint: /uploadFile`, `HEAD` the same without a body; a missing `file` part (body C, a text field only, a `text/plain` body) → 500 `{ "message": "Multipart part 'file' is not present in the request" }`; failing writes → 500 `{ "message": "Streaming failed. Could not get output stream" }`; `/unknown` → 404 `text/plain` `No listener for endpoint: /unknown`; the upload's reason phrase does not reach the next response |
+| `controller/UploadControllerTest` | on the wire through ST-1: `GET` in four letter cases → `HTTP/1.1 200 OK`, no `Content-Type`, `Content-Length: 348`, the form byte for byte; `POST` in four letter cases and body A of `SCENARIOS.md` (`test.txt`) → `HTTP/1.1 200 File was uploaded.`, no `Content-Type`, the uploaded bytes, the file stored; a second upload under a stored name replaces it; non-ASCII names decoded as ISO-8859-1; the last of several `file` parts stored; absolute, double-slash and nested names stored under the upload directory; `PUT`, `DELETE`, `PATCH`, `TRACE`, `OPTIONS` in several letter cases → 405 `text/plain` `Method not allowed for endpoint: /uploadFile`, `HEAD` the same without a body; a missing `file` part (body C, a text field only, a `text/plain` body) → 500 `{ "message": "Multipart part 'file' is not present in the request" }`; failing writes → 500 `{ "message": "Streaming failed. Could not get output stream" }`; `/unknown` → 404 `text/plain` `No listener for endpoint: /unknown`, and so do `/uploadFile;x=1`, `/uploadFile;jsessionid=ABC` and `/uploadFile;` for `GET`, `POST` with a `file` part, `PUT`, `HEAD` (without a body) and `OPTIONS`, with no file stored and `UploadService` never called; the upload's reason phrase does not reach the next response |
 | `service/UploadServiceTest` | `extractFileName` applies the original formula verbatim and fails as it did; `upload` logs the `Content-Type` at `ERROR`, stores and returns the content, replaces an existing file, and fails before logging or writing without a part or a usable `Content-Disposition`; read and write failures reach the caller unchanged; `REASON_PHRASE`; `uploadForm()` is the original page byte for byte and fails when the template is missing |
 | `config/MultipartHeaderCharsetConfigTest` | the filter sets ISO-8859-1 on every multipart request that is not a `GET` and leaves other requests unchanged; it is mapped to `/uploadFile` directly after Spring Boot's character-encoding filter |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing; `@CrossOrigin` handlers keep Spring's CORS handling |
-| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/uploadFile` gets exactly the plain `OPTIONS` reply (405, no `Access-Control-*` or `Vary`) and runs neither flow; cross-origin `GET` and `POST` still work; a pre-flight to an unserved path gets the no-listener 404 |
+| `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/uploadFile` gets exactly the plain `OPTIONS` reply (405, no `Access-Control-*` or `Vary`) and runs neither flow; cross-origin `GET` and `POST` still work; a pre-flight to `/unknown` or `/uploadFile;x=1` gets the no-listener 404 |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; the single escaped, length-bounded ERROR log line per unhandled exception |
 | `config/ReasonPhraseTest` | SC-2: the custom phrase reaches the raw status line of the current exchange only |
 | `service/FileOutboundWriterTest` | SC-6: directory creation, whole-file replacement, Mule's joining of names to the directory, and every write failure reported as `Streaming failed. Could not get output stream` |
@@ -183,9 +184,9 @@ No scenario of this project is `unreachable` or `nondeterministic`: every branch
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 302 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 302 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 158 of 185 lines (`service/UploadService` 19 of 19, `service/FileOutboundWriter` 94 of 117, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 92.1% (385 of 418 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 318 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 318 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 158 of 185 lines (`service/UploadService` 19 of 19, `service/FileOutboundWriter` 94 of 117, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 92.3% (394 of 427 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=10`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)
@@ -196,7 +197,7 @@ Tier 2A is blocked: `Tier 2A blocked: Mule EE licence and EE Maven repository cr
 - `UploadControllerTest`, `UploadServiceTest` and the shared-component tests cover every reachable branch.
 - This evidence is weaker than captured fixtures. It shows that the conversion meets the original's own assertions and the AAP's reading of the platform defaults, but not that its bytes equal what the original runtime sent.
 - Behaviours no original assertion covers, tested only by the new tests: the POST response's status line, reason phrase and body bytes; the `ERROR` log of the part's content type; the absent `Content-Type` of the GET and POST replies; the 405 for other methods; the 404 on other paths; the 500 for a missing `file` part and for a failed write; the replacement of an existing file; the ISO-8859-1 decoding of file names and the joining of absolute and nested names to the upload directory.
-- Tier 2A verification points, where a captured fixture governs and the code is changed to match: the absent `Content-Type` of the GET and POST replies; the 500 bodies for a missing part and a failed write; the exact bytes of the platform 404 and 405; the names and paths stored for the non-ASCII, absolute and nested file names.
+- Tier 2A verification points, where a captured fixture governs and the code is changed to match: the absent `Content-Type` of the GET and POST replies; the 500 bodies for a missing part and a failed write; the exact bytes of the platform 404 and 405; the 404 for `/uploadFile` with `;` segment parameters; the names and paths stored for the non-ASCII, absolute and nested file names.
 - Unverified scenarios, until captured: all ten of the table above.
 
 The parity label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed (AAP 0.8.7).

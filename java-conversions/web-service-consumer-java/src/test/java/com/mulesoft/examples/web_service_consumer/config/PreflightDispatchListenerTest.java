@@ -32,6 +32,7 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.ActiveProfiles;
@@ -49,7 +50,8 @@ import com.mulesoft.examples.web_service_consumer.support.HttpTestClient;
  * pre-flight runs the flow and is answered exactly as a plain {@code OPTIONS} request to the same path is, with no
  * {@code Access-Control-*} or {@code Vary} header: {@code /inventory} calls {@code ListInventory} once and returns its
  * JSON, {@code /orders} without a body fails in the order mapper before any SOAP call, {@code /orders} carrying an
- * order places it, and an unserved path gets the no-listener 404.
+ * order places it, and an unserved path, either listener's path with {@code ;} segment parameters included, gets the
+ * no-listener 404.
  *
  * <p>The whole application runs on its Undertow listener at a random port with the {@code test} profile, which
  * supplies the original demo API key, against a WireMock {@code TshirtService}; requests go through ST-1
@@ -205,17 +207,24 @@ class PreflightDispatchListenerTest {
                         "//*[local-name()='OrderTshirt']/*[local-name()='size']/text()", equalTo("L"))));
     }
 
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() {
-        HttpTestClient.Response plain = client().send("OPTIONS", "/unknown", null, null);
+    /**
+     * A path no listener serves, and each listener's path with {@code ;} segment parameters, which
+     * {@link ListenerPathConfig} refuses after the pre-flight has selected the {@code OPTIONS} handler.
+     *
+     * @param path the unserved request path
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"/unknown", "/orders;x=1", "/inventory;x=1"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String path) {
+        HttpTestClient.Response plain = client().send("OPTIONS", path, null, null);
 
-        HttpTestClient.Response preflight = client().send("OPTIONS", "/unknown",
+        HttpTestClient.Response preflight = client().send("OPTIONS", path,
                 preflightHeaders("POST", null, null), null);
 
         assertSameResponse(plain, preflight);
         assertThat(preflight.statusLine()).as(preflight.toString()).isEqualTo("HTTP/1.1 404 Not Found");
         assertThat(preflight.header("Content-Type")).startsWith("text/plain");
-        assertThat(preflight.bodyAsString()).isEqualTo("No listener for endpoint: /unknown");
+        assertThat(preflight.bodyAsString()).isEqualTo("No listener for endpoint: " + path);
         assertNoCorsHeaders(preflight);
         upstream.verify(0, postRequestedFor(anyUrl()));
     }

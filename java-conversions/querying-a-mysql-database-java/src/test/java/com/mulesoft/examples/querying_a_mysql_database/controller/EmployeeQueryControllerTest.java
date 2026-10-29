@@ -16,6 +16,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
 import com.mulesoft.examples.querying_a_mysql_database.client.EmployeeRepository;
@@ -44,7 +45,8 @@ import org.springframework.test.context.ActiveProfiles;
  * parameter reaches the query: a missing one is rendered as the text {@code null} as MEL rendered it, the last of
  * repeated ones wins, a form body is never read, and hostile input is bound as data. The error cases are the SC-1
  * platform defaults: the no-listener 404 and the JSON 500 for a database failure, which the flow, having no
- * exception strategy, does not handle.
+ * exception strategy, does not handle. Every 200 reply carries exactly {@code Cache-Control: no-store} and
+ * {@code X-Content-Type-Options: nosniff}, because it lists employee names; the error replies carry neither.
  *
  * <p>The repository is a spy over the real H2-backed bean, so every request runs the real query; only the last
  * name {@value #FAILING_LAST_NAME} is stubbed to fail. The stub is set before each test because the spy's default
@@ -149,6 +151,7 @@ class EmployeeQueryControllerTest {
         assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
         assertContentTypeStartsWith(response, MediaType.TEXT_PLAIN_VALUE);
         assertEquals("No listener for endpoint: /unknown", response.bodyAsString(), response::toString);
+        assertNoCacheProtectionHeaders(response);
     }
 
     @Test
@@ -158,12 +161,22 @@ class EmployeeQueryControllerTest {
         assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
         assertContentTypeStartsWith(response, MediaType.APPLICATION_JSON_VALUE);
         assertEquals("{ \"message\": \"" + FAILURE_MESSAGE + "\" }", response.bodyAsString(), response::toString);
+        assertNoCacheProtectionHeaders(response);
     }
 
+    /** The employee-name reply: 200 JSON with exactly one {@code no-store} and one {@code nosniff} header. */
     private static void assertOkJson(HttpTestClient.Response response, String expectedBody) {
         assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
         assertContentTypeStartsWith(response, MediaType.APPLICATION_JSON_VALUE);
+        assertEquals(List.of("no-store"), response.headers("Cache-Control"), response::toString);
+        assertEquals(List.of("nosniff"), response.headers("X-Content-Type-Options"), response::toString);
         assertEquals(expectedBody, response.bodyAsString(), response::toString);
+    }
+
+    /** The SC-1 error replies carry no employee data and keep their platform-default headers. */
+    private static void assertNoCacheProtectionHeaders(HttpTestClient.Response response) {
+        assertEquals(List.of(), response.headers("Cache-Control"), response::toString);
+        assertEquals(List.of(), response.headers("X-Content-Type-Options"), response::toString);
     }
 
     private static void assertContentTypeStartsWith(HttpTestClient.Response response, String mediaType) {

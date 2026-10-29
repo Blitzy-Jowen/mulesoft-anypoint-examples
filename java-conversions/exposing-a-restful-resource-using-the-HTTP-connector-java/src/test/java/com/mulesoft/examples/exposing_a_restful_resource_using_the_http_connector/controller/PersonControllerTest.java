@@ -21,10 +21,15 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpHeaders;
@@ -99,9 +104,7 @@ class PersonControllerTest {
         client = HttpTestClient.localhost(port);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // GET /person (retrieveAllPersonsFlow)
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void getPersonsReturnsEmptyArrayWhenStoreIsEmpty() {
@@ -152,9 +155,7 @@ class PersonControllerTest {
         assertEquals("No listener for endpoint: /people", response.bodyAsString());
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // POST /person (storePersonFlow)
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void postPersonReturnsCreatedWithLocation() {
@@ -238,9 +239,7 @@ class PersonControllerTest {
         assertEquals("Method not allowed for endpoint: /person", response.bodyAsString());
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // GET /person/{personId} (retrievePersonFlow)
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void getPersonReturnsStoredPerson() {
@@ -288,9 +287,115 @@ class PersonControllerTest {
         assertEquals(0, response.body().length, response::toString);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
+    // Paths carrying ; segment parameters (config/RawPathSegmentConfig)
+
+    /**
+     * A listener path whose literal segment carries {@code ;} parameters is not the listener's path: the Mule
+     * listener compared the raw path, query removed, segment by segment, so every method gets the no-listener 404
+     * naming the path with its parameters, and no flow runs. {@code /person/}, which the item listener's alias
+     * {@link PersonController#EMPTY_ID_ITEM_PATH} matches although it has no id segment, and {@code /person//} get
+     * the same 404. With one person stored first, the collection still holds only that person and the next
+     * {@code POST /person} gets id {@code 2}, so the rejected request stored nothing and consumed no id.
+     *
+     * @param method the request method; {@code POST} carries {@code person.json} as {@code application/json}
+     * @param path   a listener path whose literal {@code person} segment carries {@code ;} parameters, or the item
+     *               listener's path with an absent or empty id segment
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("unservedListenerPathRequests")
+    void unservedListenerPathReturnsNoListener404(String method, String path) {
+        postPerson();
+        boolean withBody = "POST".equals(method);
+
+        HttpTestClient.Response response = client.send(method, path, withBody ? JSON_CONTENT_TYPE : null,
+                withBody ? personJsonBytes : null);
+
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
+        // ST-1 reads no body for HEAD.
+        String body = "HEAD".equals(method) ? "" : "No listener for endpoint: " + path;
+        assertEquals(body, response.bodyAsString(), response::toString);
+
+        assertEquals("[" + personJson + "]", client.get("/person").bodyAsString(),
+                "the rejected request must store nothing");
+        HttpTestClient.Response next = client.send("POST", "/person", JSON_CONTENT_TYPE, personJsonBytes);
+        assertEquals(PersonController.LOCATION_PREFIX + "2", next.header(HttpHeaders.LOCATION),
+                "the rejected request must consume no id");
+    }
+
+    private static Stream<Arguments> unservedListenerPathRequests() {
+        return Stream.of("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of("/person;x=1", "/person;jsessionid=ABC", "/person;", "/person;x=1/1", "/person/", "/person//")
+                        .map(path -> Arguments.of(method, path)));
+    }
+
+    /**
+     * The {@code {personId}} segment is bound whole, its {@code ;} parameters included, as the Mule listener bound
+     * the raw segment, also when it is empty before its {@code ;}: {@code Integer.valueOf} rejects the id although
+     * person {@code 1} is stored, and no exception branch matches, so SC-1 answers its 500. The collection still holds
+     * only that person and the next {@code POST /person} gets id {@code 2}.
+     *
+     * @param path     the item listener's path with an id segment carrying {@code ;} parameters
+     * @param personId the raw id segment the flow receives
+     */
+    @ParameterizedTest(name = "GET {0}")
+    @CsvSource({"/person/1;x=1, 1;x=1", "/person/;x=1, ;x=1", "/person/;, ;"})
+    void personIdSegmentWithParametersIsBoundWholeAndReturns500(String path, String personId) {
+        postPerson();
+
+        HttpTestClient.Response response = client.get(path);
+
+        assertEquals("HTTP/1.1 500 Internal Server Error", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
+        assertEquals("{ \"message\": \"For input string: \\\"" + personId + "\\\"\" }", response.bodyAsString());
+        assertEquals("[" + personJson + "]", client.get("/person").bodyAsString(), "the request must store nothing");
+        HttpTestClient.Response next = client.send("POST", "/person", JSON_CONTENT_TYPE, personJsonBytes);
+        assertEquals(PersonController.LOCATION_PREFIX + "2", next.header(HttpHeaders.LOCATION),
+                "the request must consume no id");
+    }
+
+    /**
+     * A {@code {personId}} segment carrying {@code ;} parameters, also one empty before its {@code ;}, still matches
+     * the item listener's path, so a method outside its {@code allowedMethods} gets the listener's 405 naming the
+     * path with its parameters, not the 404; nothing is stored and the next {@code POST /person} gets id {@code 1}.
+     *
+     * @param method a method {@code retrievePersonFlow} does not accept; {@code POST} carries {@code person.json}
+     * @param path   the item listener's path with an id segment carrying {@code ;} parameters
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("itemListenerRejectedRequests")
+    void personIdSegmentWithParametersKeepsTheItemListener405(String method, String path) {
+        boolean withBody = "POST".equals(method);
+
+        HttpTestClient.Response response = client.send(method, path, withBody ? JSON_CONTENT_TYPE : null,
+                withBody ? personJsonBytes : null);
+
+        assertEquals("HTTP/1.1 405 Method Not Allowed", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.TEXT_PLAIN_VALUE);
+        // ST-1 reads no body for HEAD.
+        String body = "HEAD".equals(method) ? "" : "Method not allowed for endpoint: " + path;
+        assertEquals(body, response.bodyAsString(), response::toString);
+        assertEquals("[]", client.get("/person").bodyAsString(), "the rejected request must store nothing");
+        HttpTestClient.Response next = client.send("POST", "/person", JSON_CONTENT_TYPE, personJsonBytes);
+        assertEquals(PersonController.LOCATION_PREFIX + "1", next.header(HttpHeaders.LOCATION),
+                "the rejected request must consume no id");
+    }
+
+    private static Stream<Arguments> itemListenerRejectedRequests() {
+        return Stream.of("POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of("/person/1;x=1", "/person/;x=1").map(path -> Arguments.of(method, path)));
+    }
+
+    @Test
+    void semicolonInQueryStringIsNotASegmentParameter() {
+        HttpTestClient.Response response = client.get("/person?a=1;b");
+
+        assertEquals("HTTP/1.1 200 OK", response.statusLine(), response::toString);
+        assertContentType(response, MediaType.APPLICATION_JSON_VALUE);
+        assertEquals("[]", response.bodyAsString());
+    }
+
     // Helpers
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** Stores {@code person.json} through {@code POST /person}; it gets the next id, {@code 1} in a fresh context. */
     private void postPerson() {

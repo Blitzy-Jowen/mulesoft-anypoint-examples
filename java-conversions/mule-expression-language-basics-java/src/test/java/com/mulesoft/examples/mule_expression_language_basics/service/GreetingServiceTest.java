@@ -77,7 +77,7 @@ class GreetingServiceTest {
                 outDir.toString());
     }
 
-    // ---------------------------------------------------------------------------------------------- greet1
+    // greet1
 
     @ParameterizedTest(name = "{0} -> {1}")
     @MethodSource("greet1Cases")
@@ -97,7 +97,7 @@ class GreetingServiceTest {
                 Arguments.of(Named.of("\"   \"", "   "), "Hello    "));
     }
 
-    // ---------------------------------------------------------------------------------------------- greet2
+    // greet2
 
     @ParameterizedTest(name = "{0} -> {1}")
     @MethodSource("greet2Cases")
@@ -125,7 +125,7 @@ class GreetingServiceTest {
                 Arguments.of(Named.of("\" Mule \"", " Mule "), "Hello  Mule "));
     }
 
-    // ---------------------------------------------------------------------------------- melGreaterThan18
+    // melGreaterThan18
 
     @ParameterizedTest(name = "{0} -> {1}")
     @MethodSource("comparableCases")
@@ -210,7 +210,7 @@ class GreetingServiceTest {
                         "uncomparable values <<2014-11-04>> and <<18>>"));
     }
 
-    // ---------------------------------------------------------------------------------------------- greet3
+    // greet3
 
     @ParameterizedTest(name = "username={0}, age={1} -> {3}")
     @MethodSource("greet3Cases")
@@ -250,7 +250,7 @@ class GreetingServiceTest {
                 Arguments.of("", "uncomparable values <<>> and <<18>>"));
     }
 
-    // ---------------------------------------------------------------------------------------------- greet4
+    // greet4
 
     @ParameterizedTest(name = "username={0}, age={1} -> {3}")
     @MethodSource("greet4Cases")
@@ -275,7 +275,7 @@ class GreetingServiceTest {
                 Arguments.of("Mule", "abc", "Hello Mule", "Mule,abc,true\n"));
     }
 
-    // ---------------------------------------------------------------------------------------------- greet5
+    // greet5
 
     @Test
     @DisplayName("greet5: the original's message.xml -> Hello Mule and the file Mule, 1, false")
@@ -397,7 +397,7 @@ class GreetingServiceTest {
         assertThat(outDir).doesNotExist();
     }
 
-    // ---------------------------------------------------------------------------------------------- greet6
+    // greet6
 
     @Test
     @DisplayName("greet6: the original's message.json -> Hello Mule and the file Mule, 1, false")
@@ -491,7 +491,7 @@ class GreetingServiceTest {
         assertThat(outDir).doesNotExist();
     }
 
-    // ------------------------------------------------------------------------------------ greet3 to greet6
+    // greet3 to greet6
 
     @ParameterizedTest(name = "{0}")
     @MethodSource("fileWritingCalls")
@@ -534,7 +534,7 @@ class GreetingServiceTest {
                         "Mule, 1, false"));
     }
 
-    // --------------------------------------------------------------------------------------------- helpers
+    // helpers
 
     /** One call of a file-writing greeting flow. */
     @FunctionalInterface

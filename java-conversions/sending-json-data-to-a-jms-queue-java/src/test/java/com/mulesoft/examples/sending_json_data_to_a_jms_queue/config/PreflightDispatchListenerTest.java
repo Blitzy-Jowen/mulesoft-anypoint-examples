@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.ImportAutoConfiguration;
 import org.springframework.boot.autoconfigure.context.PropertyPlaceholderAutoConfiguration;
 import org.springframework.boot.autoconfigure.http.HttpMessageConvertersAutoConfiguration;
@@ -126,17 +127,24 @@ class PreflightDispatchListenerTest {
         verifyNoMoreInteractions(salesQueueService);
     }
 
-    @Test
-    void preflightToAnUnservedPathGetsTheNoListener404() {
+    /**
+     * A pre-flight to a path no listener serves, {@code /sales} with {@code ;} segment parameters included
+     * ({@link ListenerPathConfig}), gets exactly the plain {@code OPTIONS} reply: the no-listener 404.
+     *
+     * @param path the unserved request path
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"/unknown", PATH + ";x=1"})
+    void preflightToAnUnservedPathGetsTheNoListener404(String path) {
         HttpTestClient client = HttpTestClient.localhost(port);
-        HttpTestClient.Response plain = client.send("OPTIONS", "/unknown", null, null);
+        HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
 
-        HttpTestClient.Response preflight = client.send("OPTIONS", "/unknown", preflightHeaders("POST", null), null);
+        HttpTestClient.Response preflight = client.send("OPTIONS", path, preflightHeaders("POST", null), null);
 
         assertSameResponse(plain, preflight);
         assertEquals("HTTP/1.1 404 Not Found", preflight.statusLine(), preflight::toString);
         assertEquals("text/plain", preflight.header("Content-Type"), preflight::toString);
-        assertArrayEquals("No listener for endpoint: /unknown".getBytes(StandardCharsets.UTF_8), preflight.body(),
+        assertArrayEquals(("No listener for endpoint: " + path).getBytes(StandardCharsets.UTF_8), preflight.body(),
                 preflight::toString);
         assertNoCorsHeaders(preflight);
         verifyNoInteractions(salesQueueService);
@@ -176,15 +184,17 @@ class PreflightDispatchListenerTest {
     }
 
     /**
-     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig} and the
-     * listener's own beans, with {@link SalesQueueService} supplied by the test as a mock.
+     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig},
+     * {@link ListenerPathConfig} and the listener's own beans, with {@link SalesQueueService} supplied by the test as
+     * a mock.
      *
      * <p>It names the web auto-configurations rather than enabling auto-configuration and scans nothing, so the
      * context holds the listener and no broker; and it is not a {@code @SpringBootConfiguration}, so the project's
      * other {@code @SpringBootTest} classes still find exactly one application class.
      */
     @Configuration(proxyBeanMethods = false)
-    @Import({PreflightDispatchConfig.class, SalesController.class, GlobalExceptionHandler.class})
+    @Import({PreflightDispatchConfig.class, ListenerPathConfig.class, SalesController.class,
+            GlobalExceptionHandler.class})
     @ImportAutoConfiguration({
             PropertyPlaceholderAutoConfiguration.class,
             ServletWebServerFactoryAutoConfiguration.class,

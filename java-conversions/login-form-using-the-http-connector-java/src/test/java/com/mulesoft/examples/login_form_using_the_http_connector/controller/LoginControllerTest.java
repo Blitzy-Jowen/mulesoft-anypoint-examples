@@ -14,6 +14,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
@@ -38,6 +42,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
@@ -47,6 +52,7 @@ import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 
+import com.mulesoft.examples.login_form_using_the_http_connector.client.LoginRequesterClient;
 import com.mulesoft.examples.login_form_using_the_http_connector.service.LoginService;
 import com.mulesoft.examples.login_form_using_the_http_connector.support.HttpTestClient;
 
@@ -61,7 +67,8 @@ import com.mulesoft.examples.login_form_using_the_http_connector.support.HttpTes
  * as the listener writes them. Expected pages are computed from the {@code login/*.html} resources alone, never
  * hand-copied. Profile {@code test} supplies the original demo credentials {@code mule}/{@code mule}; the nested
  * {@link BlankCredentials} context blanks them to cover the fail-closed check, its WARN and the requester's failure
- * path.
+ * path, and the nested {@link SegmentParameters} context spies on the service and the requester to show that a
+ * listener path carrying {@code ;} segment parameters runs neither.
  *
  * <p>The original {@code HttpLoginHtmlFormIT} assertions are ported separately in {@code HttpLoginHtmlFormTest}.
  */
@@ -350,6 +357,68 @@ class LoginControllerTest {
         HttpTestClient.Response response = client().send(method, REQUESTER_LOGIN_PATH, null, body);
 
         assertSuccessPage(response);
+    }
+
+    /**
+     * A path carrying {@code ;} segment parameters is neither listener's path. {@link LoginService} and
+     * {@link LoginRequesterClient} are spies, so a flow run or an outbound request would be recorded; the spies give
+     * this class its own context and random port.
+     */
+    @Nested
+    class SegmentParameters {
+
+        /** The real service, recording any flow a request ran; reset after every test. */
+        @SpyBean
+        LoginService loginService;
+
+        /** The real requester, recording any outbound {@code POST /login}; reset after every test. */
+        @SpyBean
+        LoginRequesterClient requesterClient;
+
+        /** The random port of this context's listener. */
+        @LocalServerPort
+        int segmentParametersPort;
+
+        /**
+         * The Mule listener compared the raw path, query removed, literally, so every method gets the no-listener
+         * 404 naming the path with its parameters, and neither a {@code /login} flow nor the requester runs
+         * ({@code config/ListenerPathConfig}). ST-1 reads a {@code HEAD} response as bodiless, so for {@code HEAD}
+         * the {@code Content-Length} of the 404 text is asserted in place of the body.
+         *
+         * @param method the request method; {@code POST} carries the demo credentials as a form body
+         * @param path   {@code /login} or {@code /requesterLogin} followed by its segment parameters
+         */
+        @ParameterizedTest(name = "{0} {1}")
+        @MethodSource("segmentParameterRequests")
+        void pathWithSegmentParametersReturnsNoListener404(String method, String path) {
+            boolean withBody = "POST".equals(method);
+            HttpTestClient.Response response = HttpTestClient.localhost(segmentParametersPort).send(method, path,
+                    withBody ? Map.of(CONTENT_TYPE, FORM) : null,
+                    withBody ? "username=mule&password=mule".getBytes(UTF_8) : null);
+
+            byte[] noListener = ("No listener for endpoint: " + path).getBytes(UTF_8);
+            assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+            assertEquals(List.of(MediaType.TEXT_PLAIN_VALUE), response.headers(CONTENT_TYPE), response::toString);
+            if ("HEAD".equals(method)) {
+                assertEquals(List.of(String.valueOf(noListener.length)), response.headers("Content-Length"),
+                        response::toString);
+                assertArrayEquals(new byte[0], response.body(), response::toString);
+            } else {
+                assertArrayEquals(noListener, response.body(), response::toString);
+            }
+            verifyNoInteractions(loginService);
+            verify(requesterClient, never()).postLogin(anyMap());
+        }
+
+        /**
+         * @return each method with each listener path followed by {@code ;x=1}, {@code ;jsessionid=ABC} or {@code ;}
+         */
+        static Stream<Arguments> segmentParameterRequests() {
+            return Stream.of("GET", "POST", "PUT", "HEAD", "OPTIONS").flatMap(method ->
+                    Stream.of(LOGIN_PATH, REQUESTER_LOGIN_PATH).flatMap(path ->
+                            Stream.of(path + ";x=1", path + ";jsessionid=ABC", path + ";")
+                                    .map(aliased -> Arguments.of(method, aliased))));
+        }
     }
 
     /**

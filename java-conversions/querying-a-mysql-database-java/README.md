@@ -10,7 +10,7 @@ The single flow `database-to-jsonFlow` of `querying-a-mysql-database/src/main/ap
 
 | Path | Methods | Host | Port | Query parameter | Response | Source |
 |---|---|---|---|---|---|---|
-| `/` exactly | any, `HEAD`, `OPTIONS` and `TRACE` included: the listener declares no `allowedMethods` | `0.0.0.0` | `http.port`, default `8081` | `lastname`, read from the URL query string only | `200 OK`, `Content-Type: application/json`, a compact JSON array with one object per selected row, keyed by the column label `first_name`, rows in database order; a `HEAD` reply carries the headers without the body | `database-to-json.xml:4-12` |
+| `/` exactly | any, `HEAD`, `OPTIONS` and `TRACE` included: the listener declares no `allowedMethods` | `0.0.0.0` | `http.port`, default `8081` | `lastname`, read from the URL query string only | `200 OK`, `Content-Type: application/json`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, a compact JSON array with one object per selected row, keyed by the column label `first_name`, rows in database order; a `HEAD` reply carries the headers without the body | `database-to-json.xml:4-12` |
 | any other path (`/unknown`, `//` and `/error` included) | any | `0.0.0.0` | `http.port` | — | `404 Not Found`, `Content-Type: text/plain`, body `No listener for endpoint: <path>` (SC-1, AAP 0.4.7) | listener platform default |
 | `/`, when the query or any other processing fails | any | `0.0.0.0` | `http.port` | — | `500 Internal Server Error`, `Content-Type: application/json`, body `{ "message": "<exception message>" }`, where a database failure reports the JDBC driver's own message; logged at ERROR on one line (SC-1, AAP 0.4.7) | platform default for an unhandled exception; the flow has no exception strategy |
 
@@ -20,6 +20,8 @@ Example, the original README's own request (`querying-a-mysql-database/README.md
 $ curl -i 'http://localhost:8081/?lastname=Puckett'
 HTTP/1.1 200 OK
 Connection: keep-alive
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
 Content-Type: application/json
 Content-Length: 49
 Date: <current date>
@@ -28,6 +30,7 @@ Date: <current date>
 ```
 
 - How `lastname` reaches the query (`controller/EmployeeQueryController`): the raw query string is split on `&`, and each pair splits at its first `=` and is URL-decoded as UTF-8 (`+` is a space). The name matches case-sensitively. When `lastname` occurs more than once, the last occurrence is used, as Mule's `http.query.params` (`ParameterMap`) returned it; this is a Tier 2A verification point. A form-encoded request body is never read, because the original query read `http.query.params` only.
+- Every `200` reply, `[]` included and whatever the method, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, because it lists employee names: clients and caches keep no copy, and browsers do not sniff another content type. The `404`, `500` and malformed-escape `400` replies carry neither, and neither header changes a reply's status, `Content-Type` or body bytes.
 - No match → `200` with `[]`.
 - `lastname` absent (or given without `=`) → the original rendered the missing value as the text `null` inside the query literal, so `service/EmployeeQueryService` binds the string `null` (`MISSING_VALUE`), which matches no row of the shipped data: `200` with `[]`. `lastname=` binds the empty string.
 - Values are compared with `last_name` unchanged (no trimming or case change); case and accent sensitivity follow the column's collation on the configured server.
@@ -35,7 +38,7 @@ Date: <current date>
 - A CORS pre-flight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) runs the flow and is answered like any other `OPTIONS` request, with no `Access-Control-*` or `Vary` header. The original listener applied no CORS policy (`config/PreflightDispatchConfig`).
 - A query string with a malformed percent escape (for example `?lastname=%zz` or `?lastname=abc%`) is rejected by Undertow before the controller runs: `400 Bad Request`, empty body, `Connection: close`.
 - While `jdbc.url` is blank the application still starts, logging one WARN that names `jdbc.url` and `JDBC_URL`; every request to `/` then fails with `500` `{ "message": "MySQL JDBC URL (jdbc.url, environment variable JDBC_URL) is not configured" }` (`config/DataSourceConfig`, `config/UnconfiguredDataSource`).
-- Tier 2A verification points (AAP 0.4.7): the last-occurrence rule above and the bytes of the `404`, `500` and malformed-escape `400` replies. When a captured fixture shows different bytes, the fixture governs and the code is changed to match.
+- Tier 2A verification points (AAP 0.4.7): the last-occurrence rule above and the bytes of the `404`, `500` and malformed-escape `400` replies. When a captured fixture shows different bytes, the fixture governs and the code is changed to match. The `Cache-Control` and `X-Content-Type-Options` headers of the `200` reply are a comparison point too: the original declared neither, and `FixtureParityTest` compares only `Content-Type` and `Location` among the response headers, so where a capture shows a header contract that they break, the captured contract is kept and the conflict is recorded in root `DECISIONS.md` (section 8, Response header hardening).
 - The project has no non-HTTP trigger: no file poller, scheduler, queue listener or mail poller.
 
 ## Configuration keys
@@ -105,6 +108,7 @@ The unit tier executes the same script on H2. Lines 1-9 are MySQL-only administr
 
 - Externalized: the JDBC URL, and the credentials it carries, which the original README told users to write into `database-to-json.xml`, is the `jdbc.url` TODO key (`JDBC_URL`). Nothing else is configurable beyond `http.port`.
 - Changed, the only intentional difference for hostile input (AAP 0.4.10, root `DECISIONS.md` section 8): the original concatenated the query parameter into the SQL text; `client/EmployeeRepository` binds it as a JDBC parameter. Every legitimate value returns the same rows. A value containing a double quote or an SQL fragment, which made the original fail with an SQL error (500) or changed its query (for example `Puckett" or "1"="1` returned all 102 employees), now matches literally, usually `[]`.
+- Changed, response hardening (root `DECISIONS.md` section 8, Response header hardening): the `200` reply adds `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, which the original did not declare. Status, reason phrase, `Content-Type`, `Content-Length` and body bytes are unchanged, and the error replies carry neither header.
 - Changed, database outage: connections are pooled, so the original's per-request connect is not reproduced. While the database is unreachable, each request to `/` gets SC-1's `500` `{ "message": "<JDBC driver or pool message>" }` after at most about 1 s (`spring.datasource.hikari.connection-timeout`), where the original's refused connection failed it at once. After the database returns, requests can still get that `500` for up to about 5 s, until HikariCP's back-off retry of the failed connect (doubling from 10 ms to at most 5 s) reconnects the pool, where the original's next connect succeeded at once; later requests succeed.
 - Replaced in tests: the live MySQL server, `MySQLDbCreator` and the never-committed `mule.test.properties` → H2 in MySQL mode seeded from `import.sql`; Mule `FunctionalTestCase` + `MuleClient` → `@SpringBootTest` + ST-1 `support/HttpTestClient`; the original 3 s start-up sleep is dropped, because the Spring test context is ready when the test runs.
 - Nothing is stubbed at runtime. Studio metadata (`mule-project.xml`, `catalog/`) and `log4j2.xml` are not carried (AAP 0.2.2).
@@ -130,7 +134,7 @@ JDBC_URL='jdbc:mysql://localhost:3306/company?user=<user>&password=<password>' m
 | Test class | What it asserts |
 |---|---|
 | `QueryingMysqlDatabaseTest` | the ported `QueryingMysqlDatabaseIT` (`querying-a-mysql-database/src/test/java/org/mule/examples/QueryingMysqlDatabaseIT.java:62-72`): `GET /?lastname=Puckett` with an empty body returns a non-null `200` response with a non-empty body exactly equal to `[{"first_name":"Chava"},{"first_name":"Quentin"}]`, over H2 seeded from `import.sql` |
-| `controller/EmployeeQueryControllerTest` | on the wire through ST-1, over H2 with a spy repository: `GET /?lastname=Puckett` → `HTTP/1.1 200 OK`, `application/json`, the original reply; the same reply for `POST`, `PUT`, `DELETE` and `OPTIONS`; `lastname=Nobody` → `[]`; no `lastname` → `[]` with the string `null` bound; `lastname=Sosa&lastname=Puckett` → the Puckett rows, `Sosa` never queried; a form body `lastname=Puckett` is not read; `Puckett" or "1"="1` bound as data → `[]`; `/unknown` → 404 `text/plain` `No listener for endpoint: /unknown`; a failing repository → 500 `application/json` `{ "message": … }` |
+| `controller/EmployeeQueryControllerTest` | on the wire through ST-1, over H2 with a spy repository: `GET /?lastname=Puckett` → `HTTP/1.1 200 OK`, `application/json`, the original reply; the same reply for `POST`, `PUT`, `DELETE` and `OPTIONS`; `lastname=Nobody` → `[]`; no `lastname` → `[]` with the string `null` bound; `lastname=Sosa&lastname=Puckett` → the Puckett rows, `Sosa` never queried; a form body `lastname=Puckett` is not read; `Puckett" or "1"="1` bound as data → `[]`; every one of these `200` replies with exactly one `Cache-Control: no-store` and one `X-Content-Type-Options: nosniff`; `/unknown` → 404 `text/plain` `No listener for endpoint: /unknown`; a failing repository → 500 `application/json` `{ "message": … }`; neither error reply with either header |
 | `service/EmployeeQueryServiceTest` | with a mocked repository: the original reply bytes for `Puckett`; `[]` for no rows; `null` rendered as `MISSING_VALUE` `null`; empty and quote-bearing values passed through unchanged; a `DataAccessException` propagates unchanged; a serialization failure becomes `UncheckedIOException` |
 | `client/EmployeeRepositoryTest` | `@JdbcTest` over H2 in MySQL mode: `import.sql` seeds 102 employees and 100 roles; `Puckett` → `Chava`, `Quentin` in table order, each row keyed `first_name` only; `Nobody` and `null` → no rows; `Puckett" or "1"="1` → no rows; `puckett` matches case-insensitively; the bind-parameter SQL text |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path, carries no exception message except a JDBC driver's escaped, bounded diagnostic, and no stack trace; an `Error` reported with its own message; a database failure answered with the driver's message rather than the SQL statement |
@@ -176,7 +180,7 @@ Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
 - `mvn -B clean package`: `BUILD SUCCESS`; 147 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
 - `mvn -B test`: `BUILD SUCCESS`; 147 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 9 of 9 lines of `service/EmployeeQueryService` (the project has no `mapper` package). Total project LINE coverage: 96.4% (214 of 222 lines).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 9 of 9 lines of `service/EmployeeQueryService` (the project has no `mapper` package). Total project LINE coverage: 96.4% (216 of 224 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 
 Tier 2A is blocked: the Mule EE licence and the EE Maven repository credentials are unconfirmed (root `DECISIONS.md`, section 9). Tier 2B is `N/A`, because the project calls no vendor system.

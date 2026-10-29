@@ -41,7 +41,9 @@ import com.mulesoft.examples.sending_json_data_to_a_jms_queue.service.SalesQueue
  *   <li>line 6, {@code http:listener path="sales" allowedMethods="POST"}: this class, mapped to {@code POST /sales}
  *       with no {@code consumes}, {@code produces}, parameter or header condition, because the Mule listener
  *       accepted any {@code Content-Type} and ignored {@code Accept}; the listener matched the method ignoring
- *       case, which {@code config.ListenerMethodFilter} reproduces ahead of this mapping;</li>
+ *       case, which {@code config.ListenerMethodFilter} reproduces ahead of this mapping, and the raw path, query
+ *       removed, literally, which {@code config.ListenerPathConfig} reproduces before any handler of this class
+ *       runs;</li>
  *   <li>line 8, {@code byte-array-to-string-transformer}: the listener's payload. For an
  *       {@code application/x-www-form-urlencoded} entity, which curl's {@code -d} sends, that is the parameter map
  *       the listener decoded, rendered as text by {@link SalesQueueService#sendForm(byte[], String)}; for any other
@@ -74,8 +76,12 @@ import com.mulesoft.examples.sending_json_data_to_a_jms_queue.service.SalesQueue
  *   <li>{@code TRACE} and {@code OPTIONS} are answered with the listener's 405 like every other method but
  *       {@code POST}; see {@link #rejectUnsupportedMethod(HttpServletRequest)}.</li>
  * </ul>
- * Other methods, unserved paths ({@code /sales/} included) and a failed send reach the generic handler of the
- * exception package, which answers 405, 404 and 500 as the Mule listener and runtime did.
+ * Every method but {@code POST} on {@code /sales} is rejected by a mapping of this class, so that Spring MVC selects a
+ * handler for it and {@code config.ListenerPathConfig} checks the raw path before that handler runs; see
+ * {@link #rejectOtherMethod(HttpServletRequest)}. Those rejections, unserved paths ({@code /sales/} included, and
+ * {@code /sales} with {@code ;} segment parameters, such as {@code /sales;x=1}, whatever the method) and a failed send
+ * reach the generic handler of the exception package, which answers 405, 404 and 500 as the Mule listener and runtime
+ * did. A path with segment parameters is refused before any handler of this class runs, so nothing is sent for it.
  */
 @RestController
 public class SalesController {
@@ -188,15 +194,40 @@ public class SalesController {
      * of the exception package writes as {@code Method not allowed for endpoint: /sales}.
      *
      * <p>The listener allowed {@code POST} only. Without this mapping Spring MVC would answer {@code OPTIONS} itself
-     * with 200 and an {@code Allow} header. {@code TRACE} reaches the dispatcher, and so this method, only because
-     * {@code application.yml} sets {@code spring.mvc.dispatch-trace-request: true}; otherwise the servlet's own
-     * {@code TRACE} echo would answer it.
+     * with 200 and an {@code Allow} header: {@link #rejectOtherMethod(HttpServletRequest)}, which names no method,
+     * never matches {@code OPTIONS}, so this mapping is the one that selects a handler for it, and with it the
+     * raw-path check of {@code config.ListenerPathConfig}. For {@code TRACE}, which both mappings match, this one
+     * names the method and so outranks the other. {@code TRACE} reaches the dispatcher, and so this method, only
+     * because {@code application.yml} sets {@code spring.mvc.dispatch-trace-request: true}; otherwise the servlet's
+     * own {@code TRACE} echo would answer it.
      *
      * @param request the rejected request, whose method is reported
      * @throws HttpRequestMethodNotSupportedException always
      */
     @RequestMapping(path = PATH, method = {RequestMethod.OPTIONS, RequestMethod.TRACE})
     public void rejectUnsupportedMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
+        throw new HttpRequestMethodNotSupportedException(request.getMethod(), Set.of(ALLOWED_METHOD));
+    }
+
+    /**
+     * Rejects every other method on {@code /sales} with the listener's 405, which the generic handler of the
+     * exception package writes as {@code Method not allowed for endpoint: /sales}: {@code GET}, {@code HEAD},
+     * {@code PUT}, {@code DELETE}, {@code PATCH} and any other token, a spelling of {@code POST} in another letter
+     * case aside, which {@code config.ListenerMethodFilter} hands on as {@code POST}.
+     *
+     * <p>The mapping names no method, so it matches every method but {@code OPTIONS}, and the {@code POST} mapping,
+     * which names its method, outranks it for {@code POST}, as {@link #rejectUnsupportedMethod(HttpServletRequest)}
+     * does for {@code TRACE}. It exists so that Spring MVC selects a handler for those methods instead of rejecting
+     * them itself while it looks one up, which it would do before any interceptor runs. The raw-path check of
+     * {@code config.ListenerPathConfig} therefore runs for them too: the Mule listener matched the path before the
+     * method, so {@code /sales;x=1} gets the no-listener 404 whatever its method, and only {@code /sales} itself gets
+     * this 405.
+     *
+     * @param request the rejected request, whose method is reported
+     * @throws HttpRequestMethodNotSupportedException always
+     */
+    @RequestMapping(path = PATH)
+    public void rejectOtherMethod(HttpServletRequest request) throws HttpRequestMethodNotSupportedException {
         throw new HttpRequestMethodNotSupportedException(request.getMethod(), Set.of(ALLOWED_METHOD));
     }
 

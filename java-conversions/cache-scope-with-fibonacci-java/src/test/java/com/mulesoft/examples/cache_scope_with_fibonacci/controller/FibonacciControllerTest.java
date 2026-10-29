@@ -50,8 +50,8 @@ import com.mulesoft.examples.cache_scope_with_fibonacci.support.HttpTestClient.R
  * are asserted exactly as the listener writes them. The happy paths cover the calculation, every method (the listener
  * declares no {@code allowedMethods}) and the cache states the raw-string key and the two {@code nocache} controls
  * select; the error cases are the flow's {@code otherwise} branch, its favicon filter on each kind of listener payload,
- * the listener's 400 for a form body it cannot decode and the SC-1 platform defaults: the no-listener 404 and the
- * JSON 500.
+ * the listener's 400 for a form body it cannot decode and the SC-1 platform defaults: the no-listener 404,
+ * {@code /fibonacci} with {@code ;} segment parameters included, and the JSON 500.
  *
  * <p>Every case starts on an empty cache and issues any request whose cached results it depends on itself, so the
  * expected costs follow the cost model of {@code FibonacciCacheService}: {@code n < 2} costs 1, a cache hit costs 0,
@@ -328,6 +328,40 @@ class FibonacciControllerTest {
         assertEquals(List.of(MediaType.TEXT_PLAIN_VALUE), response.headers("Content-Type"), response::toString);
         assertEquals(List.of(), response.headers("cost"), response::toString);
         assertArrayEquals(bytes("No listener for endpoint: " + path), response.body(), response::toString);
+    }
+
+    /**
+     * A path carrying {@code ;} segment parameters is not the listener's path: the Mule listener compared the raw
+     * path, query removed, literally, so every method gets the no-listener 404 naming the path with its parameters
+     * and without the query, and the flow never runs, so nothing is calculated or cached
+     * ({@code config/ListenerPathConfig}). {@code HEAD} gets the same status line and headers without the body.
+     *
+     * @param method the request method; {@code POST} carries a {@code text/plain} body
+     * @param path   {@code /fibonacci} followed by its segment parameters, sent with the query {@code ?n=10}
+     */
+    @ParameterizedTest(name = "{0} {1}?n=10")
+    @MethodSource("pathParameterRequests")
+    void pathWithSegmentParametersReturnsNoListener404(String method, String path) {
+        boolean withBody = "POST".equals(method);
+        Response response = send(method, path + "?n=10",
+                withBody ? Map.of("Content-Type", MediaType.TEXT_PLAIN_VALUE) : Map.of(),
+                withBody ? bytes("ping") : new byte[0]);
+
+        byte[] expected = bytes("No listener for endpoint: " + path);
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+        assertEquals(List.of(MediaType.TEXT_PLAIN_VALUE), response.headers("Content-Type"), response::toString);
+        assertEquals(List.of(), response.headers("cost"), response::toString);
+        assertEquals(List.of(Integer.toString(expected.length)), response.headers("Content-Length"),
+                response::toString);
+        assertArrayEquals("HEAD".equals(method) ? new byte[0] : expected, response.body(), response::toString);
+        assertNull(cache.get("10"), "the rejected request must not reach the cache scope");
+    }
+
+    /** @return every method the case is sent with, each paired with every form of segment parameters */
+    private static Stream<Arguments> pathParameterRequests() {
+        return Stream.of("GET", "POST", "HEAD", "OPTIONS").flatMap(method ->
+                Stream.of("/fibonacci;x=1", "/fibonacci;jsessionid=ABC", "/fibonacci;")
+                        .map(path -> Arguments.of(method, path)));
     }
 
     /** The flow has no exception strategy, so a non-numeric {@code n} reaches the SC-1 JSON 500. */

@@ -43,6 +43,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockReset;
@@ -173,6 +174,55 @@ class SalesControllerTest {
                 response::toString);
         verifyNoInteractions(salesQueueService);
         assertNothingQueued();
+    }
+
+    /**
+     * The other methods outside {@code allowedMethods="POST"}, an unknown token included, keep the listener's 405 on
+     * {@code /sales}, as {@code GET} and {@code OPTIONS} above do, with nothing sent; a {@code HEAD} reply carries
+     * the headers without the body.
+     *
+     * @param method the request method; {@code PUT} carries a JSON body
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"PUT", "DELETE", "PATCH", "HEAD", "postx"})
+    void otherMethodOnSalesIsMethodNotAllowed(String method) {
+        HttpTestClient.Response response = send(method, PATH);
+
+        assertStatusLine(response, 405, "Method Not Allowed");
+        assertMediaType(singleContentType(response), MediaType.TEXT_PLAIN);
+        assertArrayEquals(bodyUnlessHead(method, "Method not allowed for endpoint: " + PATH), response.body(),
+                response::toString);
+        verifyNoInteractions(salesQueueService);
+        assertNothingQueued();
+    }
+
+    /**
+     * A path carrying {@code ;} segment parameters is not the listener's path: the Mule listener compared the raw
+     * path, query removed, literally before it checked the method, so every method, {@code post} in any letter case
+     * and unknown tokens included, gets the no-listener 404 naming the path with its parameters, and nothing reaches
+     * the transformer, the queue or the logger ({@code config/ListenerPathConfig}). A {@code HEAD} reply carries the
+     * headers without the body.
+     *
+     * @param method the request method; {@code POST} in any letter case carries a JSON body
+     * @param path   {@code /sales} followed by its segment parameters
+     */
+    @ParameterizedTest(name = "{0} {1}")
+    @MethodSource("pathParameterRequests")
+    void pathWithSegmentParametersHasNoListener(String method, String path) {
+        HttpTestClient.Response response = send(method, path);
+
+        assertEquals("HTTP/1.1 404 Not Found", response.statusLine(), response::toString);
+        assertMediaType(singleContentType(response), MediaType.TEXT_PLAIN);
+        assertArrayEquals(bodyUnlessHead(method, "No listener for endpoint: " + path), response.body(),
+                response::toString);
+        verifyNoInteractions(salesQueueService);
+        assertNothingQueued();
+    }
+
+    static Stream<Arguments> pathParameterRequests() {
+        return Stream.of("POST", "post", "GET", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "postx")
+                .flatMap(method -> Stream.of(PATH + ";x=1", PATH + ";jsessionid=ABC", PATH + ";")
+                        .map(path -> Arguments.of(method, path)));
     }
 
     @Test
@@ -354,6 +404,23 @@ class SalesControllerTest {
     private HttpTestClient.Response post(String path, String contentType, byte[] body) {
         Map<String, String> headers = contentType == null ? Map.of() : Map.of("Content-Type", contentType);
         return client().send("POST", path, headers, body);
+    }
+
+    /**
+     * {@code method} on {@code path}: {@code POST} in any letter case and {@code PUT} with the JSON body
+     * <code>{"sale": 1}</code> as {@code application/json}, every other method without a body or caller header.
+     */
+    private HttpTestClient.Response send(String method, String path) {
+        if (method.equalsIgnoreCase("POST") || method.equals("PUT")) {
+            return client().send(method, path, Map.of("Content-Type", "application/json"),
+                    "{\"sale\": 1}".getBytes(StandardCharsets.UTF_8));
+        }
+        return client().send(method, path, null, null);
+    }
+
+    /** The UTF-8 bytes of {@code text}, or none for {@code HEAD}, whose reply carries no body. */
+    private static byte[] bodyUnlessHead(String method, String text) {
+        return method.equals("HEAD") ? new byte[0] : text.getBytes(StandardCharsets.UTF_8);
     }
 
     /**

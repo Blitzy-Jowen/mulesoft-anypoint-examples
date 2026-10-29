@@ -57,11 +57,11 @@ import com.mulesoft.examples.scatter_gather_flow_control.support.HttpTestClient;
  * listener declares no {@code allowedMethods} and applies no CORS policy
  * (scatter-gather-flow-control/src/main/app/scatter-gather.xml:7).
  *
- * <p>The cases run the real controller and SC-1 handler on Undertow ({@link WireConfig}, random port) and send
- * requests through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are asserted as the
- * listener writes them. {@link ScatterGatherService}, which runs both routes and mails the report, is a mock
- * returning the flow's response payload (scatter-gather.xml:63); each request's single call to it shows that the
- * flow ran.
+ * <p>The cases run the real controller, {@link ListenerPathConfig} and SC-1 handler on Undertow ({@link WireConfig},
+ * random port) and send requests through ST-1 {@link HttpTestClient}, so the status line, headers and body bytes are
+ * asserted as the listener writes them. {@link ScatterGatherService}, which runs both routes and mails the report,
+ * is a mock returning the flow's response payload (scatter-gather.xml:63); each request's single call to it shows
+ * that the flow ran.
  */
 @SpringBootTest(classes = PreflightDispatchListenerTest.WireConfig.class,
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
@@ -119,12 +119,14 @@ class PreflightDispatchListenerTest {
 
     /**
      * The listener serves {@code /scatterGather} exactly, so a pre-flight to any other path, a sub-path included,
-     * gets the no-listener 404 a plain {@code OPTIONS} request to it gets, without running the flow.
+     * gets the no-listener 404 a plain {@code OPTIONS} request to it gets, without running the flow; so does the
+     * listener's path with {@code ;} segment parameters, which {@link ListenerPathConfig} refuses after the
+     * pre-flight has selected the {@code OPTIONS} handler.
      *
      * @param path the unserved request path
      */
     @ParameterizedTest(name = "OPTIONS {0}")
-    @ValueSource(strings = {"/unknown", "/scatterGather/extra"})
+    @ValueSource(strings = {"/unknown", "/scatterGather/extra", PATH + ";x=1"})
     void preflightToAnUnservedPathGetsTheNoListener404(String path) {
         HttpTestClient client = HttpTestClient.localhost(port);
         HttpTestClient.Response plain = client.send("OPTIONS", path, null, null);
@@ -194,9 +196,9 @@ class PreflightDispatchListenerTest {
     }
 
     /**
-     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig} and the
-     * listener's own beans, with the test's mock {@link ScatterGatherService} in place of the service that runs the
-     * routes and mails the report.
+     * The test's whole context: Spring Boot's servlet web stack on Undertow, {@link PreflightDispatchConfig},
+     * {@link ListenerPathConfig} and the listener's own beans, with the test's mock {@link ScatterGatherService} in
+     * place of the service that runs the routes and mails the report.
      *
      * <p>It names the web auto-configurations rather than enabling auto-configuration and scans nothing, so the
      * context holds the listener and nothing else, no mail sender included; and it is not a
@@ -204,7 +206,8 @@ class PreflightDispatchListenerTest {
      * application class.
      */
     @Configuration(proxyBeanMethods = false)
-    @Import({PreflightDispatchConfig.class, ScatterGatherController.class, GlobalExceptionHandler.class})
+    @Import({PreflightDispatchConfig.class, ListenerPathConfig.class, ScatterGatherController.class,
+            GlobalExceptionHandler.class})
     @ImportAutoConfiguration({
             PropertyPlaceholderAutoConfiguration.class,
             ServletWebServerFactoryAutoConfiguration.class,

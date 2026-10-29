@@ -80,16 +80,22 @@ public class EmployeeReportController {
      * {@value ReportMailSender#ATTACHMENT_NAME} and typed {@value ReportMailSender#ATTACHMENT_CONTENT_TYPE}. This
      * shape is a platform default rather than flow output, so a captured fixture of the original overrides it.
      *
+     * <p>That reply holds the employees' records, so it also carries {@code Cache-Control: no-store}, keeping
+     * clients and caches from retaining it, and {@code X-Content-Type-Options: nosniff}, keeping browsers from
+     * treating it as a type other than the one it declares. Neither changes its status, {@code Content-Type} or
+     * bytes. The empty reply holds no record and carries neither, nor do the error replies of the global exception
+     * handler.
+     *
      * <p>The flow runs and the entity is serialized before the response is touched, so every failure still finds an
      * uncommitted response for the global exception handler's 500. Either reply is then written complete (see the
      * class comment), with its {@code Content-Length}; the entity's {@code Content-Type} is preset, so the request's
      * {@code Accept} never turns the reply into a 406.
      *
      * @param body     the raw request body, {@code null} when the request has none; passed to the flow unchanged
-     * @param response the response written with 200 {@code multipart/form-data;boundary=...} and the mailed CSV as
-     *                 the {@code employees.csv} part, or with an empty 200 without {@code Content-Type} when the XML
-     *                 holds no {@code employee} element, where Mule's splitter ended the flow without querying or
-     *                 mailing
+     * @param response the response written with 200 {@code multipart/form-data;boundary=...}, the two headers above
+     *                 and the mailed CSV as the {@code employees.csv} part, or with an empty 200 without
+     *                 {@code Content-Type} or either header when the XML holds no {@code employee} element, where
+     *                 Mule's splitter ended the flow without querying or mailing
      * @throws Exception any failure of the flow, unchanged, for the global exception handler's 500
      */
     @RequestMapping
@@ -108,6 +114,8 @@ public class EmployeeReportController {
         byte[] bytes = entity.toByteArray();
         response.setStatus(HttpServletResponse.SC_OK);
         response.setContentType(contentType);
+        response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+        response.setHeader("X-Content-Type-Options", "nosniff");
         response.setContentLength(bytes.length);
         ServletOutputStream stream = response.getOutputStream();
         stream.write(bytes);
