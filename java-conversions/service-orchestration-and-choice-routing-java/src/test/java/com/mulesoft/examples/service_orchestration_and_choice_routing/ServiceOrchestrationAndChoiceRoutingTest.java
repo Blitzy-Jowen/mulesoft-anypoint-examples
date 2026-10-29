@@ -19,8 +19,10 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -29,10 +31,14 @@ import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
@@ -62,6 +68,11 @@ import com.mulesoft.examples.service_orchestration_and_choice_routing.support.Po
  * whether it declares its length or is sent chunked. Only a real server shows what follows a chunked body refused
  * part-way: Undertow drains the rest, so the client receives the whole 413 and its kept-alive connection then carries
  * the copied client's handshake, which is answered.
+ *
+ * <p>It also checks that no listener reads a form body sent with a method it refuses: a {@code PUT}, {@code PATCH} or
+ * {@code DELETE} declaring a 1 GiB form body, of which only 64 KiB is sent, gets the listener's 405 on each of the five
+ * listeners while the rest of the body is still unsent, as the original listeners checked the method before reading
+ * the body.
  */
 @SpringBootTest(classes = ServiceOrchestrationAndChoiceRoutingApplication.class,
         webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
@@ -89,6 +100,12 @@ class ServiceOrchestrationAndChoiceRoutingTest {
     /** Size of each chunk of a chunked request body. */
     private static final int CHUNK_BYTES = 8192;
 
+    /** The length an unsent form body declares, 1 GiB: far more than is ever written. */
+    private static final long UNSENT_BODY_LENGTH = 1L << 30;
+
+    /** The part of an unsent form body written before the response is read, 64 KiB. */
+    private static final int SENT_BODY_PREFIX_BYTES = 64 * 1024;
+
     private static String MESSAGE;
 
     private static String REPLY;
@@ -104,6 +121,14 @@ class ServiceOrchestrationAndChoiceRoutingTest {
     /** The Ajax listener serving the docroot and {@code /ajax/cometd} (originally port 8090). */
     @Value("${ajax.port}")
     private int ajaxPort;
+
+    /** The Samsung SOAP listener serving {@code /samsung/orders} (originally port 9090). */
+    @Value("${ports.samsung}")
+    private int samsungPort;
+
+    /** The price listener serving {@code /api/**} (originally port 9999). */
+    @Value("${ports.prices}")
+    private int pricesPort;
 
     @BeforeAll
     static void loadMessages() throws IOException {
@@ -245,6 +270,70 @@ class ServiceOrchestrationAndChoiceRoutingTest {
         assertTrue(response.bodyAsString().contains("\"clientId\":\""), response::toString);
     }
 
+    /** Every listener with each of {@code PUT}, {@code PATCH} and {@code DELETE}, none of which a listener accepts. */
+    static Stream<Arguments> formMethodsOutsideAllowedMethods() {
+        return Stream.of("PUT", "PATCH", "DELETE")
+                .flatMap(method -> Stream.of(Listener.values()).map(listener -> Arguments.of(method, listener)));
+    }
+
+    /**
+     * A form body sent with a method the listener refuses gets the listener's 405 before any of it is read: the
+     * request declares {@link #UNSENT_BODY_LENGTH} bytes and sends only {@link #SENT_BODY_PREFIX_BYTES}, so a server
+     * that buffers such a body before dispatch, as Spring Boot's form content filter does for these methods, sends
+     * nothing and the read times out. The SOAP paths reach the listener boundary through SC-10's named-servlet
+     * forward, every other path reaches the MVC mappings.
+     */
+    @ParameterizedTest(name = "{0} {1} with an unsent form body")
+    @MethodSource("formMethodsOutsideAllowedMethods")
+    void formBodyOutsideAllowedMethodsGets405Unread(String method, Listener listener) throws IOException {
+        RawResponse response = sendWithUnsentFormBody(port(listener), method, listener.path);
+
+        assertEquals(405, response.status(), response::toString);
+        assertEquals("text/plain", response.header("Content-Type"), response::toString);
+        assertEquals("Method not allowed for endpoint: " + listener.path, response.body(), response::toString);
+    }
+
+    /** The loaded context's port of {@code listener}. */
+    private int port(Listener listener) {
+        return switch (listener) {
+            case MAIN -> mainPort;
+            case AJAX -> ajaxPort;
+            case POPULATE -> populatePort;
+            case SAMSUNG -> samsungPort;
+            case PRICES -> pricesPort;
+        };
+    }
+
+    /**
+     * Sends {@code method path} declaring a form body of {@link #UNSENT_BODY_LENGTH} bytes, writes only the first
+     * {@link #SENT_BODY_PREFIX_BYTES} of it and reads the response that arrives while the rest is unsent. The
+     * connection is kept alive, so the server may drain the body after it answers. The socket's send buffer is sized
+     * to hold the whole prefix, so writing it never waits for the server to read.
+     *
+     * @throws AssertionError when no response arrives within {@link HttpTestClient#TIMEOUT_MILLIS}: the server is
+     *                        waiting for the body
+     */
+    private static RawResponse sendWithUnsentFormBody(int port, String method, String path) throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.setSendBufferSize(2 * SENT_BODY_PREFIX_BYTES);
+            socket.connect(new InetSocketAddress("localhost", port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " " + path + " HTTP/1.1\r\nHost: localhost:" + port + "\r\nContent-Type: " + FORM
+                    + "\r\nContent-Length: " + UNSENT_BODY_LENGTH + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            out.write(("message=" + "x".repeat(SENT_BODY_PREFIX_BYTES - "message=".length()))
+                    .getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+            try {
+                return readResponse(new BufferedInputStream(socket.getInputStream()));
+            } catch (SocketTimeoutException timeout) {
+                throw new AssertionError(method + " " + path + " got no response within "
+                        + HttpTestClient.TIMEOUT_MILLIS + " ms while " + (UNSENT_BODY_LENGTH - SENT_BODY_PREFIX_BYTES)
+                        + " bytes of its declared form body were unsent: the server waits for the body", timeout);
+            }
+        }
+    }
+
     /** A form body of {@link #OVERSIZED_BODY_BYTES} bytes, which the endpoint must never parse. */
     private static String oversizedForm() {
         return "message=" + "x".repeat(OVERSIZED_BODY_BYTES - "message=".length());
@@ -331,6 +420,29 @@ class ServiceOrchestrationAndChoiceRoutingTest {
 
         String header(String name) {
             return headers.get(name);
+        }
+    }
+
+    /**
+     * The five listeners, each with a path it serves; none accepts {@code PUT}, {@code PATCH} or {@code DELETE}.
+     * The name is the path, which identifies the listener in test names.
+     */
+    private enum Listener {
+        MAIN("/orders"),
+        AJAX(COMETD),
+        POPULATE("/populate"),
+        SAMSUNG("/samsung/orders"),
+        PRICES("/api/prices/AX02");
+
+        final String path;
+
+        Listener(String path) {
+            this.path = path;
+        }
+
+        @Override
+        public String toString() {
+            return path;
         }
     }
 

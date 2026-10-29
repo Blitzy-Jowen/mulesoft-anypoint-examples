@@ -8,6 +8,7 @@
 
 package com.mulesoft.examples.legacy_modernization.controller;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
@@ -18,8 +19,15 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -29,6 +37,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -83,11 +92,12 @@ import com.mulesoft.examples.legacy_modernization.support.HttpTestClient;
  * legacy fulfillment CSV as {@code ShippingOrder-<dd-MM-yy_HH-mm-ss.SSS>.txt}.
  *
  * <p>Every request goes through the raw-socket {@link HttpTestClient}, so status line, headers and body bytes are
- * asserted as Undertow sent them. The SOAP boundary, fault and envelope styling and the no-listener handler run
- * as configured; the only test doubles are a spy on {@link FileOutboundWriter}, which records the thread of each
- * export write, and, in {@link WhenFulfillmentFails}, a mock {@link IFulfillment}. Exports go to a {@link TempDir},
- * never into {@code src/main/resources/Output}. The nested {@link UnderRootTrace} run covers the logger level
- * {@code application.yml} pins.
+ * asserted as Undertow sent them; only the requests that declare a form body they never send whole are written over
+ * a socket of their own, because the client sends a whole body before it reads the response. The SOAP boundary, fault
+ * and envelope styling and the no-listener handler run as configured; the only test doubles are a spy on
+ * {@link FileOutboundWriter}, which records the thread of each export write, and, in {@link WhenFulfillmentFails}, a
+ * mock {@link IFulfillment}. Exports go to a {@link TempDir}, never into {@code src/main/resources/Output}. The nested
+ * {@link UnderRootTrace} run covers the logger level {@code application.yml} pins.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -122,6 +132,12 @@ class FulfillmentEndpointTest {
     private static final String UNKNOWN_OPERATION_ENVELOPE = "<soapenv:Envelope"
             + " xmlns:soapenv=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:ord=\"http://ordermgmt.org/\">"
             + "<soapenv:Header/><soapenv:Body><ord:unknownOperation/></soapenv:Body></soapenv:Envelope>";
+
+    /** The length an unsent form body declares, 1 GiB: far more than is ever written. */
+    private static final long UNSENT_BODY_LENGTH = 1L << 30;
+
+    /** The part of an unsent form body written before the response is read, 64 KiB. */
+    private static final int SENT_BODY_PREFIX_BYTES = 64 * 1024;
 
     /** Names of the threads that called {@link FileOutboundWriter#write}, recorded by the spy's answer. */
     private static final List<String> EXPORT_THREADS = new CopyOnWriteArrayList<>();
@@ -216,6 +232,22 @@ class FulfillmentEndpointTest {
         assertThat(response.status()).as("%s", response).isEqualTo(405);
         assertThat(contentType(response)).isEqualTo("text/plain");
         assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: /OrderFulfillment");
+    }
+
+    /**
+     * A form body sent with a method the POST-only listener refuses gets the listener's 405 before any of it is read:
+     * the request declares {@link #UNSENT_BODY_LENGTH} bytes and sends only {@link #SENT_BODY_PREFIX_BYTES}, so a
+     * server that buffers such a body before dispatch, as Spring Boot's form content filter does for these methods,
+     * sends nothing and the read times out.
+     */
+    @ParameterizedTest(name = "{0} with an unsent form body")
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void formBodyOutsideAllowedMethodsGets405Unread(String method) throws IOException {
+        RawResponse response = sendWithUnsentFormBody(port, method, LISTENER_PATH);
+
+        assertThat(response.status()).as("%s", response).isEqualTo(405);
+        assertThat(response.header("Content-Type")).as("%s", response).isEqualTo("text/plain");
+        assertThat(response.body()).as("%s", response).isEqualTo("Method not allowed for endpoint: /OrderFulfillment");
     }
 
     // The parser's faultstring is a Tier 2A verification point, so only the fault code is asserted.
@@ -426,6 +458,81 @@ class FulfillmentEndpointTest {
     // No SOAPAction header: the original test sent none. Host, Content-Length and Connection come from the client.
     private static HttpTestClient.Response postXml(HttpTestClient client, String path, byte[] body) {
         return client.send("POST", path, Map.of("Content-Type", "text/xml;charset=UTF-8"), body);
+    }
+
+    /**
+     * Sends {@code method path} declaring a form body of {@link #UNSENT_BODY_LENGTH} bytes, writes only the first
+     * {@link #SENT_BODY_PREFIX_BYTES} of it and reads the response that arrives while the rest is unsent: its status
+     * line, its headers and the {@code Content-Length} bytes of its body. The connection is kept alive, so the server
+     * may drain the body after it answers. The socket's send buffer is sized to hold the whole prefix, so writing it
+     * never waits for the server to read.
+     *
+     * @throws AssertionError when no response arrives within {@link HttpTestClient#TIMEOUT_MILLIS}: the server is
+     *                        waiting for the body
+     */
+    private static RawResponse sendWithUnsentFormBody(int port, String method, String path) throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.setSendBufferSize(2 * SENT_BODY_PREFIX_BYTES);
+            socket.connect(new InetSocketAddress("localhost", port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " " + path + " HTTP/1.1\r\nHost: localhost:" + port
+                    + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + UNSENT_BODY_LENGTH
+                    + "\r\n\r\n").getBytes(US_ASCII));
+            out.write(("order=" + "x".repeat(SENT_BODY_PREFIX_BYTES - "order=".length())).getBytes(US_ASCII));
+            out.flush();
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            try {
+                String statusLine = readLine(in);
+                Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+                for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+                    int colon = line.indexOf(':');
+                    assertThat(colon).as("colon in header line %s", line).isPositive();
+                    headers.put(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
+                }
+                String contentLength = headers.get("Content-Length");
+                assertThat(contentLength).as("Content-Length of %s %s", statusLine, headers).isNotNull();
+                byte[] body = in.readNBytes(Integer.parseInt(contentLength));
+                assertThat(body).as("body of %s %s", statusLine, headers).hasSize(Integer.parseInt(contentLength));
+                return new RawResponse(statusLine, headers, new String(body, UTF_8));
+            } catch (SocketTimeoutException timeout) {
+                throw new AssertionError(method + " " + path + " got no response within "
+                        + HttpTestClient.TIMEOUT_MILLIS + " ms while " + (UNSENT_BODY_LENGTH - SENT_BODY_PREFIX_BYTES)
+                        + " bytes of its declared form body were unsent: the server waits for the body", timeout);
+            }
+        }
+    }
+
+    /** One line of a response head without its CRLF; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
+    /**
+     * A response read off a raw connection.
+     *
+     * @param statusLine the status line, such as {@code HTTP/1.1 405 Method Not Allowed}
+     * @param headers    the headers, names compared case-insensitively
+     * @param body       the body as UTF-8 text
+     */
+    private record RawResponse(String statusLine, Map<String, String> headers, String body) {
+
+        int status() {
+            return Integer.parseInt(statusLine.split(" ", 3)[1]);
+        }
+
+        String header(String name) {
+            return headers.get(name);
+        }
     }
 
     private static String contentType(HttpTestClient.Response response) {

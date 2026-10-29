@@ -10,6 +10,9 @@ spring:
       add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404; AjaxResourceConfig registers its own resource handlers
   mvc:
     dispatch-trace-request: true   # every original listener declares allowedMethods: TRACE reaches the MVC mappings and gets the 405 instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false   # every listener checks the method before reading the body and no handler reads PUT/PATCH/DELETE form fields (BayeuxLongPollingController reads its POST form body itself, capped): a form body on PUT/PATCH/DELETE gets the 405 unread instead of being buffered whole by Boot's filter before dispatch
   # spring.webservices.path stays at Boot's default /services: messageDispatcherServlet is reached only through the
   # SC-10 named-servlet forwards below, so a request on /services/** matches no listener route and gets SC-10's 404.
   webservices:
