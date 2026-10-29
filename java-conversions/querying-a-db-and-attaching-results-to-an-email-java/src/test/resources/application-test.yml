@@ -42,5 +42,8 @@ mail:
 spring:
   mail:
     properties:
-      # GreenMail SMTP is plain text; mail.smtp.auth stays true, so authentication runs against the GreenMail user.
+      # GreenMail SMTP is plain text and offers no STARTTLS, so the STARTTLS that application.yml requires is turned
+      # off here, in test configuration only; mail.smtp.auth stays true, so authentication runs against the GreenMail
+      # user.
       "[mail.smtp.starttls.enable]": false
+      "[mail.smtp.starttls.required]": false

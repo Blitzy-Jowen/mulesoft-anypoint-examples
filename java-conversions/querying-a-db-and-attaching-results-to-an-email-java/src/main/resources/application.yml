@@ -56,10 +56,22 @@ spring:
     password: ${smtp.password}
     default-encoding: UTF-8
     properties:
-      # smtp:gmail-connector (attachments.xml:4): authentication and STARTTLS
+      # smtp:gmail-connector (attachments.xml:4): authentication and STARTTLS, here required, so a server or an
+      # interceptor that does not offer STARTTLS fails the send before AUTH or any mail data.
       "[mail.smtp.auth]": true
       "[mail.smtp.starttls.enable]": true
+      "[mail.smtp.starttls.required]": true
       # smtp:outbound-endpoint responseTimeout="10000" (attachments.xml:36): connect, read and write timeouts
       "[mail.smtp.connectiontimeout]": 10000
       "[mail.smtp.timeout]": 10000
       "[mail.smtp.writetimeout]": 10000
+# The original logs the employees only in the flow's INFO logger of the aggregate (attachments.xml:17,
+# service/EmployeeReportService). A root DEBUG/TRACE override, or --debug/--trace, must not reach the Angus Mail
+# category, which below INFO writes the SMTP account and the mail. A logger's own level outranks logging.level.root
+# and the --debug/--trace groups; Angus Mail logs through java.util.logging, which Spring Boot bridges and holds at
+# the same level.
+logging:
+  level:
+    # .smtp DEBUG writes the SMTP account and the recipient addresses; .smtp.protocol TRACE the whole SMTP dialogue:
+    # MAIL FROM, RCPT TO, the headers and the employees.csv records.
+    org.eclipse.angus.mail: INFO

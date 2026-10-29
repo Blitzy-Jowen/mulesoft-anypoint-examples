@@ -32,6 +32,7 @@ The rows of the eight SC-5 projects (`processing-orders-with-dataweave-and-APIki
 The row of `websphere-mq-java` was re-measured on 2026-10-29 with `mvn -B -ntp clean package` and `mvn -B -ntp test` on the tree that carries both its `config/ContentSecurityPolicyFilter` with its tests and its framework-logging caps with `config/SensitiveLogLevelsTest`; both runs reported the same test counts, and the Tier 1 tests total under Totals was updated to the sum of the 55 rows under Evidence per project.
 The rows of `processing-orders-with-dataweave-and-APIkit-java`, `mule-expression-language-basics-java`, `legacy-modernization-java`, `http-multipart-request-java`, `importing-an-email-attachment-using-the-IMAP-connector-java` and `importing-an-email-attachment-using-the-POP3-connector-java`, and the Tier 1 tests total and lowest coverage under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose SC-6 `FileOutboundWriter` follows a symbolic link only inside the target directory, holds every directory it walks open where the platform offers a secure directory stream, creates missing directories relative to the held directory and refuses a directory it cannot hold open, and adds the tests of that confinement; each project gained 104 tests and its coverage cells changed.
 The rows of `service-orchestration-and-choice-routing-java` and `websphere-mq-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose SC-12 broker binds each reply channel to its client, accepts client publications on inbound channels only and bounds clients, subscriptions, retained bytes and request size, and again on the later tree whose handler payload reservations last until the handler exits and whose Bayeux batch is counted while it is parsed. On the tree that joins these changes with the ones the lines above record, both rows were measured again with `mvn -B clean install`.
+The row of `querying-a-db-and-attaching-results-to-an-email-java` and the Tier 1 tests total under Totals were re-measured on 2026-10-29 with `mvn -B -ntp clean install` on the tree that adds its mail-logging cap and the required SMTP STARTTLS, with their tests; only its test count changed.
 
 ## Status
 
@@ -140,7 +141,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 27,930 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 27,939 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 86.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -197,7 +198,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | oauth2-client-credentials-using-the-HTTP-connector-java | 432 / 0 / 0 / 1 | 40 of 40 | 90.7% (909 of 1002) | — |
 | proxying-a-rest-api-java | 641 / 0 / 0 / 1 | 41 of 41 | 94.3% (1213 of 1287) | — |
 | proxying-a-soap-api-java | 547 / 0 / 0 / 1 | 54 of 54 | 92.7% (1468 of 1583) | — |
-| querying-a-db-and-attaching-results-to-an-email-java | 285 / 0 / 0 / 1 | 137 of 139 | 98.2% (429 of 437) | — |
+| querying-a-db-and-attaching-results-to-an-email-java | 294 / 0 / 0 / 1 | 137 of 139 | 98.2% (429 of 437) | — |
 | querying-a-mysql-database-java | 147 / 0 / 0 / 1 | 9 of 9 | 96.4% (216 of 224) | — |
 | scatter-gather-flow-control-java | 243 / 0 / 0 / 1 | 160 of 163 | 97.2% (418 of 430) | — |
 | sending-a-csv-file-through-email-using-smtp-java | 188 / 0 / 0 / 1 | 107 of 107 | 84.6% (461 of 545) | — |
