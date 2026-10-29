@@ -497,21 +497,21 @@ Fourteen scenarios are `deterministic`, five `nondeterministic` and one `unreach
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| service-orchestration-and-choice-routing-java | service-orchestration-and-choice-routing | SOAP/WSDL-based service | PASS | PASS | 99.3% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+| service-orchestration-and-choice-routing-java | service-orchestration-and-choice-routing | SOAP/WSDL-based service | PASS | PASS | 99.4% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
 This is the project's row of the root [`SUMMARY.md`](../../SUMMARY.md) (AAP 0.8.7). The fallback evidence and the scenario statuses are under [Fallback evidence](#fallback-evidence-aap-084).
 
 - Tier 2A is blocked. [`DECISIONS.md`](../../DECISIONS.md) section 9 records `Tier 2A blocked: Mule EE licence and EE Maven repository credentials unconfirmed`, so no fixture has been captured from the original. Parity rests on the fallback, which is weaker than captured fixtures. The label stays `PARITY: UNVERIFIED — Mule runtime unavailable`, never PASS, until the scenarios are captured and replayed.
 - Tier 2B is `N/A`: this is not a connector project, so it has no failsafe plugin and no `*IT` class.
 
-The run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+The run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-29 with `mvn -B clean verify`, which runs the same surefire tests and JaCoCo check, on the tree whose SC-4 `DwXmlWriter` refuses element, prefix and attribute names that are not XML names:
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 1014 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 1014 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`, nested classes counted with their outer class: 99.3%, 1197 of 1205 lines.
+- `mvn -B clean package`: `BUILD SUCCESS`; 1207 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 1207 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`, nested classes counted with their outer class: 99.4%, 1253 of 1261 lines.
   - `service`: `AjaxChannelBroker` 415 of 418, `AjaxOrderService` 35 of 35, `AuditService` 86 of 87, `InHouseOrderService` 26 of 26, `OrderOrchestrationService` 89 of 89, `PriceCacheService` 4 of 4, `ProductPriceService` 2 of 2, `SamsungOrderService` 35 of 35, `SamsungServiceImpl` 7 of 7.
-  - `mapper`: `AjaxOrderXmlMapper` 73 of 73, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `DwXmlWriter` 170 of 170, `OrderRequestMapper` 6 of 6, `OrderSummaryJsonMapper` 12 of 12, `PurchaseReceiptMapper` 6 of 6, `SoapEnvelopeTransformer` 53 of 53.
-  - Total project LINE coverage: 93.1% (3002 of 3226 lines).
+  - `mapper`: `AjaxOrderXmlMapper` 73 of 73, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `DwXmlWriter` 226 of 226, `OrderRequestMapper` 6 of 6, `OrderSummaryJsonMapper` 12 of 12, `PurchaseReceiptMapper` 6 of 6, `SoapEnvelopeTransformer` 53 of 53.
+  - Total project LINE coverage: 93.2% (3058 of 3282 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=19`, `failed=0`. `post-orders-samsung-rejected` is `UNREACHABLE` and counted in none.
 - Runtime check of the packaged jar, on free ports: `/populate`, the `reply.xml` exchange, the quantity-5 order, the Samsung `purchase`, the price `POST` and `GET`, the 405, 404 and fault answers, the in-house path and the Bayeux `/orders/manufacturers` and `/orders/request` replies answered as this README states.
 

@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -28,6 +29,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockftpserver.core.MockFtpServerException;
 import org.mockftpserver.core.command.CommandHandler;
@@ -65,9 +67,9 @@ import com.mulesoft.examples.upload_to_ftp_after_converting_json_to_xml.support.
  *
  * <p>The happy path covers every method, because the original listener declares no {@code allowedMethods}. The error
  * cases are the failures the flow does not handle, each answered with the platform-default 500 of SC-1 (malformed
- * JSON, no body, a rejected FTP login, a missing remote directory, a hostile FTP reply), and the no-listener 404 for a
- * path the flow does not serve. Every test starts from the same seeded FTP server, so the order of the tests does not
- * matter.
+ * JSON, a member name that is not an XML element name, no body, a rejected FTP login, a missing remote
+ * directory, a hostile FTP reply), and the no-listener 404 for a path the flow does not serve. Every test starts
+ * from the same seeded FTP server, so the order of the tests does not matter.
  *
  * <p>The original {@code UploadToFtpAfterConvertingJsonToXmlIT} assertion is ported separately in
  * {@code UploadToFtpAfterConvertingJsonToXmlTest}.
@@ -94,6 +96,9 @@ class EmployeeUploadControllerTest {
     private static final String ROOT = "/";
     private static final String CONTENT_TYPE = "Content-Type";
     private static final String ERROR_BODY_PREFIX = "{ \"message\": ";
+
+    /** The security review's key, which as a raw element name would inject an {@code <evil/>} element. */
+    private static final String INJECTION_KEY = "x><!--</x>--><evil/><!--x--";
 
     /** Text a hostile FTP server puts into its reply. */
     private static final String HOSTILE_REPLY_MARKER = "MARKER-REPLY-SECRET";
@@ -215,6 +220,37 @@ class EmployeeUploadControllerTest {
 
         assertPlatform500(response);
         assertThat(response.bodyAsString()).as("%s", response).contains("Unexpected end-of-input");
+        assertNothingUploaded();
+    }
+
+    /**
+     * Employees whose address item carries the security review's comment-balanced injection key, as a direct member
+     * and in an object nested in the item.
+     */
+    static Stream<String> bodiesWithAnInjectionKey() {
+        String employee = "{\"employees\":{\"employee\":[{\"name\":\"John\",\"lastName\":\"Doe\",\"addresses\":"
+                + "{\"address\":[%s]}}]}}";
+        return Stream.of(
+                String.format(employee, "{\"street\":\"1 A St\",\"" + INJECTION_KEY + "\":\"v\"}"),
+                String.format(employee, "{\"street\":\"1 A St\",\"geo\":{\"" + INJECTION_KEY + "\":\"v\"}}"));
+    }
+
+    /**
+     * A JSON member name that is not an XML element name: the writer refuses it while the transform builds the
+     * document, before the upload step, so the 500 carries neither the key nor the markup it would inject, and
+     * nothing is stored.
+     */
+    @ParameterizedTest
+    @MethodSource("bodiesWithAnInjectionKey")
+    void keyThatIsNotAnElementNameReturns500WithoutTheKeyAndUploadsNothing(String body) {
+        HttpTestClient.Response response = http.send("POST", ROOT, Map.of(CONTENT_TYPE, "application/json"),
+                body.getBytes(UTF_8));
+
+        assertPlatform500(response);
+        assertThat(response.bodyAsString()).as("%s", response)
+                .isEqualTo("{ \"message\": \"Invalid XML element name: character U+003E at offset 1 is not allowed\" }")
+                .doesNotContain(INJECTION_KEY)
+                .doesNotContain("<evil");
         assertNothingUploaded();
     }
 

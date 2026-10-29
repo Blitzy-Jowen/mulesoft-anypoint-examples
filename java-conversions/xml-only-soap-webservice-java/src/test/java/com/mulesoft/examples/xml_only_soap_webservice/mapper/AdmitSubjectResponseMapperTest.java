@@ -262,19 +262,43 @@ class AdmitSubjectResponseMapperTest {
 
     /**
      * Without strict error checking a DOM accepts an element name that is not an XML Name, which the mapper
-     * copies as it is; the rendered document then does not parse back into an element.
+     * copies; the writer refuses it before anything is written, naming the character rather than the name.
      */
     @Test
-    void toElementRejectsARenderedDocumentThatDoesNotParse() {
+    void copiedNameThatIsNotAnXmlNameIsRefusedByTheWriterInBothConversions() {
         Element input = parse(episodeResponse(START_DATE_TIME, END_DATE_TIME));
         Document document = input.getOwnerDocument();
         document.setStrictErrorChecking(false);
         Node episodeId = input.getElementsByTagName("episodeId").item(0);
         episodeId.setTextContent("");
         episodeId.appendChild(document.createElementNS(null, "a b")).setTextContent("E1");
+        String invalid = "Invalid XML element name: character U+0020 at offset 1 is not allowed";
 
-        assertThat(mapper.toXml(input)).contains("\t\t<episodeId>\n\t\t\t<a b>E1</a b>\n\t\t</episodeId>\n");
+        assertThatThrownBy(() -> mapper.toXml(input))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
         assertThatThrownBy(() -> mapper.toElement(input))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+    }
+
+    /**
+     * The writer refuses every name and character that would make its output ill-formed, so a writer whose output
+     * is not well-formed stands in for one: the rendered document then does not parse back into an element.
+     */
+    @Test
+    void toElementRejectsARenderedDocumentThatDoesNotParse() {
+        DwXmlWriter illFormedWriter = new DwXmlWriter() {
+            @Override
+            public String write(DwXmlWriter.Element root) {
+                return "<?xml version='1.0' encoding='UTF-8'?>\n<ns0:admitSubjectResponse xmlns:ns0=\""
+                        + AdmitSubjectResponseMapper.NS0 + "\"><a b>E1</a b></ns0:admitSubjectResponse>";
+            }
+        };
+
+        assertThatThrownBy(() -> new AdmitSubjectResponseMapper(illFormedWriter).toElement(null))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("Cannot parse the admitSubjectResponse document: ")
                 .hasCauseInstanceOf(SAXException.class);

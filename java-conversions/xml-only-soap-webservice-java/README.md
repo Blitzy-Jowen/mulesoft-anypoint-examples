@@ -247,13 +247,13 @@ No scenario of this project is `unreachable`.
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| xml-only-soap-webservice-java | xml-only-soap-webservice | SOAP/WSDL-based service | PASS | PASS | 98.0% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+| xml-only-soap-webservice-java | xml-only-soap-webservice | SOAP/WSDL-based service | PASS | PASS | 98.2% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
-Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-28 with `mvn -B clean verify`, which runs the same surefire tests and JaCoCo check, on the tree whose SC-4 `DwXmlWriter` refuses element, prefix and attribute names that are not XML names:
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 419 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 419 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 644 of 657 lines. `service` 44 of 44: `AdmissionOrchestrationService` 14 of 14, `PatientMockService` 15 of 15, `EhrMockService` 15 of 15. `mapper` 600 of 613: `AdmitSubjectResponseMapper` 123 of 123, `DwXmlWriter` 170 of 170, `EhrMockResponseMapper` 102 of 104, `CreateEpisodeRequestMapper` 90 of 95, `UpsertPatientRequestMapper` 77 of 79, `PatientMockResponseMapper` 38 of 42 (nested and anonymous classes counted with their outer class). Total project LINE coverage: 91.6% (1457 of 1591 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 615 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 615 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 700 of 713 lines. `service` 44 of 44: `AdmissionOrchestrationService` 14 of 14, `PatientMockService` 15 of 15, `EhrMockService` 15 of 15. `mapper` 656 of 669: `AdmitSubjectResponseMapper` 123 of 123, `DwXmlWriter` 226 of 226, `EhrMockResponseMapper` 102 of 104, `CreateEpisodeRequestMapper` 90 of 95, `UpsertPatientRequestMapper` 77 of 79, `PatientMockResponseMapper` 38 of 42 (nested and anonymous classes counted with their outer class). Total project LINE coverage: 91.9% (1513 of 1647 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=10`, `failed=0`, every scenario `UNVERIFIED-uncaptured`.
 
 ## Fallback evidence (AAP 0.8.4)

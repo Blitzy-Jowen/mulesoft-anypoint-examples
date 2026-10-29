@@ -8,12 +8,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -40,10 +44,13 @@ import ch.qos.logback.core.read.ListAppender;
  * whatever the file name, names exceptions only by their type identifiers, never by their message, cause messages
  * or suppressed exceptions, and attaches no throwable, while file disposition is unchanged.
  *
- * <p>Every file-triggered project carries this class with only its {@code package} line changed, so it depends on
- * the JDK, JUnit, SLF4J, Logback and {@link FileInboundPoller} alone. File names carry CR, LF, TAB, the reverse
- * solidus and other control characters, which POSIX file systems accept, and every directory lives under
- * {@link TempDir}.
+ * <p>It supplements {@code FileInboundPollerTest}, the SC-5 reference test, which every SC-5 consumer carries. This
+ * class is carried only by {@code processing-orders-with-dataweave-and-APIkit}, its reference, and by
+ * {@code import-leads-into-salesforce}, a copy with only its {@code package} line changed; the other SC-5 consumers
+ * carry {@code FileInboundPollerTest} alone. It depends on the JDK, JUnit, SLF4J, Logback and
+ * {@link FileInboundPoller} alone, so that it copies with only that line changed. File and directory names carry
+ * CR, LF, TAB, the reverse solidus and other control characters, which POSIX file systems accept, and every
+ * directory and every link target lives under {@link TempDir}.
  */
 class FileInboundPollerLogSafetyTest {
 
@@ -266,7 +273,7 @@ class FileInboundPollerLogSafetyTest {
         AtomicInteger handled = new AtomicInteger();
         FileInboundPoller poller = new FileInboundPoller(inputDirectory, null, inbound -> handled.incrementAndGet()) {
             @Override
-            protected byte[] readContent(Path listed) throws IOException {
+            protected byte[] readContent(Path listed, SeekableByteChannel channel) throws IOException {
                 Throwable thrown = failure.apply(listed);
                 if (thrown instanceof IOException ioFailure) {
                     throw ioFailure;
@@ -291,31 +298,44 @@ class FileInboundPollerLogSafetyTest {
         assertArrayEquals(CONTENT, Files.readAllBytes(file));
     }
 
-    /** What a handler does to its file before the poller deletes it. */
+    /** What a handler or read hook does to its file before the poller disposes of it. */
     @FunctionalInterface
     interface FileAction {
 
         void apply(Path file) throws IOException;
     }
 
-    static Stream<Arguments> deleteFailures() {
+    static Stream<Arguments> disposalFailures() {
+        String replaced = "Leaving file {file} in place: it was replaced after it was read, so the replacement is"
+                + " neither moved nor deleted";
         return Stream.of(
-                Arguments.of("file replaced by a non-empty directory",
+                Arguments.of("file replaced by a non-empty directory, file deleted",
                         (FileAction) file -> {
                             Files.delete(file);
                             Files.createDirectories(file.resolve("child"));
                         },
-                        ": java\\.nio\\.file\\.DirectoryNotEmptyException at " + JDK_FRAME),
-                Arguments.of("file already removed",
+                        false, replaced),
+                Arguments.of("file replaced by a link, file moved",
+                        (FileAction) file -> {
+                            Files.delete(file);
+                            Files.createSymbolicLink(file, Path.of("elsewhere.csv"));
+                        },
+                        true, replaced),
+                Arguments.of("file already removed, file deleted",
                         (FileAction) Files::delete,
-                        Pattern.quote(": it no longer exists")));
+                        false, "Failed to delete file {file}: it no longer exists"),
+                Arguments.of("file already removed, file moved",
+                        (FileAction) Files::delete,
+                        true, "Failed to move file {file} to {target}: it no longer exists"));
     }
 
     @ParameterizedTest(name = "{0}")
-    @MethodSource("deleteFailures")
-    void deleteFailureLogsOneSafeWarning(String label, FileAction action, String continuation) throws IOException {
+    @MethodSource("disposalFailures")
+    void disposalFailureLogsOneSafeWarning(String label, FileAction action, boolean withMoveDirectory,
+                                           String expected) throws IOException {
         Path file = writeInputFile(FORGING_NAME);
-        FileInboundPoller poller = new FileInboundPoller(inputDirectory, null, inbound -> action.apply(inbound.path()));
+        FileInboundPoller poller = new FileInboundPoller(inputDirectory, withMoveDirectory ? moveDirectory : null,
+                inbound -> action.apply(inbound.path()));
 
         assertEquals(1, poller.pollOnce());
 
@@ -323,10 +343,170 @@ class FileInboundPollerLogSafetyTest {
         assertEquals(1, events.size());
         assertEquals(Level.WARN, events.get(0).getLevel());
         String message = events.get(0).getFormattedMessage();
-        String expected = Pattern.quote("Failed to delete file " + inputDirectory + "/" + FORGING_NAME_RENDERING)
-                + continuation;
+        assertEquals(expected.replace("{file}", inputDirectory + "/" + FORGING_NAME_RENDERING)
+                .replace("{target}", moveDirectory + "/" + FORGING_NAME_RENDERING), message);
+        assertDisclosesNothing(message);
+        // Nothing reached the move directory, and a replacement is left where it stands.
+        assertFalse(Files.exists(moveDirectory.resolve(FORGING_NAME), LinkOption.NOFOLLOW_LINKS));
+        assertEquals(expected.startsWith("Leaving"), Files.exists(file, LinkOption.NOFOLLOW_LINKS));
+    }
+
+    /** The forging names whose rendering stays within the limit once the input directory precedes it. */
+    static Stream<Arguments> forgingLinkNames() {
+        return forgingFileNames().filter(arguments -> !LONG_NAME.equals(arguments.get()[1]));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("forgingLinkNames")
+    void symbolicLinkLogsOneSafeWarningAndIsLeftInPlace(String label, String linkName, String rendering,
+                                                        boolean withMoveDirectory) throws IOException {
+        Path outside = Files.write(tempDir.resolve("outside.csv"), CONTENT);
+        Files.createDirectories(inputDirectory);
+        Path link = Files.createSymbolicLink(inputDirectory.resolve(linkName), outside);
+        AtomicInteger handled = new AtomicInteger();
+        FileInboundPoller poller = new FileInboundPoller(inputDirectory, withMoveDirectory ? moveDirectory : null,
+                inbound -> handled.incrementAndGet());
+
+        assertEquals(0, poller.pollOnce());
+
+        assertEquals(0, handled.get());
+        List<ILoggingEvent> events = loggedEvents();
+        assertEquals(1, events.size());
+        assertEquals(Level.WARN, events.get(0).getLevel());
+        assertEquals("Skipping symbolic link " + inputDirectory + "/" + rendering
+                + ": links are not followed, leaving it in place", events.get(0).getFormattedMessage());
+        assertDisclosesNothing(events.get(0).getFormattedMessage());
+        assertTrue(Files.isSymbolicLink(link));
+        assertArrayEquals(CONTENT, Files.readAllBytes(outside));
+    }
+
+    static Stream<Arguments> changesWhileRead() {
+        return Stream.of(
+                Arguments.of("file removed", (FileAction) Files::delete, "removed"),
+                Arguments.of("file replaced by a link",
+                        (FileAction) file -> {
+                            Files.delete(file);
+                            Files.createSymbolicLink(file, Path.of("elsewhere.csv"));
+                        },
+                        "replaced"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("changesWhileRead")
+    void fileChangedWhileBeingReadLogsOneSafeWarningAndIsNotHandedOver(String label, FileAction action,
+                                                                         String change) throws IOException {
+        writeInputFile(FORGING_NAME);
+        AtomicInteger handled = new AtomicInteger();
+        FileInboundPoller poller = new FileInboundPoller(inputDirectory, moveDirectory,
+                inbound -> handled.incrementAndGet()) {
+            @Override
+            protected byte[] readContent(Path listed, SeekableByteChannel channel) throws IOException {
+                action.apply(listed);
+                return super.readContent(listed, channel);
+            }
+        };
+
+        assertEquals(0, poller.pollOnce());
+
+        assertEquals(0, handled.get());
+        List<ILoggingEvent> events = loggedEvents();
+        assertEquals(1, events.size());
+        assertEquals(Level.WARN, events.get(0).getLevel());
+        String message = events.get(0).getFormattedMessage();
+        String expected = Pattern.quote("Could not open file " + inputDirectory + "/" + FORGING_NAME_RENDERING
+                        + ", leaving it for the next poll: java.nio.file.FileSystemException at "
+                        + FileInboundPoller.class.getName() + ".requireUnchanged(FileInboundPoller.java:")
+                + "\\d+"
+                + Pattern.quote(") [reason: file was " + change + " while being read]");
         assertTrue(message.matches(expected), message);
         assertDisclosesNothing(message);
+        assertFalse(Files.exists(moveDirectory.resolve(FORGING_NAME), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    static Stream<Arguments> relocatedDirectories() {
+        return Stream.of(
+                Arguments.of("input directory redirected through a link", true),
+                Arguments.of("move directory redirected through a link", false));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("relocatedDirectories")
+    void relocatedDirectoryLogsOneSafeWarningAndPollsNothing(String label, boolean relocateInput)
+            throws IOException {
+        Path input = relocateInput ? tempDir.resolve("input\nINFO forged") : inputDirectory;
+        Path move = relocateInput ? moveDirectory : tempDir.resolve("moved\nINFO forged");
+        AtomicInteger handled = new AtomicInteger();
+        FileInboundPoller poller = new FileInboundPoller(input, move, inbound -> handled.incrementAndGet());
+        assertEquals(0, poller.pollOnce());
+        Path elsewhere = Files.createDirectories(tempDir.resolve("elsewhere"));
+        Path waiting = Files.write((relocateInput ? elsewhere : input).resolve(FORGING_NAME), CONTENT);
+        Path relocated = relocateInput ? input : move;
+        Files.move(relocated, tempDir.resolve("original"));
+        Files.createSymbolicLink(relocated, elsewhere);
+
+        assertEquals(0, poller.pollOnce());
+
+        assertEquals(0, handled.get());
+        List<ILoggingEvent> events = loggedEvents();
+        assertEquals(1, events.size());
+        assertEquals(Level.WARN, events.get(0).getLevel());
+        assertEquals("Not polling: the " + (relocateInput ? "input" : "move") + " directory " + tempDir + "/"
+                        + (relocateInput ? "input" : "moved") + "\\nINFO forged no longer resolves to the directory it"
+                        + " resolved to at the first poll, so nothing is read, moved or deleted; restart to poll a new"
+                        + " location",
+                events.get(0).getFormattedMessage());
+        assertDisclosesNothing(events.get(0).getFormattedMessage());
+        assertArrayEquals(CONTENT, Files.readAllBytes(waiting));
+        if (!relocateInput) {
+            assertFalse(Files.exists(elsewhere.resolve(FORGING_NAME), LinkOption.NOFOLLOW_LINKS));
+        }
+    }
+
+    static Stream<Arguments> nestedDirectories() {
+        return Stream.of(
+                Arguments.of("move directory inside the input directory", true),
+                Arguments.of("input directory inside the move directory", false));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("nestedDirectories")
+    void nestedDirectoriesByPathLogOneSafeWarningPerPollAndPollNothing(String label, boolean moveInsideInput)
+            throws IOException {
+        Path outer = tempDir.resolve("outer\nINFO forged");
+        Path input = moveInsideInput ? outer : outer.resolve("input\nINFO forged");
+        Path move = moveInsideInput ? outer.resolve("moved\nINFO forged") : outer;
+        Files.createDirectories(input);
+        Path waiting = Files.write(input.resolve(FORGING_NAME), CONTENT);
+        AtomicInteger handled = new AtomicInteger();
+        FileInboundPoller poller = new FileInboundPoller(input, move, inbound -> handled.incrementAndGet()) {
+            @Override
+            DirectoryStream<Path> openDirectory(Path directory) throws IOException {
+                return new ListingOnlyStream(super.openDirectory(directory));
+            }
+        };
+
+        assertEquals(0, poller.pollOnce());
+        assertEquals(0, poller.pollOnce());
+
+        assertEquals(0, handled.get());
+        List<ILoggingEvent> events = loggedEvents();
+        assertEquals(2, events.size());
+        String outerRendering = tempDir + "/outer\\nINFO forged";
+        String expected = "Not polling: the "
+                + (moveInsideInput
+                        ? "move directory " + outerRendering + "/moved\\nINFO forged lies inside the input directory "
+                                + outerRendering
+                        : "input directory " + outerRendering + "/input\\nINFO forged lies inside the move directory "
+                                + outerRendering)
+                + ", and without a secure directory stream a link swapped in for the inner one could redirect the"
+                + " poll, so nothing is read, moved or deleted; configure directories that are not nested and restart";
+        for (ILoggingEvent event : events) {
+            assertEquals(Level.WARN, event.getLevel());
+            assertEquals(expected, event.getFormattedMessage());
+            assertDisclosesNothing(event.getFormattedMessage());
+        }
+        assertArrayEquals(CONTENT, Files.readAllBytes(waiting));
+        assertFalse(Files.exists(move.resolve(FORGING_NAME), LinkOption.NOFOLLOW_LINKS));
     }
 
     @Test
@@ -447,6 +627,26 @@ class FileInboundPollerLogSafetyTest {
     private static void assertDisclosesNothing(String message) {
         for (String undisclosed : UNDISCLOSED) {
             assertFalse(message.contains(undisclosed), () -> "'" + undisclosed + "' disclosed in " + message);
+        }
+    }
+
+    /** A plain directory stream over the platform's, so that the poller takes its path-based operations. */
+    private static final class ListingOnlyStream implements DirectoryStream<Path> {
+
+        private final DirectoryStream<Path> delegate;
+
+        ListingOnlyStream(DirectoryStream<Path> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Iterator<Path> iterator() {
+            return delegate.iterator();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
         }
     }
 

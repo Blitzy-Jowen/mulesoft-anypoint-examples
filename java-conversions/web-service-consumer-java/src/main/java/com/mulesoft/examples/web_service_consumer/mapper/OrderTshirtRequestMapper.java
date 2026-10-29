@@ -60,7 +60,8 @@ import com.fasterxml.jackson.core.StreamReadFeature;
  *       has a single root element ("XML output requires a single root element");</li>
  *   <li>each member of a JSON object becomes one child element named after its key, in body order (not the
  *       {@code xsd:sequence} order of {@code tshirt.wsdl}), and a key the body repeats is written once per
- *       occurrence;</li>
+ *       occurrence; a key that becomes an element and is not an XML element name, at any depth, is refused by the
+ *       writer before anything is written;</li>
  *   <li>a JSON array repeats its key's element once per item; JSON {@code null} is an empty element
  *       {@code <key/>};</li>
  *   <li>strings are written as they are, numbers in their parsed form (decimals keep their scale, so {@code 1.50}
@@ -142,8 +143,12 @@ public class OrderTshirtRequestMapper {
      * @return the DataWeave XML document, declaration included, without a trailing line feed
      * @throws IllegalArgumentException when the body is {@code null}, empty or JSON whitespace only
      *         ("Request body is empty"), is not well-formed JSON or holds anything after its value (the parser's
-     *         message, with the parser exception as cause), or is a JSON array, which the writer rejects
-     *         ("XML output requires a single root element"); a scalar or {@code null} body is not rejected
+     *         message, with the parser exception as cause), is a JSON array, which the writer rejects
+     *         ("XML output requires a single root element"), or has a member name, at any depth, that becomes an
+     *         element and is not an XML element name, which the writer rejects naming the first offending character
+     *         by code point and offset, never the name
+     *         ({@code Invalid XML element name: character U+0020 at offset 1 is not allowed}); a scalar or
+     *         {@code null} body is not rejected
      * @throws IllegalStateException when a string value holds a character XML 1.0 does not allow (a C0 control
      *         other than tab, line feed and carriage return, an unpaired surrogate, U+FFFE or U+FFFF), which the
      *         writer rejects, naming its code point and element
@@ -165,8 +170,9 @@ public class OrderTshirtRequestMapper {
      * @param json the request body
      * @return the document whose element is {@code OrderTshirt} in {@link #NAMESPACE}; for a scalar body that
      *         element's text is the scalar, and for a JSON {@code null} body it is empty
-     * @throws IllegalArgumentException under the conditions of {@link #toXml(byte[])}, a JSON array body included
-     *         ("XML output requires a single root element")
+     * @throws IllegalArgumentException under the conditions of {@link #toXml(byte[])}, a JSON array body
+     *         ("XML output requires a single root element") and a member name that becomes an element and is not an
+     *         XML element name included, before anything is parsed
      * @throws IllegalStateException when the writer rejects a character XML 1.0 does not allow, as for
      *         {@link #toXml(byte[])}, before anything is parsed; when no secure XML parser can be configured; or
      *         when the writer's output cannot be parsed

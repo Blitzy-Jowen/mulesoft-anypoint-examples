@@ -293,13 +293,13 @@ While `application-it.yml` or one of the five keys is missing, blank or still `T
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| get-customer-list-from-netsuite-java | get-customer-list-from-netsuite | Third-party connector | PASS | PASS | 98.5% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
+| get-customer-list-from-netsuite-java | get-customer-list-from-netsuite | Third-party connector | PASS | PASS | 98.7% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 
-This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-28 with `mvn -B clean verify`, which runs the same surefire tests, JaCoCo check and failsafe run, on the tree whose SC-4 `DwXmlWriter` refuses element, prefix and attribute names that are not XML names:
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 708 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`GetCustomersListFromNetsuiteIT`, no `application-it.yml`).
-- `mvn -B test`: `BUILD SUCCESS`; 708 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 257 of 261 lines (98.5%) of `service/NetsuiteCustomerService`, `mapper/CustomerHtmlMapper`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 95.5% (1302 of 1363 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 901 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 1 test, skipped (`GetCustomersListFromNetsuiteIT`, no `application-it.yml`).
+- `mvn -B test`: `BUILD SUCCESS`; 901 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 313 of 317 lines (98.7%) of `service/NetsuiteCustomerService`, `mapper/CustomerHtmlMapper`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 95.7% (1358 of 1419 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=10`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `GetCustomersListFromNetsuiteIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

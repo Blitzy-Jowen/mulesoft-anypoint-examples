@@ -161,6 +161,8 @@ public class EhrMockResponseMapper {
      *
      * @param request the SOAP Body root, expected to be {@code {NS0}createEpisode}; may be {@code null}
      * @return the DataWeave XML text, without a trailing line feed
+     * @throws IllegalArgumentException when a copied element or attribute name is not an XML name, which only a DOM
+     *         built without strict error checking can hold; the writer refuses it before anything is written
      */
     public String createEpisodeResponseXml(Element request) {
         String now = now();
@@ -179,6 +181,7 @@ public class EhrMockResponseMapper {
      *
      * @param request the SOAP Body root, expected to be {@code {NS0}createEpisode}; may be {@code null}
      * @return the {@code {NS0}createEpisodeResponse} element
+     * @throws IllegalArgumentException under the conditions of {@link #createEpisodeResponseXml(Element)}
      * @throws IllegalStateException when the rendered text cannot be parsed
      */
     public Element createEpisodeResponse(Element request) {
@@ -201,6 +204,8 @@ public class EhrMockResponseMapper {
      *
      * @param request the SOAP Body root, expected to be {@code {NS0}findEpisodes}; may be {@code null}
      * @return the DataWeave XML text, without a trailing line feed
+     * @throws IllegalArgumentException when a copied element or attribute name is not an XML name, which only a DOM
+     *         built without strict error checking can hold; the writer refuses it before anything is written
      */
     public String findEpisodesResponseXml(Element request) {
         DwXmlWriter.Element episode = DwXmlWriter.element(NS1_PREFIX, NS1, EPISODE)
@@ -213,6 +218,7 @@ public class EhrMockResponseMapper {
      *
      * @param request the SOAP Body root, expected to be {@code {NS0}findEpisodes}; may be {@code null}
      * @return the {@code {NS0}findEpisodesResponse} element
+     * @throws IllegalArgumentException under the conditions of {@link #findEpisodesResponseXml(Element)}
      * @throws IllegalStateException when the rendered text cannot be parsed
      */
     public Element findEpisodesResponse(Element request) {

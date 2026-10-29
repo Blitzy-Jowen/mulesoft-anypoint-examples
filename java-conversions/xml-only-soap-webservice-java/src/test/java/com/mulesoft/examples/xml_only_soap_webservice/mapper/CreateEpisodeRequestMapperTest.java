@@ -238,23 +238,40 @@ class CreateEpisodeRequestMapperTest {
     }
 
     @Test
-    void toElementFailsWithoutStderrWhenOutputIsNotWellFormed() {
-        // Without strict error checking a DOM accepts an element name that is not an XML Name; the mapper copies
-        // it as it is, so the writer's output is not well-formed and the parser rejects it.
+    void copiedNameThatIsNotAnXmlNameIsRefusedByTheWriterInBothConversions() {
+        // Without strict error checking a DOM accepts an element name that is not an XML Name; the mapper copies it,
+        // and the writer refuses it before anything is written, naming the character rather than the name.
         Element upsertPatientResponse = patientIdWithChildNamed("a b");
-        assertThat(mapper.toXml(upsertPatientResponse)).isEqualTo(String.join("\n",
-                "<?xml version='1.0' encoding='UTF-8'?>",
-                "<ns0:createEpisode xmlns:ns0=\"http://www.mule-health.com/SOA/message/1.0\">",
-                "\t<ns1:PatientId xmlns:ns1=\"http://www.mule-health.com/SOA/model/1.0\">",
-                "\t\t<a b>1</a b>",
-                "\t</ns1:PatientId>",
-                "</ns0:createEpisode>"));
+        String invalid = "Invalid XML element name: character U+0020 at offset 1 is not allowed";
+
+        assertThat(catchThrowable(() -> mapper.toXml(upsertPatientResponse)))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+        assertThat(catchThrowable(() -> mapper.toElement(upsertPatientResponse)))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+    }
+
+    @Test
+    void toElementFailsWithoutStderrWhenOutputIsNotWellFormed() {
+        // The writer refuses every name and character that would make its output ill-formed, so a writer whose
+        // output is not well-formed stands in for one, to show the parser's rejection and that it stays off stderr.
+        DwXmlWriter illFormedWriter = new DwXmlWriter() {
+            @Override
+            public String write(DwXmlWriter.Element root) {
+                return "<?xml version='1.0' encoding='UTF-8'?>\n<ns0:createEpisode xmlns:ns0=\"" + MESSAGE_NS
+                        + "\"><a b>1</a b></ns0:createEpisode>";
+            }
+        };
+        CreateEpisodeRequestMapper illFormedMapper = new CreateEpisodeRequestMapper(illFormedWriter);
         PrintStream originalErr = System.err;
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         Throwable thrown;
         System.setErr(new PrintStream(stderr, true, StandardCharsets.UTF_8));
         try {
-            thrown = catchThrowable(() -> mapper.toElement(upsertPatientResponse));
+            thrown = catchThrowable(() -> illFormedMapper.toElement(null));
         } finally {
             System.setErr(originalErr);
         }

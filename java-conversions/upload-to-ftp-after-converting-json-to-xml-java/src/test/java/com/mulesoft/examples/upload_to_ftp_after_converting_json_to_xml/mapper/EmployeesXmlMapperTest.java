@@ -21,6 +21,8 @@ import java.nio.charset.UnmappableCharacterException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Stream;
 
 import org.assertj.core.api.AbstractThrowableAssert;
@@ -136,6 +138,12 @@ class EmployeesXmlMapperTest {
             + "\t\t</addresses>\n"
             + "\t</employee>\n"
             + "</employees>";
+
+    /**
+     * The security review's key: as raw markup in an element name it would close a comment around the real end tag
+     * and inject an {@code <evil/>} element into the response and the uploaded document.
+     */
+    private static final String INJECTION_KEY = "x><!--</x>--><evil/><!--x--";
 
     private final ObjectMapper json = new ObjectMapper();
 
@@ -604,6 +612,54 @@ class EmployeesXmlMapperTest {
     void invalidInputIsRejected(String label, byte[] input, String message, Class<? extends Throwable> cause) {
         assertRejected(assertThatThrownBy(() -> mapper.toXml(input)), message, cause);
         assertRejected(assertThatThrownBy(() -> mapper.toXmlBytes(input)), message, cause);
+    }
+
+    /**
+     * Payloads with a member name that the script writes as an element name and that is not one, each with the
+     * message the writer refuses it with: the comment-balanced injection key of the security review, an inner space
+     * and a leading digit, placed as a direct member of an address item, in an object or an array item nested in
+     * one, two objects deep, as a repeated key after a repeated valid key, in an object member of an address object,
+     * and in the second employee after a valid first one.
+     */
+    static Stream<Arguments> keysThatAreNotElementNames() {
+        String johnDoe = "{\"name\":\"John\",\"lastName\":\"Doe\",\"addresses\":{\"address\":";
+        List<Map.Entry<String, String>> placements = List.of(
+                Map.entry("direct member of an address item", johnDoe + "[{\"street\":\"1 A St\",\"KEY\":\"v\"}]}}"),
+                Map.entry("member of an object in an address item",
+                        johnDoe + "[{\"street\":\"1 A St\",\"geo\":{\"KEY\":\"v\"}}]}}"),
+                Map.entry("two objects below an address item", johnDoe + "[{\"geo\":{\"point\":{\"KEY\":1}}}]}}"),
+                Map.entry("member of an array item in an address item", johnDoe + "[{\"lines\":[{\"KEY\":\"v\"}]}]}}"),
+                Map.entry("repeated key after a repeated valid key",
+                        johnDoe + "[{\"street\":\"1\",\"street\":\"2\",\"KEY\":\"v\",\"KEY\":\"w\"}]}}"),
+                Map.entry("member of an object member of an address object", johnDoe + "{\"home\":{\"KEY\":\"v\"}}}}"),
+                Map.entry("second employee after a valid one",
+                        "{\"name\":\"Jane\"}," + johnDoe + "[{\"KEY\":null}]}}"));
+        List<Map.Entry<String, String>> keys = List.of(
+                Map.entry(INJECTION_KEY, "character U+003E at offset 1"),
+                Map.entry("a b", "character U+0020 at offset 1"),
+                Map.entry("1st", "character U+0031 at offset 0"));
+        return placements.stream().flatMap(placement -> keys.stream().map(key -> Arguments.of(
+                placement.getKey() + ": " + key.getKey(),
+                utf8("{\"employees\":{\"employee\":[" + placement.getValue().replace("KEY", key.getKey()) + "]}}"),
+                key.getKey(),
+                "Invalid XML element name: " + key.getValue() + " is not allowed")));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("keysThatAreNotElementNames")
+    @DisplayName("a member name written as an element name that is not one raises IllegalArgumentException from both "
+            + "methods, before any XML is written, with a message that never repeats the name")
+    void keyThatIsNotAnElementNameIsRejected(String label, byte[] input, String key, String message) {
+        assertThatThrownBy(() -> mapper.toXml(input))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(message)
+                .hasNoCause()
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain(key).doesNotContain("<evil"));
+        assertThatThrownBy(() -> mapper.toXmlBytes(input))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(message)
+                .hasNoCause()
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain(key).doesNotContain("<evil"));
     }
 
     /**

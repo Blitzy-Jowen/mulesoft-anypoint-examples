@@ -19,6 +19,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import javax.xml.XMLConstants;
+
 import org.springframework.stereotype.Component;
 
 /**
@@ -77,7 +79,36 @@ import org.springframework.stereotype.Component;
  * namespace declarations, then the attributes in insertion order. An element declares its explicit
  * {@link Element#namespace(String, String)} entries in insertion order, followed by its own binding, and
  * skips every binding an ancestor already declared; a declaration's scope ends with its element, so
- * siblings each declare it again. Text escapes {@code &}, {@code <} and {@code >}; attribute values and
+ * siblings each declare it again.
+ *
+ * <p>Names are checked when they are given, by {@link #element(String, String, String)},
+ * {@link Element#namespace(String, String)} and {@link Element#attribute(String, String)}, and for a map key of
+ * {@link #fromObject(String, String, String, Object)} when it becomes an element, so a name taken from caller data is
+ * refused before anything is written and never becomes markup. The rules are those of XML 1.0 (Fifth Edition) and
+ * Namespaces in XML 1.0, read by code point, so a supplementary character counts once and an unpaired surrogate is
+ * never a name character:
+ * <ul>
+ *   <li>An element's local name is an {@code NCName} (an XML {@code Name} without {@code ':'}), optionally followed
+ *       by U+0020 spaces and nothing else. Those spaces are written as they are, in the start and the end tag, where
+ *       XML allows white space before {@code >} and before an attribute, so the element name a script spelled with
+ *       trailing spaces ({@code "Bill "}) stays the one it wrote: {@code <ns1:Bill  xmlns:ns1="...">} ...
+ *       {@code </ns1:Bill >}. Any other space, tab, line feed or carriage return is refused.</li>
+ *   <li>An element's prefix and a {@link Element#namespace(String, String)} prefix are {@code null}, empty or an
+ *       {@code NCName}, never {@code xmlns}.</li>
+ *   <li>An attribute name is a {@code QName} ({@code NCName} or {@code NCName:NCName}), never {@code xmlns} or
+ *       {@code xmlns:*}: namespace declarations are added with {@link Element#namespace(String, String)}. An
+ *       attribute's prefix needs no declaration on the element ({@code xsi:type}, {@code xml:lang}).</li>
+ *   <li>Bindings, an element's own and each declaration: {@code xml} is bound only to
+ *       {@code http://www.w3.org/XML/1998/namespace}, that namespace only to {@code xml}, and nothing to
+ *       {@code http://www.w3.org/2000/xmlns/}.</li>
+ * </ul>
+ * A refused name raises {@link IllegalArgumentException} whose message names the first character that breaks the
+ * rule by its code point and its offset in code points ({@code Invalid XML element name: character U+003E at offset 1
+ * is not allowed}), never the name itself, because the name may come from a request and the message may reach a
+ * SOAP fault or a JSON error body. How DataWeave 1.0 treated a dynamic key that is not an XML name is not documented;
+ * it is a Tier 2A verification point.
+ *
+ * <p>Text escapes {@code &}, {@code <} and {@code >}; attribute values and
  * namespace URIs also escape {@code "}. A character XML 1.0 does not allow in a text, attribute value or
  * namespace URI (a C0 control other than tab, line feed and carriage return, an unpaired surrogate, U+FFFE or
  * U+FFFF) makes {@link #write(Element)} and {@link #writeBytes(Element)} throw {@link IllegalStateException}
@@ -95,6 +126,12 @@ public class DwXmlWriter {
     public static final String DECLARATION = "<?xml version='1.0' encoding='UTF-8'?>";
 
     private static final String DEFAULT_PREFIX = "";
+
+    /** The roles a refused name is reported under, as in {@code Invalid XML element name: ...}. */
+    private static final String ELEMENT_NAME = "element name";
+    private static final String ELEMENT_PREFIX = "element prefix";
+    private static final String NAMESPACE_PREFIX = "namespace prefix";
+    private static final String ATTRIBUTE_NAME = "attribute name";
 
     /** Creates a writer; it holds no state, so one instance serves every caller. */
     public DwXmlWriter() {
@@ -138,8 +175,9 @@ public class DwXmlWriter {
      * @param name the root element name
      * @param value the root content, converted as {@link #fromObject(String, String, String, Object)} states
      * @return the root element
-     * @throws IllegalArgumentException when {@code value} is an {@link Iterable} or an array, or a name is
-     *         empty
+     * @throws IllegalArgumentException when {@code value} is an {@link Iterable} or an array, or a name, the root's
+     *         or that of a map key that becomes an element, is empty or not an element name by the rules of the class
+     *         description
      */
     public Element fromObject(String name, Object value) {
         return fromObject(null, null, name, value);
@@ -152,7 +190,9 @@ public class DwXmlWriter {
      *
      * <ul>
      *   <li>A {@link Map} becomes one child per entry of {@code entrySet()}, in iteration order, named
-     *       {@code String.valueOf(key)}. Repeated keys in the entry set produce repeated children.</li>
+     *       {@code String.valueOf(key)}. Repeated keys in the entry set produce repeated children. Every key that
+     *       becomes an element is checked as an element local name when that element is created, before anything is
+     *       written; a key whose value is an empty {@link Iterable} or array gives no element and is not checked.</li>
      *   <li>An {@link Iterable} or array (object or primitive) under a key repeats that key's element once per
      *       item, each item converted by these rules; a nested iterable repeats the same key again.</li>
      *   <li>{@code null} becomes an element with no text and no children.</li>
@@ -164,8 +204,9 @@ public class DwXmlWriter {
      * @param name the root element name
      * @param value the root content
      * @return the root element
-     * @throws IllegalArgumentException when {@code value} is an {@link Iterable} or an array, or a name is
-     *         empty
+     * @throws IllegalArgumentException when {@code value} is an {@link Iterable} or an array; when the root's prefix,
+     *         URI and name are refused as {@link #element(String, String, String)} states; or when a map key that
+     *         becomes an element is empty or not an element local name
      */
     public Element fromObject(String prefix, String uri, String name, Object value) {
         if (isRepeated(value)) {
@@ -179,9 +220,10 @@ public class DwXmlWriter {
     /**
      * Creates an unqualified element.
      *
-     * @param name the local name
+     * @param name the local name: an {@code NCName}, optionally followed by U+0020 spaces
      * @return the element
-     * @throws IllegalArgumentException when {@code name} is {@code null} or empty
+     * @throws IllegalArgumentException when {@code name} is {@code null}, empty or not such a name; the message
+     *         names the first offending character by code point and offset, never the name
      */
     public static Element element(String name) {
         return new Element(null, null, name);
@@ -190,11 +232,15 @@ public class DwXmlWriter {
     /**
      * Creates an element with a prefix and namespace URI.
      *
-     * @param prefix the prefix; {@code null} or empty for the default namespace or none
+     * @param prefix the prefix; {@code null} or empty for the default namespace or none, otherwise an
+     *        {@code NCName} other than {@code xmlns}
      * @param uri the namespace URI; {@code null} or empty when the element declares none
-     * @param name the local name
+     * @param name the local name: an {@code NCName}, optionally followed by U+0020 spaces
      * @return the element
-     * @throws IllegalArgumentException when {@code name} is {@code null} or empty
+     * @throws IllegalArgumentException when {@code name} is {@code null}, empty or not such a name, when a non-empty
+     *         {@code prefix} is not such a prefix, or when the binding of {@code prefix} to {@code uri} misuses
+     *         {@code xml} or a reserved namespace; the message names the first offending
+     *         character by code point and offset, or the rule broken, never the caller's name or URI
      */
     public static Element element(String prefix, String uri, String name) {
         return new Element(prefix, uri, name);
@@ -243,6 +289,143 @@ public class DwXmlWriter {
 
     private static String normalizePrefix(String prefix) {
         return prefix == null ? DEFAULT_PREFIX : prefix;
+    }
+
+    /**
+     * Returns {@code name} once it is known to be an element local name: an {@code NCName} followed by nothing or by
+     * U+0020 spaces only.
+     *
+     * @throws IllegalArgumentException when {@code name} is {@code null}, empty or not such a name
+     */
+    private static String requireElementName(String name) {
+        if (name == null || name.isEmpty()) {
+            throw new IllegalArgumentException("An XML element name must not be null or empty");
+        }
+        int end = ncNameEnd(name, 0);
+        int at = end;
+        while (end > 0 && at < name.length() && name.charAt(at) == ' ') {
+            at++;
+        }
+        if (at < name.length()) {
+            // Without an NCName the first character is reported; after one, the character that ends it, which is
+            // also the first space of a run that something other than spaces follows.
+            throw invalidName(ELEMENT_NAME, name, end);
+        }
+        return name;
+    }
+
+    /**
+     * Checks an element prefix or a namespace declaration's prefix: {@code null}, empty or an {@code NCName}, never
+     * {@code xmlns}, which only declares namespaces.
+     *
+     * @param kind the name's role in the message, {@link #ELEMENT_PREFIX} or {@link #NAMESPACE_PREFIX}
+     */
+    private static void checkPrefix(String prefix, String kind) {
+        if (prefix == null || prefix.isEmpty()) {
+            return;
+        }
+        int end = ncNameEnd(prefix, 0);
+        if (end < prefix.length()) {
+            throw invalidName(kind, prefix, end);
+        }
+        if (XMLConstants.XMLNS_ATTRIBUTE.equals(prefix)) {
+            throw new IllegalArgumentException(
+                    "Invalid XML " + kind + ": the prefix reserved for namespace declarations is not allowed");
+        }
+    }
+
+    /**
+     * Checks an attribute name: a {@code QName}, an {@code NCName} or two joined by one {@code ':'}, that is not a
+     * namespace declaration ({@code xmlns} or {@code xmlns:*}). Its prefix is not required to be bound.
+     */
+    private static void checkAttributeName(String name) {
+        int end = ncNameEnd(name, 0);
+        if (end < name.length()) {
+            if (end == 0 || name.charAt(end) != ':') {
+                throw invalidName(ATTRIBUTE_NAME, name, end);
+            }
+            int localEnd = ncNameEnd(name, end + 1);
+            if (localEnd < name.length()) {
+                throw invalidName(ATTRIBUTE_NAME, name, localEnd);
+            }
+            if (localEnd == end + 1) {
+                // Nothing follows the ':', so the ':' itself cannot stand where it does.
+                throw invalidName(ATTRIBUTE_NAME, name, end);
+            }
+        }
+        if (XMLConstants.XMLNS_ATTRIBUTE.equals(name.substring(0, end))) {
+            throw new IllegalArgumentException("Invalid XML " + ATTRIBUTE_NAME
+                    + ": namespace declarations are added with namespace(prefix, uri), not as attributes");
+        }
+    }
+
+    /**
+     * Checks a binding of {@code prefix} ({@code ""} for the default namespace) to {@code uri} against Namespaces in
+     * XML 1.0, section 3: {@code xml} is bound only to its namespace, that namespace only to {@code xml}, and the
+     * namespace of namespace declarations to nothing. A {@code null} or empty {@code uri} binds nothing here.
+     */
+    private static void checkBinding(String prefix, String uri) {
+        if (uri == null || uri.isEmpty()) {
+            return;
+        }
+        boolean xmlPrefix = XMLConstants.XML_NS_PREFIX.equals(prefix);
+        if (xmlPrefix != XMLConstants.XML_NS_URI.equals(uri)) {
+            throw new IllegalArgumentException("Invalid XML namespace binding: " + (xmlPrefix
+                    ? "the prefix 'xml' is bound only to " + XMLConstants.XML_NS_URI
+                    : XMLConstants.XML_NS_URI + " is bound only to the prefix 'xml'"));
+        }
+        if (XMLConstants.XMLNS_ATTRIBUTE_NS_URI.equals(uri)) {
+            throw new IllegalArgumentException(
+                    "Invalid XML namespace binding: " + XMLConstants.XMLNS_ATTRIBUTE_NS_URI + " cannot be bound");
+        }
+    }
+
+    /**
+     * The index at which the {@code NCName} starting at {@code from} ends: {@code from} itself when no
+     * {@code NameStartChar} is there, otherwise the index of the first code point that is not a {@code NameChar}, or
+     * the length of {@code value}. The value is read by code point, so a supplementary character counts as one
+     * character and an unpaired surrogate matches no range.
+     */
+    private static int ncNameEnd(String value, int from) {
+        if (from >= value.length() || !isNameStartChar(value.codePointAt(from))) {
+            return from;
+        }
+        int at = from + Character.charCount(value.codePointAt(from));
+        while (at < value.length()) {
+            int codePoint = value.codePointAt(at);
+            if (!isNameChar(codePoint)) {
+                break;
+            }
+            at += Character.charCount(codePoint);
+        }
+        return at;
+    }
+
+    /** XML 1.0 (Fifth Edition) {@code NameStartChar} without {@code ':'}. */
+    private static boolean isNameStartChar(int c) {
+        return (c >= 'A' && c <= 'Z') || c == '_' || (c >= 'a' && c <= 'z')
+                || (c >= 0xC0 && c <= 0xD6) || (c >= 0xD8 && c <= 0xF6) || (c >= 0xF8 && c <= 0x2FF)
+                || (c >= 0x370 && c <= 0x37D) || (c >= 0x37F && c <= 0x1FFF) || (c >= 0x200C && c <= 0x200D)
+                || (c >= 0x2070 && c <= 0x218F) || (c >= 0x2C00 && c <= 0x2FEF) || (c >= 0x3001 && c <= 0xD7FF)
+                || (c >= 0xF900 && c <= 0xFDCF) || (c >= 0xFDF0 && c <= 0xFFFD) || (c >= 0x10000 && c <= 0xEFFFF);
+    }
+
+    /** XML 1.0 (Fifth Edition) {@code NameChar} without {@code ':'}. */
+    private static boolean isNameChar(int c) {
+        return isNameStartChar(c) || c == '-' || c == '.' || (c >= '0' && c <= '9') || c == 0xB7
+                || (c >= 0x300 && c <= 0x36F) || (c >= 0x203F && c <= 0x2040);
+    }
+
+    /**
+     * The failure for the code point at {@code index} of {@code name}, named by its value and its offset in code
+     * points, so that the message, which may reach a SOAP fault or a JSON error body, never carries the name.
+     *
+     * @param kind the name's role, for example {@link #ELEMENT_NAME}
+     */
+    private static IllegalArgumentException invalidName(String kind, String name, int index) {
+        return new IllegalArgumentException(String.format(
+                "Invalid XML %s: character U+%04X at offset %d is not allowed",
+                kind, name.codePointAt(index), name.codePointCount(0, index)));
     }
 
     private static void writeElement(Element element, int depth, Map<String, String> inScope, StringBuilder out) {
@@ -413,28 +596,33 @@ public class DwXmlWriter {
         private String text;
 
         private Element(String prefix, String uri, String name) {
-            if (name == null || name.isEmpty()) {
-                throw new IllegalArgumentException("An XML element name must not be null or empty");
-            }
+            this.name = requireElementName(name);
+            checkPrefix(prefix, ELEMENT_PREFIX);
+            checkBinding(normalizePrefix(prefix), uri);
             this.prefix = prefix;
             this.uri = uri;
-            this.name = name;
         }
 
         /**
          * Adds a namespace declaration to this element, written before its own binding. A binding an
          * ancestor already declared with the same URI is not written again.
          *
-         * @param prefix the prefix to bind; {@code null} or empty for the default namespace ({@code xmlns})
+         * @param prefix the prefix to bind; {@code null} or empty for the default namespace ({@code xmlns}),
+         *        otherwise an {@code NCName} other than {@code xmlns}
          * @param uri the namespace URI; may be empty only for the default namespace
          * @return this element
-         * @throws IllegalArgumentException when {@code uri} is {@code null}, or empty for a prefix
+         * @throws IllegalArgumentException when {@code prefix} is not such a prefix (the message names the first
+         *         offending character by code point and offset, never the prefix), when {@code uri} is {@code null},
+         *         or empty for a prefix, or when the binding misuses {@code xml},
+         *         {@code http://www.w3.org/XML/1998/namespace} or {@code http://www.w3.org/2000/xmlns/}
          */
         public Element namespace(String prefix, String uri) {
             String key = normalizePrefix(prefix);
+            checkPrefix(key, NAMESPACE_PREFIX);
             if (uri == null || (!key.isEmpty() && uri.isEmpty())) {
                 throw new IllegalArgumentException("Namespace prefix '" + key + "' needs a namespace URI");
             }
+            checkBinding(key, uri);
             namespaces.put(key, uri);
             return this;
         }
@@ -442,15 +630,19 @@ public class DwXmlWriter {
         /**
          * Sets an attribute, keeping the order in which attributes were first set.
          *
-         * @param name the attribute name, written as given (for example {@code xsi:type})
+         * @param name the attribute name, a {@code QName} written as given (for example {@code xsi:type}); its prefix
+         *        needs no declaration on this element
          * @param value the attribute value; {@code null} removes the attribute
          * @return this element
-         * @throws IllegalArgumentException when {@code name} is {@code null} or empty
+         * @throws IllegalArgumentException when {@code name} is {@code null}, empty, not a {@code QName}, or
+         *         {@code xmlns} or {@code xmlns:*}, which {@link #namespace(String, String)} declares; the message
+         *         names the first offending character by code point and offset, never the name
          */
         public Element attribute(String name, String value) {
             if (name == null || name.isEmpty()) {
                 throw new IllegalArgumentException("An XML attribute name must not be null or empty");
             }
+            checkAttributeName(name);
             if (value == null) {
                 attributes.remove(name);
             } else {

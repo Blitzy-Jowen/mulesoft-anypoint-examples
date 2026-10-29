@@ -37,12 +37,12 @@ import com.mulesoft.examples.jms_message_rollback_and_redelivery.exception.MyExc
  * <p>The catch branch's ERROR line records the failure it consumes, as Mule's catch exception strategy logged the
  * exception it handled: the branch name, then the exception's class with the frame that threw it and the classes
  * of its causes, for example {@code Catch Exception Strategy: jakarta.jms.MessageFormatException at
- * org.apache.activemq.artemis.jms.client.ActiveMQObjectMessage.getBodyInternal(ActiveMQObjectMessage.java:169)} for
- * an object message whose class is not on the classpath. The exception is never handed to the logger and no
- * message, cause message, suppressed exception or stack trace is written, because a message can quote the
- * delivered payload or a class name the sender chose. Every logged name is bounded in length and its
- * control, line-separator and format characters, unpaired surrogates and reverse solidus are escaped, so the event
- * stays on one line.
+ * com.mulesoft.examples.jms_message_rollback_and_redelivery.trigger.InQueueListener.readObjectBody(InQueueListener.java:266)
+ * <- java.io.InvalidClassException} for an object message body the listener's deserialization filter rejects. The
+ * exception is never handed to the logger and no message, cause message, suppressed exception or stack trace is
+ * written, because a message can quote the delivered payload or a class name the sender chose. Every logged name is
+ * bounded in length and its control, line-separator and format characters, unpaired surrogates and reverse solidus
+ * are escaped, so the event stays on one line.
  *
  * <p>The class holds no transaction of its own: the session belongs to the listener container, and
  * {@link TopicPublisher} sends on it, as {@code ALWAYS_JOIN} did. The pause before a rollback belongs to

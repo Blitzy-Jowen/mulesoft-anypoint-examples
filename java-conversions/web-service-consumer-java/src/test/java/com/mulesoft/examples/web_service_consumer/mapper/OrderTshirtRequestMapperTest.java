@@ -40,12 +40,14 @@ import com.fasterxml.jackson.core.JsonProcessingException;
  * {@link DwXmlWriter} layout, members in body order, a repeated key or an array item once per occurrence,
  * {@code null} as an empty element, decimals with their scale; a scalar body is the root's text and a {@code null}
  * body the empty root, as the script places any payload under {@code ns0#OrderTshirt}; an empty or malformed body,
- * and a root array, which the writer refuses as XML output has a single root, are rejected with
+ * a root array, which the writer refuses as XML output has a single root, and a member name that is not an XML
+ * element name, which the writer refuses before writing anything, are rejected with
  * {@link IllegalArgumentException} by both conversions.
  *
  * <p>The sample is the original example's {@code /message.json}, read from the test classpath as bytes. Expected
  * documents are spelled out with explicit {@code \n} and {@code \t}. The mapper is built directly over a real
- * {@link DwXmlWriter}; no Spring context is started.
+ * {@link DwXmlWriter}, except where a writer subclass records its input or stands in for unparseable output; no
+ * Spring context is started.
  */
 class OrderTshirtRequestMapperTest {
 
@@ -402,16 +404,55 @@ class OrderTshirtRequestMapperTest {
                 .hasNoCause();
     }
 
-    static Stream<Arguments> bodiesWhoseXmlIsNotWellFormed() {
+    /**
+     * Bodies with a member name that is not an XML element name, at the top or nested, with the key and the message
+     * the writer refuses it with.
+     */
+    static Stream<Arguments> bodiesWithAKeyThatIsNotAnElementName() {
+        String injection = "x><!--</x>--><evil/><!--x--";
         return Stream.of(
-                Arguments.of("space in a key", "{\"a b\":1}"),
-                Arguments.of("key starting with a digit", "{\"1st\":1}"));
+                Arguments.of("space in a key", "{\"a b\":1}", "a b", "character U+0020 at offset 1"),
+                Arguments.of("key starting with a digit", "{\"1st\":1}", "1st", "character U+0031 at offset 0"),
+                Arguments.of("comment-balanced injection key", "{\"" + injection + "\":\"v\"}", injection,
+                        "character U+003E at offset 1"),
+                Arguments.of("injection key nested in an object after a valid member",
+                        "{\"email\":\"a@b.c\",\"address\":{\"" + injection + "\":\"v\"}}", injection,
+                        "character U+003E at offset 1"),
+                Arguments.of("injection key in an array item", "{\"items\":[{\"" + injection + "\":1}]}", injection,
+                        "character U+003E at offset 1"));
     }
 
     @ParameterizedTest(name = "{0}")
-    @MethodSource("bodiesWhoseXmlIsNotWellFormed")
-    void writerOutputTheParserRejectsFailsTheDocumentWithTheParserDiagnostic(String description, String json) {
-        assertThatThrownBy(() -> mapper.toDocument(utf8(json)))
+    @MethodSource("bodiesWithAKeyThatIsNotAnElementName")
+    void keyThatIsNotAnElementNameIsRefusedByTheWriterInBothConversionsWithoutEchoingIt(String description,
+            String json, String key, String position) {
+        String message = "Invalid XML element name: " + position + " is not allowed";
+        byte[] body = utf8(json);
+
+        assertThatThrownBy(() -> mapper.toXml(body))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(message)
+                .hasNoCause()
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain(key).doesNotContain("<evil"));
+        assertThatThrownBy(() -> mapper.toDocument(body))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(message)
+                .hasNoCause()
+                .satisfies(e -> assertThat(e.getMessage()).doesNotContain(key).doesNotContain("<evil"));
+    }
+
+    @Test
+    void writerOutputTheParserRejectsFailsTheDocumentWithTheParserDiagnostic() {
+        // The writer refuses every name and character that would make its output ill-formed, so a writer whose
+        // output the parser rejects stands in for one, to show the diagnostic toDocument then raises.
+        DwXmlWriter illFormedWriter = new DwXmlWriter() {
+            @Override
+            public String write(DwXmlWriter.Element root) {
+                return DECLARATION_LINE + "<ns0:OrderTshirt xmlns:ns0=\"" + TSHIRT_NAMESPACE + "\"><a b/>";
+            }
+        };
+
+        assertThatThrownBy(() -> new OrderTshirtRequestMapper(illFormedWriter).toDocument(utf8("{\"size\":\"L\"}")))
                 .isExactlyInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("DataWeave XML output could not be parsed: ")
                 .hasCauseInstanceOf(SAXParseException.class);

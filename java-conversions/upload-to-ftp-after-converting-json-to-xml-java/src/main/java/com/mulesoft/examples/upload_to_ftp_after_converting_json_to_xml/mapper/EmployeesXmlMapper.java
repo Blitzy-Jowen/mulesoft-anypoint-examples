@@ -60,7 +60,10 @@ import org.springframework.stereotype.Component;
  * <p>JSON objects keep their members in input order, repeated keys included, decimals are read as
  * {@link java.math.BigDecimal} with their scale kept ({@code 1.50}), and every other value is carried as read and
  * rendered by {@link DwXmlWriter}. Input that is empty, not JSON, followed by trailing content, or whose root is not
- * an object raises {@link IllegalArgumentException}.
+ * an object raises {@link IllegalArgumentException}, as does a member name that becomes an element name, such as a
+ * key of an address object at any depth, and is not one by {@link DwXmlWriter}'s rules: the writer refuses it while
+ * the document is built, before anything is written or uploaded, naming the first offending character by code point
+ * and offset, never the name.
  *
  * <p>The payload's bytes are read with the charset the request declared, which Mule 3.8's HTTP listener made the
  * message encoding the script read its input with. Without a declared charset the encoding is detected from the bytes
@@ -131,7 +134,8 @@ public class EmployeesXmlMapper {
      *
      * @param json the JSON payload
      * @return the XML document, declaration included, without a trailing line feed
-     * @throws IllegalArgumentException when the payload is empty, malformed, or its root is not an object
+     * @throws IllegalArgumentException when the payload is empty, malformed, or its root is not an object, or a
+     *                                  member name written as an element name is not an XML element name
      */
     public String toXml(byte[] json) {
         return toXml(json, null);
@@ -145,7 +149,8 @@ public class EmployeesXmlMapper {
      *                        in which case UTF-8, UTF-16 or UTF-32 is detected from the bytes
      * @return the XML document, declaration included, without a trailing line feed
      * @throws IllegalArgumentException when the payload cannot be decoded with {@code declaredCharset}, or is empty,
-     *                                  malformed, or its root is not an object
+     *                                  malformed, or its root is not an object, or a member name written as an
+     *                                  element name is not an XML element name
      */
     public String toXml(byte[] json, Charset declaredCharset) {
         return dwXmlWriter.write(buildEmployees(json, declaredCharset));
@@ -157,7 +162,8 @@ public class EmployeesXmlMapper {
      *
      * @param json the JSON payload
      * @return the UTF-8 bytes of {@link #toXml(byte[])}
-     * @throws IllegalArgumentException when the payload is empty, malformed, or its root is not an object
+     * @throws IllegalArgumentException when the payload is empty, malformed, or its root is not an object, or a
+     *                                  member name written as an element name is not an XML element name
      */
     public byte[] toXmlBytes(byte[] json) {
         return toXmlBytes(json, null);
@@ -172,7 +178,8 @@ public class EmployeesXmlMapper {
      *                        in which case UTF-8, UTF-16 or UTF-32 is detected from the bytes
      * @return the UTF-8 bytes of {@link #toXml(byte[], Charset)}
      * @throws IllegalArgumentException when the payload cannot be decoded with {@code declaredCharset}, or is empty,
-     *                                  malformed, or its root is not an object
+     *                                  malformed, or its root is not an object, or a member name written as an
+     *                                  element name is not an XML element name
      */
     public byte[] toXmlBytes(byte[] json, Charset declaredCharset) {
         return dwXmlWriter.writeBytes(buildEmployees(json, declaredCharset));

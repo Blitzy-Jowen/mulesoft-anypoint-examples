@@ -325,18 +325,40 @@ class UpsertPatientRequestMapperTest {
     }
 
     @Test
-    void toElementFailsWhenWriterOutputCannotBeParsed() {
+    void copiedNameThatIsNotAnXmlNameIsRefusedByTheWriterInBothConversions() {
         Document input = builder(true).newDocument();
         // Without strict error checking a DOM accepts an element name that is not an XML Name; the mapper copies the
-        // name as it is, so the writer's output is not well-formed and the parser rejects it.
+        // name, and the writer refuses it before anything is written, naming the character rather than the name.
         input.setStrictErrorChecking(false);
         Element admitSubject = input.createElementNS(NS0, "ns:admitSubject");
         Element notAName = input.createElementNS(null, "a b");
         notAName.appendChild(input.createTextNode("1234"));
         admitSubject.appendChild(input.createElementNS(NS1, "ns1:Subject")).appendChild(notAName);
+        String invalid = "Invalid XML element name: character U+0020 at offset 1 is not allowed";
 
-        assertThat(mapper.toXml(admitSubject)).isEqualTo(expectedDocument("\t\t<a b>1234</a b>"));
+        assertThatThrownBy(() -> mapper.toXml(admitSubject))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
         assertThatThrownBy(() -> mapper.toElement(admitSubject))
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(invalid)
+                .hasNoCause();
+    }
+
+    @Test
+    void toElementFailsWhenWriterOutputCannotBeParsed() {
+        // The writer refuses every name and character that would make its output ill-formed, so a writer whose
+        // output is not well-formed stands in for one, to show the parser's rejection.
+        DwXmlWriter illFormedWriter = new DwXmlWriter() {
+            @Override
+            public String write(DwXmlWriter.Element root) {
+                return "<?xml version='1.0' encoding='UTF-8'?>\n<ns0:upsertPatient xmlns:ns0=\"" + NS0
+                        + "\"><a b>1234</a b></ns0:upsertPatient>";
+            }
+        };
+
+        assertThatThrownBy(() -> new UpsertPatientRequestMapper(illFormedWriter).toElement(null))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith("upsertPatient XML could not be parsed: ")
                 .hasCauseInstanceOf(SAXException.class);

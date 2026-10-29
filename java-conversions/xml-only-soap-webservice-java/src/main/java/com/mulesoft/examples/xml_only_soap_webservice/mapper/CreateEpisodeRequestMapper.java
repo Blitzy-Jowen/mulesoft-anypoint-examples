@@ -133,6 +133,8 @@ public class CreateEpisodeRequestMapper {
      * @param upsertPatientResponse the response body's root element; {@code null} is accepted and selects
      *        {@code null}, as every non-matching input does
      * @return the DataWeave XML document, declaration included, without a trailing line feed
+     * @throws IllegalArgumentException when a copied element or attribute name is not an XML name, which only a DOM
+     *         built without strict error checking can hold; the writer refuses it before anything is written
      */
     public String toXml(Element upsertPatientResponse) {
         DwXmlWriter.Element patientId = DwXmlWriter.element(NS1_PREFIX, NS1, PATIENT_ID);
@@ -151,6 +153,7 @@ public class CreateEpisodeRequestMapper {
      *
      * @param upsertPatientResponse the response body's root element, as for {@link #toXml(Element)}
      * @return the document element, {@code createEpisode} in {@link #NS0}
+     * @throws IllegalArgumentException under the conditions of {@link #toXml(Element)}
      * @throws IllegalStateException when no secure XML parser can be configured, or the writer's output cannot
      *         be parsed
      */

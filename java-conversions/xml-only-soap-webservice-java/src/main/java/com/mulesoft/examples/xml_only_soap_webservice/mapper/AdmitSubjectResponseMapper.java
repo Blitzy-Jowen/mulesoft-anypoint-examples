@@ -144,7 +144,8 @@ public class AdmitSubjectResponseMapper {
      * @param createEpisodeResponse the EHRService response body root, or {@code null} for an empty body
      * @return the declaration and the document, without a trailing line feed
      * @throws IllegalArgumentException when an upstream {@code startDate} or {@code endDate} is present but
-     *         cannot be coerced to a date
+     *         cannot be coerced to a date, or a copied element or attribute name is not an XML name, which only a
+     *         DOM built without strict error checking can hold and the writer refuses before anything is written
      */
     public String toXml(Element createEpisodeResponse) {
         Element episode = createEpisodeResponse != null && INPUT_ROOT.equals(localName(createEpisodeResponse))

@@ -322,17 +322,21 @@ class TshirtControllerTest {
     }
 
     /**
-     * A truncated JSON order, and an unterminated XML element where {@code /inventory} expects a SOAP body, each with
-     * the 500 body carrying its reader's message. Jackson's message for the order is fixed English text, its line
-     * break JSON-escaped. The JDK XML parser words its message in the default locale's language (the JDK ships
-     * translations such as de, fr and ja), so the inventory's expected message is the one {@link #xmlParserMessage}
-     * obtains from this JVM's own parser for the same bytes, and the expected body is exact in every locale.
+     * A truncated JSON order, an order whose member name is not an XML element name, and an unterminated XML element
+     * where {@code /inventory} expects a SOAP body, each with the 500 body carrying its reader's or writer's message.
+     * Jackson's message for the order is fixed English text, its line break JSON-escaped; the writer names the
+     * offending character of the comment-balanced injection key, never the key. The JDK XML parser words its message
+     * in the default locale's language (the JDK ships translations such as de, fr and ja), so the inventory's
+     * expected message is the one {@link #xmlParserMessage} obtains from this JVM's own parser for the same bytes,
+     * and the expected body is exact in every locale.
      */
     static Stream<Arguments> unreadableBodies() throws Exception {
         String unterminatedInventory = "<ns0:ListInventory xmlns:ns0=\"http://mulesoft.org/tshirt-service\">";
         return Stream.of(
                 Arguments.of("/orders", JSON, "{\"email\":", "{ \"message\": \"Unexpected end-of-input within/between"
                         + " Object entries\\n at [Source: UNKNOWN; line: 1, column: 10]\" }"),
+                Arguments.of("/orders", JSON, "{\"email\":\"a@b.c\",\"x><!--</x>--><evil/><!--x--\":\"v\"}",
+                        "{ \"message\": \"Invalid XML element name: character U+003E at offset 1 is not allowed\" }"),
                 Arguments.of("/inventory", "text/xml", unterminatedInventory,
                         "{ \"message\": \"" + jsonEscaped(xmlParserMessage(unterminatedInventory)) + "\" }"));
     }

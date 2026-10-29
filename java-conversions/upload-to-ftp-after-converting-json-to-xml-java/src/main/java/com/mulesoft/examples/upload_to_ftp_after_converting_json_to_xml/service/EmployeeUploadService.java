@@ -47,7 +47,8 @@ public class EmployeeUploadService {
      *                        none
      * @return the uploaded XML bytes, the same array that was stored on the FTP server
      * @throws IllegalArgumentException when the payload cannot be decoded with {@code declaredCharset}, or is empty,
-     *                                  malformed, or its root is not a JSON object
+     *                                  malformed, or its root is not a JSON object, or a member name written as an
+     *                                  element name is not an XML element name; nothing is uploaded
      * @throws IllegalStateException when the FTP settings are missing or the server rejects the upload
      * @throws java.io.UncheckedIOException when the FTP connection or transfer fails
      */

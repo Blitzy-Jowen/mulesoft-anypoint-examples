@@ -245,13 +245,13 @@ While `application-it.yml` or one of the three keys is missing, blank or still `
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| salesforce-data-retrieval-java | salesforce-data-retrieval | Third-party connector | PASS | PASS | 98.9% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
+| salesforce-data-retrieval-java | salesforce-data-retrieval | Third-party connector | PASS | PASS | 99.0% | PARITY: UNVERIFIED — Mule runtime unavailable | NOT RUN — sandbox credentials not supplied |
 
-This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-28 with `mvn -B clean verify`, which runs the same surefire tests, JaCoCo check and failsafe run, on the tree whose SC-4 `DwXmlWriter` refuses element, prefix and attribute names that are not XML names:
 
-- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 1059 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 2 tests, both skipped (`SalesforceIdRetrievalIT`, no `application-it.yml`).
-- `mvn -B test`: `BUILD SUCCESS`; 1059 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 357 of 361 lines (98.9%) of `service/SalesforceRetrievalService`, `mapper/SObjectOptionsMapper`, `mapper/QueryResultFormatter`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 95.8% (1107 of 1155 lines).
+- `mvn -B clean install`: `BUILD SUCCESS`. Surefire ran 1252 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`. Failsafe ran 2 tests, both skipped (`SalesforceIdRetrievalIT`, no `application-it.yml`).
+- `mvn -B test`: `BUILD SUCCESS`; 1252 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 413 of 417 lines (99.0%) of `service/SalesforceRetrievalService`, `mapper/SObjectOptionsMapper`, `mapper/QueryResultFormatter`, `mapper/DwXmlWriter` and `mapper/ParseTemplateRenderer`. Total project LINE coverage: 96.0% (1163 of 1211 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=11`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `SalesforceIdRetrievalIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

@@ -251,13 +251,13 @@ No scenario is `unreachable` or `nondeterministic`: the flow reads no clock or r
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| importing-an-email-attachment-using-the-IMAP-connector-java | importing-an-email-attachment-using-the-IMAP-connector | General | PASS | PASS | 94.2% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+| importing-an-email-attachment-using-the-IMAP-connector-java | importing-an-email-attachment-using-the-IMAP-connector | General | PASS | PASS | 94.9% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
-Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
+Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-28 with `mvn -B clean verify`, which runs the same surefire tests and JaCoCo check, on the tree whose SC-4 `DwXmlWriter` refuses element, prefix and attribute names that are not XML names:
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 280 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 280 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 372 of 395 lines. The `mapper` package is fully covered (253 of 253 lines); `service` has 119 of 142 (`AttachmentImportService` 25 of 25, `FileOutboundWriter` with its nested `TargetLock` 94 of 117). Total project LINE coverage: 95.1% (543 of 571 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 473 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 473 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 428 of 451 lines. The `mapper` package is fully covered (309 of 309 lines); `service` has 119 of 142 (`AttachmentImportService` 25 of 25, `FileOutboundWriter` with its nested `TargetLock` 94 of 117). Total project LINE coverage: 95.5% (599 of 627 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=2`, `failed=0`.
 
 Tier 1 evidence shows that the project builds and passes its own tests. It is not parity evidence.

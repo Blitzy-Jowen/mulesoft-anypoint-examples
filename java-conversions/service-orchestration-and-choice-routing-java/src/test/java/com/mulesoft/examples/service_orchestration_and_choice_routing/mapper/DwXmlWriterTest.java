@@ -12,6 +12,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
 
+import java.io.IOException;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -20,10 +22,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
 
 /**
  * Byte contract of {@link DwXmlWriter}: the single-quoted declaration, a line feed, then the root element in
@@ -38,12 +48,24 @@ import org.junit.jupiter.params.provider.MethodSource;
  * ending at {@code </summary>}) and the options payload of {@code salesforce-data-retrieval}, whose
  * {@code </div>} the recorded page follows directly with its template's next line, end the same way.
  *
+ * <p>Names are held to the XML name rules the writer documents: a refused element name, prefix, binding or
+ * attribute name raises {@link IllegalArgumentException} from every call that takes it, map keys nested in a value
+ * tree included whenever they become elements, with a message that never repeats the caller's text; a key under an
+ * empty list or array, which gives no element, is not checked; legitimate names, an element name with trailing spaces
+ * included, are written byte for byte.
+ *
  * <p>Expected documents are spelled out with explicit {@code \n} and {@code \t}; no file or classpath resource
  * is read, so the class is copied with {@link DwXmlWriter} changing only the package line.
  */
 class DwXmlWriterTest {
 
     private static final String DECLARATION_LINE = "<?xml version='1.0' encoding='UTF-8'?>\n";
+
+    /** The namespace the {@code xml} prefix is bound to by definition (Namespaces in XML 1.0, section 3). */
+    private static final String XML_NAMESPACE = "http://www.w3.org/XML/1998/namespace";
+
+    /** The namespace of namespace declarations, to which nothing may be bound. */
+    private static final String XMLNS_NAMESPACE = "http://www.w3.org/2000/xmlns/";
 
     /**
      * The element and text tree of the upload-to-ftp {@code reply.xml}: its first 633 bytes, which end at
@@ -656,6 +678,330 @@ class DwXmlWriterTest {
         assertThat(element.getChildren()).isEmpty();
     }
 
+    /**
+     * Element local names the writer refuses, with the code point and the code-point offset it reports: the
+     * comment-balanced injection key of the security review, markup and syntax characters, a colon, a start that is
+     * not a {@code NameStartChar}, a leading or inner space, white space other than U+0020 after the name, and
+     * unpaired surrogates.
+     */
+    static Stream<Arguments> invalidElementNames() {
+        return Stream.of(
+                Arguments.of("comment-balanced injection key", "x><!--</x>--><evil/><!--x--", "U+003E", 1),
+                Arguments.of("inner space", "a b", "U+0020", 1),
+                Arguments.of("trailing space run followed by a letter", "Bill x", "U+0020", 4),
+                Arguments.of("trailing space run followed by a tab", "a \t", "U+0020", 1),
+                Arguments.of("leading digit", "1st", "U+0031", 0),
+                Arguments.of("leading hyphen", "-x", "U+002D", 0),
+                Arguments.of("leading middle dot, a NameChar only", "\u00b7x", "U+00B7", 0),
+                Arguments.of("colon", "a:b", "U+003A", 1),
+                Arguments.of("leading space", " lead", "U+0020", 0),
+                Arguments.of("trailing tab", "a\t", "U+0009", 1),
+                Arguments.of("trailing line feed", "a\n", "U+000A", 1),
+                Arguments.of("trailing carriage return", "a\r", "U+000D", 1),
+                Arguments.of("multiplication sign, between NameChar ranges", "a\u00d7", "U+00D7", 1),
+                Arguments.of("lone high surrogate", "\ud800", "U+D800", 0),
+                Arguments.of("lone low surrogate after a letter", "a\udc00", "U+DC00", 1),
+                Arguments.of("offset in code points after supplementary U+20000", "\ud840\udc00<", "U+003C", 1),
+                Arguments.of("less-than sign", "<", "U+003C", 0),
+                Arguments.of("ampersand", "&", "U+0026", 0),
+                Arguments.of("quotation mark", "\"", "U+0022", 0),
+                Arguments.of("equals sign", "=", "U+003D", 0),
+                Arguments.of("solidus", "/", "U+002F", 0),
+                Arguments.of("question mark", "?", "U+003F", 0));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidElementNames")
+    void invalidElementNameIsRefusedBeforeAnythingIsWrittenWithoutEchoingIt(String description, String name,
+            String codePoint, int offset) {
+        String message = "Invalid XML element name: character " + codePoint + " at offset " + offset
+                + " is not allowed";
+        List<ThrowingCallable> refusals = List.of(
+                () -> DwXmlWriter.element(name),
+                () -> DwXmlWriter.element("p", "urn:p", name),
+                () -> writer.fromObject(name, "v"),
+                () -> writer.fromObject("p", "urn:p", name, null),
+                // Map keys nested as an address item's are: under a scalar, an object and a null value, and after a
+                // valid sibling.
+                () -> writer.fromObject("employees", ordered("employee", ordered("address", ordered(name, "v")))),
+                () -> writer.fromObject("r", ordered("item", ordered(name, ordered("inner", "v")))),
+                () -> writer.fromObject("r", ordered("ok", "1", name, null)));
+
+        for (ThrowingCallable refusal : refusals) {
+            assertRefused(refusal, message, name);
+        }
+    }
+
+    /**
+     * Each refused name of {@link #invalidElementNames()} as a map key under each kind of value that repeats its key
+     * once per item, an {@link Iterable}, an object array and a primitive array, given empty and with one item.
+     */
+    static Stream<Arguments> invalidElementNamesUnderValuesRepeatedPerItem() {
+        List<Arguments> values = List.of(
+                Arguments.of("List", List.of(), List.of("v")),
+                Arguments.of("Object[]", new Object[0], new Object[] {"v"}),
+                Arguments.of("int[]", new int[0], new int[] {1}));
+        return invalidElementNames().flatMap(name -> values.stream().map(value -> Arguments.of(
+                name.get()[0] + " under an empty " + value.get()[0], name.get()[1], value.get()[1], value.get()[2],
+                name.get()[2], name.get()[3])));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidElementNamesUnderValuesRepeatedPerItem")
+    void invalidMapKeyUnderAnEmptyListOrArrayWritesNoElementAndIsRefusedOnceItHasAnItem(String description,
+            String name, Object empty, Object oneItem, String codePoint, int offset) {
+        String rootAlone = DECLARATION_LINE + "<r/>";
+
+        // An empty list or array gives no element, so its key never becomes markup and is not checked: the root is
+        // written alone, and a nested parent stays empty.
+        assertThat(writer.write(writer.fromObject("r", ordered(name, empty)))).isEqualTo(rootAlone);
+        assertThat(writer.writeBytes(writer.fromObject("r", ordered(name, empty))))
+                .isEqualTo(rootAlone.getBytes(StandardCharsets.UTF_8));
+        assertThat(writer.write(writer.fromObject("r", ordered("item", ordered(name, empty)))))
+                .isEqualTo(DECLARATION_LINE + "<r>\n\t<item/>\n</r>");
+
+        // With one item the key becomes an element, so it is refused before anything is written.
+        assertRefused(() -> writer.fromObject("r", ordered(name, oneItem)),
+                "Invalid XML element name: character " + codePoint + " at offset " + offset + " is not allowed", name);
+    }
+
+    /** Element and namespace-declaration prefixes the writer refuses, with the reason it reports. */
+    static Stream<Arguments> invalidPrefixes() {
+        return Stream.of(
+                Arguments.of("xmlns, reserved for namespace declarations", "xmlns",
+                        "the prefix reserved for namespace declarations is not allowed"),
+                Arguments.of("leading digit", "1p", "character U+0031 at offset 0 is not allowed"),
+                Arguments.of("inner space", "p q", "character U+0020 at offset 1 is not allowed"),
+                Arguments.of("trailing space", "p ", "character U+0020 at offset 1 is not allowed"),
+                Arguments.of("colon", "p:q", "character U+003A at offset 1 is not allowed"),
+                Arguments.of("markup", "p><evil/", "character U+003E at offset 1 is not allowed"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidPrefixes")
+    void invalidPrefixIsRefusedForAnElementAndANamespaceDeclarationWithoutEchoingIt(String description,
+            String prefix, String reason) {
+        for (String uri : Arrays.asList("urn:p", "", null)) {
+            assertRefused(() -> DwXmlWriter.element(prefix, uri, "e"), "Invalid XML element prefix: " + reason,
+                    prefix);
+            assertRefused(() -> writer.fromObject(prefix, uri, "r", "v"), "Invalid XML element prefix: " + reason,
+                    prefix);
+        }
+        DwXmlWriter.Element element = DwXmlWriter.element("e");
+        assertRefused(() -> element.namespace(prefix, "urn:p"), "Invalid XML namespace prefix: " + reason, prefix);
+        assertRefused(() -> element.namespace(prefix, null), "Invalid XML namespace prefix: " + reason, prefix);
+        assertThat(element.getNamespaces()).isEmpty();
+    }
+
+    /**
+     * Bindings Namespaces in XML 1.0 (section 3) forbids, with the reason the writer reports and the caller-chosen
+     * text it must not repeat ({@code null} where the binding holds only reserved names).
+     */
+    static Stream<Arguments> misusedBindings() {
+        String xmlPrefixOnly = "the prefix 'xml' is bound only to " + XML_NAMESPACE;
+        String xmlNamespaceOnly = XML_NAMESPACE + " is bound only to the prefix 'xml'";
+        String xmlnsNamespace = XMLNS_NAMESPACE + " cannot be bound";
+        return Stream.of(
+                Arguments.of("xml to another namespace", "xml", "urn:caller-namespace", xmlPrefixOnly,
+                        "urn:caller-namespace"),
+                Arguments.of("xml to the xmlns namespace", "xml", XMLNS_NAMESPACE, xmlPrefixOnly, null),
+                Arguments.of("another prefix to the xml namespace", "callerPrefix", XML_NAMESPACE, xmlNamespaceOnly,
+                        "callerPrefix"),
+                Arguments.of("the default namespace to the xml namespace", "", XML_NAMESPACE, xmlNamespaceOnly, null),
+                Arguments.of("a prefix to the xmlns namespace", "callerPrefix", XMLNS_NAMESPACE, xmlnsNamespace,
+                        "callerPrefix"),
+                Arguments.of("the default namespace to the xmlns namespace", null, XMLNS_NAMESPACE, xmlnsNamespace,
+                        null));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("misusedBindings")
+    void bindingThatMisusesXmlOrXmlnsIsRefusedForAnElementAndANamespaceDeclaration(String description, String prefix,
+            String uri, String reason, String callerText) {
+        String message = "Invalid XML namespace binding: " + reason;
+
+        assertRefused(() -> DwXmlWriter.element(prefix, uri, "e"), message, callerText);
+        assertRefused(() -> writer.fromObject(prefix, uri, "r", null), message, callerText);
+        DwXmlWriter.Element element = DwXmlWriter.element("e");
+        assertRefused(() -> element.namespace(prefix, uri), message, callerText);
+        assertThat(element.getNamespaces()).isEmpty();
+    }
+
+    @Test
+    void xmlPrefixBoundToTheXmlNamespaceIsAccepted() {
+        assertThat(writer.write(DwXmlWriter.element("r").namespace("xml", XML_NAMESPACE).attribute("xml:lang", "en")))
+                .isEqualTo(DECLARATION_LINE
+                        + "<r xmlns:xml=\"http://www.w3.org/XML/1998/namespace\" xml:lang=\"en\"/>");
+        assertThat(writer.write(DwXmlWriter.element("xml", XML_NAMESPACE, "space")))
+                .isEqualTo(DECLARATION_LINE + "<xml:space xmlns:xml=\"http://www.w3.org/XML/1998/namespace\"/>");
+    }
+
+    /** Attribute names the writer refuses, with the reason it reports. */
+    static Stream<Arguments> invalidAttributeNames() {
+        String declaration = "namespace declarations are added with namespace(prefix, uri), not as attributes";
+        return Stream.of(
+                Arguments.of("xmlns, a default namespace declaration", "xmlns", declaration),
+                Arguments.of("xmlns:x, a prefix declaration", "xmlns:x", declaration),
+                Arguments.of("inner space", "a b", "character U+0020 at offset 1 is not allowed"),
+                Arguments.of("trailing space", "a ", "character U+0020 at offset 1 is not allowed"),
+                Arguments.of("nothing after the colon", "a:", "character U+003A at offset 1 is not allowed"),
+                Arguments.of("nothing before the colon", ":a", "character U+003A at offset 0 is not allowed"),
+                Arguments.of("two colons", "a:b:c", "character U+003A at offset 3 is not allowed"),
+                Arguments.of("local part starting with a digit", "a:1", "character U+0031 at offset 2 is not allowed"),
+                Arguments.of("leading digit", "1a", "character U+0031 at offset 0 is not allowed"),
+                Arguments.of("a second attribute smuggled in", "x=\"1\" y",
+                        "character U+003D at offset 1 is not allowed"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("invalidAttributeNames")
+    void invalidAttributeNameIsRefusedWithoutEchoingIt(String description, String name, String reason) {
+        String message = "Invalid XML attribute name: " + reason;
+        DwXmlWriter.Element element = DwXmlWriter.element("e");
+
+        assertRefused(() -> element.attribute(name, "v"), message, name);
+        // Removing it is refused too, so no call takes such a name.
+        assertRefused(() -> element.attribute(name, null), message, name);
+        assertThat(element.getAttributes()).isEmpty();
+    }
+
+    /** Element local names the writer accepts and writes as given. */
+    static Stream<Arguments> validElementNames() {
+        return Stream.of(
+                Arguments.of("underscore start", "_under"),
+                Arguments.of("dot, hyphen, underscore and digit after the start", "a.b-c_9"),
+                Arguments.of("Latin-1 letter", "stra\u00dfe"),
+                Arguments.of("CJK ideographs", "\u540d\u524d"),
+                Arguments.of("supplementary NameStartChar U+20000", "\ud840\udc00"),
+                Arguments.of("middle dot, combining grave and undertie after the start", "a\u00b7\u0300\u203fb"),
+                Arguments.of("one trailing space", "Bill "),
+                Arguments.of("several trailing spaces", "Bill   "));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("validElementNames")
+    void validElementNameIsWrittenAsGivenFromElementsAndMapKeys(String description, String name) {
+        String leaf = "<" + name + ">v</" + name + ">";
+
+        assertThat(writer.write(DwXmlWriter.element(name).text("v"))).isEqualTo(DECLARATION_LINE + leaf);
+        assertThat(writer.writeBytes(DwXmlWriter.element(name).text("v")))
+                .isEqualTo((DECLARATION_LINE + leaf).getBytes(StandardCharsets.UTF_8));
+        assertThat(writer.write(DwXmlWriter.element("p", "urn:p", name)))
+                .isEqualTo(DECLARATION_LINE + "<p:" + name + " xmlns:p=\"urn:p\"/>");
+        assertThat(writer.write(writer.fromObject("r", ordered("item", ordered(name, "v")))))
+                .isEqualTo(DECLARATION_LINE + "<r>\n\t<item>\n\t\t" + leaf + "\n\t</item>\n</r>");
+    }
+
+    /**
+     * The edges of the XML 1.0 (Fifth Edition) name character ranges, as hexadecimal code points: the first and last
+     * character of each {@code NameStartChar} range with the characters just outside it, then the characters only
+     * {@code NameChar} adds, which may follow the first character but not be it.
+     */
+    static Stream<Arguments> nameCharacterBoundaries() {
+        return Stream.of(
+                refused("0040"), anywhere("0041"), anywhere("005A"), refused("005B"),
+                refused("005E"), anywhere("005F"), refused("0060"),
+                anywhere("0061"), anywhere("007A"), refused("007B"),
+                refused("00BF"), anywhere("00C0"), anywhere("00D6"), refused("00D7"),
+                anywhere("00D8"), anywhere("00F6"), refused("00F7"),
+                anywhere("00F8"), anywhere("02FF"),
+                anywhere("0370"), anywhere("037D"), refused("037E"),
+                anywhere("037F"), anywhere("1FFF"), refused("2000"),
+                refused("200B"), anywhere("200C"), anywhere("200D"), refused("200E"),
+                refused("206F"), anywhere("2070"), anywhere("218F"), refused("2190"),
+                refused("2BFF"), anywhere("2C00"), anywhere("2FEF"), refused("2FF0"),
+                refused("3000"), anywhere("3001"), anywhere("D7FF"),
+                refused("F8FF"), anywhere("F900"), anywhere("FDCF"), refused("FDD0"),
+                refused("FDEF"), anywhere("FDF0"), anywhere("FFFD"), refused("FFFE"),
+                anywhere("10000"), anywhere("EFFFF"), refused("F0000"),
+                refused("002C"), afterTheFirst("002D"), afterTheFirst("002E"), refused("002F"),
+                afterTheFirst("0030"), afterTheFirst("0039"), refused("003A"),
+                refused("00B6"), afterTheFirst("00B7"), refused("00B8"),
+                afterTheFirst("0300"), afterTheFirst("036F"),
+                refused("203E"), afterTheFirst("203F"), afterTheFirst("2040"), refused("2041"));
+    }
+
+    @ParameterizedTest(name = "U+{0}: first {1}, after the first {2}")
+    @MethodSource("nameCharacterBoundaries")
+    void nameCharacterBoundariesFollowXmlFifthEdition(String hex, boolean first, boolean afterTheFirst) {
+        String character = Character.toString(Integer.parseInt(hex, 16));
+        String refusal = "Invalid XML element name: character U+" + hex + " at offset ";
+
+        if (first) {
+            assertThat(writer.write(DwXmlWriter.element(character)))
+                    .isEqualTo(DECLARATION_LINE + "<" + character + "/>");
+        } else {
+            assertRefused(() -> DwXmlWriter.element(character), refusal + "0 is not allowed", null);
+        }
+        if (afterTheFirst) {
+            assertThat(writer.write(DwXmlWriter.element("a" + character)))
+                    .isEqualTo(DECLARATION_LINE + "<a" + character + "/>");
+        } else {
+            assertRefused(() -> DwXmlWriter.element("a" + character), refusal + "1 is not allowed", null);
+        }
+    }
+
+    private static Arguments anywhere(String hex) {
+        return Arguments.of(hex, true, true);
+    }
+
+    private static Arguments afterTheFirst(String hex) {
+        return Arguments.of(hex, false, true);
+    }
+
+    private static Arguments refused(String hex) {
+        return Arguments.of(hex, false, false);
+    }
+
+    @Test
+    void trailingSpaceElementNameIsWrittenVerbatimAndParsesAsTheNameWithoutIt()
+            throws ParserConfigurationException, SAXException, IOException {
+        String model = "http://www.mule-health.com/SOA/model/1.0";
+        DwXmlWriter.Element bill = DwXmlWriter.element("ns1", model, "Bill ").children(
+                DwXmlWriter.element("costPerNight").text("100"),
+                DwXmlWriter.element("status").text("ADMITTED"));
+        String expected = DECLARATION_LINE
+                + "<ns1:Bill  xmlns:ns1=\"http://www.mule-health.com/SOA/model/1.0\">\n"
+                + "\t<costPerNight>100</costPerNight>\n"
+                + "\t<status>ADMITTED</status>\n"
+                + "</ns1:Bill >";
+
+        assertThat(writer.write(bill)).isEqualTo(expected);
+        assertThat(writer.writeBytes(bill)).isEqualTo(expected.getBytes(StandardCharsets.UTF_8));
+        assertThat(bill.getName()).isEqualTo("Bill ");
+        assertThat(writer.write(DwXmlWriter.element("Bill ").attribute("a", "1")))
+                .isEqualTo(DECLARATION_LINE + "<Bill  a=\"1\"/>");
+        assertThat(writer.write(DwXmlWriter.element("Bill "))).isEqualTo(DECLARATION_LINE + "<Bill />");
+
+        // XML allows white space before '>' and before an attribute, so the document is well-formed and its
+        // element is named Bill.
+        Element parsed = parse(expected).getDocumentElement();
+        assertThat(parsed.getLocalName()).isEqualTo("Bill");
+        assertThat(parsed.getNamespaceURI()).isEqualTo(model);
+        assertThat(parse(writer.write(DwXmlWriter.element("Bill ").attribute("a", "1"))).getDocumentElement()
+                .getAttribute("a")).isEqualTo("1");
+    }
+
+    /** Attribute names the writer accepts, prefixed ones whose prefix the element does not declare included. */
+    static Stream<Arguments> validAttributeNames() {
+        return Stream.of(
+                Arguments.of("xml:lang, bound by definition", "xml:lang"),
+                Arguments.of("xsi:type, not declared on the element", "xsi:type"),
+                Arguments.of("dot, hyphen and digit after the start", "data.v-1"),
+                Arguments.of("underscore start", "_x"),
+                Arguments.of("CJK ideographs", "\u540d\u524d"),
+                Arguments.of("supplementary NameStartChar U+20000 in both parts", "\ud840\udc00:\ud840\udc00"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("validAttributeNames")
+    void validAttributeNameIsWrittenAsGiven(String description, String name) {
+        DwXmlWriter.Element element = DwXmlWriter.element("e").attribute(name, "v");
+
+        assertThat(element.getAttributes()).containsExactly(entry(name, "v"));
+        assertThat(writer.write(element)).isEqualTo(DECLARATION_LINE + "<e " + name + "=\"v\"/>");
+    }
+
     @Test
     void gettersExposeStateThroughUnmodifiableViews() {
         DwXmlWriter.Element child = DwXmlWriter.element("child");
@@ -780,6 +1126,29 @@ class DwXmlWriterTest {
                 DwXmlWriter.element("name").text(name),
                 DwXmlWriter.element("units").text("1"),
                 DwXmlWriter.element("pricePerUnit").text("1")));
+    }
+
+    /**
+     * Asserts that {@code call} raises an {@link IllegalArgumentException} with exactly {@code message} and no cause,
+     * and that the message does not contain {@code callerText} unless that is {@code null}.
+     */
+    private static void assertRefused(ThrowingCallable call, String message, String callerText) {
+        assertThatThrownBy(call)
+                .isExactlyInstanceOf(IllegalArgumentException.class)
+                .hasMessage(message)
+                .hasNoCause()
+                .satisfies(e -> {
+                    if (callerText != null) {
+                        assertThat(e.getMessage()).doesNotContain(callerText);
+                    }
+                });
+    }
+
+    /** Parses {@code xml} with a namespace-aware JDK parser, which fails on a document that is not well-formed. */
+    private static Document parse(String xml) throws ParserConfigurationException, SAXException, IOException {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(true);
+        return factory.newDocumentBuilder().parse(new InputSource(new StringReader(xml)));
     }
 
     /** Bytes from unsigned values, so UTF-8 sequences read as they are written. */
