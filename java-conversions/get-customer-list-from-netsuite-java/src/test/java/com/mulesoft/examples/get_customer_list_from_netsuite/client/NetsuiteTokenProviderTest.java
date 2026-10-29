@@ -30,6 +30,7 @@ import com.nimbusds.jwt.SignedJWT;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URLDecoder;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.NoSuchFileException;
@@ -86,7 +87,8 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
  * client assertion (AAP 0.3.3), caching until 60 s before the stated expiry, eviction, concurrent callers sharing
  * one token request and its outcome without waiting longer than that request, the configuration failures
  * that name the {@code netsuite.oauth.*} key (AAP 0.4.6), the private-key loading failures whose caller-facing
- * message leaves the configured location and the cause to the log, and the unwrapped token-endpoint failure the
+ * message names only the setting and the problem and whose ERROR line holds neither the configured value (key text
+ * configured in place of a path included) nor a cause's message, and the unwrapped token-endpoint failure the
  * SC-9 classifier relies on (AAP 0.4.8). No Spring context starts and no classpath resource is read.
  *
  * <p>{@code netsuite-data-retrieval-java} carries this class with the provider, changing only the package line and
@@ -460,7 +462,9 @@ class NetsuiteTokenProviderTest {
     /*
      * The configured value is trimmed before use, so the malformed path keeps its NUL inside the name. The DER
      * bodies are minimal SEQUENCEs: the PKCS#1 armour alone decides that rejection, and an INTEGER alone is no
-     * PKCS#8 key.
+     * PKCS#8 key. Key text configured in place of a path is read as a file path: no such file exists, or one of its
+     * '/'-separated parts exceeds the file-name limit, so its cause is a NoSuchFileException or its parent
+     * FileSystemException.
      */
     static Stream<Arguments> unloadableKeys() {
         return Stream.of(
@@ -492,19 +496,27 @@ class NetsuiteTokenProviderTest {
                     generator.initialize(1024);
                     return pemAt(dir.resolve("short-netsuite-key.pem"), "PRIVATE KEY",
                             generator.generateKeyPair().getPrivate().getEncoded());
-                }), "holds an RSA key of 1024 bits", null));
+                }), "holds an RSA key of 1024 bits", null),
+                Arguments.of(named("key text in place of a path", (UnloadableKey) dir -> {
+                    KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+                    generator.initialize(2048);
+                    return pemText("PRIVATE KEY", generator.generateKeyPair().getPrivate().getEncoded());
+                }), "could not be read", FileSystemException.class));
     }
 
     /*
-     * The unhandled-exception 500 hands the message to the caller, so it names the setting and the problem only;
-     * the configured location and the cause go to one ERROR line per failed call, and the cause stays on the
-     * exception. A key that failed to load is not cached, so each call fails and logs again.
+     * The unhandled-exception 500 hands the message to the caller, so it names the setting and the problem only.
+     * Each failed call writes one ERROR line with that message, the kind and length of the configured value and the
+     * cause's class, but neither the value nor a cause's message, since either can be key text an operator put in
+     * place of a path; the cause stays on the exception. A key that failed to load is not cached, so each call fails
+     * and logs again.
      */
     @ParameterizedTest(name = "{0}")
     @MethodSource("unloadableKeys")
     @ExtendWith(OutputCaptureExtension.class)
-    void unloadableKeyFailsWithCallerSafeMessageAndLogsLocation(UnloadableKey unloadable, String problem,
-            Class<? extends Throwable> causeType, CapturedOutput output) throws IOException, GeneralSecurityException {
+    void unloadableKeyFailsWithCallerSafeMessageAndLogsNeitherValueNorCauseMessage(UnloadableKey unloadable,
+            String problem, Class<? extends Throwable> causeType, CapturedOutput output)
+            throws IOException, GeneralSecurityException {
         String location = unloadable.locate(tmp);
         props.getOauth().setPrivateKeyPath(location);
         stubToken("tok-1", "\"3600\"");
@@ -518,15 +530,38 @@ class NetsuiteTokenProviderTest {
             assertCallerSafe(failure, location, problem, causeType);
         }
         wm.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
-        List<String> logLines = output.getAll().lines()
+        String captured = output.getAll();
+        // The provider uses the value as NetsuiteProperties hands it over, trimmed.
+        String configured = location.trim();
+        String fileName = fileName(location);
+        List<String> logLines = captured.lines()
                 .filter(line -> line.contains(PRIVATE_KEY_PATH + " " + problem))
                 .toList();
         assertThat(logLines).hasSize(failures.size()).allSatisfy(line -> {
-            assertThat(line).contains("ERROR").contains("configured location: " + location);
+            assertThat(line).contains("ERROR")
+                    .contains("(configured value: ")
+                    .contains(" of " + configured.length() + " characters")
+                    .doesNotContain(location)
+                    .doesNotContain(tmp.toString());
+            if (!fileName.isEmpty()) {
+                assertThat(line).doesNotContain(fileName);
+            }
             if (causeType != null) {
-                assertThat(line).contains(failures.get(0).getCause().getClass().getName());
+                assertThat(line).contains("; cause: " + failures.get(0).getCause().getClass().getName() + ")");
             }
         });
+        // For key text these lines are its armour and every base64 line of its body.
+        List<String> neverLogged = new ArrayList<>(nonBlankLines(location));
+        for (Throwable failure : failures) {
+            if (failure.getCause() != null && failure.getCause().getMessage() != null) {
+                neverLogged.addAll(nonBlankLines(failure.getCause().getMessage()));
+            }
+        }
+        assertThat(neverLogged).isNotEmpty().allSatisfy(text -> assertThat(captured).doesNotContain(text));
+        if (configured.contains("-----BEGIN ")) {
+            assertThat(logLines).allSatisfy(line -> assertThat(line).contains("key text of "));
+            assertThat(captured).doesNotContain("BEGIN" + " PRIVATE KEY");
+        }
     }
 
     // derivations
@@ -664,7 +699,7 @@ class NetsuiteTokenProviderTest {
             Class<? extends Throwable> causeType) {
         assertThat(failure).isInstanceOf(IllegalStateException.class)
                 .hasMessageStartingWith(PRIVATE_KEY_PATH + " " + problem);
-        String fileName = location.substring(Math.max(location.lastIndexOf('/'), location.lastIndexOf(':')) + 1);
+        String fileName = fileName(location);
         assertThat(failure.getMessage())
                 .doesNotContain(location)
                 .doesNotContain(tmp.toString())
@@ -678,6 +713,16 @@ class NetsuiteTokenProviderTest {
             assertThat(failure.getCause()).isInstanceOf(causeType);
             assertThat(failure.getMessage()).doesNotContain(failure.getCause().getClass().getSimpleName());
         }
+    }
+
+    /** What follows the last {@code /} or {@code :} of a configured location, empty when nothing does. */
+    private static String fileName(String location) {
+        return location.substring(Math.max(location.lastIndexOf('/'), location.lastIndexOf(':')) + 1);
+    }
+
+    /** The lines of {@code text} that hold more than whitespace, stripped. */
+    private static List<String> nonBlankLines(String text) {
+        return text.lines().map(String::strip).filter(line -> !line.isEmpty()).toList();
     }
 
     /** The decoded form of the only token request received. */
@@ -723,11 +768,15 @@ class NetsuiteTokenProviderTest {
         return file.toString();
     }
 
-    /** The armour is assembled from its label, so this source holds no literal key block for secret scanners. */
+    /** Writes {@link #pemText} to {@code file}. */
     private static void writePem(Path file, String label, byte[] der) throws IOException {
+        Files.writeString(file, pemText(label, der), US_ASCII);
+    }
+
+    /** The armour is assembled from its label, so this source holds no literal key block for secret scanners. */
+    private static String pemText(String label, byte[] der) {
         String base64 = Base64.getMimeEncoder(64, "\n".getBytes(US_ASCII)).encodeToString(der);
-        Files.writeString(file, "-----BEGIN " + label + "-----\n" + base64 + "\n-----END " + label + "-----\n",
-                US_ASCII);
+        return "-----BEGIN " + label + "-----\n" + base64 + "\n-----END " + label + "-----\n";
     }
 
     /** A clock that stands still until advanced, so a token's expiry is crossed without waiting. */

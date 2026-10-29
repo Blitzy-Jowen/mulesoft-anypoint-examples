@@ -74,9 +74,9 @@ import org.springframework.web.reactive.function.client.WebClient;
  * NetSuite's status, headers and body but neither the request method nor the token URL.
  *
  * <p>Neither the assertion, the token, the key nor the token response body is ever logged or placed in an exception
- * message; logs name only the token URL, the expiry instant and, when the private key cannot be loaded, its
- * configured location and the cause. A key-loading failure's message names the setting and the problem but not the
- * location or a Java class, because the message reaches the caller in the 500 body.
+ * message; logs name only the token URL, the expiry instant and, for a private key that cannot be loaded, the problem,
+ * the configured value's kind and length and the cause's class, never that value or a cause message, either of which
+ * can be the key text. A key-loading failure's message, which reaches the caller, names just the setting and problem.
  */
 @Component
 public class NetsuiteTokenProvider {
@@ -346,8 +346,9 @@ public class NetsuiteTokenProvider {
     /**
      * Reads an unencrypted PKCS#8 PEM RSA private key from a file path or a {@code classpath:} location. Error
      * messages name the key and the problem only, never the configured location, a Java class name or the file
-     * content, because the unhandled-exception 500 returns the message to the caller; the location and the cause's
-     * class and message are logged at ERROR for the operator instead, and the cause stays on the exception.
+     * content, because the unhandled-exception 500 returns the message to the caller. The ERROR line each failure
+     * writes for the operator adds only the kind and length of the configured value and the cause's class (see
+     * {@link #keyLoadFailure}), and the cause stays on the exception.
      */
     private static PrivateKey loadPrivateKey(String location) {
         String pem = readKeyText(location);
@@ -400,25 +401,43 @@ public class NetsuiteTokenProvider {
     }
 
     /**
-     * Logs a private-key loading failure in one ERROR line with the configured location and, when there is one, the
-     * cause's class and message (for an I/O failure, the path), and returns the exception to throw. Its message is
-     * {@code netsuite.oauth.private-key-path <problem>}, which names neither the location nor a Java class, since
-     * it reaches the caller.
+     * Logs a private-key loading failure in one ERROR line and returns the exception to throw. The line holds the
+     * exception's message, the kind and length of the configured value ({@link #describeLocation}) and, when there is
+     * one, the cause's class. It holds neither the value nor the cause's message: an operator may have configured the
+     * key text itself in place of a location, and an I/O failure's message repeats the path it was given. The
+     * exception's message is {@code netsuite.oauth.private-key-path <problem>}, which names neither the location nor
+     * a Java class, since it reaches the caller; the cause stays attached to it.
      *
-     * @param location the configured {@code netsuite.oauth.private-key-path}
+     * @param location the configured {@code netsuite.oauth.private-key-path}, described in the log but never written
      * @param problem  what is wrong with the key, free of the location and of the key content
      * @param cause    the failure behind it, kept as the exception's cause, or {@code null}
      */
     private static IllegalStateException keyLoadFailure(String location, String problem, Throwable cause) {
         String message = PRIVATE_KEY_PATH_KEY + " " + problem;
         if (cause == null) {
-            LOG.error("{} (configured location: {})", message, location);
+            LOG.error("{} (configured value: {})", message, describeLocation(location));
             return new IllegalStateException(message);
         }
-        // Class and message are passed as text, so the line carries no stack trace.
-        LOG.error("{} (configured location: {}; cause: {}: {})", message, location, cause.getClass().getName(),
-                cause.getMessage());
+        // Only the class name is passed: the cause's message, or a stack trace printing it, could hold the key text.
+        LOG.error("{} (configured value: {}; cause: {})", message, describeLocation(location),
+                cause.getClass().getName());
         return new IllegalStateException(message, cause);
+    }
+
+    /**
+     * Describes the configured {@code netsuite.oauth.private-key-path} for the log by its kind and length only, with
+     * no part of the value: key text where a location belongs when it holds PEM armour, a classpath location when it
+     * starts with {@code classpath:}, and a file path otherwise.
+     */
+    private static String describeLocation(String location) {
+        int length = location.length();
+        if (location.contains("-----BEGIN")) {
+            return "key text of " + length + " characters in place of a file path or classpath location";
+        }
+        if (location.startsWith(CLASSPATH_PREFIX)) {
+            return "a classpath location of " + length + " characters";
+        }
+        return "a file path of " + length + " characters";
     }
 
     private JsonNode parse(String body) {

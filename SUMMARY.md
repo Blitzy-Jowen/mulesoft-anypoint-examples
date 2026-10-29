@@ -33,6 +33,7 @@ The row of `websphere-mq-java` was re-measured on 2026-10-29 with `mvn -B -ntp c
 The rows of `processing-orders-with-dataweave-and-APIkit-java`, `mule-expression-language-basics-java`, `legacy-modernization-java`, `http-multipart-request-java`, `importing-an-email-attachment-using-the-IMAP-connector-java` and `importing-an-email-attachment-using-the-POP3-connector-java`, and the Tier 1 tests total and lowest coverage under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose SC-6 `FileOutboundWriter` follows a symbolic link only inside the target directory, holds every directory it walks open where the platform offers a secure directory stream, creates missing directories relative to the held directory and refuses a directory it cannot hold open, and adds the tests of that confinement; each project gained 104 tests and its coverage cells changed.
 The rows of `service-orchestration-and-choice-routing-java` and `websphere-mq-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose SC-12 broker binds each reply channel to its client, accepts client publications on inbound channels only and bounds clients, subscriptions, retained bytes and request size, and again on the later tree whose handler payload reservations last until the handler exits and whose Bayeux batch is counted while it is parsed. On the tree that joins these changes with the ones the lines above record, both rows were measured again with `mvn -B clean install`.
 The row of `querying-a-db-and-attaching-results-to-an-email-java` and the Tier 1 tests total under Totals were re-measured on 2026-10-29 with `mvn -B -ntp clean install` on the tree that adds its mail-logging cap and the required SMTP STARTTLS, with their tests; only its test count changed.
+The rows of `get-customer-list-from-netsuite-java` and `netsuite-data-retrieval-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B -ntp clean install` on the tree whose NetSuite token provider logs an unloadable private-key setting by its kind and length and its cause's class only, with the test of key text configured as the path; only their test counts and total LINE coverage changed.
 
 ## Status
 
@@ -141,7 +142,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 27,939 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 27,941 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 86.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -165,8 +166,8 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | import-contacts-into-salesforce-java | 770 / 0 / 0 / 1 | 92 of 92 | 89.7% (875 of 976) | 1 run, 1 skipped, 0 failed, 0 errors |
 | import-leads-into-salesforce-java | 881 / 0 / 0 / 1 | 341 of 346 | 94.0% (1173 of 1248) | 1 run, 1 skipped, 0 failed, 0 errors |
 | authenticating-salesforce-using-oauth2-java | 959 / 0 / 0 / 1 | 156 of 156 | 96.6% (990 of 1025) | 1 run, 1 skipped, 0 failed, 0 errors |
-| get-customer-list-from-netsuite-java | 915 / 0 / 0 / 1 | 313 of 317 | 95.7% (1370 of 1431) | 1 run, 1 skipped, 0 failed, 0 errors |
-| netsuite-data-retrieval-java | 1524 / 0 / 0 / 0 | 438 of 441 | 93.3% (2047 of 2195) | 3 run, 3 skipped, 0 failed, 0 errors |
+| get-customer-list-from-netsuite-java | 916 / 0 / 0 / 1 | 313 of 317 | 95.8% (1376 of 1437) | 1 run, 1 skipped, 0 failed, 0 errors |
+| netsuite-data-retrieval-java | 1525 / 0 / 0 / 0 | 438 of 441 | 93.3% (2053 of 2201) | 3 run, 3 skipped, 0 failed, 0 errors |
 | salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 766 / 0 / 0 / 1 | 339 of 350 | 96.6% (932 of 965) | 1 run, 1 skipped, 0 failed, 0 errors |
 | salesforce-to-MySQL-DB-using-Batch-Processing-java | 818 / 0 / 0 / 1 | 363 of 374 | 96.7% (1007 of 1041) | 1 run, 1 skipped, 0 failed, 0 errors |
 | adding-a-new-customer-to-workday-revenue-management-java | 577 / 0 / 0 / 1 | 73 of 73 | 96.4% (669 of 694) | 1 run, 1 skipped, 0 failed, 0 errors |
