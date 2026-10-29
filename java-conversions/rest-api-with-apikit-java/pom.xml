@@ -24,6 +24,19 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
+    <dependencyManagement>
+        <dependencies>
+            <!-- json-schema-core 1.2.14 brings Rhino 1.7.7.2, affected by CVE-2025-66453 (GHSA-3w8q-xq97-5j7x,
+                 excessive CPU in Number.prototype.toFixed); 1.7.15.1 is the fixed release of the 1.7.15 line.
+                 json-schema-validator stays at 2.2.14 and draft-03 validation is unchanged. -->
+            <dependency>
+                <groupId>org.mozilla</groupId>
+                <artifactId>rhino</artifactId>
+                <version>1.7.15.1</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <dependencies>
         <!-- Tomcat 10.1 drops custom reason phrases; Undertow writes them to the status line. -->
         <dependency>

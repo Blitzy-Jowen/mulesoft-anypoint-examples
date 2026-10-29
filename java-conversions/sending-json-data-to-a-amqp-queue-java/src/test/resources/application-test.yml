@@ -4,9 +4,9 @@
 # guest/guest is the embedded broker's demo user declared in src/test/resources/config.json (the original
 # test broker's work/etc/passwd held the same guest:guest entry); it is not a real credential.
 amqp:
-  host: localhost   # original test property amqp.host (SendingJsonDataToAmqpQueueIT.java:131)
+  host: 127.0.0.1   # original test property amqp.host (SendingJsonDataToAmqpQueueIT.java:131)
 spring:
   rabbitmq:
-    host: localhost
+    host: 127.0.0.1   # the embedded broker binds 127.0.0.1 only (config.json); localhost may resolve to ::1
     username: guest
     password: guest

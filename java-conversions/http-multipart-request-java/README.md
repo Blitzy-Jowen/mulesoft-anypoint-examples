@@ -180,13 +180,13 @@ No scenario of this project is `unreachable` or `nondeterministic`: every branch
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| http-multipart-request-java | http-multipart-request | General | PASS | PASS | 85.4% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+| http-multipart-request-java | http-multipart-request | General | PASS | PASS | 86.4% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 318 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 318 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 158 of 185 lines (`service/UploadService` 19 of 19, `service/FileOutboundWriter` 94 of 117, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 92.3% (394 of 427 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 422 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 422 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 407 of 471 lines (`service/UploadService` 19 of 19, `service/FileOutboundWriter` 343 of 403, `mapper/ParseTemplateRenderer` 45 of 49). Total project LINE coverage: 90.2% (643 of 713 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=10`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

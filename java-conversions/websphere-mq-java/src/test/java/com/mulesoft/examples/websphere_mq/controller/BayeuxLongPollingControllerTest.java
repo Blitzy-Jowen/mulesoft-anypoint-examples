@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.fail;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.asyncDispatch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -12,9 +14,12 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 
 import java.io.IOException;
 import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -22,11 +27,15 @@ import java.util.stream.Stream;
 
 import jakarta.servlet.AsyncEvent;
 import jakarta.servlet.AsyncListener;
+import jakarta.servlet.Filter;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletRequestWrapper;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,12 +47,16 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockAsyncContext;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.test.web.servlet.setup.StandaloneMockMvcBuilder;
+import org.springframework.web.context.request.async.DeferredResult;
 
 import com.mulesoft.examples.websphere_mq.service.AjaxChannelBroker;
 
@@ -55,10 +68,13 @@ import com.mulesoft.examples.websphere_mq.service.AjaxChannelBroker;
  * <p>Every test builds its own {@link AjaxChannelBroker} from a {@link MockEnvironment} and its own controller on
  * standalone {@link MockMvc}: no application context, no network port and no project advice, so only what the
  * controller and Spring MVC's default resolvers produce is asserted. The channels are neutral: {@value #ECHO} is an
- * inbound channel whose handler returns the publication's {@code data}, and {@value #OUT} is a plain application
- * channel. A held connect is observed through its {@link MvcResult}'s async result, never by sleeping. The race tests
- * replace the broker with a {@link PausingBroker} that pauses a held connect's wait thread on a latch, and play the
- * container's timeout, error and completion through the request's async listeners ({@link ContainerEvent}).
+ * inbound channel whose handler returns the publication's {@code data}, and {@value #OUT} is an application channel
+ * without a handler, which only the server publishes on. A held connect is observed through its {@link MvcResult}'s
+ * async result, never by sleeping. The race tests replace the broker with a {@link PausingBroker} that pauses a held
+ * connect's wait thread on a latch, and play the container's timeout, error and completion through the request's
+ * async listeners ({@link ContainerEvent}). A body without a declared length is played by a filter that hides the
+ * length ({@link BodyFraming}); that Undertow drains the unread rest of a refused chunked body, so the client receives
+ * the whole 413, is covered over the wire by each project's application test.
  *
  * <p>The class names no project value, so every project serving the Mule Ajax transport carries it with only the
  * {@code package} line and the package root of the {@link AjaxChannelBroker} import changed.
@@ -70,10 +86,16 @@ class BayeuxLongPollingControllerTest {
     /** Inbound channel; its handler answers each publication with the publication's {@code data}. */
     private static final String ECHO = "/test/echo";
 
-    /** Application channel without a handler: publications reach its subscribers. */
+    /** Channel without a handler: the server's publications reach its subscribers; a client's are denied. */
     private static final String OUT = "/test/out";
 
     private static final String OTHER = "/test/other";
+
+    /** Inbound channel registered by a test whose handler records each payload it receives. */
+    private static final String RECORDED = "/test/recorded";
+
+    /** The content type {@code dojox.cometd} posts with. */
+    private static final MediaType FORM = MediaType.APPLICATION_FORM_URLENCODED;
 
     private static final String HANDSHAKE_CHANNEL = "/meta/handshake";
     private static final String CONNECT_CHANNEL = "/meta/connect";
@@ -94,6 +116,9 @@ class BayeuxLongPollingControllerTest {
 
     /** How long a connect is watched to show that it is held. */
     private static final long HELD_PROBE_MS = 300;
+
+    /** Clients a test registers at most while looking for the broker's client bound. */
+    private static final int MAX_PROBED_CLIENTS = 100_000;
 
     private static final MediaType JSON_TYPE = MediaType.parseMediaType("text/json");
     private static final MediaType JSONP_TYPE = MediaType.parseMediaType("text/javascript");
@@ -430,8 +455,7 @@ class BayeuxLongPollingControllerTest {
         String clientId = handshake(mvc);
         exchange(mvc, batch(subscribe(clientId, OUT)));
         JsonNode data = mapper.readTree("{\"n\":1,\"list\":[true,null,\"s\"],\"text\":\"a\u2028b\u2029c\"}");
-        JsonNode ack = single(exchange(mvc, batch(publish(clientId, OUT, data))));
-        assertThat(ack.path("successful").asBoolean()).as(ack.toString()).isTrue();
+        broker.publish(OUT, mapper.treeToValue(data, Object.class));
 
         MvcResult started = start(mvc, batch(connect(clientId)));
         assertAnsweredPromptly(started);
@@ -556,22 +580,25 @@ class BayeuxLongPollingControllerTest {
         assertThat(mapper.isEnabled(DeserializationFeature.FAIL_ON_TRAILING_TOKENS))
                 .as("the injected mapper is left unchanged").isFalse();
         String clientId = handshake(mvc);
-        exchange(mvc, batch(subscribe(clientId, OUT)));
-        String valid = batch(publish(clientId, OUT, mapper.getNodeFactory().textNode("published")),
-                envelope(HANDSHAKE_CHANNEL, null));
+        String replyTo = ECHO + "#" + clientId;
+        exchange(mvc, batch(subscribe(clientId, replyTo)));
+        ObjectNode rpc = mapper.createObjectNode().put("data", "published").put("replyTo", replyTo);
+        String valid = batch(publish(clientId, ECHO, rpc), envelope(HANDSHAKE_CHANNEL, null));
 
         MockHttpServletResponse response = finish(mvc, start(mvc, valid + suffix));
 
         assertThat(response.getStatus()).isEqualTo(400);
         assertContentType(response, JSON_TYPE);
         assertThat(response.getContentAsString(UTF_8)).isEqualTo("[]");
-        assertThat(broker.drain(clientId)).as("the refused publication reached no subscriber").isEmpty();
+        assertThat(counting.publications).as("the refused publication reached no handler").hasValue(0);
         assertThat(counting.handshakes).as("only the setup's handshake reached the broker").hasValue(1);
 
         // The batch alone is valid, so the suffix alone made the request malformed.
         ArrayNode accepted = exchange(mvc, valid);
-        assertThat(find(accepted, OUT).path("successful").asBoolean()).as(accepted.toString()).isTrue();
-        assertThat(broker.drain(clientId)).extracting(AjaxChannelBroker.Delivery::data).containsExactly("published");
+        assertThat(find(accepted, ECHO).path("successful").asBoolean()).as(accepted.toString()).isTrue();
+        assertThat(broker.awaitMessages(clientId, PROMPT_MS)).extracting(AjaxChannelBroker.Delivery::data)
+                .containsExactly("published");
+        assertThat(counting.publications).hasValue(1);
         assertThat(counting.handshakes).hasValue(2);
     }
 
@@ -625,6 +652,338 @@ class BayeuxLongPollingControllerTest {
     }
 
     @Test
+    void handshakeBeyondTheBrokersClientBoundIsDeniedInBandUntilAClientLeaves() throws Exception {
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        List<String> registered = registerClientsUntilRefused();
+        ObjectNode handshake = envelope(HANDSHAKE_CHANNEL, null).put("version", "1.0");
+
+        JsonNode denied = single(exchange(mvc, batch(handshake)));
+
+        assertThat(denied.path("channel").asText()).isEqualTo(HANDSHAKE_CHANNEL);
+        assertThat(denied.path("successful").asBoolean(true)).as(denied.toString()).isFalse();
+        assertThat(denied.path("error").asText()).isEqualTo("403::Handshake denied");
+        assertThat(denied.path("advice").path("reconnect").asText()).isEqualTo("handshake");
+        assertThat(denied.path("advice").path("interval").asInt()).isEqualTo(1000);
+        assertThat(denied.has("clientId")).as(denied.toString()).isFalse();
+        assertThat(denied.get("id")).isEqualTo(handshake.get("id"));
+
+        broker.disconnect(registered.get(0));
+
+        assertThat(broker.isKnownClient(handshake(mvc))).isTrue();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("refusedSubscriptions")
+    void subscriptionTheBrokerRefusesIsDeniedInBandAndSubscribesToNone(String description,
+            SubscriptionOf subscriptionOf) throws Exception {
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        String clientId = handshake(mvc);
+        String owner = handshake(mvc);
+        JsonNode channels = subscriptionOf.of(owner);
+        ObjectNode subscribe = subscribe(clientId, channels);
+
+        JsonNode reply = single(exchange(mvc, batch(subscribe)));
+
+        assertThat(reply.path("channel").asText()).isEqualTo(SUBSCRIBE_CHANNEL);
+        assertThat(reply.path("successful").asBoolean(true)).as(reply.toString()).isFalse();
+        assertThat(reply.path("error").asText()).isEqualTo("403::cannot subscribe");
+        assertThat(reply.path("clientId").asText()).isEqualTo(clientId);
+        assertThat(reply.get("subscription")).as("echoed so the client can match it").isEqualTo(channels);
+        assertThat(reply.has("advice")).as("no handshake advice: " + reply).isFalse();
+        assertThat(reply.get("id")).isEqualTo(subscribe.get("id"));
+        assertThat(broker.isKnownClient(clientId)).as("a denied subscription keeps the client").isTrue();
+        broker.publish(OUT, "m");
+        broker.publish(ECHO + "#" + owner, "m");
+        assertThat(broker.drain(clientId)).isEmpty();
+        // The owner of the reply channel subscribes to it.
+        JsonNode owned = single(exchange(mvc, batch(subscribe(owner, ECHO + "#" + owner))));
+        assertThat(owned.path("successful").asBoolean()).as(owned.toString()).isTrue();
+    }
+
+    static Stream<Arguments> refusedSubscriptions() {
+        JsonNodeFactory nodes = JsonNodeFactory.instance;
+        return Stream.of(
+                Arguments.of("another client's reply channel",
+                        (SubscriptionOf) owner -> nodes.textNode(ECHO + "#" + owner)),
+                Arguments.of("a channel name beyond the broker's bound",
+                        (SubscriptionOf) owner -> nodes.textNode("/" + "c".repeat(256))),
+                Arguments.of("several channels, one of them another client's reply channel",
+                        (SubscriptionOf) owner -> nodes.arrayNode().add(OUT).add(ECHO + "#" + owner)));
+    }
+
+    @Test
+    void rpcNamingAnotherClientsReplyChannelRunsTheHandlerWhileOnlyAnOwnReplyChannelGetsTheReply() throws Exception {
+        BlockingQueue<Object> handled = new LinkedBlockingQueue<>();
+        broker.registerInbound(RECORDED, data -> {
+            handled.add(data);
+            return data;
+        });
+        MockMvc mvc = mvc(LONG_TIMEOUT_MS);
+        String thief = handshake(mvc);
+        String victim = handshake(mvc);
+        exchange(mvc, batch(connect(thief)));
+        exchange(mvc, batch(subscribe(victim, RECORDED + "#" + victim)));
+        exchange(mvc, batch(subscribe(thief, RECORDED + "#" + thief)));
+
+        ObjectNode stolen = mapper.createObjectNode().put("data", "stolen").put("replyTo", RECORDED + "#" + victim);
+        JsonNode ack = single(exchange(mvc, batch(publish(thief, RECORDED, stolen))));
+
+        assertThat(ack.path("successful").asBoolean()).as(ack.toString()).isTrue();
+        assertThat(handled.poll(PROMPT_MS, TimeUnit.MILLISECONDS)).as("the handler still runs").isEqualTo("stolen");
+        assertThat(broker.awaitMessages(victim, HELD_PROBE_MS)).as("the victim receives nothing").isEmpty();
+
+        ObjectNode own = mapper.createObjectNode().put("data", "own").put("replyTo", RECORDED + "#" + thief);
+        exchange(mvc, batch(publish(thief, RECORDED, own)));
+        ArrayNode reply = exchange(mvc, batch(connect(thief)));
+
+        assertThat(deliveries(reply)).as(reply.toString()).singleElement().satisfies(delivery -> {
+            assertThat(delivery.path("channel").asText()).isEqualTo(RECORDED + "#" + thief);
+            assertThat(delivery.path("data").asText()).isEqualTo("own");
+        });
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("channelsWithoutInboundHandler")
+    void publicationOnAChannelWithoutInboundHandlerIsDeniedInBandAndReachesNobody(String description,
+            ChannelOf channelOf) throws Exception {
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        String forger = handshake(mvc);
+        String subscriber = handshake(mvc);
+        String channel = channelOf.name(subscriber);
+        JsonNode subscribed = single(exchange(mvc, batch(subscribe(subscriber, channel))));
+        assertThat(subscribed.path("successful").asBoolean()).as(subscribed.toString()).isTrue();
+        ObjectNode publication = publish(forger, channel, mapper.getNodeFactory().textNode("forged - processed"));
+
+        JsonNode ack = single(exchange(mvc, batch(publication)));
+
+        assertThat(ack.path("channel").asText()).isEqualTo(channel);
+        assertThat(ack.path("successful").asBoolean(true)).as(ack.toString()).isFalse();
+        assertThat(ack.path("error").asText()).isEqualTo("403::Publish denied");
+        assertThat(ack.has("data")).as(ack.toString()).isFalse();
+        assertThat(ack.get("id")).isEqualTo(publication.get("id"));
+        assertThat(broker.drain(subscriber)).as("the forged publication reached no subscriber").isEmpty();
+        assertThat(broker.isKnownClient(forger)).isTrue();
+    }
+
+    static Stream<Arguments> channelsWithoutInboundHandler() {
+        return Stream.of(
+                Arguments.of("outbound channel", (ChannelOf) subscriber -> OUT),
+                Arguments.of("another client's reply channel", (ChannelOf) subscriber -> ECHO + "#" + subscriber),
+                Arguments.of("unconfigured channel", (ChannelOf) subscriber -> "/test/unconfigured"));
+    }
+
+    @ParameterizedTest(name = "a form body of {1} bytes, {0}, is answered {2}")
+    @MethodSource("bodyFramings")
+    void requestBodyBeyondMaxRequestBytesIsRefused413BeforeItIsParsed(BodyFraming framing, int length, int status)
+            throws Exception {
+        HandshakeCountingBroker counting = replaceBroker(new HandshakeCountingBroker(brokerEnvironment()));
+        MockMvc mvc = framing.mvc(controller(SHORT_TIMEOUT_MS));
+        String prefix = "message=" + URLEncoder.encode(HANDSHAKE, UTF_8) + "&padding=";
+        String form = prefix + "p".repeat(length - prefix.length());
+
+        MockHttpServletResponse response = finish(mvc,
+                mvc.perform(post(PATH).contentType(FORM).content(form)).andReturn());
+
+        assertSizeOutcome(response, status, counting, 1);
+    }
+
+    static Stream<Arguments> bodyFramings() {
+        return Stream.of(BodyFraming.values()).flatMap(framing -> bodyLengths()
+                .map(lengthAndStatus -> Arguments.of(framing, lengthAndStatus.get()[0], lengthAndStatus.get()[1])));
+    }
+
+    @Test
+    void formBodyIsDecodedByTheControllerTakingTheFirstMessageAndJsonp() throws Exception {
+        // Built directly rather than through MockMvc, which would also parse the body into the request parameters:
+        // here the parameters are empty, as Undertow's are once the controller has read the body.
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", PATH);
+        request.setContentType("Application/X-WWW-Form-URLEncoded; charset=UTF-8");
+        String handshake = HANDSHAKE.replace(",", ", ");
+        request.setContent(("padding=a+b%20c&message=" + URLEncoder.encode(handshake, UTF_8)
+                + "&jsonp=cb&message=%5B%5D&jsonp=other&flag").getBytes(UTF_8));
+
+        ResponseEntity<String> response = answer(controller(SHORT_TIMEOUT_MS), request);
+
+        assertThat(response.getStatusCode().value()).as(response.toString()).isEqualTo(200);
+        assertThat(response.getHeaders().getContentType())
+                .isEqualTo(MediaType.parseMediaType("text/javascript;charset=UTF-8"));
+        String body = response.getBody();
+        assertThat(body).startsWith("cb([").endsWith("])");
+        JsonNode reply = single((ArrayNode) mapper.readTree(body.substring("cb(".length(), body.length() - 1)));
+        assertThat(reply.path("channel").asText()).isEqualTo(HANDSHAKE_CHANNEL);
+        assertThat(reply.path("successful").asBoolean()).as(body).isTrue();
+        assertThat(broker.isKnownClient(reply.path("clientId").asText())).isTrue();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("undecodableFormBodies")
+    void formBodyThatCannotBeDecodedIsAnswered400AndNothingOfItIsActedOn(String description, String contentType,
+            byte[] body) throws Exception {
+        HandshakeCountingBroker counting = replaceBroker(new HandshakeCountingBroker(brokerEnvironment()));
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", PATH);
+        request.setContentType(contentType);
+        request.setContent(body);
+
+        ResponseEntity<String> response = answer(controller(SHORT_TIMEOUT_MS), request);
+
+        assertThat(response.getStatusCode().value()).as(response.toString()).isEqualTo(400);
+        assertThat(response.getHeaders().getContentType())
+                .isEqualTo(MediaType.parseMediaType("text/json;charset=UTF-8"));
+        assertThat(response.getBody()).isEqualTo("[]");
+        assertThat(counting.handshakes).as("the body's handshake reached no broker").hasValue(0);
+    }
+
+    static Stream<Arguments> undecodableFormBodies() {
+        String form = "application/x-www-form-urlencoded";
+        String handshake = "message=" + URLEncoder.encode(HANDSHAKE, UTF_8);
+        return Stream.of(
+                Arguments.of("a % followed by a non-hexadecimal digit", form,
+                        (handshake + "&padding=%zz").getBytes(UTF_8)),
+                Arguments.of("a % followed by one hexadecimal digit at the end", form,
+                        (handshake + "&padding=%4").getBytes(UTF_8)),
+                Arguments.of("a % in a parameter name", form, ("pad%g1=x&" + handshake).getBytes(UTF_8)),
+                Arguments.of("a percent-encoded byte sequence that is not UTF-8", form,
+                        (handshake + "&padding=%C3%28").getBytes(UTF_8)),
+                Arguments.of("a raw byte that is not UTF-8", form,
+                        (handshake + "&padding=\u00ff").getBytes(StandardCharsets.ISO_8859_1)),
+                Arguments.of("bytes beyond the declared US-ASCII", form + ";charset=US-ASCII",
+                        (handshake + "&padding=%C3%A9").getBytes(UTF_8)),
+                Arguments.of("a character encoding the JVM does not support", form + ";charset=x-no-such-charset",
+                        handshake.getBytes(UTF_8)));
+    }
+
+    @Test
+    void queryStringParametersOfAPostComeBeforeItsFormBody() throws Exception {
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+
+        MockHttpServletResponse response = finish(mvc, mvc.perform(post(PATH + "?message={m}", HANDSHAKE)
+                .contentType(FORM).content("message=42&jsonp=cb")).andReturn());
+
+        // The query string's handshake is handled; the body's jsonp still applies, as the query string has none.
+        assertThat(response.getStatus()).as(response.getContentAsString(UTF_8)).isEqualTo(200);
+        assertContentType(response, JSONP_TYPE);
+        String body = response.getContentAsString(UTF_8);
+        assertThat(body).startsWith("cb([").endsWith("])");
+        JsonNode reply = single((ArrayNode) mapper.readTree(body.substring("cb(".length(), body.length() - 1)));
+        assertThat(reply.path("successful").asBoolean()).as(body).isTrue();
+        assertThat(broker.isKnownClient(reply.path("clientId").asText())).isTrue();
+    }
+
+    @Test
+    void failureReadingTheFormBodyPropagatesUnchanged() throws Exception {
+        BayeuxLongPollingController controller = controller(SHORT_TIMEOUT_MS);
+        IOException failure = new IOException("Connection reset by peer");
+        HttpServletRequest request = mock(HttpServletRequest.class);
+        when(request.getContentLengthLong()).thenReturn(-1L);
+        when(request.getContentType()).thenReturn(FORM.toString());
+        when(request.getInputStream()).thenThrow(failure);
+
+        assertThatThrownBy(() -> controller.cometd(request)).isSameAs(failure);
+    }
+
+    static Stream<Arguments> bodyLengths() {
+        return Stream.of(
+                Arguments.of(BayeuxLongPollingController.MAX_REQUEST_BYTES, 200),
+                Arguments.of(BayeuxLongPollingController.MAX_REQUEST_BYTES + 1, 413));
+    }
+
+    @ParameterizedTest(name = "a message parameter of {0} characters is answered {1}")
+    @MethodSource("bodyLengths")
+    void messageParameterBeyondMaxRequestBytesCharactersIsRefused413(int length, int status) throws Exception {
+        HandshakeCountingBroker counting = replaceBroker(new HandshakeCountingBroker(brokerEnvironment()));
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        // Whitespace after the single JSON value is allowed, so only the length decides.
+        String message = HANDSHAKE + " ".repeat(length - HANDSHAKE.length());
+
+        MockHttpServletResponse response = finish(mvc, mvc.perform(get(PATH).param("message", message)).andReturn());
+
+        assertSizeOutcome(response, status, counting, 1);
+    }
+
+    @ParameterizedTest(name = "a batch of {0} messages is answered {1}")
+    @MethodSource("batchSizes")
+    void batchBeyondMaxBatchMessagesIsRefused413WithoutSideEffects(int size, int status) throws Exception {
+        HandshakeCountingBroker counting = replaceBroker(new HandshakeCountingBroker(brokerEnvironment()));
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        ObjectNode[] handshakes = new ObjectNode[size];
+        for (int i = 0; i < size; i++) {
+            handshakes[i] = envelope(HANDSHAKE_CHANNEL, null);
+        }
+
+        MockHttpServletResponse response = finish(mvc, start(mvc, batch(handshakes)));
+
+        assertSizeOutcome(response, status, counting, size);
+        if (status == 200) {
+            assertThat(parse(response)).hasSize(size);
+        }
+    }
+
+    static Stream<Arguments> batchSizes() {
+        return Stream.of(
+                Arguments.of(BayeuxLongPollingController.MAX_BATCH_MESSAGES, 200),
+                Arguments.of(BayeuxLongPollingController.MAX_BATCH_MESSAGES + 1, 413));
+    }
+
+    @ParameterizedTest(name = "{0} is answered {3}")
+    @MethodSource("batchesCheckedElementByElement")
+    void batchIsCountedWhileItIsParsedAndRefusedWithoutSideEffects(String description, int objects, String rest,
+            int status) throws Exception {
+        HandshakeCountingBroker counting = replaceBroker(new HandshakeCountingBroker(brokerEnvironment()));
+        MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
+        ObjectNode[] handshakes = new ObjectNode[objects];
+        for (int i = 0; i < objects; i++) {
+            handshakes[i] = envelope(HANDSHAKE_CHANNEL, null);
+        }
+        String array = batch(handshakes);
+        // The handshakes, then the element under test in place of the closing bracket.
+        String message = array.substring(0, array.length() - 1) + "," + rest;
+
+        MockHttpServletResponse response = finish(mvc, start(mvc, message));
+
+        assertThat(response.getStatus()).as(response.getContentAsString(UTF_8)).isEqualTo(status);
+        assertContentType(response, JSON_TYPE);
+        assertThat(response.getContentAsString(UTF_8)).isEqualTo("[]");
+        assertThat(counting.handshakes).as("nothing of the refused batch reached the broker").hasValue(0);
+    }
+
+    static Stream<Arguments> batchesCheckedElementByElement() {
+        int limit = BayeuxLongPollingController.MAX_BATCH_MESSAGES;
+        return Stream.of(
+                Arguments.of("a 101st element that is not JSON", limit, "@]", 413),
+                Arguments.of("a 101st element that is a 100000-character string", limit,
+                        "\"" + "x".repeat(100_000) + "\"]", 413),
+                Arguments.of("a 101st element left unterminated, the array never ended", limit, "{\"channel\":", 413),
+                Arguments.of("a 100th element that is not an object", limit - 1, "42]", 400),
+                Arguments.of("a 100th element that is not JSON", limit - 1, "@]", 400));
+    }
+
+    @ParameterizedTest(name = "a batch of {0} empty objects is answered {1}")
+    @MethodSource("countedBatchSizes")
+    void noMessageBeyondMaxBatchMessagesIsReadIntoATree(int size, int status) throws Exception {
+        CountingNodeFactory nodes = new CountingNodeFactory();
+        BayeuxLongPollingController controller =
+                new BayeuxLongPollingController(broker, new ObjectMapper().setNodeFactory(nodes), SHORT_TIMEOUT_MS);
+        controllers.add(controller);
+        MockMvc mvc = mvc(controller);
+
+        MockHttpServletResponse response = finish(mvc, start(mvc, "[" + "{},".repeat(size - 1) + "{}]"));
+
+        assertThat(response.getStatus()).as(response.getContentAsString(UTF_8)).isEqualTo(status);
+        assertThat(nodes.objects.get()).as("message trees built")
+                .isLessThanOrEqualTo(BayeuxLongPollingController.MAX_BATCH_MESSAGES);
+        if (status == 200) {
+            assertThat(nodes.objects.get()).as("every message of a handled batch is counted").isEqualTo(size);
+            assertThat(parse(response)).hasSize(size);
+        }
+    }
+
+    static Stream<Arguments> countedBatchSizes() {
+        return Stream.of(
+                Arguments.of(BayeuxLongPollingController.MAX_BATCH_MESSAGES, 200),
+                Arguments.of(1000, 413));
+    }
+
+    @Test
     void methodOtherThanGetOrPostIsRefused() throws Exception {
         MockMvc mvc = mvc(SHORT_TIMEOUT_MS);
 
@@ -669,6 +1028,15 @@ class BayeuxLongPollingControllerTest {
 
     private static MockMvc mvc(BayeuxLongPollingController controller) {
         return MockMvcBuilders.standaloneSetup(controller).build();
+    }
+
+    /** Calls the controller with a request the test built itself and returns the answer, which must be set at once. */
+    @SuppressWarnings("unchecked")
+    private static ResponseEntity<String> answer(BayeuxLongPollingController controller, HttpServletRequest request)
+            throws IOException {
+        DeferredResult<ResponseEntity<String>> result = controller.cometd(request);
+        assertThat(result.hasResult()).as("answered at once").isTrue();
+        return (ResponseEntity<String>) result.getResult();
     }
 
     /** Posts the form body {@code dojox.cometd} sends; the answer may still be pending. */
@@ -797,6 +1165,37 @@ class BayeuxLongPollingControllerTest {
         assertThat(reply.get("id")).isEqualTo(request.get("id"));
     }
 
+    /**
+     * Asserts the plain-JSON answer to a request checked against a size limit: 413 with {@code []} when it was
+     * refused, nothing of it having reached the broker, or {@code status} with {@code handshakes} handshakes having
+     * reached the broker when it was handled.
+     */
+    private static void assertSizeOutcome(MockHttpServletResponse response, int status,
+            HandshakeCountingBroker counting, int handshakes) throws Exception {
+        assertThat(response.getStatus()).as(response.getContentAsString(UTF_8)).isEqualTo(status);
+        assertContentType(response, JSON_TYPE);
+        if (status == 413) {
+            assertThat(response.getContentAsString(UTF_8)).isEqualTo("[]");
+            assertThat(counting.handshakes).as("nothing of the refused request reached the broker").hasValue(0);
+        } else {
+            assertThat(counting.handshakes).hasValue(handshakes);
+        }
+    }
+
+    /** Registers clients on the broker directly until its client bound refuses one, and returns them. */
+    private List<String> registerClientsUntilRefused() {
+        List<String> registered = new ArrayList<>();
+        while (registered.size() <= MAX_PROBED_CLIENTS) {
+            try {
+                registered.add(broker.handshake());
+            } catch (AjaxChannelBroker.ChannelRefusedException refused) {
+                assertThat(refused.reason()).isEqualTo(AjaxChannelBroker.RefusalReason.CLIENT_LIMIT);
+                return registered;
+            }
+        }
+        return fail("The broker registered more than " + MAX_PROBED_CLIENTS + " clients");
+    }
+
     private static void assertHeld(MvcResult started) {
         assertThat(started.getRequest().isAsyncStarted()).isTrue();
         assertThatThrownBy(() -> started.getAsyncResult(HELD_PROBE_MS)).isInstanceOf(IllegalStateException.class);
@@ -810,6 +1209,50 @@ class BayeuxLongPollingControllerTest {
 
     private static long elapsedMs(long startNanos) {
         return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+    }
+
+    /** The {@code subscription} of a {@code /meta/subscribe}, named after another client. */
+    @FunctionalInterface
+    interface SubscriptionOf {
+
+        JsonNode of(String otherClientId);
+    }
+
+    /** Names a channel after one client. */
+    @FunctionalInterface
+    interface ChannelOf {
+
+        String name(String clientId);
+    }
+
+    /** How a form body reaches the controller: with a declared length, or without one, as a chunked body arrives. */
+    enum BodyFraming {
+
+        /** With {@code Content-Length}, as MockMvc sends every body. */
+        DECLARED,
+
+        /** Without a declared length: a filter makes the request report the length -1, as a chunked request does. */
+        CHUNKED;
+
+        MockMvc mvc(BayeuxLongPollingController controller) {
+            StandaloneMockMvcBuilder builder = MockMvcBuilders.standaloneSetup(controller);
+            if (this == CHUNKED) {
+                Filter undeclaredLength = (request, response, chain) -> chain.doFilter(
+                        new HttpServletRequestWrapper((HttpServletRequest) request) {
+                            @Override
+                            public int getContentLength() {
+                                return -1;
+                            }
+
+                            @Override
+                            public long getContentLengthLong() {
+                                return -1;
+                            }
+                        }, response);
+                builder.addFilters(undeclaredLength);
+            }
+            return builder.build();
+        }
     }
 
     /** What the container can do to a held request, played through the async listeners registered on it. */
@@ -961,10 +1404,28 @@ class BayeuxLongPollingControllerTest {
         }
     }
 
-    /** A broker that counts the clients registered through {@link AjaxChannelBroker#handshake()}. */
+    /** A node factory that counts the object nodes built with it: one per message the controller reads into a tree. */
+    static final class CountingNodeFactory extends JsonNodeFactory {
+
+        private static final long serialVersionUID = 1L;
+
+        final AtomicInteger objects = new AtomicInteger();
+
+        @Override
+        public ObjectNode objectNode() {
+            objects.incrementAndGet();
+            return super.objectNode();
+        }
+    }
+
+    /**
+     * A broker that counts the handshakes reaching {@link AjaxChannelBroker#handshake()} and the client publications
+     * reaching {@link AjaxChannelBroker#onPublication(String, String, Object)}.
+     */
     static final class HandshakeCountingBroker extends AjaxChannelBroker {
 
         final AtomicInteger handshakes = new AtomicInteger();
+        final AtomicInteger publications = new AtomicInteger();
 
         HandshakeCountingBroker(MockEnvironment environment) {
             super(environment);
@@ -974,6 +1435,12 @@ class BayeuxLongPollingControllerTest {
         public String handshake() {
             handshakes.incrementAndGet();
             return super.handshake();
+        }
+
+        @Override
+        public void onPublication(String clientId, String channel, Object data) {
+            publications.incrementAndGet();
+            super.onPublication(clientId, channel, data);
         }
     }
 }

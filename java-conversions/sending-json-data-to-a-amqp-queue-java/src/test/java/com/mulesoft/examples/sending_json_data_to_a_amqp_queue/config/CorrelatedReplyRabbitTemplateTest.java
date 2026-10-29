@@ -213,9 +213,9 @@ class CorrelatedReplyRabbitTemplateTest {
 
     @DynamicPropertySource
     static void brokerProperties(DynamicPropertyRegistry registry) {
-        registry.add("spring.rabbitmq.host", () -> "localhost");
+        registry.add("spring.rabbitmq.host", () -> LOOPBACK);
         registry.add("spring.rabbitmq.port", () -> amqpPort);
-        registry.add("amqp.host", () -> "localhost");
+        registry.add("amqp.host", () -> LOOPBACK);
     }
 
     /**
@@ -226,7 +226,7 @@ class CorrelatedReplyRabbitTemplateTest {
     void connectResponder() throws Exception {
         applicationConnectionFactory = connectionFactory;
         ConnectionFactory factory = new ConnectionFactory();
-        factory.setHost("localhost");
+        factory.setHost(LOOPBACK);
         factory.setPort(amqpPort);
         factory.setUsername(brokerUsername);
         factory.setPassword(brokerPassword);
@@ -564,7 +564,7 @@ class CorrelatedReplyRabbitTemplateTest {
      * @return the template, with Spring AMQP's defaults otherwise
      */
     private CorrelatedReplyRabbitTemplate dedicatedTemplate(boolean publisherReturns, long replyTimeoutMillis) {
-        CachingConnectionFactory factory = new CachingConnectionFactory("localhost", amqpPort);
+        CachingConnectionFactory factory = new CachingConnectionFactory(LOOPBACK, amqpPort);
         factory.setUsername(brokerUsername);
         factory.setPassword(brokerPassword);
         factory.setPublisherReturns(publisherReturns);

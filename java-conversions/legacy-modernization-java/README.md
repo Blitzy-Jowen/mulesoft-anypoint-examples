@@ -223,13 +223,13 @@ No scenario is `unreachable`: `FulfillmentImpl.putShippingOrder` has a single pa
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| legacy-modernization-java | legacy-modernization | General | PASS | PASS | 90.7% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
+| legacy-modernization-java | legacy-modernization | General | PASS | PASS | 88.7% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 352 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); enforcer ban passed; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 352 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 224 of 247 lines. `service/ShippingOrderExportService` 18 of 18, `service/FulfillmentService` 10 of 10, `service/FileOutboundWriter` 94 of 117 (its `TargetLock` included), `mapper/ShippingOrderCsvMapper` 47 of 47, `mapper/DwCsvWriter` 55 of 55. Total project LINE coverage: 88.7% (1154 of 1301 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 456 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); enforcer ban passed; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 456 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 473 of 533 lines. `service/ShippingOrderExportService` 18 of 18, `service/FulfillmentService` 10 of 10, `service/FileOutboundWriter` 343 of 403 (its nested classes included), `mapper/ShippingOrderCsvMapper` 47 of 47, `mapper/DwCsvWriter` 55 of 55. Total project LINE coverage: 88.4% (1403 of 1587 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

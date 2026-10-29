@@ -8,6 +8,7 @@
 
 package com.mulesoft.examples.websphere_mq;
 
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -22,12 +23,15 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.BufferedInputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URLEncoder;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -37,6 +41,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -63,6 +68,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -92,6 +98,7 @@ import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import com.mulesoft.examples.websphere_mq.client.MqQueueSender;
+import com.mulesoft.examples.websphere_mq.config.ContentSecurityPolicyFilter;
 import com.mulesoft.examples.websphere_mq.config.IbmMqConfig;
 import com.mulesoft.examples.websphere_mq.support.HttpTestClient;
 
@@ -128,7 +135,16 @@ import com.mulesoft.examples.websphere_mq.support.HttpTestClient;
  *       container acknowledges on receipt without a transaction; and the
  *       {@link IbmMqConfig#TRANSACTED_LISTENER_FACTORY} bean builds every container that way.</li>
  *   <li>The docroot page, the Mule Ajax JavaScript and the listener's no-listener 404 are fetched from the same
- *       running application.</li>
+ *       running application. Every response that yields the page ({@code /services/wmqExample/} forwarded to its
+ *       welcome file, {@code index.html} by name, {@code HEAD}) carries {@link ContentSecurityPolicyFilter#POLICY}
+ *       exactly once, the page bytes unchanged; the script, the 302 of {@code /services/wmqExample} and the 404
+ *       carry no policy.</li>
+ *   <li>The SC-12 endpoint's hostile-input limits are checked on the same running Undertow server: a form body of
+ *       300000 bytes is refused with 413 and {@code []}, whether it declares its length or is sent chunked; Undertow
+ *       drains the rest of the chunked body refused part-way, so the client receives the whole 413 and its kept-alive
+ *       connection then carries a handshake, which is answered, as the round-trip test's handshake is; and a
+ *       client publication on the dequeue channel, which only flow {@code Output} publishes on, is denied in-band
+ *       with {@code 403::Publish denied} and reaches no subscriber.</li>
  *   <li>The IBM MQ factory configuration, which the embedded broker replaces at run time, is verified without a
  *       queue manager: {@link IbmMqConfig#mqConnectionFactory} against a {@link MockEnvironment}; the
  *       {@code connectionFactory} bean's condition, its {@code wmq.host} requirement and the start-up check of
@@ -194,6 +210,12 @@ class WebsphereMqBrokerTest {
 
     /** Bound of each wait for the flows or the broker, as in the round-trip test. */
     private static final Duration FLOW_TIMEOUT = Duration.ofSeconds(20);
+
+    /** A form body well beyond the Bayeux endpoint's 200000-byte limit. */
+    private static final int OVERSIZED_BODY_BYTES = 300_000;
+
+    /** Size of each chunk of a chunked request body. */
+    private static final int CHUNK_BYTES = 8192;
 
     /**
      * Prefixes of the JVM-wide IBM client properties {@link IbmMqConfig#mqConnectionFactory} sets (transport budgets,
@@ -287,6 +309,8 @@ class WebsphereMqBrokerTest {
         handshake.putArray("supportedConnectionTypes").add("long-polling");
         HttpTestClient.Response handshakeResponse = postBayeux(batch(handshake));
         assertThat(handshakeResponse.header("Content-Type")).as(handshakeResponse.toString()).startsWith("text/json");
+        assertThat(handshakeResponse.headers(ContentSecurityPolicyFilter.HEADER_NAME))
+                .as(handshakeResponse.toString()).isEmpty();
         JsonNode handshakeReply = reply(messages(handshakeResponse), HANDSHAKE);
         assertSuccessful(handshakeReply);
         String clientId = handshakeReply.path("clientId").asText();
@@ -444,7 +468,31 @@ class WebsphereMqBrokerTest {
 
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.header("Content-Type")).as(response.toString()).startsWith("text/html");
+        assertThat(response.headers(ContentSecurityPolicyFilter.HEADER_NAME)).as(response.toString())
+                .containsExactly(ContentSecurityPolicyFilter.POLICY);
         assertThat(response.body()).isEqualTo(classpathBytes("static/services/wmqExample/index.html"));
+    }
+
+    /** The page requested by its file name, and HEAD of the docroot directory, carry the policy too. */
+    @ParameterizedTest(name = "{0} {1}")
+    @CsvSource({"GET, " + SERVER_PATH + "/index.html", "HEAD, " + SERVER_PATH + "/"})
+    void everyResponseYieldingThePageCarriesTheContentSecurityPolicy(String method, String path) {
+        HttpTestClient.Response response = http().send(method, path, null, null);
+
+        assertThat(response.status()).as(response.toString()).isEqualTo(200);
+        assertThat(response.header("Content-Type")).as(response.toString()).startsWith("text/html");
+        assertThat(response.headers(ContentSecurityPolicyFilter.HEADER_NAME)).as(response.toString())
+                .containsExactly(ContentSecurityPolicyFilter.POLICY);
+    }
+
+    /** The script, the redirect of the docroot directory without its trailing slash and the 404 carry no policy. */
+    @ParameterizedTest(name = "GET {0} -> {1}")
+    @CsvSource({SERVER_PATH + "/mule-resource/js/mule.js, 200", SERVER_PATH + ", 302", "/unknown, 404"})
+    void responsesOtherThanThePageCarryNoContentSecurityPolicy(String path, int status) {
+        HttpTestClient.Response response = http().get(path);
+
+        assertThat(response.status()).as(response.toString()).isEqualTo(status);
+        assertThat(response.headers(ContentSecurityPolicyFilter.HEADER_NAME)).as(response.toString()).isEmpty();
     }
 
     @Test
@@ -453,6 +501,66 @@ class WebsphereMqBrokerTest {
 
         assertThat(response.status()).as(response.toString()).isEqualTo(200);
         assertThat(response.body()).isEqualTo(classpathBytes("mule-resource/js/mule.js"));
+    }
+
+    @Test
+    void oversizedBayeuxBodyDeclaringItsLengthIsRefused413() {
+        HttpTestClient.Response response = http().post(COMETD, FORM, oversizedForm());
+
+        assertThat(response.status()).as(response.toString()).isEqualTo(413);
+        assertThat(response.header("Content-Type")).as(response.toString()).startsWith("text/json");
+        assertThat(response.bodyAsString()).isEqualTo("[]");
+    }
+
+    @Test
+    void oversizedChunkedBayeuxBodyIsAnswered413WholeAndItsConnectionThenCarriesAHandshake() throws Exception {
+        try (Socket socket = new Socket(LOOPBACK, port)) {
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            AtomicReference<IOException> writeFailure = new AtomicReference<>();
+            Thread writer = writeChunked(out, COMETD, oversizedForm().getBytes(US_ASCII), writeFailure);
+
+            RawResponse refused = readResponse(in);
+            writer.join(HttpTestClient.TIMEOUT_MILLIS);
+
+            assertThat(refused.status()).as(refused.toString()).isEqualTo(413);
+            assertThat(refused.header("Content-Type")).as(refused.toString()).isEqualTo("text/json;charset=UTF-8");
+            assertThat(refused.body()).as(refused.toString()).isEqualTo("[]");
+            // The server read the body to its end, after the 413, rather than closing the connection on it.
+            assertThat(writer.isAlive()).as("the chunked body still being written").isFalse();
+            assertThat(writeFailure.get()).as("failure writing the chunked body").isNull();
+
+            ObjectNode handshake = message(HANDSHAKE).put("version", "1.0").put("minimumVersion", "0.9");
+            byte[] form = ("message=" + URLEncoder.encode(batch(handshake), UTF_8)).getBytes(US_ASCII);
+            out.write(("POST " + COMETD + " HTTP/1.1\r\nHost: " + LOOPBACK + ":" + port + "\r\nContent-Type: " + FORM
+                    + "\r\nContent-Length: " + form.length + "\r\nConnection: close\r\n\r\n").getBytes(US_ASCII));
+            out.write(form);
+            out.flush();
+            RawResponse answered = readResponse(in);
+
+            assertThat(answered.status()).as(answered.toString()).isEqualTo(200);
+            assertThat(answered.header("Content-Type")).as(answered.toString()).startsWith("text/json");
+            assertSuccessful(reply(objectMapper.readTree(answered.body()), HANDSHAKE));
+        }
+    }
+
+    @Test
+    void forgedPublicationOnTheDequeueChannelIsDeniedAndReachesNoSubscriber() throws IOException {
+        String forged = "forged" + PROCESSED_SUFFIX;
+        String forger = handshakeClient();
+        String subscriber = handshakeClient();
+        List<JsonNode> deliveries = new ArrayList<>(connect(subscriber));
+        subscribe(subscriber, DEQUEUE);
+
+        ObjectNode publication = message(DEQUEUE).put("clientId", forger).put("data", forged);
+        JsonNode ack = reply(bayeux(batch(publication)), DEQUEUE);
+
+        assertThat(ack.path("successful").asBoolean(true)).as(ack.toString()).isFalse();
+        assertThat(ack.path("error").asText()).as(ack.toString()).isEqualTo("403::Publish denied");
+        // Held for the test profile's connect timeout unless a delivery arrives.
+        deliveries.addAll(connect(subscriber));
+        assertThat(deliveries).as("deliveries").noneMatch(delivery -> isDequeueDelivery(delivery, forged));
     }
 
     @Test
@@ -1030,6 +1138,94 @@ class WebsphereMqBrokerTest {
 
     private HttpTestClient http() {
         return new HttpTestClient(LOOPBACK, port);
+    }
+
+    /** A form body of {@link #OVERSIZED_BODY_BYTES} bytes, which the endpoint must never parse. */
+    private static String oversizedForm() {
+        return "message=" + "x".repeat(OVERSIZED_BODY_BYTES - "message=".length());
+    }
+
+    /**
+     * Starts writing a {@code POST} of {@code body} with {@code Transfer-Encoding: chunked}, which declares no length,
+     * in chunks of {@link #CHUNK_BYTES}, on a connection kept alive. The request is written on a thread of its own, so
+     * the caller reads a response the server sends before the body ends; a write that fails, as when the server
+     * closes the connection on the body, ends the writer and is recorded in {@code failure}.
+     *
+     * @return the started writer thread
+     */
+    private Thread writeChunked(OutputStream out, String path, byte[] body, AtomicReference<IOException> failure) {
+        String head = "POST " + path + " HTTP/1.1\r\nHost: " + LOOPBACK + ":" + port + "\r\nContent-Type: " + FORM
+                + "\r\nTransfer-Encoding: chunked\r\n\r\n";
+        Thread writer = new Thread(() -> {
+            try {
+                out.write(head.getBytes(US_ASCII));
+                for (int offset = 0; offset < body.length; offset += CHUNK_BYTES) {
+                    int length = Math.min(CHUNK_BYTES, body.length - offset);
+                    out.write((Integer.toHexString(length) + "\r\n").getBytes(US_ASCII));
+                    out.write(body, offset, length);
+                    out.write("\r\n".getBytes(US_ASCII));
+                }
+                out.write("0\r\n\r\n".getBytes(US_ASCII));
+                out.flush();
+            } catch (IOException writeFailure) {
+                failure.set(writeFailure);
+            }
+        }, "chunked-body-writer");
+        writer.setDaemon(true);
+        writer.start();
+        return writer;
+    }
+
+    /**
+     * Reads one response off the connection: its status line, its headers and the {@code Content-Length} bytes of its
+     * body, leaving the connection positioned at the next response.
+     */
+    private static RawResponse readResponse(InputStream in) throws IOException {
+        String statusLine = readLine(in);
+        Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+            int colon = line.indexOf(':');
+            assertThat(colon).as("header line %s", line).isPositive();
+            headers.put(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
+        }
+        String contentLength = headers.get("Content-Length");
+        assertThat(contentLength).as("Content-Length of %s %s", statusLine, headers).isNotNull();
+        int length = Integer.parseInt(contentLength);
+        byte[] body = in.readNBytes(length);
+        assertThat(body).as("body of %s %s", statusLine, headers).hasSize(length);
+        return new RawResponse(statusLine, headers, new String(body, UTF_8));
+    }
+
+    /** One line of a response head without its CRLF; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
+    /**
+     * A response read off a raw connection.
+     *
+     * @param statusLine the status line, such as {@code HTTP/1.1 413 Request Entity Too Large}
+     * @param headers    the headers, names compared case-insensitively
+     * @param body       the body as UTF-8 text
+     */
+    private record RawResponse(String statusLine, Map<String, String> headers, String body) {
+
+        int status() {
+            return Integer.parseInt(statusLine.split(" ", 3)[1]);
+        }
+
+        String header(String name) {
+            return headers.get(name);
+        }
     }
 
     /** The first message of the answer on {@code channel}. */

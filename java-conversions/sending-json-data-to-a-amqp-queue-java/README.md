@@ -90,7 +90,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
 
 - Broker connection: Spring Boot's defaults (port `5672`, username `guest`, password `guest`, virtual host `/`) equal the Mule AMQP connector defaults the original relied on; its `amqp:connector` sets none of them (`json-to-rabbitmq.xml:3`). No credential is written in `application.yml` (AAP 0.4.6). To use other values, set `spring.rabbitmq.username` and `spring.rabbitmq.password` (both `String`; environment `SPRING_RABBITMQ_USERNAME`, `SPRING_RABBITMQ_PASSWORD`), `spring.rabbitmq.port` (`Integer`) or `spring.rabbitmq.virtual-host` (`String`).
-- `src/test/resources/application-test.yml` holds the embedded-broker values for profile `test`: `amqp.host` and `spring.rabbitmq.host` `localhost`, and the embedded broker's demo user `guest`/`guest`. The tests register the broker's free port through `@DynamicPropertySource`.
+- `src/test/resources/application-test.yml` holds the embedded-broker values for profile `test`: `amqp.host` and `spring.rabbitmq.host` `127.0.0.1`, the only address the embedded broker binds (`localhost` may resolve to `::1`), and the embedded broker's demo user `guest`/`guest`. The tests register the broker's free port, and the same host, through `@DynamicPropertySource`.
 
 Original-to-new key map:
 
@@ -123,7 +123,7 @@ Override on the command line, for example `java -jar target/sending-json-data-to
 - Mule-internal `MULE_*` message headers the Mule transport may have added to the AMQP message are not reproduced. Tier 2A capture of the queued message settles which, if any, existed.
 - Each request carries a random `correlation_id`, and only a reply carrying it is returned (security hardening against forged replies on the reply queue). How the original matched replies is settled by the `post-root-reply` capture.
 - The response `Content-Type` and the empty-body result on timeout are plan defaults and Tier 2A verification points.
-- The tests replace Qpid 0.24 with embedded Qpid Broker-J 9.2.1. `src/test/resources/config.json` is rewritten for the 9.x model: memory virtual-host node, Plain provider with `guest`/`guest`, a single AMQP port, no HTTP/JMX/RMI ports, no Derby store.
+- The tests replace Qpid 0.24 with embedded Qpid Broker-J 9.2.1. `src/test/resources/config.json` is rewritten for the 9.x model: memory virtual-host node, Plain provider with `guest`/`guest`, a single AMQP port bound to `127.0.0.1` only, no HTTP/JMX/RMI ports, no Derby store.
 
 Studio metadata (`mule-project.xml`, `catalog/`) and `log4j2.xml` are not carried (AAP 0.2.2).
 

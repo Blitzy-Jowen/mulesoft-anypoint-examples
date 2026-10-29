@@ -214,13 +214,13 @@ Open the console at `http://localhost:8081/api/console/`.
 
 | Project | Source folder | Category | Tier 1 build (mvn clean package) | Tier 1 tests (mvn test) | Coverage (service + mapper) | Parity evidence | Tier 2B live sandbox |
 |---|---|---|---|---|---|---|---|
-| processing-orders-with-dataweave-and-APIkit-java | processing-orders-with-dataweave-and-APIkit | RAML/APIkit-driven REST API | PASS | PASS | 91.3% | RAML DIFF: 1:1 (Tier 1 static) | N/A |
+| processing-orders-with-dataweave-and-APIkit-java | processing-orders-with-dataweave-and-APIkit | RAML/APIkit-driven REST API | PASS | PASS | 89.7% | RAML DIFF: 1:1 (Tier 1 static) | N/A |
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 796 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 796 tests, 0 failures, 0 errors, 0 skipped.
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 421 of 461 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 88.6% (1487 of 1679 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 900 tests, 0 failures, 0 errors, 0 skipped; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 900 tests, 0 failures, 0 errors, 0 skipped.
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 670 of 747 lines (`service/CurrencyService`, `OrderFlowService`, `FileOutboundWriter`; `mapper/OrderMapper`, `OrderReportMapper`, `DwJsonWriter`, `DwCsvWriter`, `ParseTemplateRenderer`). Total project LINE coverage: 88.3% (1736 of 1965 lines).
 
 No Tier 2A fixture set applies, because this is a RAML-backed project: it has no `FixtureParityTest` and no `SCENARIOS.md`. Its evidence is the static RAML-to-controller diff in [`RAML-CONTROLLER-DIFF.md`](../../RAML-CONTROLLER-DIFF.md) plus the ported original assertions of `ProcessingOrdersWithDataweaveAndApikitTest`. That is Tier 1 evidence, not runtime parity with the original. The same row appears in the root [`SUMMARY.md`](../../SUMMARY.md).
 

@@ -41,6 +41,14 @@
                 <artifactId>commons-net</artifactId>
                 <version>3.13.0</version>
             </dependency>
+            <!-- HtmlUnit 2.70.0 (kept at the Boot BOM version) declares commons-io 2.10.0, which CVE-2024-47554
+                 (XmlStreamReader CPU exhaustion, 2.0 to before 2.14.0) affects, so a fixed release is managed here.
+                 HtmlUnit and commons-net are its only consumers, both test-only, so it stays test scope. -->
+            <dependency>
+                <groupId>commons-io</groupId>
+                <artifactId>commons-io</artifactId>
+                <version>2.22.0</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 

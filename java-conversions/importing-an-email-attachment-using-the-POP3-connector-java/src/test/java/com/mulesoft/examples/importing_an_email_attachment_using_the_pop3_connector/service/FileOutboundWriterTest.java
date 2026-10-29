@@ -16,12 +16,15 @@ import java.lang.reflect.Field;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.SecureDirectoryStream;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -32,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -43,6 +47,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -63,12 +68,20 @@ import org.junit.jupiter.params.provider.ValueSource;
  * {@code <uuid>.dat} name.
  *
  * <p>The overwrite is a whole-file replacement. Simultaneous writers of one name, each with its own instance, never
- * interleave and never expose an empty or partial file to a reader; a write through a symbolic link replaces the
- * linked file and keeps the link; an overwrite keeps the file's POSIX permissions, and the temporary file replacing
- * an existing file is owner-only while it receives the content; a read-only file is refused unless the process may
- * write it; in a directory that refuses new entries an existing file is still overwritten, in place, and a new one is
- * refused unless the process may create it; an existing file in a sticky directory is overwritten; a named pipe is
- * written in place; a failed write leaves the existing content and no temporary file behind.
+ * interleave and never expose an empty or partial file to a reader; a write through a symbolic link that lies inside
+ * the directory and leads to an entry inside it, at the target or in place of a directory, follows it, replacing the
+ * linked file and keeping the link; a link that leads out of the directory, or one met once the name's own {@code ..}
+ * has left it, is refused, and nothing outside the directory is created, written, re-moded or removed, also when the
+ * destination, its directory, the directory a missing directory is created in or the temporary file is swapped for a
+ * link while the write runs; a directory the process may search but not read fails the write where the walk must
+ * hold it open, and a missing directory that cannot be created relative to its open directory is never created by
+ * its path instead; an overwrite keeps the file's POSIX permissions, and the temporary file replacing an existing
+ * file is owner-only while it receives the content; a read-only file is refused unless the process may write it; in
+ * a directory that refuses new entries an existing file is still overwritten, in place, and a new one is refused
+ * unless the process may create it; an existing file in a sticky directory is overwritten; a named pipe is written
+ * in place; a failed write leaves the existing content and no temporary file behind. The cases that concern how
+ * directories are reached run with each {@link FileOutboundWriter.DirectoryAccess}: the directory-relative walk the
+ * platform offers, and the path-name walk used where it offers none.
  *
  * <p>Every project that carries {@code FileOutboundWriter} carries this test with only the {@code package} line
  * changed, so it depends on the writer, JUnit 5, AssertJ and the JDK alone: no Spring context, no mock, no project
@@ -81,6 +94,18 @@ class FileOutboundWriterTest {
      * 205, with which its file connector wrapped the {@link IOException} of an outbound file write.
      */
     private static final String STREAMING_FAILED = "Streaming failed. Could not get output stream";
+
+    /** The reason of the failure refusing a symbolic link that is not confined to the target directory. */
+    private static final String LINK_NOT_CONFINED = "Symbolic link is not confined to the target directory";
+
+    /** The reason of the failure ending a write whose temporary file was swapped for another entry. */
+    private static final String TEMPORARY_FILE_REPLACED = "Temporary file was replaced while it was being written";
+
+    /**
+     * The reason of the failure ending a write whose missing directory cannot be created relative to the open
+     * directory that is to hold it.
+     */
+    private static final String NOT_CREATED_RELATIVE = "Directory cannot be created relative to the open directory";
 
     private static final Pattern DEFAULT_NAME =
             Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.dat");
@@ -315,16 +340,18 @@ class FileOutboundWriterTest {
     }
 
     /**
-     * Nested names whose parent directories do not exist yet: one missing parent, three, and a name that climbs out
-     * of the directory with {@code ..} into a missing sibling, which is kept as given, as Mule kept it.
+     * Nested names whose parent directories do not exist yet, in each directory access: one missing parent, three, a
+     * name that climbs out of the directory with {@code ..} into a missing sibling, which is kept as given, as Mule
+     * kept it, and one that climbs out and back in again.
      *
-     * @return description, the name
+     * @return access, description, the name
      */
     static Stream<Arguments> nestedNamesWithMissingParents() {
-        return Stream.of(
+        return withEachAccess(Stream.of(
                 Arguments.of("one missing parent", "qa-sub/qa-nested.txt"),
                 Arguments.of("three missing parents", "a/b/c/deep.txt"),
-                Arguments.of(".. into a missing sibling of the directory", "../sibling/up.txt"));
+                Arguments.of(".. into a missing sibling of the directory", "../sibling/up.txt"),
+                Arguments.of(".. out of the directory and back into a missing parent", "../inner/back/in.txt")));
     }
 
     /**
@@ -332,13 +359,16 @@ class FileOutboundWriterTest {
      * them, and the file holds the exact bytes; a second write of the name replaces it as a whole and leaves no
      * temporary file beside it.
      *
+     * @param access      how the writer reaches the directories
      * @param description the case, for the test name
      * @param name        the nested name
-     * @throws IOException when a file operation of the test fails
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
      */
-    @ParameterizedTest(name = "{0}")
+    @ParameterizedTest(name = "{1} ({0})")
     @MethodSource("nestedNamesWithMissingParents")
-    void nestedNameGetsItsMissingParentDirectoriesCreated(String description, String name) throws IOException {
+    void nestedNameGetsItsMissingParentDirectoriesCreated(FileOutboundWriter.DirectoryAccess access,
+            String description, String name) throws Exception {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = tempDir.resolve("out").resolve("inner");
         byte[] first = bytes(0x00, 'Q', 'A', 0xFF, '\r', '\n');
         byte[] second = "replaced".getBytes(StandardCharsets.UTF_8);
@@ -353,18 +383,19 @@ class FileOutboundWriterTest {
         assertThat(rewritten).isEqualTo(written);
         assertThat(Files.readAllBytes(written)).isEqualTo(second);
         assertThat(names(written.getParent())).containsExactly(written.getFileName().toString());
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     /**
-     * Names whose write fails in a way whose own exception text names the directory or a temporary file: names
-     * longer than the file system allows, at the first refused length and far beyond it, whose rename is refused
-     * once the temporary file was written; {@code .}, {@code ..} and the empty name, which resolve to directories; a
-     * name holding a NUL character, which is no path; and a nested name whose parent is an existing regular file.
+     * Names whose write fails in a way whose own exception text names the directory or a temporary file, in each
+     * directory access: names longer than the file system allows, at the first refused length and far beyond it,
+     * whose lookup is refused; {@code .}, {@code ..} and the empty name, which resolve to directories; a name holding
+     * a NUL character, which is no path; and a nested name whose parent is an existing regular file.
      *
-     * @return description, the name, the type of the failure the streaming failure is caused by
+     * @return access, description, the name, the type of the failure the streaming failure is caused by
      */
     static Stream<Arguments> namesWhoseWriteFails() {
-        return Stream.of(
+        return withEachAccess(Stream.of(
                 Arguments.of("256-character name", "x".repeat(256), FileSystemException.class),
                 Arguments.of("1,000-character name", "a".repeat(1000), FileSystemException.class),
                 Arguments.of("the name .", ".", FileSystemException.class),
@@ -372,22 +403,24 @@ class FileOutboundWriterTest {
                 Arguments.of("the empty name", "", FileSystemException.class),
                 Arguments.of("a name holding NUL", "a" + cp(0) + ".txt", InvalidPathException.class),
                 Arguments.of("a missing parent blocked by a regular file", "blocker/qa-nested.txt",
-                        FileAlreadyExistsException.class));
+                        FileAlreadyExistsException.class)));
     }
 
     /**
      * A failed write is reported with Mule's message alone, which names neither the directory nor a temporary file,
      * and the failure as its cause; every file and directory is left exactly as it was.
      *
+     * @param access      how the writer reaches the directories
      * @param description the case, for the test name
      * @param name        the name whose write fails
      * @param cause       the type of the failure the streaming failure is caused by
-     * @throws IOException when a file operation of the test fails
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
      */
-    @ParameterizedTest(name = "{0}")
+    @ParameterizedTest(name = "{1} ({0})")
     @MethodSource("namesWhoseWriteFails")
-    void failedWriteIsReportedWithAMessageNamingNoPath(String description, String name,
-            Class<? extends Throwable> cause) throws IOException {
+    void failedWriteIsReportedWithAMessageNamingNoPath(FileOutboundWriter.DirectoryAccess access,
+            String description, String name, Class<? extends Throwable> cause) throws Exception {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         Files.writeString(dir.resolve("blocker"), "a regular file");
         Map<String, String> before = tree(tempDir);
@@ -400,6 +433,7 @@ class FileOutboundWriterTest {
                 .hasCauseExactlyInstanceOf(cause);
 
         assertThat(tree(tempDir)).isEqualTo(before);
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     static Stream<Arguments> nullArguments() {
@@ -504,42 +538,47 @@ class FileOutboundWriterTest {
         assertWhole(result);
         assertThat(result[0]).isBetween((byte) 1, (byte) WRITERS);
         assertThat(names(dir)).containsExactly(name);
-        assertThat(lockedDestinations()).doesNotContain(target.toAbsolutePath().normalize());
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     /**
-     * Symbolic links at the target: relative and absolute link text, a link into another directory, a chain of
-     * links, and links whose file does not exist yet.
+     * Symbolic links at the target that lie inside the target directory and lead to an entry inside it, in each
+     * directory access: relative and absolute link text, a link into a subdirectory, a chain of links, and links
+     * whose file does not exist yet.
      *
-     * @return description, absolute link text, linked file in another directory, chain length, linked file exists
+     * @return access, description, absolute link text, linked file in a subdirectory, chain length, linked file
+     *         exists
      */
     static Stream<Arguments> symbolicLinks() {
-        return Stream.of(
+        return withEachAccess(Stream.of(
                 Arguments.of("relative link to an existing file", false, false, 1, true),
                 Arguments.of("absolute link to an existing file", true, false, 1, true),
-                Arguments.of("relative link into another directory", false, true, 1, true),
+                Arguments.of("relative link into a subdirectory", false, true, 1, true),
                 Arguments.of("chain of two links to an existing file", false, false, 2, true),
                 Arguments.of("relative dangling link", false, false, 1, false),
-                Arguments.of("absolute dangling link into another directory", true, true, 1, false));
+                Arguments.of("absolute dangling link into a subdirectory", true, true, 1, false)));
     }
 
     /**
-     * Writing through a symbolic link replaces, or for a dangling link creates, the file the link chain ends at,
-     * keeps every link unchanged and leaves no temporary file in either directory.
+     * Writing through a symbolic link confined to the target directory replaces, or for a dangling link creates, the
+     * file the link chain ends at, keeps every link unchanged and leaves no temporary file in either directory.
      *
+     * @param access           how the writer reaches the directories
      * @param description      the case, for the test name
      * @param absolute         whether the link text is an absolute path rather than one relative to the link
-     * @param otherDirectory   whether the linked file lives outside the target directory
+     * @param subdirectory     whether the linked file lives in a subdirectory of the target directory
      * @param links            the number of links in the chain
      * @param linkedFileExists whether the linked file exists before the write
-     * @throws IOException when a file operation of the test fails
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
      */
-    @ParameterizedTest(name = "{0}")
+    @ParameterizedTest(name = "{1} ({0})")
     @MethodSource("symbolicLinks")
-    void writeThroughSymbolicLinkReplacesTheLinkedFileAndKeepsTheLink(String description, boolean absolute,
-            boolean otherDirectory, int links, boolean linkedFileExists) throws IOException {
+    void writeThroughSymbolicLinkReplacesTheLinkedFileAndKeepsTheLink(FileOutboundWriter.DirectoryAccess access,
+            String description, boolean absolute, boolean subdirectory, int links, boolean linkedFileExists)
+            throws Exception {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = Files.createDirectories(tempDir.resolve("out"));
-        Path linkedDir = otherDirectory ? Files.createDirectories(tempDir.resolve("elsewhere")) : dir;
+        Path linkedDir = subdirectory ? Files.createDirectories(dir.resolve("sub")) : dir;
         Path linked = linkedDir.resolve("linked.json");
         if (linkedFileExists) {
             Files.writeString(linked, "old content");
@@ -565,22 +604,565 @@ class FileOutboundWriterTest {
         assertThat(Files.readString(linked)).isEqualTo("new");
         List<String> expectedNames = new ArrayList<>();
         linkTexts.keySet().forEach(link -> expectedNames.add(link.getFileName().toString()));
-        if (otherDirectory) {
+        if (subdirectory) {
             assertThat(names(linkedDir)).containsExactly("linked.json");
+            expectedNames.add("sub");
         } else {
             expectedNames.add("linked.json");
         }
         assertThat(names(dir)).containsExactlyInAnyOrderElementsOf(expectedNames);
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Symbolic links that are not confined to the target directory {@code out}, beside which the directory
+     * {@code outside} holds the owned fixture file {@code secret.txt}, in each directory access. Each link is written
+     * {@code name -> text}, with <code>{outside}</code> and <code>{out}</code> standing for the absolute paths of the
+     * two directories; {@code out} also holds the empty directory {@code real}. At the target: relative and absolute
+     * text to the fixture, dangling text into the outside directory, a chain whose last link escapes, and text that
+     * climbs above the target directory with {@code ..}, through a subdirectory, after the directory's own absolute
+     * path, or from a link in a subdirectory. In place of a directory: relative and absolute text to the outside
+     * directory, a link in a subdirectory climbing out, and an escaping link with a missing directory below it.
+     *
+     * @return access, description, the name written, the link the failure names, relative to {@code out}, the links
+     */
+    static Stream<Arguments> linksNotConfinedToTheDirectory() {
+        return withEachAccess(Stream.of(
+                Arguments.of("relative link to a file outside", "victim.txt", "victim.txt",
+                        new String[] {"victim.txt -> ../outside/secret.txt"}),
+                Arguments.of("absolute link to a file outside", "victim.txt", "victim.txt",
+                        new String[] {"victim.txt -> {outside}/secret.txt"}),
+                Arguments.of("absolute dangling link into the outside directory", "victim.txt", "victim.txt",
+                        new String[] {"victim.txt -> {outside}/new.txt"}),
+                Arguments.of("relative dangling link into the outside directory", "victim.txt", "victim.txt",
+                        new String[] {"victim.txt -> ../outside/new.txt"}),
+                Arguments.of("chain whose last link escapes", "victim.txt", "hop.txt",
+                        new String[] {"victim.txt -> hop.txt", "hop.txt -> ../outside/secret.txt"}),
+                Arguments.of("relative text climbing out through a subdirectory", "victim.txt", "victim.txt",
+                        new String[] {"victim.txt -> real/../../outside/secret.txt"}),
+                Arguments.of("absolute text under the directory climbing out", "victim.txt", "victim.txt",
+                        new String[] {"victim.txt -> {out}/../outside/secret.txt"}),
+                Arguments.of("link in a subdirectory climbing out", "real/victim.txt", "real/victim.txt",
+                        new String[] {"real/victim.txt -> ../../outside/secret.txt"}),
+                Arguments.of("relative link to the outside directory on the way", "sub/report.csv", "sub",
+                        new String[] {"sub -> ../outside"}),
+                Arguments.of("absolute link to the outside directory on the way", "sub/report.csv", "sub",
+                        new String[] {"sub -> {outside}"}),
+                Arguments.of("link in a subdirectory climbing out on the way", "real/sub/report.csv", "real/sub",
+                        new String[] {"real/sub -> ../../outside"}),
+                Arguments.of("missing directory below an escaping link", "sub/new/report.csv", "sub",
+                        new String[] {"sub -> ../outside"})));
+    }
+
+    /**
+     * A symbolic link that leads out of the target directory is refused: the write fails with Mule's streaming
+     * failure, caused by a {@link FileSystemException} naming the refused link with the confinement reason. The
+     * fixture file outside keeps its bytes and mode, the outside directory gains no entry, every link and entry of the
+     * target directory is left as it was, no temporary file remains and the lock entry is released.
+     *
+     * @param access      how the writer reaches the directories
+     * @param description the case, for the test name
+     * @param name        the name written
+     * @param refused     the link the failure names, relative to the target directory
+     * @param links       the links to create, as {@code name -> text}
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @ParameterizedTest(name = "{1} ({0})")
+    @MethodSource("linksNotConfinedToTheDirectory")
+    void linkNotConfinedToTheDirectoryIsRefusedAndNothingOutsideChanges(FileOutboundWriter.DirectoryAccess access,
+            String description, String name, String refused, String[] links) throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Files.createDirectories(dir.resolve("real"));
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        Path secret = Files.writeString(outside.resolve("secret.txt"), "secret");
+        Set<PosixFilePermission> secretMode = PosixFilePermissions.fromString("rw-r-----");
+        Files.setPosixFilePermissions(secret, secretMode);
+        createLinks(dir, outside, links);
+        Map<String, String> outsideBefore = tree(outside);
+        Map<String, String> dirBefore = tree(dir);
+
+        assertThatThrownBy(() -> new FileOutboundWriter(access).write(dir, name, "QA_SECURITY_CONTENT"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
+                .isExactlyInstanceOf(FileSystemException.class)
+                .isInstanceOfSatisfying(FileSystemException.class, failure -> {
+                    assertThat(failure.getFile()).isEqualTo(dir.resolve(refused).toString());
+                    assertThat(failure.getReason()).isEqualTo(LINK_NOT_CONFINED);
+                });
+
+        assertThat(Files.readString(secret)).isEqualTo("secret");
+        assertThat(Files.getPosixFilePermissions(secret, LinkOption.NOFOLLOW_LINKS)).isEqualTo(secretMode);
+        assertThat(tree(outside)).isEqualTo(outsideBefore);
+        assertThat(tree(dir)).isEqualTo(dirBefore);
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Symbolic links in place of a directory the name leads through that lie inside the target directory {@code out}
+     * and lead to a directory inside it, in each directory access, written as in
+     * {@link #linksNotConfinedToTheDirectory()}, with <code>{real}</code> standing for the real path of {@code out};
+     * {@code out} holds the empty directories {@code real} and {@code other}: relative text, absolute text by the
+     * directory's path and by its real path, a link in a subdirectory climbing back into the directory, a missing
+     * directory below a link, and links to the directory itself.
+     *
+     * @return access, description, the name written, the file written to, relative to {@code out}, the links
+     */
+    static Stream<Arguments> linksConfinedToTheDirectoryOnTheWay() {
+        return withEachAccess(Stream.of(
+                Arguments.of("relative link to a subdirectory", "sub-link/report.csv", "real/report.csv",
+                        new String[] {"sub-link -> real"}),
+                Arguments.of("absolute link to a subdirectory", "sub-link/report.csv", "real/report.csv",
+                        new String[] {"sub-link -> {out}/real"}),
+                Arguments.of("absolute link by the directory's real path", "sub-link/report.csv", "real/report.csv",
+                        new String[] {"sub-link -> {real}/real"}),
+                Arguments.of("link in a subdirectory climbing back into the directory", "real/up/report.csv",
+                        "other/report.csv", new String[] {"real/up -> ../other"}),
+                Arguments.of("missing directory below a link", "sub-link/new/report.csv", "real/new/report.csv",
+                        new String[] {"sub-link -> real"}),
+                Arguments.of("absolute link to the directory itself", "self/report.csv", "report.csv",
+                        new String[] {"self -> {out}"}),
+                Arguments.of("relative link to the directory itself", "self/report.csv", "report.csv",
+                        new String[] {"self -> ."})));
+    }
+
+    /**
+     * A symbolic link in place of a directory is followed when it stays inside the target directory: the file lands
+     * where the link leads, holding the exact bytes, with any missing directory below the link created there; the
+     * written path is the one the caller named; the link and every other entry are kept, no temporary file remains
+     * and the lock entry is released.
+     *
+     * @param access      how the writer reaches the directories
+     * @param description the case, for the test name
+     * @param name        the name written
+     * @param expected    the file the content must land in, relative to the target directory
+     * @param links       the links to create, as {@code name -> text}
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @ParameterizedTest(name = "{1} ({0})")
+    @MethodSource("linksConfinedToTheDirectoryOnTheWay")
+    void linkConfinedToTheDirectoryOnTheWayIsFollowed(FileOutboundWriter.DirectoryAccess access, String description,
+            String name, String expected, String[] links) throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Files.createDirectories(dir.resolve("real"));
+        Files.createDirectories(dir.resolve("other"));
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        createLinks(dir, outside, links);
+        Map<String, String> before = tree(dir);
+
+        Path written = new FileOutboundWriter(access).write(dir, name, "QA_CONFINED_CONTENT");
+
+        assertThat(written).isEqualTo(dir.resolve(name));
+        assertThat(Files.readString(dir.resolve(expected))).isEqualTo("QA_CONFINED_CONTENT");
+        Set<String> expectedEntries = new TreeSet<>(before.keySet());
+        for (Path entry = Path.of(expected); entry != null; entry = entry.getParent()) {
+            expectedEntries.add(entry.toString());
+        }
+        Map<String, String> after = tree(dir);
+        assertThat(after.keySet()).containsExactlyInAnyOrderElementsOf(expectedEntries);
+        before.forEach((entry, kind) -> assertThat(after.get(entry)).isEqualTo(kind));
+        assertThat(outside).isEmptyDirectory();
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Symbolic links met once the name's own {@code ..} took the walk above the target directory {@code out/inner},
+     * in each directory access: each lies in {@code out} and leads back into the target directory, at the target and
+     * in place of a directory.
+     *
+     * @return access, description, the name written, the link the failure names relative to {@code out}, the link
+     *         text
+     */
+    static Stream<Arguments> linksBeyondTheNamesDotDot() {
+        return withEachAccess(Stream.of(
+                Arguments.of("link at the target", "../back.txt", "back.txt", "inner/target.txt"),
+                Arguments.of("link in place of a directory", "../back/report.csv", "back", "inner")));
+    }
+
+    /**
+     * The name's own {@code ..} is kept as given, as Mule kept it, but once it has taken the walk above the target
+     * directory no symbolic link is followed, even one leading back inside: the write fails, caused by a
+     * {@link FileSystemException} naming the link with the confinement reason, and nothing is created.
+     *
+     * @param access      how the writer reaches the directories
+     * @param description the case, for the test name
+     * @param name        the name written
+     * @param link        the link the failure names, relative to the target directory's parent
+     * @param text        the link's text
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @ParameterizedTest(name = "{1} ({0})")
+    @MethodSource("linksBeyondTheNamesDotDot")
+    void linkMetAfterTheNamesDotDotLeftTheDirectoryIsRefused(FileOutboundWriter.DirectoryAccess access,
+            String description, String name, String link, String text) throws Exception {
+        Path parent = Files.createDirectories(tempDir.resolve("out"));
+        Path dir = Files.createDirectories(parent.resolve("inner"));
+        Files.createSymbolicLink(parent.resolve(link), Path.of(text));
+        Map<String, String> before = tree(tempDir);
+
+        assertThatThrownBy(() -> new FileOutboundWriter(access).write(dir, name, "QA_SECURITY_CONTENT"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
+                .isInstanceOfSatisfying(FileSystemException.class, failure -> {
+                    assertThat(failure.getFile()).isEqualTo(dir.resolve("..").resolve(link).toString());
+                    assertThat(failure.getReason()).isEqualTo(LINK_NOT_CONFINED);
+                });
+
+        assertThat(tree(tempDir)).isEqualTo(before);
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Once the temporary file holds the content, the observer swaps the existing destination for a symbolic link to
+     * an owned file outside the target directory: the link is replaced by the new file, never followed, so the
+     * outside file keeps its bytes and mode and the destination is a regular file holding the new content.
+     *
+     * @param access how the writer reaches the directories
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void destinationSwappedForALinkDuringTheWriteIsReplacedNotFollowed(FileOutboundWriter.DirectoryAccess access)
+            throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Path destination = Files.writeString(dir.resolve("report.csv"), "old");
+        Files.setPosixFilePermissions(destination, PosixFilePermissions.fromString("rw-r-----"));
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        Path secret = Files.writeString(outside.resolve("secret.txt"), "secret");
+        Set<PosixFilePermission> secretMode = PosixFilePermissions.fromString("rw-------");
+        Files.setPosixFilePermissions(secret, secretMode);
+        FileOutboundWriter swapping = new FileOutboundWriter(access, temp -> {
+            Files.delete(destination);
+            Files.createSymbolicLink(destination, secret);
+        });
+
+        Path written = swapping.write(dir, "report.csv", "new");
+
+        assertThat(written).isEqualTo(destination);
+        assertThat(Files.isRegularFile(destination, LinkOption.NOFOLLOW_LINKS)).isTrue();
+        assertThat(Files.readString(destination)).isEqualTo("new");
+        assertThat(Files.readString(secret)).isEqualTo("secret");
+        assertThat(Files.getPosixFilePermissions(secret)).isEqualTo(secretMode);
+        assertThat(names(outside)).containsExactly("secret.txt");
+        assertThat(names(dir)).containsExactly("report.csv");
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Once the temporary file holds the content, the observer moves the destination's directory away and puts a
+     * symbolic link to an outside directory in its place. The directory-relative walk keeps acting in the directory
+     * it holds, so the file is replaced as a whole, by a new inode, in the moved directory with the replaced file's
+     * mode, and nothing reaches the outside directory. Runs only where the platform offers the directory-relative
+     * walk.
+     *
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @Test
+    void directorySwappedForALinkDuringTheWriteSendsNothingOutside() throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Assumptions.assumeTrue(offersDirectoryRelativeWalk(dir), "no SecureDirectoryStream on this platform");
+        Path sub = Files.createDirectories(dir.resolve("sub"));
+        Set<PosixFilePermission> mode = PosixFilePermissions.fromString("rw-r-----");
+        Path replaced = Files.writeString(sub.resolve("report.csv"), "old");
+        Files.setPosixFilePermissions(replaced, mode);
+        Object inode = Files.readAttributes(replaced, BasicFileAttributes.class).fileKey();
+        Path moved = dir.resolve("moved");
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        FileOutboundWriter swapping = new FileOutboundWriter(FileOutboundWriter.DirectoryAccess.AUTOMATIC, temp -> {
+            Files.move(sub, moved);
+            Files.createSymbolicLink(sub, outside);
+        });
+
+        Path written = swapping.write(dir, "sub/report.csv", "new");
+
+        assertThat(written).isEqualTo(sub.resolve("report.csv"));
+        assertThat(outside).isEmptyDirectory();
+        assertThat(Files.readSymbolicLink(sub)).isEqualTo(outside);
+        assertThat(names(moved)).containsExactly("report.csv");
+        assertThat(Files.readString(moved.resolve("report.csv"))).isEqualTo("new");
+        assertThat(Files.getPosixFilePermissions(moved.resolve("report.csv"))).isEqualTo(mode);
+        assertThat(Files.readAttributes(moved.resolve("report.csv"), BasicFileAttributes.class).fileKey())
+                .isNotEqualTo(inode);
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Once the temporary file holds the content, the observer swaps it for a symbolic link, or a hard link, to an
+     * owned file outside the target directory whose mode differs from the destination's: the swapped-in entry is
+     * neither given the destination's mode nor renamed into place, but removed, and the write fails, caused by a
+     * {@link FileSystemException} naming the temporary file. The outside file keeps its bytes and mode, and the
+     * destination its content and mode.
+     *
+     * @param access   how the writer reaches the directories
+     * @param hardLink whether the swapped-in entry is a hard link rather than a symbolic link
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @ParameterizedTest(name = "{0}, hard link {1}")
+    @MethodSource("eachAccessWithAndWithoutHardLink")
+    void temporaryFileSwappedDuringTheWriteIsRemovedAndNothingOutsideChanges(
+            FileOutboundWriter.DirectoryAccess access, boolean hardLink) throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Path destination = Files.writeString(dir.resolve("report.csv"), "old");
+        Set<PosixFilePermission> destinationMode = PosixFilePermissions.fromString("rw-r--r--");
+        Files.setPosixFilePermissions(destination, destinationMode);
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        Path secret = Files.writeString(outside.resolve("secret.txt"), "secret");
+        Set<PosixFilePermission> secretMode = PosixFilePermissions.fromString("rw-------");
+        Files.setPosixFilePermissions(secret, secretMode);
+        List<Path> swapped = new ArrayList<>();
+        FileOutboundWriter swapping = new FileOutboundWriter(access, temp -> {
+            Files.delete(temp);
+            if (hardLink) {
+                Files.createLink(temp, secret);
+            } else {
+                Files.createSymbolicLink(temp, secret);
+            }
+            swapped.add(temp);
+        });
+
+        assertThatThrownBy(() -> swapping.write(dir, "report.csv", "new"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .cause()
+                .isInstanceOfSatisfying(FileSystemException.class, failure -> {
+                    assertThat(failure.getFile()).isEqualTo(swapped.get(0).toString());
+                    assertThat(failure.getReason()).isEqualTo(TEMPORARY_FILE_REPLACED);
+                });
+
+        assertThat(Files.readString(secret)).isEqualTo("secret");
+        assertThat(Files.getPosixFilePermissions(secret)).isEqualTo(secretMode);
+        assertThat(names(outside)).containsExactly("secret.txt");
+        assertThat(Files.readString(destination)).isEqualTo("old");
+        assertThat(Files.getPosixFilePermissions(destination)).isEqualTo(destinationMode);
+        assertThat(names(dir)).containsExactly("report.csv");
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Each directory access, with the temporary file swapped for a symbolic link and for a hard link.
+     *
+     * @return access, whether the swapped-in entry is a hard link
+     */
+    static Stream<Arguments> eachAccessWithAndWithoutHardLink() {
+        return withEachAccess(Stream.of(Arguments.of(false), Arguments.of(true)));
+    }
+
+    /**
+     * Just before a missing directory is created, the observer moves the directory it is to be created in away and
+     * puts a symbolic link to an owned outside directory in its place, which is empty or already holds a directory of
+     * the missing directory's name. The directory-relative walk creates the missing directory relative to the
+     * directory it holds open, never by that directory's path, so the missing directory lands in the moved directory
+     * and the outside directory gains nothing: no directory, no file and no temporary file. The temporary file is
+     * written in the created directory, named by the path the walk reached that directory by, and is gone afterwards.
+     * Where the outside directory holds the name, the file lands in the moved directory too. Where it is empty, the
+     * file-store query the write makes on that path, which now leads through the link to nothing, fails the write
+     * once the temporary file holds the content, and the temporary file is removed: the streaming failure is caused
+     * by a {@link NoSuchFileException} naming the path, and the moved directory holds the created directory alone.
+     * Runs only where the platform offers the directory-relative walk; the path-name walk offers no such
+     * protection.
+     *
+     * @param outsideHoldsTheName whether the outside directory already holds a directory of the missing name
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @ParameterizedTest(name = "outside directory holds the missing name: {0}")
+    @ValueSource(booleans = {false, true})
+    void directorySwappedForALinkJustBeforeAMissingDirectoryIsCreatedSendsNothingOutside(boolean outsideHoldsTheName)
+            throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Assumptions.assumeTrue(offersDirectoryRelativeWalk(dir), "no SecureDirectoryStream on this platform");
+        Path sub = Files.createDirectories(dir.resolve("sub"));
+        Path moved = dir.resolve("moved");
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        if (outsideHoldsTheName) {
+            Files.createDirectory(outside.resolve("daily"));
+        }
+        Map<String, String> outsideBefore = tree(outside);
+        List<Path> parents = new ArrayList<>();
+        List<Path> temporaryFiles = new ArrayList<>();
+        FileOutboundWriter swapping = new FileOutboundWriter(FileOutboundWriter.DirectoryAccess.AUTOMATIC,
+                temporaryFiles::add, parent -> {
+                    parents.add(parent);
+                    Files.move(sub, moved);
+                    Files.createSymbolicLink(sub, outside);
+                });
+        Path walked = sub.resolve("daily");
+
+        Map<String, String> movedAfter = new TreeMap<>(Map.of("", "directory", "daily", "directory"));
+        if (outsideHoldsTheName) {
+            Path written = swapping.write(dir, "sub/daily/report.csv", "new");
+
+            assertThat(written).isEqualTo(walked.resolve("report.csv"));
+            movedAfter.put(Path.of("daily", "report.csv").toString(), "file new");
+        } else {
+            assertThatThrownBy(() -> swapping.write(dir, "sub/daily/report.csv", "new"))
+                    .isExactlyInstanceOf(IOException.class)
+                    .hasMessage(STREAMING_FAILED)
+                    .cause()
+                    .isInstanceOfSatisfying(NoSuchFileException.class, failure ->
+                            assertThat(failure.getFile()).isEqualTo(walked.toString()));
+        }
+
+        assertThat(tree(outside)).isEqualTo(outsideBefore);
+        assertThat(tree(moved)).isEqualTo(movedAfter);
+        assertThat(temporaryFiles).singleElement().satisfies(temp -> {
+            assertThat(temp.getParent()).isEqualTo(walked);
+            assertThat(temp.getFileName().toString()).matches(TEMPORARY_NAME);
+        });
+        assertThat(parents).containsExactly(sub);
+        assertThat(Files.readSymbolicLink(sub)).isEqualTo(outside);
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Listings of open file descriptors in which no entry may be used to create a missing directory relative to the
+     * open directory: a missing listing, an empty one, one whose entries lead to another directory, to a regular
+     * file and nowhere, and a listing that names the open directory while the directory has no file key to find it
+     * by.
+     *
+     * @return description, whether the listing exists, whether it holds entries leading elsewhere, whether it names
+     *         the open directory, whether the open directory's file key is known
+     */
+    static Stream<Arguments> listingsNamingNoOpenDirectory() {
+        return Stream.of(
+                Arguments.of("missing listing", false, false, false, true),
+                Arguments.of("empty listing", true, false, false, true),
+                Arguments.of("entries leading elsewhere", true, true, false, true),
+                Arguments.of("no file key", true, true, true, false));
+    }
+
+    /**
+     * Where no entry of the listing of open file descriptors names the open directory, the missing directory is not
+     * created at all, and never by its path instead: the failure is a {@link FileSystemException} naming the directory
+     * to create with the reason {@value #NOT_CREATED_RELATIVE}, the failure reading a missing listing as its cause.
+     *
+     * @param description   the case, for the test name
+     * @param listingExists whether the listing exists
+     * @param elsewhere     whether the listing holds entries leading to another directory, a file and nowhere
+     * @param namingHeld    whether the listing holds an entry leading to the open directory
+     * @param fileKeyKnown  whether the open directory's file key is passed
+     * @throws IOException when a file operation of the test fails
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("listingsNamingNoOpenDirectory")
+    void missingDirectoryIsNotCreatedWhenNoOpenDescriptorNamesItsDirectory(String description,
+            boolean listingExists, boolean elsewhere, boolean namingHeld, boolean fileKeyKnown) throws IOException {
+        Path held = Files.createDirectories(tempDir.resolve("out"));
+        Path created = held.resolve("daily");
+        Path descriptors = tempDir.resolve("fd");
+        if (listingExists) {
+            Files.createDirectory(descriptors);
+        }
+        if (elsewhere) {
+            Files.createSymbolicLink(descriptors.resolve("3"), Files.createDirectory(tempDir.resolve("other")));
+            Files.createSymbolicLink(descriptors.resolve("4"), Files.writeString(tempDir.resolve("file"), "x"));
+            Files.createSymbolicLink(descriptors.resolve("5"), tempDir.resolve("closed"));
+        }
+        if (namingHeld) {
+            Files.createSymbolicLink(descriptors.resolve("6"), held);
+        }
+        Object identity = fileKeyKnown ? Files.readAttributes(held, BasicFileAttributes.class).fileKey() : null;
+
+        assertThatThrownBy(() -> FileOutboundWriter.descriptorOf(descriptors, identity, created))
+                .isExactlyInstanceOf(FileSystemException.class)
+                .isInstanceOfSatisfying(FileSystemException.class, refused -> {
+                    assertThat(refused.getFile()).isEqualTo(created.toString());
+                    assertThat(refused.getReason()).isEqualTo(NOT_CREATED_RELATIVE);
+                    if (listingExists) {
+                        assertThat(refused.getCause()).isNull();
+                    } else {
+                        assertThat(refused.getCause()).isInstanceOf(NoSuchFileException.class);
+                    }
+                });
+
+        assertThat(created).doesNotExist();
+    }
+
+    /**
+     * The directories given mode {@code 0300}, write and search without read, in each directory access: the target
+     * directory, a directory below it that the name leads through, and that directory with a missing directory to
+     * create inside it.
+     *
+     * @return access, description, the directory given the mode relative to the target directory, the name
+     */
+    static Stream<Arguments> directoriesWithoutReadPermission() {
+        return withEachAccess(Stream.of(
+                Arguments.of("target directory", "", "orders.json"),
+                Arguments.of("directory on the way", "drop", "drop/orders.json"),
+                Arguments.of("missing directory inside it", "drop", "drop/daily/orders.json")));
+    }
+
+    /**
+     * A directory the process may write and search but not read, mode {@code 0300}, whether the target directory or
+     * a directory below it that the name leads through, with or without a missing directory to create inside it.
+     * The directory-relative walk must hold every directory open, which needs read permission, so
+     * {@link Files#isReadable(Path)} on the directory decides its expectation: when the process may still read it, as
+     * a superuser may, the file is written; otherwise the write fails, the streaming failure caused by an
+     * {@link AccessDeniedException} naming that directory, and the tree is left exactly as it was. Where the
+     * platform offers no directory-relative walk, only the target directory is opened, and the path-name walk needs
+     * no read permission: there, and with {@link FileOutboundWriter.DirectoryAccess#PATH_NAMES}, a directory below
+     * the target directory is written into. The directory keeps its mode, and a written tree holds the file and the
+     * directories leading to it, nothing else.
+     *
+     * @param access      how the writer reaches the directories
+     * @param description what the case covers
+     * @param searchOnly  the directory given mode {@code 0300}, relative to the target directory
+     * @param name        the file name passed to the writer
+     * @throws Exception when a file operation of the test fails or the lock map cannot be read
+     */
+    @ParameterizedTest(name = "{1} ({0})")
+    @MethodSource("directoriesWithoutReadPermission")
+    void directoryWithoutReadPermissionIsWrittenIntoOnlyWhereItNeedNotBeHeldOpen(
+            FileOutboundWriter.DirectoryAccess access, String description, String searchOnly, String name)
+            throws Exception {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Path unreadable = Files.createDirectories(dir.resolve(searchOnly));
+        boolean opened = access == FileOutboundWriter.DirectoryAccess.AUTOMATIC
+                && (unreadable.equals(dir) || offersDirectoryRelativeWalk(dir));
+        Map<String, String> before = tree(dir);
+        int unreadableMode = unixMode(unreadable);
+        Files.setAttribute(unreadable, "unix:mode", 0300);
+        boolean refused = opened && !Files.isReadable(unreadable);
+        try {
+            if (refused) {
+                assertThatThrownBy(() -> new FileOutboundWriter(access).write(dir, name, "{}"))
+                        .isExactlyInstanceOf(IOException.class)
+                        .hasMessage(STREAMING_FAILED)
+                        .cause()
+                        .isInstanceOfSatisfying(AccessDeniedException.class, failure ->
+                                assertThat(failure.getFile()).isEqualTo(unreadable.toString()));
+            } else {
+                Path written = new FileOutboundWriter(access).write(dir, name, "{}");
+
+                assertThat(written).isEqualTo(dir.resolve(name));
+                assertThat(Files.readString(written)).isEqualTo("{}");
+            }
+            assertThat(unixMode(unreadable)).isEqualTo(0300);
+        } finally {
+            Files.setAttribute(unreadable, "unix:mode", unreadableMode);
+        }
+        Map<String, String> expected = new TreeMap<>(before);
+        if (!refused) {
+            expected.put(name, "file {}");
+            for (Path parent = Path.of(name).getParent(); parent != null; parent = parent.getParent()) {
+                expected.put(parent.toString(), "directory");
+            }
+        }
+        assertThat(tree(dir)).isEqualTo(expected);
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     /**
      * Two links naming each other fail as the operating system's lookup would, the streaming failure caused by the
      * lookup's {@link FileSystemException}, and nothing is created.
      *
+     * @param access how the writer reaches the directories
      * @throws IOException when a file operation of the test fails
      */
-    @Test
-    void writeThroughSymbolicLinkLoopFails() throws IOException {
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void writeThroughSymbolicLinkLoopFails(FileOutboundWriter.DirectoryAccess access) throws IOException {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         Files.createSymbolicLink(dir.resolve("a"), Path.of("b"));
         Files.createSymbolicLink(dir.resolve("b"), Path.of("a"));
@@ -599,10 +1181,13 @@ class FileOutboundWriterTest {
     /**
      * A chain of forty links, the most a Linux path lookup follows, is followed to the file it ends at.
      *
+     * @param access how the writer reaches the directories
      * @throws IOException when a file operation of the test fails
      */
-    @Test
-    void chainOfFortySymbolicLinksIsFollowed() throws IOException {
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void chainOfFortySymbolicLinksIsFollowed(FileOutboundWriter.DirectoryAccess access) throws IOException {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         String name = linkChain(dir, 40, "linked.json");
 
@@ -615,10 +1200,13 @@ class FileOutboundWriterTest {
      * A chain of forty-one links, one more than a Linux path lookup follows, fails, the streaming failure caused by
      * the lookup's {@link FileSystemException}, and creates nothing.
      *
+     * @param access how the writer reaches the directories
      * @throws IOException when a file operation of the test fails
      */
-    @Test
-    void chainOfFortyOneSymbolicLinksFails() throws IOException {
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void chainOfFortyOneSymbolicLinksFails(FileOutboundWriter.DirectoryAccess access) throws IOException {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         String name = linkChain(dir, 41, "linked.json");
 
@@ -668,21 +1256,35 @@ class FileOutboundWriterTest {
     }
 
     /**
+     * The modes of a file being replaced, in each directory access.
+     *
+     * @return access, the mode
+     */
+    static Stream<Arguments> replacedFileModes() {
+        return withEachAccess(Stream.of(Arguments.of("rw-------"), Arguments.of("rw-r-----"),
+                Arguments.of("rw-r--r--")));
+    }
+
+    /**
      * The temporary file that replaces an existing file is created empty and readable and writable by its owner
      * only, whatever the replaced file's mode, so no other user can read the new content while it is written.
      *
+     * @param access      how the directory is reached
      * @param permissions the mode of the file being replaced
      * @throws IOException when a file operation of the test fails
      */
-    @ParameterizedTest
-    @ValueSource(strings = {"rw-------", "rw-r-----", "rw-r--r--"})
-    void temporaryFileReplacingAFileIsCreatedEmptyAndOwnerOnly(String permissions) throws IOException {
+    @ParameterizedTest(name = "{1} ({0})")
+    @MethodSource("replacedFileModes")
+    void temporaryFileReplacingAFileIsCreatedEmptyAndOwnerOnly(FileOutboundWriter.DirectoryAccess access,
+            String permissions) throws IOException {
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         Path destination = Files.writeString(dir.resolve("private.dat"), "old");
         Files.setPosixFilePermissions(destination, PosixFilePermissions.fromString(permissions));
         Path temp = dir.resolve(".replacement.tmp");
 
-        try (SeekableByteChannel channel = FileOutboundWriter.createTemporaryFile(temp, destination)) {
+        try (FileOutboundWriter.DirectoryHandle directory = FileOutboundWriter.openDirectory(dir, access);
+                SeekableByteChannel channel = FileOutboundWriter.createTemporaryFile(directory,
+                        temp.getFileName(), destination.getFileName())) {
             assertThat(channel.size()).isZero();
             assertThat(Files.size(temp)).isZero();
             assertThat(OWNER_ONLY).containsAll(Files.getPosixFilePermissions(temp));
@@ -693,20 +1295,51 @@ class FileOutboundWriterTest {
     /**
      * The temporary file of a new file is created empty with the permissions an ordinary create gives a file.
      *
+     * @param access how the directory is reached
      * @throws IOException when a file operation of the test fails
      */
-    @Test
-    void temporaryFileOfANewFileGetsThePermissionsOfAnOrdinaryCreate() throws IOException {
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void temporaryFileOfANewFileGetsThePermissionsOfAnOrdinaryCreate(FileOutboundWriter.DirectoryAccess access)
+            throws IOException {
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         Path reference = Files.write(dir.resolve("reference.dat"), new byte[0]);
         Path destination = dir.resolve("orders.json");
         Path temp = dir.resolve(".new.tmp");
 
-        try (SeekableByteChannel channel = FileOutboundWriter.createTemporaryFile(temp, destination)) {
+        try (FileOutboundWriter.DirectoryHandle directory = FileOutboundWriter.openDirectory(dir, access);
+                SeekableByteChannel channel = FileOutboundWriter.createTemporaryFile(directory,
+                        temp.getFileName(), destination.getFileName())) {
             assertThat(channel.size()).isZero();
             assertThat(Files.getPosixFilePermissions(temp)).isEqualTo(Files.getPosixFilePermissions(reference));
         }
         assertThat(destination).doesNotExist();
+    }
+
+    /**
+     * The temporary file is never created through a symbolic link already at its name, here a dangling link into an
+     * outside directory: the create fails with a {@link FileAlreadyExistsException} naming the temporary file by
+     * its full path, and nothing is created where the link leads.
+     *
+     * @param access how the directory is reached
+     * @throws IOException when a file operation of the test fails
+     */
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void temporaryFileIsNotCreatedThroughALinkAtItsName(FileOutboundWriter.DirectoryAccess access)
+            throws IOException {
+        Path dir = Files.createDirectories(tempDir.resolve("out"));
+        Path outside = Files.createDirectories(tempDir.resolve("outside"));
+        Path temp = Files.createSymbolicLink(dir.resolve(".planted.tmp"), outside.resolve("new.txt"));
+
+        try (FileOutboundWriter.DirectoryHandle directory = FileOutboundWriter.openDirectory(dir, access)) {
+            assertThatThrownBy(() -> FileOutboundWriter.createTemporaryFile(directory, temp.getFileName(),
+                    Path.of("orders.json")))
+                    .isInstanceOfSatisfying(FileAlreadyExistsException.class, failure ->
+                            assertThat(failure.getFile()).isEqualTo(temp.toString()));
+        }
+        assertThat(outside).isEmptyDirectory();
+        assertThat(Files.readSymbolicLink(temp)).isEqualTo(outside.resolve("new.txt"));
     }
 
     /**
@@ -718,12 +1351,14 @@ class FileOutboundWriterTest {
      * holds the previous content. After each write that temporary file is gone, and the target, alone in its
      * directory, holds the new content with its own mode, which for the wider modes the temporary file did not have.
      *
+     * @param access      how the writer reaches the directories
      * @param permissions the mode of the file being replaced
      * @throws IOException when a file operation of the test fails
      */
-    @ParameterizedTest
-    @ValueSource(strings = {"rw-------", "rw-r-----", "rw-r--r--"})
-    void temporaryFileIsOwnerOnlyOnceItHoldsTheContentOfEachReplacement(String permissions) throws IOException {
+    @ParameterizedTest(name = "{1} ({0})")
+    @MethodSource("replacedFileModes")
+    void temporaryFileIsOwnerOnlyOnceItHoldsTheContentOfEachReplacement(FileOutboundWriter.DirectoryAccess access,
+            String permissions) throws IOException {
         Path dir = tempDir.resolve("out");
         Path target = writer.write(dir, "private.dat", "old");
         Set<PosixFilePermission> mode = PosixFilePermissions.fromString(permissions);
@@ -733,7 +1368,7 @@ class FileOutboundWriterTest {
             byte[] content = filled((byte) round);
             byte[] replaced = previous;
             List<Path> observed = new ArrayList<>();
-            FileOutboundWriter observing = new FileOutboundWriter(temp -> {
+            FileOutboundWriter observing = new FileOutboundWriter(access, temp -> {
                 assertThat(temp.getParent()).isEqualTo(dir);
                 assertThat(temp.getFileName().toString()).matches(TEMPORARY_NAME);
                 assertThat(OWNER_ONLY).containsAll(Files.getPosixFilePermissions(temp, LinkOption.NOFOLLOW_LINKS));
@@ -760,10 +1395,14 @@ class FileOutboundWriterTest {
      * directory is left exactly as it was; when it may, as a superuser may, the content is replaced. The file stays
      * read-only either way.
      *
+     * @param access how the writer reaches the directories
      * @throws Exception when a file operation fails or the lock map cannot be read
      */
-    @Test
-    void readOnlyFileIsRefusedUnlessTheProcessMayWriteIt() throws Exception {
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void readOnlyFileIsRefusedUnlessTheProcessMayWriteIt(FileOutboundWriter.DirectoryAccess access)
+            throws Exception {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = tempDir.resolve("out");
         Path target = writer.write(dir, "report.csv", "first");
         Set<PosixFilePermission> readOnly = PosixFilePermissions.fromString("r--r--r--");
@@ -786,7 +1425,7 @@ class FileOutboundWriterTest {
             assertThat(tree(dir)).isEqualTo(before);
         }
         assertThat(Files.getPosixFilePermissions(target)).isEqualTo(readOnly);
-        assertThat(lockedDestinations()).doesNotContain(target.toAbsolutePath().normalize());
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     /**
@@ -800,12 +1439,15 @@ class FileOutboundWriterTest {
      * new inode; otherwise it is written in place and keeps its inode. Either way it holds the new content and keeps
      * its mode, no temporary file is left behind and the lock entry is released.
      *
+     * @param access        how the writer reaches the directories
      * @param directoryMode the octal mode the directory has during the write
      * @throws Exception when a file operation fails or the lock map cannot be read
      */
-    @ParameterizedTest(name = "directory mode {0}")
-    @ValueSource(strings = {"0555", "1777"})
-    void existingFileInARestrictiveDirectoryIsOverwritten(String directoryMode) throws Exception {
+    @ParameterizedTest(name = "directory mode {1} ({0})")
+    @MethodSource("restrictiveDirectoryModes")
+    void existingFileInARestrictiveDirectoryIsOverwritten(FileOutboundWriter.DirectoryAccess access,
+            String directoryMode) throws Exception {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = tempDir.resolve("out");
         Path target = writer.write(dir, "report.csv", "first");
         Set<PosixFilePermission> mode = PosixFilePermissions.fromString("rw-r-----");
@@ -833,7 +1475,16 @@ class FileOutboundWriterTest {
         } finally {
             Files.setAttribute(dir, "unix:mode", dirMode);
         }
-        assertThat(lockedDestinations()).doesNotContain(target.toAbsolutePath().normalize());
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * The directory modes that can refuse a replacement, in each directory access.
+     *
+     * @return access, the octal mode
+     */
+    static Stream<Arguments> restrictiveDirectoryModes() {
+        return withEachAccess(Stream.of(Arguments.of("0555"), Arguments.of("1777")));
     }
 
     /**
@@ -843,10 +1494,14 @@ class FileOutboundWriterTest {
      * {@link AccessDeniedException} naming the file, as its in-place create failed, and the directory is left
      * exactly as it was. The lock entry is released either way.
      *
+     * @param access how the writer reaches the directories
      * @throws Exception when a file operation fails or the lock map cannot be read
      */
-    @Test
-    void newFileInAReadOnlyDirectoryIsRefusedUnlessTheProcessMayCreateIt() throws Exception {
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void newFileInAReadOnlyDirectoryIsRefusedUnlessTheProcessMayCreateIt(FileOutboundWriter.DirectoryAccess access)
+            throws Exception {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         Path reference = Files.write(dir.resolve("reference.dat"), new byte[] {1});
         Path target = dir.resolve("orders.json");
@@ -874,7 +1529,7 @@ class FileOutboundWriterTest {
         } finally {
             Files.setPosixFilePermissions(dir, dirMode);
         }
-        assertThat(lockedDestinations()).doesNotContain(target.toAbsolutePath().normalize());
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     /**
@@ -883,12 +1538,15 @@ class FileOutboundWriterTest {
      * no temporary file appears. Writer and reader run on daemon threads waited on boundedly, because opening a
      * pipe blocks until its other end is opened.
      *
+     * @param access how the writer reaches the directories
      * @throws Exception when a file operation, the {@code mkfifo} command, a wait on another thread fails, or the
      *                   lock map cannot be read
      */
-    @Test
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
     @Timeout(value = 5, unit = TimeUnit.MINUTES)
-    void namedPipeIsWrittenInPlace() throws Exception {
+    void namedPipeIsWrittenInPlace(FileOutboundWriter.DirectoryAccess access) throws Exception {
+        FileOutboundWriter writer = new FileOutboundWriter(access);
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         Path pipe = dir.resolve("orders.pipe");
         Process mkfifo = new ProcessBuilder("mkfifo", pipe.toString()).redirectErrorStream(true).start();
@@ -912,7 +1570,18 @@ class FileOutboundWriterTest {
         assertThat(Files.readAttributes(pipe, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).isOther())
                 .isTrue();
         assertThat(names(dir)).containsExactly("orders.pipe");
-        assertThat(lockedDestinations()).doesNotContain(pipe.toAbsolutePath().normalize());
+        assertThat(lockedDestinations()).isEmpty();
+    }
+
+    /**
+     * Names that resolve to a directory, in each directory access: the empty name, a directory, a link to it, the
+     * same link written with a trailing separator, and a nested name ending in {@code ..}.
+     *
+     * @return access, the name
+     */
+    static Stream<Arguments> namesOfDirectories() {
+        return withEachAccess(Stream.of(Arguments.of(""), Arguments.of("sub"), Arguments.of("sub-link"),
+                Arguments.of("sub-link/"), Arguments.of("sub/..")));
     }
 
     /**
@@ -920,12 +1589,14 @@ class FileOutboundWriterTest {
      * failure caused by a {@link FileSystemException} with the reason {@code Is a directory}; every file and
      * directory is left exactly as it was and no temporary file appears.
      *
-     * @param name the file name passed to the writer
+     * @param access how the writer reaches the directories
+     * @param name   the file name passed to the writer
      * @throws Exception when a file operation fails or the lock map cannot be read
      */
-    @ParameterizedTest(name = "name \"{0}\"")
-    @ValueSource(strings = {"", "sub", "sub-link"})
-    void writeToADirectoryFailsAndLeavesEverythingAsItWas(String name) throws Exception {
+    @ParameterizedTest(name = "name \"{1}\" ({0})")
+    @MethodSource("namesOfDirectories")
+    void writeToADirectoryFailsAndLeavesEverythingAsItWas(FileOutboundWriter.DirectoryAccess access, String name)
+            throws Exception {
         Path dir = Files.createDirectories(tempDir.resolve("out"));
         Path sub = Files.createDirectories(dir.resolve("sub"));
         Files.writeString(dir.resolve("kept.txt"), "kept");
@@ -933,7 +1604,7 @@ class FileOutboundWriterTest {
         Files.createSymbolicLink(dir.resolve("sub-link"), Path.of("sub"));
         Map<String, String> before = tree(dir);
 
-        assertThatThrownBy(() -> writer.write(dir, name, "new"))
+        assertThatThrownBy(() -> new FileOutboundWriter(access).write(dir, name, "new"))
                 .isExactlyInstanceOf(IOException.class)
                 .hasMessage(STREAMING_FAILED)
                 .cause()
@@ -941,29 +1612,38 @@ class FileOutboundWriterTest {
                         assertThat(failure.getReason()).isEqualTo("Is a directory"));
 
         assertThat(tree(dir)).isEqualTo(before);
-        assertThat(lockedDestinations()).doesNotContain(dir.resolve(name).toAbsolutePath().normalize(),
-                sub.toAbsolutePath().normalize());
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     /**
-     * A write that fails after its temporary file was written, here because the rename onto a name longer than the
-     * file system allows is refused, removes the temporary file and leaves the existing files untouched. The
-     * temporary file's own short name is accepted, so the failure comes from the final rename.
+     * A write whose rename is refused after its temporary file was written, here because the observer puts a
+     * non-empty directory where the new file was to go, removes the temporary file and leaves every other entry as
+     * it was; with no regular file left to overwrite in place, the refused rename is the failure reported.
      *
+     * @param access how the writer reaches the directories
      * @throws Exception when a file operation fails or the lock map cannot be read
      */
-    @Test
-    void failedRenameLeavesTheExistingContentAndNoTemporaryFile() throws Exception {
+    @ParameterizedTest
+    @EnumSource(FileOutboundWriter.DirectoryAccess.class)
+    void failedRenameLeavesTheExistingContentAndNoTemporaryFile(FileOutboundWriter.DirectoryAccess access)
+            throws Exception {
         Path dir = tempDir.resolve("out");
         Path existing = writer.write(dir, "orders.json", "first");
-        String tooLong = "x".repeat(256);
-        Map<String, String> before = tree(dir);
+        Path blocker = dir.resolve("report.csv");
+        FileOutboundWriter blocked = new FileOutboundWriter(access, temp -> {
+            Files.createDirectory(blocker);
+            Files.writeString(blocker.resolve("inner.txt"), "inner");
+        });
 
-        assertThatThrownBy(() -> writer.write(dir, tooLong, "second")).isInstanceOf(IOException.class);
+        assertThatThrownBy(() -> blocked.write(dir, "report.csv", "second"))
+                .isExactlyInstanceOf(IOException.class)
+                .hasMessage(STREAMING_FAILED)
+                .hasCauseInstanceOf(FileSystemException.class);
 
-        assertThat(tree(dir)).isEqualTo(before);
+        assertThat(names(dir)).containsExactly("orders.json", "report.csv");
         assertThat(Files.readString(existing)).isEqualTo("first");
-        assertThat(lockedDestinations()).doesNotContain(dir.resolve(tooLong).toAbsolutePath().normalize());
+        assertThat(names(blocker)).containsExactly("inner.txt");
+        assertThat(lockedDestinations()).isEmpty();
     }
 
     private static String cp(int codePoint) {
@@ -1007,6 +1687,59 @@ class FileOutboundWriterTest {
             next = "link" + i;
         }
         return next;
+    }
+
+    /**
+     * Creates symbolic links under {@code dir}, each written {@code name -> text}, the name relative to {@code dir};
+     * in the text, <code>{outside}</code> stands for the absolute path of {@code outside}, <code>{out}</code> for the
+     * absolute path of {@code dir} and <code>{real}</code> for its real path.
+     *
+     * @param dir     the target directory
+     * @param outside the directory beside it
+     * @param links   the links
+     * @throws IOException when a link cannot be created or the real path cannot be read
+     */
+    private static void createLinks(Path dir, Path outside, String... links) throws IOException {
+        String real = dir.toRealPath().toString();
+        for (String link : links) {
+            String[] nameAndText = link.split(" -> ", 2);
+            String text = nameAndText[1]
+                    .replace("{outside}", outside.toAbsolutePath().toString())
+                    .replace("{out}", dir.toAbsolutePath().toString())
+                    .replace("{real}", real);
+            Files.createSymbolicLink(dir.resolve(nameAndText[0]), Path.of(text));
+        }
+    }
+
+    /**
+     * Returns every case once for each {@link FileOutboundWriter.DirectoryAccess}, the access as its first argument.
+     *
+     * @param cases the cases
+     * @return the cases for the first access, then for the next
+     */
+    private static Stream<Arguments> withEachAccess(Stream<Arguments> cases) {
+        List<Arguments> each = cases.toList();
+        return Stream.of(FileOutboundWriter.DirectoryAccess.values()).flatMap(access -> each.stream().map(one -> {
+            Object[] values = one.get();
+            Object[] withAccess = new Object[values.length + 1];
+            withAccess[0] = access;
+            System.arraycopy(values, 0, withAccess, 1, values.length);
+            return Arguments.of(withAccess);
+        }));
+    }
+
+    /**
+     * Tells whether the platform offers the directory-relative walk for {@code dir}, as
+     * {@link FileOutboundWriter.DirectoryAccess#AUTOMATIC} uses it.
+     *
+     * @param dir an existing directory
+     * @return {@code true} when {@link Files#newDirectoryStream(Path)} returns a {@link SecureDirectoryStream}
+     * @throws IOException when the directory cannot be opened
+     */
+    private static boolean offersDirectoryRelativeWalk(Path dir) throws IOException {
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+            return stream instanceof SecureDirectoryStream;
+        }
     }
 
     /**
@@ -1132,8 +1865,9 @@ class FileOutboundWriterTest {
     }
 
     /**
-     * Returns the destinations whose lock entry is currently held or awaited, read from the writer's private lock
-     * map: the map must lose every entry once its last writer finishes, so it never grows with each new name.
+     * Returns the keys of the destinations whose lock entry is currently held or awaited, read from the writer's
+     * private lock map: the map must lose every entry once its last writer finishes, so it never grows with each new
+     * name. The tests of this class run one at a time, so the map is empty whenever none of them is writing.
      *
      * @return a copy of the lock map's keys
      * @throws ReflectiveOperationException when the lock map cannot be read

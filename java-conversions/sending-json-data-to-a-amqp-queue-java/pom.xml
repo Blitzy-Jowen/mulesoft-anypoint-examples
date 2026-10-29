@@ -32,7 +32,40 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <qpid-broker-j.version>9.2.1</qpid-broker-j.version>
+        <bouncycastle.version>1.86</bouncycastle.version>
+        <guava.version>33.7.2-jre</guava.version>
     </properties>
+
+    <!-- The test broker qpid-broker-core 9.2.1 brings Bouncy Castle bcprov and bcpkix 1.80 with bcutil 1.80.2, and Guava
+         33.4.0-jre, none managed by the Boot BOM. They move to fixed releases, Bouncy Castle as one family: Bouncy Castle
+         1.86 for the advisories fixed from 1.84 to 1.86 (CVE-2025-14813, CVE-2026-0636, CVE-2026-5588, CVE-2026-5598
+         and later), and Guava 33.7.2-jre for CVE-2026-102554 (GHSA-xxph-c9ww-hj94). These are the versions the Spring WS
+         security projects manage (Bouncy Castle 1.86 is the version WSS4J 4.0.2 is built with). The Qpid Broker-J pin
+         9.2.1 stays, and both families keep the test scope Qpid gives them. Root DECISIONS.md section 11.3. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcpkix-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcutil-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>${guava.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <!-- Undertow replaces Tomcat, which does not put reason phrases on the wire. -->

@@ -131,7 +131,7 @@ logging:
     org.springframework.ws.server.MessageTracing: INFO   # .received/.sent TRACE write every processOrder envelope and its OrderSummary reply, customer included
     org.springframework.ws.client.MessageTracing: INFO   # the same for every envelope SamsungServiceClient sends and receives
     org.springframework.web.servlet.DispatcherServlet: WARN   # request line with the query: a GET to /ajax/cometd carries the published order in its message parameter. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
-    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments: the Bayeux message holding the published order
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, the handled exception and its message included; the Bayeux handler takes the servlet request, so no published order
     org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter: INFO   # TRACE writes the async result a held /meta/connect resumes with: the order summary reply
     org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # TRACE writes the response body: the same Bayeux reply
     # The embedded broker's audit loggers write at INFO, so they need their own level: fulfillment.xml declares none.

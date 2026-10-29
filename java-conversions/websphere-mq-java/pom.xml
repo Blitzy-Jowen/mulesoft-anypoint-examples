@@ -53,6 +53,26 @@
                 <artifactId>commons-logging</artifactId>
                 <version>1.3.2</version>
             </dependency>
+            <!-- The IBM MQ client 9.3.5.0 brings Bouncy Castle bcprov, bcpkix and bcutil 1.77, which the Boot BOM does not
+                 manage. The three move together to 1.86 for the certificate, signature and ASN.1 advisories fixed from
+                 1.78 to 1.86 (CVE-2024-29857, CVE-2024-30172, CVE-2025-8916 and later); 1.86 is also the version
+                 WSS4J 4.0.2 is built with, the one the Spring WS security projects manage. The IBM MQ client stays at
+                 9.3.5.0. Root DECISIONS.md section 11.3.2. -->
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>1.86</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcpkix-jdk18on</artifactId>
+                <version>1.86</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcutil-jdk18on</artifactId>
+                <version>1.86</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 

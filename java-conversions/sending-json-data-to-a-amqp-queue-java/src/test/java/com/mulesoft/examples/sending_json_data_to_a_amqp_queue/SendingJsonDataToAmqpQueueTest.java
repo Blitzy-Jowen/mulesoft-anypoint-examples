@@ -173,15 +173,15 @@ class SendingJsonDataToAmqpQueueTest {
     @DynamicPropertySource
     static void brokerProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.rabbitmq.port", () -> AMQP_PORT);
-        registry.add("amqp.host", () -> "localhost");
-        registry.add("spring.rabbitmq.host", () -> "localhost");
+        registry.add("amqp.host", () -> LOOPBACK);
+        registry.add("spring.rabbitmq.host", () -> LOOPBACK);
     }
 
     @BeforeEach
     void declareSalesDestination() throws Exception {
         applicationConnectionFactory = connectionFactory;
         ConnectionFactory factory = new ConnectionFactory();
-        factory.setHost("localhost");
+        factory.setHost(LOOPBACK);
         factory.setPort(AMQP_PORT);
         factory.setUsername(brokerUsername);
         factory.setPassword(brokerPassword);

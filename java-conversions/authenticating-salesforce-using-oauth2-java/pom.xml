@@ -34,6 +34,7 @@
         <force-partner-api.version>65.0.0</force-partner-api.version>
         <wiremock.version>3.13.2</wiremock.version>
         <commons-net.version>3.13.0</commons-net.version>
+        <commons-io.version>2.22.0</commons-io.version>
 
         <!-- Build plugins. The compiler, surefire, failsafe and enforcer properties reuse Boot's names with Boot's own values, so the parent's pluginManagement resolves the same versions. -->
         <maven-compiler-plugin.version>3.11.0</maven-compiler-plugin.version>
@@ -52,6 +53,14 @@
                 <groupId>commons-net</groupId>
                 <artifactId>commons-net</artifactId>
                 <version>${commons-net.version}</version>
+            </dependency>
+            <!-- HtmlUnit 2.70.0 (kept at the Boot BOM version) declares commons-io 2.10.0, which CVE-2024-47554
+                 (XmlStreamReader CPU exhaustion, 2.0 to before 2.14.0) affects, so a fixed release is managed here.
+                 HtmlUnit and commons-net are its only consumers, both test-only, so it stays test scope. -->
+            <dependency>
+                <groupId>commons-io</groupId>
+                <artifactId>commons-io</artifactId>
+                <version>${commons-io.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

@@ -229,7 +229,8 @@ java -jar target/adding-a-new-customer-to-workday-revenue-management-java-1.0.0-
 ```
 
 - `mvn test` needs no licence, credential or network access to Workday: Workday is a WireMock SOAP stub on `localhost`, or a Mockito mock.
-- The build needs the Shibboleth releases repository `https://build.shibboleth.net/maven/releases/`, declared in `pom.xml` as `shibboleth-releases`. `spring-ws-security` 4.1.4 brings WSS4J 4.0.1, which depends on OpenSAML 5, and OpenSAML 5 is not published to Maven Central. Every other artefact comes from Maven Central.
+- The build needs the Shibboleth releases repository `https://build.shibboleth.net/maven/releases/`, declared in `pom.xml` as `shibboleth-releases`. `spring-ws-security` 4.1.4 brings WSS4J 4.0.1, which declares OpenSAML 5.1.6, and OpenSAML 5 is not published to Maven Central. Every other artefact comes from Maven Central.
+- The pom's `<dependencyManagement>` moves the OpenSAML and Shibboleth support modules to 5.2.3 and 9.2.3, Bouncy Castle to 1.86 and Guava to 33.7.2-jre, fixed releases of their published advisories (root `DECISIONS.md` section 11.3); Spring WS 4.1.4, WSS4J 4.0.1 and xmlsec 4.0.4 stay unchanged.
 - `<spring-ws.version>4.1.4</spring-ws.version>` overrides the Boot 3.2.12 BOM's Spring WS 4.0.11; Spring Framework stays at the BOM's 6.1.15 (root `DECISIONS.md`).
 - The build runs the `maven-enforcer-plugin` ban on JAX-WS and CXF at `validate` and the WSDL presence check and XJC at `generate-sources` (Workday WSDL and generated classes above).
 - Reports land under `target/`: `surefire-reports/`, `failsafe-reports/`, JaCoCo in `site/jacoco/` (`index.html`, `jacoco.csv`), and the fixture-replay summary `fixture-parity/summary.properties`.

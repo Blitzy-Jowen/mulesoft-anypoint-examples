@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -28,10 +29,12 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BooleanSupplier;
 import java.util.regex.Pattern;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
+import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -95,6 +98,16 @@ class AjaxChannelBrokerTest {
     private static final String FORGED_CLIENT = "client\r\nFORGED";
 
     private static final String FORGED_CLIENT_RENDERING = "client\\u000d\\u000aFORGED";
+
+    /** 2 MiB, the estimated retained size of {@link #TWO_MIB_TEXT}. */
+    private static final long TWO_MIB = 2L * 1024 * 1024;
+
+    /**
+     * Text the broker estimates at exactly {@link #TWO_MIB} ({@code 40 + 2 * 1048556} bytes): two fill a client's
+     * queue or a cached channel's hold to its byte bound, and 32 fill the broker's retained bytes. Every use shares
+     * this one instance, so the test retains 2 MiB however often it is published.
+     */
+    private static final String TWO_MIB_TEXT = "x".repeat(1_048_556);
 
     private final List<AjaxChannelBroker> brokers = new ArrayList<>();
 
@@ -574,9 +587,28 @@ class AjaxChannelBrokerTest {
                     broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET);
                 }, Level.DEBUG, "Ajax publication from client " + FORGED_CLIENT_RENDERING
                         + " dispatched to the handler of channel " + FORGED_CHANNEL_RENDERING),
-                Arguments.of("drop on an unknown channel", Map.of(),
-                        (BrokerScenario) broker -> broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL, SECRET),
+                Arguments.of("drop on a channel without subscriber", Map.of(),
+                        (BrokerScenario) broker -> broker.publish(FORGED_CHANNEL, SECRET),
                         Level.DEBUG, "No subscriber on Ajax channel " + FORGED_CHANNEL_RENDERING + "; message dropped"),
+                Arguments.of("rpc naming a reply channel other than its own", Map.of(), (BrokerScenario) broker -> {
+                    broker.registerInbound(FORGED_CHANNEL, data -> null);
+                    broker.onPublication(FORGED_CLIENT, FORGED_CHANNEL,
+                            rpc(SECRET, FORGED_CHANNEL + "#" + FORGED_CLIENT));
+                }, Level.WARN, "Ajax rpc publication from client " + FORGED_CLIENT_RENDERING + " on channel "
+                        + FORGED_CHANNEL_RENDERING + " names a reply channel other than its own; the handler runs"
+                        + " without a reply"),
+                Arguments.of("hold beyond its byte bound", Map.of("ajax.cache-messages-channels[0]", FORGED_CHANNEL),
+                        (BrokerScenario) broker -> IntStream.range(0, 3)
+                                .forEach(i -> broker.publish(FORGED_CHANNEL, TWO_MIB_TEXT)),
+                        Level.WARN, "Ajax channel " + FORGED_CHANNEL_RENDERING + " would hold more than "
+                                + AjaxChannelBroker.MAX_HELD_BYTES
+                                + " estimated bytes for its first subscriber; message dropped"),
+                Arguments.of("publication beyond the retained bytes", Map.of(), (BrokerScenario) broker -> {
+                    fillRetainedBytes(broker, FORGED_CHANNEL);
+                    broker.publish(FORGED_CHANNEL, SECRET);
+                }, Level.WARN, "Ajax publication on channel " + FORGED_CHANNEL_RENDERING + " dropped: it would take"
+                        + " the retained messages and payloads past " + AjaxChannelBroker.MAX_RETAINED_BYTES
+                        + " estimated bytes"),
                 Arguments.of("timeout", Map.of(timeout, "100"), (BrokerScenario) broker -> {
                     // Blocks on a latch nobody releases; the 100 ms response timeout interrupts it.
                     CountDownLatch never = new CountDownLatch(1);
@@ -664,21 +696,128 @@ class AjaxChannelBrokerTest {
         assertThat(broker.drain(wildcard)).isEmpty();
     }
 
-    @Test
-    void publicationOnChannelWithoutHandlerReachesEverySubscriberPublisherIncluded() {
-        AjaxChannelBroker broker = broker(new MockEnvironment());
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("channelsWithoutInboundHandler")
+    void clientPublicationOnAChannelWithoutInboundHandlerIsRefusedAndReachesNobody(String description,
+            ChannelOf channelOf, boolean publicChannel) throws Exception {
+        AjaxChannelBroker broker = broker(handlerEnvironment().withProperty("ajax.cache-messages-channels", CACHED));
+        AtomicInteger handled = new AtomicInteger();
+        broker.registerInbound(INBOUND, data -> "echo:" + handled.incrementAndGet());
         String publisher = broker.handshake();
         String subscriber = broker.handshake();
-        broker.subscribe(publisher, OUTBOUND);
-        broker.subscribe(subscriber, OUTBOUND);
-        Map<String, Object> data = Map.of("text", "hi", "count", 2);
+        String channel = channelOf.name(subscriber);
+        broker.subscribe(subscriber, channel);
+        if (publicChannel) {
+            broker.subscribe(publisher, channel);
+        }
 
-        broker.onPublication(publisher, OUTBOUND, data);
+        assertRefused(() -> broker.onPublication(publisher, channel, Map.of("text", "forged", "count", 2)),
+                AjaxChannelBroker.RefusalReason.NOT_INBOUND);
 
-        List<AjaxChannelBroker.Delivery> expected = List.of(new AjaxChannelBroker.Delivery(OUTBOUND, data));
-        assertThat(broker.drain(publisher)).isEqualTo(expected);
-        assertThat(broker.drain(subscriber)).isEqualTo(expected);
-        assertThat(broker.drain(subscriber)).isEmpty();
+        assertThat(broker.awaitMessages(subscriber, QUIET_MS)).isEmpty();
+        assertThat(broker.drain(publisher)).isEmpty();
+        assertThat(handled).hasValue(0);
+        assertThat(broker.isKnownClient(publisher)).as("a refusal keeps the publisher").isTrue();
+        // The server's own publication on the same channel still reaches the subscriber.
+        broker.publish(channel, "server");
+        assertThat(broker.drain(subscriber)).containsExactly(new AjaxChannelBroker.Delivery(channel, "server"));
+    }
+
+    static Stream<Arguments> channelsWithoutInboundHandler() {
+        return Stream.of(
+                Arguments.of("outbound channel", (ChannelOf) subscriber -> OUTBOUND, true),
+                Arguments.of("cached outbound channel", (ChannelOf) subscriber -> CACHED, true),
+                Arguments.of("another client's reply channel", (ChannelOf) AjaxChannelBrokerTest::replyChannel, false),
+                Arguments.of("unconfigured channel", (ChannelOf) subscriber -> "/test/unconfigured", true));
+    }
+
+    @Test
+    void refusedClientPublicationOnACachedChannelIsNotHeldWhileTheServersPublicationIs() {
+        AjaxChannelBroker broker = broker(environment(Map.of("ajax.cache-messages-channels", CACHED)));
+        String publisher = broker.handshake();
+
+        assertRefused(() -> broker.onPublication(publisher, CACHED, "forged"),
+                AjaxChannelBroker.RefusalReason.NOT_INBOUND);
+        broker.publish(CACHED, "server");
+
+        String subscriber = broker.handshake();
+        broker.subscribe(subscriber, CACHED);
+        assertThat(broker.drain(subscriber)).containsExactly(new AjaxChannelBroker.Delivery(CACHED, "server"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("privateChannelForms")
+    void onlyTheClientNamedAfterTheLastHashSubscribesToAPrivateChannel(String description, ClientPair channelOf,
+            boolean firstAdmitted, boolean secondAdmitted) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String first = broker.handshake();
+        String second = broker.handshake();
+        String channel = channelOf.name(first, second);
+
+        AjaxChannelBroker.RefusalReason foreign = AjaxChannelBroker.RefusalReason.FOREIGN_PRIVATE_CHANNEL;
+
+        assertSubscription(broker, first, channel, firstAdmitted, foreign);
+        assertSubscription(broker, second, channel, secondAdmitted, foreign);
+
+        broker.publish(channel, "reply");
+        assertThat(broker.drain(first)).isEqualTo(firstAdmitted
+                ? List.of(new AjaxChannelBroker.Delivery(channel, "reply")) : List.of());
+        assertThat(broker.drain(second)).isEqualTo(secondAdmitted
+                ? List.of(new AjaxChannelBroker.Delivery(channel, "reply")) : List.of());
+        assertThat(List.of(first, second)).as("a refusal keeps the client").allMatch(broker::isKnownClient);
+    }
+
+    static Stream<Arguments> privateChannelForms() {
+        return Stream.of(
+                Arguments.of("the second client's reply channel",
+                        (ClientPair) (first, second) -> INBOUND + "#" + second, false, true),
+                Arguments.of("owner after the last of two hashes", (ClientPair) (first, second) ->
+                        "/test/a#" + first + "#" + second, false, true),
+                Arguments.of("an empty owner", (ClientPair) (first, second) -> INBOUND + "#", false, false),
+                Arguments.of("an owner that only starts with the ID", (ClientPair) (first, second) ->
+                        INBOUND + "#" + second + "0", false, false),
+                Arguments.of("a public channel", (ClientPair) (first, second) -> OUTBOUND, true, true));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unownedReplyChannels")
+    void rpcNamingAReplyChannelOtherThanThePublishersOwnRunsTheHandlerWithoutReply(String description,
+            ClientPair replyToOf, boolean subscribedBySecond) throws Exception {
+        AjaxChannelBroker broker = broker(handlerEnvironment().withProperty("ajax.disable-reply-to", "false"));
+        BlockingQueue<Object> handled = new LinkedBlockingQueue<>();
+        broker.registerInbound(INBOUND, data -> {
+            handled.add(data);
+            return "echo:" + data;
+        });
+        String first = broker.handshake();
+        String second = broker.handshake();
+        String foreign = replyToOf.name(first, second);
+        broker.subscribe(subscribedBySecond ? second : first, foreign);
+        broker.subscribe(first, replyChannel(first));
+
+        broker.onPublication(first, INBOUND, rpc("stolen", foreign));
+
+        assertThat(handled.poll(WAIT_MS, TimeUnit.MILLISECONDS)).as("the handler still runs").isEqualTo("stolen");
+        assertThat(broker.awaitMessages(subscribedBySecond ? second : first, QUIET_MS)).isEmpty();
+        assertThat(loggedMessages(Level.WARN)).containsExactly("Ajax rpc publication from client " + first
+                + " on channel " + INBOUND + " names a reply channel other than its own; the handler runs without a"
+                + " reply");
+
+        // The publisher's own reply channel still receives its reply.
+        broker.onPublication(first, INBOUND, rpc("own", replyChannel(first)));
+
+        assertThat(broker.awaitMessages(first, WAIT_MS))
+                .containsExactly(new AjaxChannelBroker.Delivery(replyChannel(first), "echo:own"));
+        assertThat(broker.drain(second)).isEmpty();
+    }
+
+    static Stream<Arguments> unownedReplyChannels() {
+        return Stream.of(
+                Arguments.of("another client's reply channel of the channel",
+                        (ClientPair) (first, second) -> replyChannel(second), true),
+                Arguments.of("a public outbound channel", (ClientPair) (first, second) -> OUTBOUND, true),
+                Arguments.of("the publisher's reply channel of another channel",
+                        (ClientPair) (first, second) -> OUTBOUND + "#" + first, false));
     }
 
     @ParameterizedTest(name = "{0}")
@@ -1163,6 +1302,7 @@ class AjaxChannelBrokerTest {
     void activeClientSurvivesTheSweepsThatExpireASilentOne(String description, ClientAction activity) {
         // Wide enough that a stalled test thread on a loaded host cannot let the active client's activity lapse.
         AjaxChannelBroker broker = broker(new MockEnvironment().withProperty("ajax.max-interval-ms", "500"));
+        broker.registerInbound(INBOUND, data -> null);
         String silent = broker.handshake();
         String active = broker.handshake();
 
@@ -1184,7 +1324,10 @@ class AjaxChannelBrokerTest {
                 Arguments.of("unsubscribe",
                         (ClientAction) (broker, clientId) -> broker.unsubscribe(clientId, OUTBOUND)),
                 Arguments.of("publication",
-                        (ClientAction) (broker, clientId) -> broker.onPublication(clientId, TICK, "ping")));
+                        (ClientAction) (broker, clientId) -> broker.onPublication(clientId, INBOUND, "ping")),
+                Arguments.of("refused publication", (ClientAction) (broker, clientId) ->
+                        assertRefused(() -> broker.onPublication(clientId, TICK, "ping"),
+                                AjaxChannelBroker.RefusalReason.NOT_INBOUND)));
     }
 
     @Test
@@ -1265,6 +1408,7 @@ class AjaxChannelBrokerTest {
     @Test
     void subscriberThatNeverDrainsIsRemovedByTheDeliveryBeyondItsQueueBound() throws Exception {
         AjaxChannelBroker broker = broker(new MockEnvironment());
+        broker.registerInbound(INBOUND, data -> null);
         int max = AjaxChannelBroker.MAX_QUEUED_DELIVERIES;
         String hoarder = broker.handshake();
         String reader = broker.handshake();
@@ -1275,7 +1419,7 @@ class AjaxChannelBrokerTest {
         for (int i = 1; i <= max; i++) {
             broker.publish(OUTBOUND, i);
             // The hoarder keeps publishing, so inactivity alone would never remove it; it never connects or drains.
-            broker.onPublication(hoarder, TICK, "ping");
+            broker.onPublication(hoarder, INBOUND, "ping");
             read.addAll(broker.drain(reader));
         }
 
@@ -1369,6 +1513,504 @@ class AjaxChannelBrokerTest {
         assertThat(broker.drain(next)).containsExactly(new AjaxChannelBroker.Delivery(OUTBOUND, "later"));
     }
 
+    @ParameterizedTest(name = "slot freed by {0}")
+    @MethodSource("clientSlotReleases")
+    void handshakeBeyondMaxClientsIsRefusedUntilAClientIsRemoved(String description, Map<String, String> properties,
+            ClientAction removal, boolean oneSlotFreed) {
+        AjaxChannelBroker broker = broker(environment(properties));
+        List<String> registered = IntStream.range(0, AjaxChannelBroker.MAX_CLIENTS)
+                .mapToObj(i -> broker.handshake())
+                .toList();
+
+        assertRefused(broker::handshake, AjaxChannelBroker.RefusalReason.CLIENT_LIMIT);
+        assertThat(registered).doesNotHaveDuplicates().allMatch(broker::isKnownClient);
+
+        removal.apply(broker, registered.get(0));
+
+        assertThat(broker.isKnownClient(broker.handshake())).isTrue();
+        assertThat(broker.isKnownClient(registered.get(0))).isFalse();
+        if (oneSlotFreed) {
+            assertRefused(broker::handshake, AjaxChannelBroker.RefusalReason.CLIENT_LIMIT);
+        }
+    }
+
+    static Stream<Arguments> clientSlotReleases() {
+        return Stream.of(
+                Arguments.of("disconnect", Map.of(), (ClientAction) AjaxChannelBroker::disconnect, true),
+                Arguments.of("queue overflow", Map.of(), (ClientAction) (broker, clientId) -> {
+                    broker.subscribe(clientId, OUTBOUND);
+                    IntStream.rangeClosed(0, AjaxChannelBroker.MAX_QUEUED_DELIVERIES)
+                            .forEach(i -> broker.publish(OUTBOUND, i));
+                }, true),
+                // Every client goes idle together; the next handshake expires them before it counts the clients.
+                Arguments.of("idle expiry", Map.of("ajax.max-interval-ms", "3000"), (ClientAction) (broker, clientId) ->
+                        await().pollDelay(Duration.ofMillis(3_100)).until(() -> true), false));
+    }
+
+    @Test
+    void concurrentHandshakesNeverRegisterMoreThanMaxClients() throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        int threads = 8;
+        int attemptsPerThread = AjaxChannelBroker.MAX_CLIENTS / 4;
+        Queue<String> admitted = new ConcurrentLinkedQueue<>();
+        AtomicInteger refused = new AtomicInteger();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService racers = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<?>> tasks = new ArrayList<>();
+            for (int thread = 0; thread < threads; thread++) {
+                tasks.add(racers.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < attemptsPerThread; i++) {
+                        try {
+                            admitted.add(broker.handshake());
+                        } catch (AjaxChannelBroker.ChannelRefusedException limit) {
+                            assertThat(limit.reason()).isEqualTo(AjaxChannelBroker.RefusalReason.CLIENT_LIMIT);
+                            refused.incrementAndGet();
+                        }
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (Future<?> task : tasks) {
+                task.get(WAIT_MS, TimeUnit.MILLISECONDS);
+            }
+        } finally {
+            racers.shutdownNow();
+        }
+
+        assertThat(admitted).hasSize(AjaxChannelBroker.MAX_CLIENTS).doesNotHaveDuplicates()
+                .allMatch(broker::isKnownClient);
+        assertThat(refused).hasValue(threads * attemptsPerThread - AjaxChannelBroker.MAX_CLIENTS);
+    }
+
+    @ParameterizedTest(name = "{0} characters admitted: {1}")
+    @CsvSource({"256, true", "257, false"})
+    void subscriptionNamesChannelsOfAtMostMaxChannelNameLengthCharacters(int length, boolean admitted) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        String channel = "/" + "c".repeat(length - 1);
+
+        assertSubscription(broker, client, channel, admitted, AjaxChannelBroker.RefusalReason.CHANNEL_NAME_TOO_LONG);
+
+        broker.publish(channel, "m");
+        assertThat(broker.drain(client))
+                .isEqualTo(admitted ? List.of(new AjaxChannelBroker.Delivery(channel, "m")) : List.of());
+    }
+
+    @Test
+    void clientSubscribesToAtMostMaxSubscriptionsPerClientDistinctChannels() {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        int max = AjaxChannelBroker.MAX_SUBSCRIPTIONS_PER_CLIENT;
+        IntStream.range(0, max).forEach(i -> broker.subscribe(client, numbered(i)));
+
+        // Channels already subscribed, or named twice, are not counted again.
+        broker.subscribe(client, List.of(numbered(0), numbered(0), numbered(max - 1)));
+        assertRefused(() -> broker.subscribe(client, numbered(max)),
+                AjaxChannelBroker.RefusalReason.SUBSCRIPTION_LIMIT);
+
+        broker.unsubscribe(client, numbered(0));
+        broker.subscribe(client, numbered(max));
+        broker.publish(numbered(max), "m");
+        assertThat(broker.drain(client)).containsExactly(new AjaxChannelBroker.Delivery(numbered(max), "m"));
+        assertThat(broker.isKnownClient(client)).isTrue();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("subscriptionsRefusedWhole")
+    void subscriptionNamingSeveralChannelsIsRefusedWholeAndSubscribesToNone(String description,
+            ChannelsOf channelsOf, AjaxChannelBroker.RefusalReason reason) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        String other = broker.handshake();
+        IntStream.range(0, AjaxChannelBroker.MAX_SUBSCRIPTIONS_PER_CLIENT - 1)
+                .forEach(i -> broker.subscribe(client, numbered(i)));
+        List<String> channels = channelsOf.names(other);
+
+        assertRefused(() -> broker.subscribe(client, channels), reason);
+
+        channels.forEach(channel -> broker.publish(channel, "m"));
+        assertThat(broker.drain(client)).as("subscribed to none of %s", channels).isEmpty();
+        assertThat(broker.isKnownClient(client)).isTrue();
+        // The refused request took none of the client's subscriptions: its last one still fits.
+        broker.subscribe(client, OUTBOUND);
+    }
+
+    static Stream<Arguments> subscriptionsRefusedWhole() {
+        return Stream.of(
+                Arguments.of("another client's reply channel among public ones",
+                        (ChannelsOf) other -> List.of(OUTBOUND, replyChannel(other)),
+                        AjaxChannelBroker.RefusalReason.FOREIGN_PRIVATE_CHANNEL),
+                Arguments.of("an over-long channel among public ones",
+                        (ChannelsOf) other -> List.of(OUTBOUND,
+                                "/" + "c".repeat(AjaxChannelBroker.MAX_CHANNEL_NAME_LENGTH)),
+                        AjaxChannelBroker.RefusalReason.CHANNEL_NAME_TOO_LONG),
+                Arguments.of("two new channels where one place is left",
+                        (ChannelsOf) other -> List.of(OUTBOUND, CACHED),
+                        AjaxChannelBroker.RefusalReason.SUBSCRIPTION_LIMIT));
+    }
+
+    @Test
+    void allClientsTogetherHoldAtMostMaxSubscriptions() {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        int perClient = AjaxChannelBroker.MAX_SUBSCRIPTIONS_PER_CLIENT;
+        List<String> channels = IntStream.range(0, perClient).mapToObj(AjaxChannelBrokerTest::numbered).toList();
+        List<String> full = IntStream.range(0, AjaxChannelBroker.MAX_SUBSCRIPTIONS / perClient)
+                .mapToObj(i -> {
+                    String client = broker.handshake();
+                    broker.subscribe(client, channels);
+                    return client;
+                })
+                .toList();
+        String late = broker.handshake();
+
+        assertRefused(() -> broker.subscribe(late, OUTBOUND), AjaxChannelBroker.RefusalReason.SUBSCRIPTION_LIMIT);
+        // A subscription the client already holds is not counted again.
+        broker.subscribe(full.get(0), channels.get(0));
+
+        broker.disconnect(full.get(0));
+        broker.subscribe(late, OUTBOUND);
+        broker.subscribe(late, channels.subList(1, perClient));
+        String later = broker.handshake();
+        assertRefused(() -> broker.subscribe(later, OUTBOUND), AjaxChannelBroker.RefusalReason.SUBSCRIPTION_LIMIT);
+        broker.unsubscribe(late, OUTBOUND);
+        broker.subscribe(later, OUTBOUND);
+        broker.publish(OUTBOUND, "m");
+        assertThat(broker.drain(later)).containsExactly(new AjaxChannelBroker.Delivery(OUTBOUND, "m"));
+        assertThat(broker.drain(late)).isEmpty();
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("retainedSizeEstimates")
+    void retainedBytesAreEstimatedFromTheValueWithoutSerializingIt(String description, Object value, long expected) {
+        assertThat(AjaxChannelBroker.estimateRetainedBytes(value, Long.MAX_VALUE)).isEqualTo(expected);
+    }
+
+    static Stream<Arguments> retainedSizeEstimates() {
+        List<Object> selfContaining = new ArrayList<>();
+        selfContaining.add(selfContaining);
+        Map<String, Object> shared = Map.of();
+        return Stream.of(
+                Arguments.of("null", null, 8L),
+                Arguments.of("empty text", "", 40L),
+                Arguments.of("text, two bytes per character", "abc", 46L),
+                Arguments.of("other character sequence", new StringBuilder("ab"), 44L),
+                Arguments.of("number", 7, 24L),
+                Arguments.of("boolean", true, 24L),
+                Arguments.of("character", 'c', 24L),
+                Arguments.of("map: entries, keys and values", Map.of("k", "v"), 48L + 40 + 42 + 42),
+                Arguments.of("list: slots and elements", List.of("a", 1), 48L + 16 + 42 + 24),
+                Arguments.of("object array", new Object[] {"a"}, 48L + 8 + 42),
+                Arguments.of("primitive array", new int[3], 48L + 24),
+                Arguments.of("any other value", new Object(), 64L),
+                Arguments.of("list containing itself", selfContaining, 48L + 8 + 8),
+                Arguments.of("one map referenced twice", List.of(shared, shared), 48L + 16 + 48 + 8),
+                Arguments.of("the two-MiB test text", TWO_MIB_TEXT, TWO_MIB));
+    }
+
+    @Test
+    void estimateWalksDeepNestingWithoutRecursionAndStopsOnceItPassesTheLimit() {
+        int depth = 100_000;
+        List<Object> outermost = new ArrayList<>();
+        List<Object> current = outermost;
+        for (int i = 0; i < depth; i++) {
+            List<Object> inner = new ArrayList<>();
+            current.add(inner);
+            current = inner;
+        }
+        List<String> texts = Collections.nCopies(1000, "t".repeat(1000));
+
+        assertThat(AjaxChannelBroker.estimateRetainedBytes(outermost, Long.MAX_VALUE)).isEqualTo(depth * 56L + 48);
+        // The list and its first text pass 10000 bytes; the other 999 texts are never visited.
+        assertThat(AjaxChannelBroker.estimateRetainedBytes(texts, 10_000)).isEqualTo(48L + 8 * 1000 + 2040);
+    }
+
+    @Test
+    void deliveryBeyondTheQueueByteBoundRemovesOnlyThatClient() {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String hoarder = broker.handshake();
+        String reader = broker.handshake();
+        broker.subscribe(hoarder, OUTBOUND);
+        broker.subscribe(reader, OUTBOUND);
+        List<AjaxChannelBroker.Delivery> read = new ArrayList<>();
+
+        broker.publish(OUTBOUND, TWO_MIB_TEXT);
+        read.addAll(broker.drain(reader));
+        broker.publish(OUTBOUND, TWO_MIB_TEXT);
+        read.addAll(broker.drain(reader));
+
+        assertThat(broker.isKnownClient(hoarder)).as("a queue at exactly its byte bound is kept").isTrue();
+        assertThat(loggedMessages(Level.WARN)).isEmpty();
+
+        broker.publish(OUTBOUND, 1);
+
+        assertThat(broker.isKnownClient(hoarder)).isFalse();
+        assertThat(broker.drain(hoarder)).isEmpty();
+        assertThat(loggedMessages(Level.WARN)).containsExactly(byteOverflowWarning(hoarder));
+        read.addAll(broker.drain(reader));
+        assertThat(read).extracting(AjaxChannelBroker.Delivery::data).containsExactly(TWO_MIB_TEXT, TWO_MIB_TEXT, 1);
+        assertThat(broker.isKnownClient(reader)).isTrue();
+    }
+
+    @ParameterizedTest(name = "{0} two-MiB deliveries restored onto a queue holding a small one")
+    @CsvSource({"1, true", "2, false"})
+    void restoreIsBoundedByTheQueueBytesAndAnOverflowRemovesTheClient(int restored, boolean kept) {
+        AjaxChannelBroker broker = broker(new MockEnvironment());
+        String client = broker.handshake();
+        broker.subscribe(client, OUTBOUND);
+        broker.publish(OUTBOUND, TWO_MIB_TEXT);
+        broker.publish(OUTBOUND, TWO_MIB_TEXT);
+        List<AjaxChannelBroker.Delivery> undelivered = broker.drain(client).subList(0, restored);
+        broker.publish(OUTBOUND, "small");
+
+        broker.restore(client, undelivered);
+
+        assertThat(broker.isKnownClient(client)).isEqualTo(kept);
+        if (kept) {
+            assertThat(broker.drain(client)).extracting(AjaxChannelBroker.Delivery::data)
+                    .containsExactly(TWO_MIB_TEXT, "small");
+            assertThat(loggedMessages(Level.WARN)).isEmpty();
+        } else {
+            assertThat(broker.drain(client)).isEmpty();
+            assertThat(loggedMessages(Level.WARN)).containsExactly(byteOverflowWarning(client));
+        }
+    }
+
+    @ParameterizedTest(name = "on a cached channel: {0}")
+    @ValueSource(booleans = {false, true})
+    void serverPublicationBeyondTheRetainedBytesIsDroppedWholeUntilBytesAreReleased(boolean cachedChannel) {
+        AjaxChannelBroker broker = broker(environment(Map.of("ajax.cache-messages-channels", CACHED)));
+        String channel = cachedChannel ? CACHED : TICK;
+        List<String> fillers = fillRetainedBytes(broker, OUTBOUND);
+        String receiver = broker.handshake();
+        if (!cachedChannel) {
+            broker.subscribe(receiver, channel);
+        }
+
+        broker.publish(channel, "dropped");
+
+        assertThat(loggedMessages(Level.WARN)).containsExactly("Ajax publication on channel " + channel
+                + " dropped: it would take the retained messages and payloads past "
+                + AjaxChannelBroker.MAX_RETAINED_BYTES + " estimated bytes");
+        assertThat(fillers).as("the drop removes nobody").allMatch(broker::isKnownClient);
+
+        broker.drain(fillers.get(0));
+        broker.publish(channel, "kept");
+
+        if (cachedChannel) {
+            broker.subscribe(receiver, channel);
+        }
+        assertThat(broker.drain(receiver)).containsExactly(new AjaxChannelBroker.Delivery(channel, "kept"));
+    }
+
+    @ParameterizedTest(name = "released as the calls {0}")
+    @MethodSource("handlerCallEndings")
+    void clientPublicationBeyondTheRetainedBytesIsRefusedUntilItsHandlerCallsEnd(String description,
+            String responseTimeoutMs, boolean releaseHandlers) throws Exception {
+        AjaxChannelBroker broker = broker(new MockEnvironment()
+                .withProperty("ajax.response-timeout-ms", responseTimeoutMs));
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch probed = new CountDownLatch(1);
+        broker.registerInbound(INBOUND, data -> {
+            if ("probe".equals(data)) {
+                probed.countDown();
+            } else {
+                release.await(WAIT_MS, TimeUnit.MILLISECONDS);
+            }
+            return null;
+        });
+        String client = broker.handshake();
+        int fitting = (int) (AjaxChannelBroker.MAX_RETAINED_BYTES / TWO_MIB);
+
+        try {
+            IntStream.range(0, fitting).forEach(i -> broker.onPublication(client, INBOUND, TWO_MIB_TEXT));
+            assertRefused(() -> broker.onPublication(client, INBOUND, "probe"),
+                    AjaxChannelBroker.RefusalReason.RETAINED_BYTES);
+            if (releaseHandlers) {
+                release.countDown();
+            }
+
+            await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(50)).ignoreExceptions()
+                    .until(() -> {
+                        broker.onPublication(client, INBOUND, "probe");
+                        return true;
+                    });
+            assertThat(probed.await(WAIT_MS, TimeUnit.MILLISECONDS)).isTrue();
+        } finally {
+            release.countDown();
+        }
+    }
+
+    static Stream<Arguments> handlerCallEndings() {
+        return Stream.of(
+                Arguments.of("complete", "60000", true),
+                Arguments.of("time out", "1000", false));
+    }
+
+    @ParameterizedTest(name = "probed by a {0}")
+    @MethodSource("retainedBytesProbes")
+    void handlerIgnoringItsTimeoutKeepsItsPayloadBytesReservedUntilItReturns(String description,
+            RetainedBytesProbe probe) throws Exception {
+        AjaxChannelBroker broker = broker(handlerEnvironment());
+        AtomicInteger running = new AtomicInteger();
+        CountDownLatch started = new CountDownLatch(2);
+        CountDownLatch release = new CountDownLatch(1);
+        broker.registerInbound(INBOUND, data -> {
+            running.incrementAndGet();
+            started.countDown();
+            try {
+                // Ignoring the timeout's interrupt, the handler keeps its payload long after the timeout.
+                awaitIgnoringInterrupts(release);
+                return null;
+            } finally {
+                running.decrementAndGet();
+            }
+        });
+        String client = broker.handshake();
+        BooleanSupplier fits = probe.prepare(broker, client);
+        // Draining one full queue leaves room for exactly the two two-MiB payloads published next.
+        broker.drain(fillRetainedBytes(broker, OUTBOUND).get(0));
+        String timeoutLine = "Ajax handler for channel " + INBOUND + " did not respond within " + HANDLER_TIMEOUT_MS
+                + " ms";
+
+        try {
+            broker.onPublication(client, INBOUND, TWO_MIB_TEXT);
+            broker.onPublication(client, INBOUND, TWO_MIB_TEXT);
+            assertThat(started.await(WAIT_MS, TimeUnit.MILLISECONDS)).isTrue();
+            await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(20)).until(() ->
+                    loggedMessages(Level.INFO).stream().filter(timeoutLine::equals).count() == 2);
+
+            assertThat(fits.getAsBoolean()).as("probe while the timed-out handlers still hold their payloads")
+                    .isFalse();
+            assertThat(running).as("handlers still blocked past their timeout").hasValue(2);
+        } finally {
+            release.countDown();
+        }
+        // Released, the handlers return and only then give their payloads' bytes back.
+        await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(20)).until(fits::getAsBoolean);
+    }
+
+    @ParameterizedTest(name = "probed by a {0}")
+    @MethodSource("retainedBytesProbes")
+    void callCancelledWhileWaitingForAHandlerThreadReleasesItsPayloadBytesAtItsTimeout(String description,
+            RetainedBytesProbe probe) throws Exception {
+        int maxRunning = AjaxChannelBroker.MAX_RUNNING_HANDLERS;
+        AjaxChannelBroker broker = broker(handlerEnvironment());
+        AtomicInteger running = new AtomicInteger();
+        CountDownLatch started = new CountDownLatch(maxRunning);
+        CountDownLatch release = new CountDownLatch(1);
+        broker.registerInbound(INBOUND, data -> {
+            running.incrementAndGet();
+            started.countDown();
+            try {
+                awaitIgnoringInterrupts(release);
+                return null;
+            } finally {
+                running.decrementAndGet();
+            }
+        });
+        String client = broker.handshake();
+        BooleanSupplier fits = probe.prepare(broker, client);
+        broker.drain(fillRetainedBytes(broker, OUTBOUND).get(0));
+        String timeoutLine = "Ajax handler for channel " + INBOUND + " did not respond within " + HANDLER_TIMEOUT_MS
+                + " ms";
+
+        try {
+            // Number payloads of 24 estimated bytes take every handler thread; the two-MiB payload waits for one.
+            IntStream.range(0, maxRunning).forEach(i -> broker.onPublication(client, INBOUND, i));
+            assertThat(started.await(WAIT_MS, TimeUnit.MILLISECONDS)).isTrue();
+            broker.onPublication(client, INBOUND, TWO_MIB_TEXT);
+            assertThat(fits.getAsBoolean()).as("probe while the waiting call holds its payload").isFalse();
+
+            await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(20)).until(() ->
+                    loggedMessages(Level.INFO).stream().filter(timeoutLine::equals).count() == maxRunning + 1);
+
+            assertThat(fits.getAsBoolean()).as("probe right after the waiting call's timeout").isTrue();
+            assertThat(running).as("every handler thread still blocked").hasValue(maxRunning);
+        } finally {
+            release.countDown();
+        }
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> running.get() == 0);
+    }
+
+    static Stream<Arguments> retainedBytesProbes() {
+        RetainedBytesProbe clientPublication = (broker, client) -> () -> {
+            try {
+                broker.onPublication(client, INBOUND, TWO_MIB_TEXT);
+                return true;
+            } catch (AjaxChannelBroker.ChannelRefusedException refused) {
+                assertThat(refused.reason()).isEqualTo(AjaxChannelBroker.RefusalReason.RETAINED_BYTES);
+                return false;
+            }
+        };
+        RetainedBytesProbe serverPublication = (broker, client) -> {
+            String receiver = broker.handshake();
+            broker.subscribe(receiver, numbered(0));
+            return () -> {
+                broker.publish(numbered(0), TWO_MIB_TEXT);
+                return !broker.drain(receiver).isEmpty();
+            };
+        };
+        return Stream.of(
+                Arguments.of("client publication", clientPublication),
+                Arguments.of("server publication", serverPublication));
+    }
+
+    @Test
+    void shutdownReleasesWaitingCallsAtOnceAndRunningCallsWhenTheirHandlersReturn() throws Exception {
+        int maxRunning = AjaxChannelBroker.MAX_RUNNING_HANDLERS;
+        // No response timeout fires during the test, so only the shutdown ends the calls.
+        AjaxChannelBroker broker = broker(new MockEnvironment().withProperty("ajax.response-timeout-ms", "60000"));
+        AtomicInteger running = new AtomicInteger();
+        CountDownLatch started = new CountDownLatch(maxRunning);
+        CountDownLatch release = new CountDownLatch(1);
+        broker.registerInbound(INBOUND, data -> {
+            running.incrementAndGet();
+            started.countDown();
+            try {
+                // Ignoring the shutdown's interrupt, the handler keeps its payload until released.
+                awaitIgnoringInterrupts(release);
+                return null;
+            } finally {
+                running.decrementAndGet();
+            }
+        });
+        String client = broker.handshake();
+        long freeWhileHandlersRun = AjaxChannelBroker.MAX_RETAINED_BYTES - maxRunning * TWO_MIB;
+        Object fillingTheRest = payloadEstimatedAt(freeWhileHandlersRun);
+        Object beyondTheRest = payloadEstimatedAt(freeWhileHandlersRun + 8);
+        Object fillingTheBound = payloadEstimatedAt(AjaxChannelBroker.MAX_RETAINED_BYTES);
+        String shutDownLine = "Ajax handler for channel " + INBOUND + " failed: the broker has been shut down";
+
+        try {
+            // Sixteen two-MiB calls run and sixteen wait: together they retain exactly the bound.
+            IntStream.range(0, 2 * maxRunning).forEach(i -> broker.onPublication(client, INBOUND, TWO_MIB_TEXT));
+            assertThat(started.await(WAIT_MS, TimeUnit.MILLISECONDS)).isTrue();
+            assertRefused(() -> broker.onPublication(client, INBOUND, "x"),
+                    AjaxChannelBroker.RefusalReason.RETAINED_BYTES);
+
+            broker.shutdown();
+
+            // The dropped waiting calls have released their payloads; the still running handlers keep theirs.
+            assertRefused(() -> broker.onPublication(client, INBOUND, beyondTheRest),
+                    AjaxChannelBroker.RefusalReason.RETAINED_BYTES);
+            assertThatCode(() -> broker.onPublication(client, INBOUND, fillingTheRest)).doesNotThrowAnyException();
+            assertThat(running).hasValue(maxRunning);
+        } finally {
+            release.countDown();
+        }
+        await().atMost(Duration.ofMillis(WAIT_MS)).until(() -> running.get() == 0);
+        await().atMost(Duration.ofMillis(WAIT_MS)).pollInterval(Duration.ofMillis(20)).ignoreExceptions()
+                .until(() -> {
+                    broker.onPublication(client, INBOUND, fillingTheBound);
+                    return true;
+                });
+        // Both publications admitted after the shutdown were refused by it, and released their bytes at once.
+        assertThat(loggedMessages(Level.INFO)).containsExactly(shutDownLine, shutDownLine);
+    }
+
     @Test
     void shutdownReleasesConnectsInterruptsHandlersAndRefusesLaterPublications() throws Exception {
         AjaxChannelBroker broker = broker(handlerEnvironment());
@@ -1445,6 +2087,53 @@ class AjaxChannelBrokerTest {
     /** The publication {@code mule.rpc} sends: {@code {"data": <data>, "replyTo": <replyTo>}}. */
     private static Map<String, Object> rpc(Object data, String replyTo) {
         return Map.of("data", data, "replyTo", replyTo);
+    }
+
+    /** The {@code n}-th of a family of distinct public channels. */
+    private static String numbered(int n) {
+        return "/test/c" + n;
+    }
+
+    /**
+     * Subscribes as many new clients to {@code channel} as {@link AjaxChannelBroker#MAX_RETAINED_BYTES} has room for
+     * full queues, and publishes {@link #TWO_MIB_TEXT} there twice: every one of their queues then holds exactly
+     * {@link AjaxChannelBroker#MAX_QUEUED_BYTES_PER_CLIENT}, and the broker retains exactly its retained-byte bound.
+     *
+     * @return the filling clients; draining one releases one queue's bytes
+     */
+    private static List<String> fillRetainedBytes(AjaxChannelBroker broker, String channel) {
+        int fillers = (int) (AjaxChannelBroker.MAX_RETAINED_BYTES / AjaxChannelBroker.MAX_QUEUED_BYTES_PER_CLIENT);
+        List<String> clients = IntStream.range(0, fillers).mapToObj(i -> broker.handshake()).toList();
+        clients.forEach(client -> broker.subscribe(client, channel));
+        broker.publish(channel, TWO_MIB_TEXT);
+        broker.publish(channel, TWO_MIB_TEXT);
+        return clients;
+    }
+
+    /**
+     * A payload the broker estimates at exactly {@code bytes}: a primitive array, which counts 48 bytes plus 8 per
+     * element whatever its element type, so a {@code boolean[]} keeps only an eighth of its estimate alive.
+     */
+    private static Object payloadEstimatedAt(long bytes) {
+        boolean[] payload = new boolean[Math.toIntExact((bytes - 48) / 8)];
+        assertThat(AjaxChannelBroker.estimateRetainedBytes(payload, Long.MAX_VALUE)).isEqualTo(bytes);
+        return payload;
+    }
+
+    /** Asserts that {@code call} is refused by the broker for {@code reason}. */
+    private static void assertRefused(ThrowingCallable call, AjaxChannelBroker.RefusalReason reason) {
+        assertThatThrownBy(call).isInstanceOfSatisfying(AjaxChannelBroker.ChannelRefusedException.class,
+                refused -> assertThat(refused.reason()).isEqualTo(reason));
+    }
+
+    /** Asserts that subscribing a client to a channel succeeds when {@code admitted}, else is refused for reason. */
+    private static void assertSubscription(AjaxChannelBroker broker, String clientId, String channel,
+            boolean admitted, AjaxChannelBroker.RefusalReason reason) {
+        if (admitted) {
+            assertThatCode(() -> broker.subscribe(clientId, channel)).doesNotThrowAnyException();
+        } else {
+            assertRefused(() -> broker.subscribe(clientId, channel), reason);
+        }
     }
 
     /**
@@ -1541,6 +2230,40 @@ class AjaxChannelBrokerTest {
         void run(AjaxChannelBroker broker) throws Exception;
     }
 
+    /** Names a channel after one client of a broker. */
+    @FunctionalInterface
+    interface ChannelOf {
+
+        String name(String clientId);
+    }
+
+    /** Names a channel after two clients of a broker. */
+    @FunctionalInterface
+    interface ClientPair {
+
+        String name(String first, String second);
+    }
+
+    /** Names the channels of one subscription after another client of a broker. */
+    @FunctionalInterface
+    interface ChannelsOf {
+
+        List<String> names(String otherClientId);
+    }
+
+    /** A publication of {@link #TWO_MIB_TEXT} that fits only while the retained bytes have room for it. */
+    @FunctionalInterface
+    interface RetainedBytesProbe {
+
+        /**
+         * Sets the probe up on a broker that retains nothing yet.
+         *
+         * @return publishes once and tells whether the publication fitted; one that did not was refused or dropped
+         *         and left nothing behind
+         */
+        BooleanSupplier prepare(AjaxChannelBroker broker, String clientId);
+    }
+
     /**
      * A handler failure whose message, cause message and suppressed message carry payload content and line breaks.
      */
@@ -1593,6 +2316,12 @@ class AjaxChannelBrokerTest {
     private static String overflowWarning(String clientId) {
         return "Ajax client " + clientId + " exceeded " + AjaxChannelBroker.MAX_QUEUED_DELIVERIES
                 + " queued deliveries without a connect; client removed with its subscriptions";
+    }
+
+    /** The WARN the broker logs when it removes a client whose queue overflowed its byte bound. */
+    private static String byteOverflowWarning(String clientId) {
+        return "Ajax client " + clientId + " exceeded " + AjaxChannelBroker.MAX_QUEUED_BYTES_PER_CLIENT
+                + " estimated bytes of queued deliveries without a connect; client removed with its subscriptions";
     }
 
     /**

@@ -71,9 +71,10 @@ import com.mulesoft.examples.websphere_mq.support.HttpTestClient;
  * logger; its only log line is the {@code test:component}'s {@code logMessageDetails}, which
  * {@link MqProcessingService} writes at INFO ({@code Message Received in service: MessageProcessor. Content is:
  * <text>}). Below INFO, Spring's servlet and handler loggers write the {@code message} query of a {@code GET} to
- * {@code /ajax/cometd}, the handler's arguments (the Bayeux message, posted or queried), and the async result and
- * response body a held {@code /meta/connect} is answered with; Spring JMS writes the messages it sends and the
- * messages its {@code @JmsListener} methods receive; Undertow's request-IO logger writes a query it cannot decode.
+ * {@code /ajax/cometd} and the async result and response body a held {@code /meta/connect} is answered with; the
+ * Bayeux handler takes the servlet request itself, so its arguments carry no message. Spring JMS writes the messages
+ * it sends and the messages its {@code @JmsListener} methods receive; Undertow's request-IO logger writes a query it
+ * cannot decode.
  *
  * <p>Two layers:
  * <ul>
@@ -96,7 +97,7 @@ import com.mulesoft.examples.websphere_mq.support.HttpTestClient;
  *       recording appender on the root names every logger that wrote a marker in its formatted message, its
  *       arguments or its throwable chain, outside the application's own packages and the Artemis stand-in: none.
  *       The control setup clears the caps, so their categories inherit the root's TRACE, and proves that the
- *       oracle sees the leak: exactly the four Spring web loggers, Spring Messaging's {@code HandlerMethod} and
+ *       oracle sees the leak: exactly the three Spring web loggers, Spring Messaging's {@code HandlerMethod} and
  *       Undertow's {@code io.undertow.request.io} write a marker.</li>
  * </ul>
  *
@@ -226,8 +227,8 @@ class SensitiveLogLevelsTest {
         return Stream.of(
                 arguments(named("application.yml levels", true), Set.of()),
                 arguments(named("no levels (control)", false),
-                        Set.of(DISPATCHER_SERVLET, WEB_HANDLER_METHOD, HANDLER_ADAPTER, ENTITY_PROCESSOR,
-                                MESSAGING_HANDLER_METHOD, UNDERTOW_REQUEST_IO)));
+                        Set.of(DISPATCHER_SERVLET, HANDLER_ADAPTER, ENTITY_PROCESSOR, MESSAGING_HANDLER_METHOD,
+                                UNDERTOW_REQUEST_IO)));
     }
 
     /**

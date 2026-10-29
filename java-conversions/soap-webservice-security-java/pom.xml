@@ -33,11 +33,17 @@
         <!-- Overrides the BOM's Spring WS 4.0.11; moves spring-ws-core, spring-ws-security, spring-ws-test and spring-xml together. -->
         <spring-ws.version>4.1.4</spring-ws.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- WS-Security transitives outside the Boot BOM, managed in <dependencyManagement> below. -->
+        <bouncycastle.version>1.86</bouncycastle.version>
+        <opensaml.version>5.2.3</opensaml.version>
+        <shibboleth.version>9.2.3</shibboleth.version>
+        <guava.version>33.7.2-jre</guava.version>
     </properties>
 
     <repositories>
-        <!-- spring-ws-security 4.1.4 brings WSS4J 4.0.1, which needs OpenSAML 5.1.6 (opensaml-saml-impl, opensaml-xacml-impl,
-             opensaml-xacml-saml-impl); OpenSAML 4 and later are published only to Shibboleth's repository.
+        <!-- spring-ws-security 4.1.4 brings WSS4J 4.0.1, which declares OpenSAML 5.1.6 (opensaml-saml-impl, opensaml-xacml-impl,
+             opensaml-xacml-saml-impl); <dependencyManagement> below moves the OpenSAML and Shibboleth support modules to
+             5.2.3 and 9.2.3. OpenSAML 4 and later are published only to Shibboleth's repository.
              Maven Central stays the default repository for every other artefact. -->
         <repository>
             <id>shibboleth-releases</id>
@@ -50,6 +56,130 @@
             </snapshots>
         </repository>
     </repositories>
+
+    <!-- Fixed releases of the transitives WSS4J 4.0.1 brings, none managed by the Boot BOM; each family moves as one:
+         - Bouncy Castle bcprov, bcpkix and bcutil 1.77 (from OpenSAML 5.1.6) to 1.86: the certificate, signature and
+           ASN.1 advisories fixed from 1.78 to 1.86 (CVE-2024-29857, CVE-2024-30172, CVE-2025-8916 and later).
+         - The OpenSAML 5.1.6 modules to 5.2.3 and their Shibboleth 9.1.6 support modules to 9.2.3: Shibboleth advisory
+           secadv_20260513a (crafted-XML resource exhaustion), fixed in 5.2.2.
+         - Guava 33.5.0-jre to 33.7.2-jre: CVE-2026-102554 (GHSA-xxph-c9ww-hj94), fixed in 33.7.2.
+         Bouncy Castle 1.86 and OpenSAML 5.2.3 are the versions WSS4J 4.0.2 is built and tested with. spring-ws-security
+         4.1.4, WSS4J 4.0.1 and xmlsec 4.0.4 stay unchanged. Every module is listed: the OpenSAML BOM is not imported,
+         because its parent would also manage xmlsec, Guava and other libraries. Root DECISIONS.md section 11.3. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcpkix-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcutil-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-core-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-core-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-profile-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-saml-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-saml-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-security-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-security-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-soap-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xmlsec-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xmlsec-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-saml-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-saml-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-networking</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-security</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-support</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-velocity</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>${guava.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <!-- Tomcat 10.1 never sends a custom reason phrase; every HTTP-serving conversion runs on Undertow instead. -->
