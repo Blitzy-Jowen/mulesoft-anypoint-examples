@@ -1,4 +1,4 @@
-/**
+/*
  * MuleSoft Examples
  * Copyright 2014 MuleSoft, Inc.
  *

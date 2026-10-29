@@ -1,4 +1,3 @@
-# querying-a-mysql-database-java runtime configuration
 # Replaces querying-a-mysql-database/src/main/app/mule-app.properties (empty) and the
 # db:generic-config / http:listener-config of database-to-json.xml
 http:

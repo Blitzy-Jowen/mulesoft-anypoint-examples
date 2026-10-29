@@ -149,9 +149,7 @@ class DynamicsWebApiClientTest {
         wireMock.stubFor(post(urlEqualTo(TOKEN_PATH)).willReturn(okJson(TOKEN_JSON)));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Token and create
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void createContactPostsTheAttributesWithAClientCredentialsTokenAndReturnsTheEntityGuid() {
@@ -204,9 +202,7 @@ class DynamicsWebApiClientTest {
                 .allSatisfy(request -> assertThat(request.getHeader("Authorization")).isEqualTo(BEARER));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Approved connector failure modes (SC-9)
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void expiredTokenIsEvictedAndTheCreateRetriedOnceWithANewToken() {
@@ -345,9 +341,7 @@ class DynamicsWebApiClientTest {
         assertThat(dataverseRequests()).isEmpty();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Query and delete: the original test sub-flows selectContactFromDynamics and deleteContactFromDynamics
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void findContactsByEmailSelectsTheOriginalColumnsWithAnEncodedODataFilter() {
@@ -408,9 +402,7 @@ class DynamicsWebApiClientTest {
         assertThat(wireMock.getAllServeEvents()).isEmpty();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Missing configuration: the context starts, the first call fails naming the key
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> missingSettings() {
         return Stream.of(
@@ -434,9 +426,7 @@ class DynamicsWebApiClientTest {
         assertThat(wireMock.getAllServeEvents()).isEmpty();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Fixture helpers
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** The settings every test starts from: Entra and Dataverse both on the WireMock server. */
     private static Map<String, String> defaultSettings() {

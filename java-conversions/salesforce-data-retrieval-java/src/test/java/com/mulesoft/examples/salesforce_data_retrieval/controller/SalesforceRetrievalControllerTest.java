@@ -134,7 +134,7 @@ class SalesforceRetrievalControllerTest {
         given(client.queryAll(anyString())).willReturn(records());
     }
 
-    // ---------------------------------------------------------------- GET / (showFormFlow)
+    // GET / (showFormFlow)
 
     @Test
     void getRendersTheFormWithOneOptionPerDescribedObject() throws Exception {
@@ -175,7 +175,7 @@ class SalesforceRetrievalControllerTest {
         verify(client).describeGlobal();
     }
 
-    // ---------------------------------------------------------------- POST / (salesforceDataRetrievalFlow)
+    // POST / (salesforceDataRetrievalFlow)
 
     @Test
     void postRunsTheOriginalQueryAndReturnsTheRecordText() throws Exception {
@@ -244,7 +244,7 @@ class SalesforceRetrievalControllerTest {
         verify(client, never()).queryAll(any());
     }
 
-    // ---------------------------------------------------------------- listener defaults (SC-1)
+    // listener defaults (SC-1)
 
     @ParameterizedTest(name = "{0} /")
     @ValueSource(strings = {"PUT", "PATCH", "DELETE", "OPTIONS"})
@@ -257,7 +257,7 @@ class SalesforceRetrievalControllerTest {
         verifyNoInteractions(client);
     }
 
-    // ---------------------------------------------------------------- method letter case (config/ListenerMethodFilter)
+    // method letter case (config/ListenerMethodFilter)
 
     @ParameterizedTest(name = "{0} /")
     @ValueSource(strings = {"get", "Get", "gEt"})
@@ -356,7 +356,7 @@ class SalesforceRetrievalControllerTest {
         verifyNoInteractions(client);
     }
 
-    // ---------------------------------------------------------------- approved connector failure modes (SC-9)
+    // approved connector failure modes (SC-9)
 
     /** The two Salesforce-calling endpoints and the client call each one fails on. */
     enum Endpoint {
@@ -433,7 +433,7 @@ class SalesforceRetrievalControllerTest {
         assertThat(response.header("Retry-After")).isNull();
     }
 
-    // ---------------------------------------------------------------- fixtures and assertions
+    // fixtures and assertions
 
     private static DescribeGlobalResult describeGlobal() {
         DescribeGlobalResult result = new DescribeGlobalResult();

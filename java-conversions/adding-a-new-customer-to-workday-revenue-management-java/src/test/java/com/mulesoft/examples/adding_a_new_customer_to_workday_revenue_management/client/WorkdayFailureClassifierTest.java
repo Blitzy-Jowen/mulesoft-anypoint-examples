@@ -175,9 +175,7 @@ class WorkdayFailureClassifierTest {
                 new UpstreamCallExecutor(List.of(new WorkdayFailureClassifier())));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // system() and null
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void servesWorkday() {
@@ -190,9 +188,7 @@ class WorkdayFailureClassifierTest {
         assertThat(classifier.classify(null)).isEqualTo(UpstreamFailureKind.OTHER);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // HTTP 401 and WS-Security faults → authentication
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Supplier<Throwable>>> authenticationRejections() {
         return Stream.of(
@@ -228,9 +224,7 @@ class WorkdayFailureClassifierTest {
                 .getFaultCode().getLocalPart()).isEqualTo("FailedAuthentication");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // HTTP 429 → rate limit with Workday's Retry-After
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Arguments> rateLimits() {
         return Stream.of(
@@ -250,9 +244,7 @@ class WorkdayFailureClassifierTest {
         assertThat(kind.retryAfterValue()).isEqualTo(Optional.ofNullable(retryAfter));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Timeouts and connectivity failures → unavailable
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Supplier<Throwable>>> unavailableFailures() {
         List<Named<Supplier<IOException>>> socketCauses = List.of(
@@ -314,9 +306,7 @@ class WorkdayFailureClassifierTest {
         assertThat(reauthentications).hasValue(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Everything else → other, rethrown unchanged
-    // ---------------------------------------------------------------------------------------------------------------
 
     static Stream<Named<Supplier<Throwable>>> otherFailures() {
         return Stream.of(
@@ -357,9 +347,7 @@ class WorkdayFailureClassifierTest {
         assertThat(classifier.upstreamMessage(httpStatus(429, "30"))).isEqualTo("Too Many Requests [429]");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Executor runs with a scripted call
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void http401IsReauthenticatedAndRetriedOnce() throws Exception {
@@ -413,9 +401,7 @@ class WorkdayFailureClassifierTest {
         assertThat(reauthentications).hasValue(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // End to end: the real client against a WireMock Workday
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void putCustomerRejectedWithHttp401IsSentTwiceAndSucceeds() throws Exception {
@@ -487,9 +473,7 @@ class WorkdayFailureClassifierTest {
         assertThat(WORKDAY.findAll(postRequestedFor(urlEqualTo(PATH)))).hasSize(1);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Helpers
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** Classifies {@code failure}, failing the test instead of hanging should a cause cycle never end. */
     private UpstreamFailureKind classify(Throwable failure) {

@@ -46,7 +46,7 @@ class ContactMapperTest {
 
     private final ContactMapper mapper = new ContactMapper();
 
-    // ---------------------------------------------------------------- key names and order
+    // key names and order
 
     @Test
     @DisplayName("Each record holds exactly FirstName, LastName, Email, Phone in that order, as a LinkedHashMap")
@@ -82,7 +82,7 @@ class ContactMapperTest {
         }
     }
 
-    // ---------------------------------------------------------------- absent values
+    // absent values
 
     @ParameterizedTest(name = "row without {0} -> {1} kept with a null value")
     @CsvSource({"phone, Phone", "email, Email", "firstname, FirstName", "surname, LastName"})
@@ -116,7 +116,7 @@ class ContactMapperTest {
         }
     }
 
-    // ---------------------------------------------------------------- value fidelity
+    // value fidelity
 
     @Test
     @DisplayName("Values stay the reader's Strings: no coercion, trimming, re-casing, or empty-to-null")
@@ -128,7 +128,7 @@ class ContactMapperTest {
         assertContact(contact, " Jane ", "", "john.doe@texasComp.com", "096548763");
     }
 
-    // ---------------------------------------------------------------- collection handling
+    // collection handling
 
     @Test
     @DisplayName("An empty input, immutable or mutable, gives an empty, non-null list")
@@ -188,7 +188,7 @@ class ContactMapperTest {
         assertEquals(keysBefore, new ArrayList<>(row.keySet()));
     }
 
-    // ---------------------------------------------------------------- fixtures and assertions
+    // fixtures and assertions
 
     /** A CSV row keyed by the {@code contacts.csv} header, in header order. */
     private static Map<String, String> csvRow(String firstname, String surname, String phone, String email) {

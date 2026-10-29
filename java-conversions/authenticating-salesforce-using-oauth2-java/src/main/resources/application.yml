@@ -39,6 +39,8 @@ sfdc:
       # The callback is served by this application's own listener, so it follows http.port (the original fixed 8081, its default).
       local-port: ${http.port:8081}
       path: oauth2callback
+    # How long the state of an authorization started at /, and the browser cookie carrying it, stay valid for the callback.
+    state-ttl: 10m
 
 # Below INFO these loggers write the authorization code, the consumer secret and the refresh token, which the original
 # never logged. A logger's own level outranks logging.level.root and the groups that --debug and --trace raise, so

@@ -70,7 +70,7 @@ class AccountMapperTest {
         mapper = new AccountMapper(lookup);
     }
 
-    // ---------------------------------------------------------------- shipped input
+    // shipped input
 
     @Test
     @DisplayName("The companies.csv rows map to the two Accounts, in input order and script key order")
@@ -92,7 +92,7 @@ class AccountMapperTest {
         assertThat(account.get("Region__c")).isEqualTo("South East");
     }
 
-    // ---------------------------------------------------------------- value fidelity
+    // value fidelity
 
     @Test
     @DisplayName("upper $.company_state: fl becomes FL in BillingState while the input row keeps fl, unmodified")
@@ -145,7 +145,7 @@ class AccountMapperTest {
                 .containsExactly("West Coast", "South East");
     }
 
-    // ---------------------------------------------------------------- absent values
+    // absent values
 
     @Test
     @DisplayName("A row without company_state keeps BillingState with a null value, and Region__c is UNKNOWN")
@@ -184,7 +184,7 @@ class AccountMapperTest {
         assertAccount(account, null, null, null, "TX", null, "South East");
     }
 
-    // ---------------------------------------------------------------- ignored columns
+    // ignored columns
 
     @Test
     @DisplayName("has_given_contact_permission (\"\" or yes) and extra columns never reach the Account")
@@ -207,7 +207,7 @@ class AccountMapperTest {
                 "West Coast");
     }
 
-    // ---------------------------------------------------------------- lookup contract
+    // lookup contract
 
     @Test
     @DisplayName("lookup(\"LookUpSalesRegionFlow\", $) runs once per row and receives the raw row ($), in row order")
@@ -249,7 +249,7 @@ class AccountMapperTest {
                 "00001", region);
     }
 
-    // ---------------------------------------------------------------- collection handling
+    // collection handling
 
     @Test
     @DisplayName("An empty input gives an empty, mutable list and no lookup")
@@ -293,7 +293,7 @@ class AccountMapperTest {
         assertThat(AccountMapper.SOBJECT_TYPE).isEqualTo("Account");
     }
 
-    // ---------------------------------------------------------------- fixtures and assertions
+    // fixtures and assertions
 
     /** A CSV row keyed by the {@code companies.csv} header, in header order. */
     private static Map<String, String> row(String name, String address, String city, String state, String zip,

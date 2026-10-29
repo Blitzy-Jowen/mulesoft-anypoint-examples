@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -41,6 +42,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.source.ConfigurationPropertySources;
@@ -53,6 +55,7 @@ import org.springframework.core.io.ClassPathResource;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
@@ -67,6 +70,7 @@ import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.github.tomakehurst.wiremock.matching.StringValuePattern;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.ContactQueryService;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.SalesforceOAuthService;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.HttpTestClient;
 
 /**
@@ -82,20 +86,24 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.Http
  *   <li>The log itself. The whole application runs on its Undertow listener with WireMock standing in for
  *       {@code login.salesforce.com} and for the user's instance. Each case sets the Logback root, and the loggers
  *       {@code --trace} raises besides it, to TRACE and applies the bound levels it selects through Spring Boot's own
- *       {@link LoggingSystem}. A browser request then brings the callback {@code /oauth2callback?code=<sentinel>}:
- *       the token client exchanges the code with the sentinel consumer secret, the Partner API query sent with the
- *       sentinel access token is rejected with {@code INVALID_SESSION_ID}, the session is renewed with the sentinel
- *       refresh token and the query is retried with the renewed sentinel access token, all through the production
- *       code. A Logback {@link ListAppender} on the root logger then names every
+ *       {@link LoggingSystem}. A browser that has started its authorization at {@code /}, which redirects it with a
+ *       {@code state} and the state cookie, then brings the callback
+ *       {@code /oauth2callback?code=<sentinel>&state=<state>} with that cookie: the token client exchanges the code
+ *       with the sentinel consumer secret, the Partner API query sent with the sentinel access token is rejected with
+ *       {@code INVALID_SESSION_ID}, the session is renewed with the sentinel refresh token and the query is retried
+ *       with the renewed sentinel access token, all through the production code. A Logback {@link ListAppender} on the
+ *       root logger then names every
  *       logger that wrote a sentinel, in its formatted message or its throwable, and which sentinels it wrote. With
  *       every cap applied no logger writes one; the controls prove that the oracle sees the leak: without any cap
  *       the capped loggers write the sentinels, and with every cap but one exactly the loggers under that one do.</li>
  * </ul>
  *
- * <p>The sentinels are dummy values: none is a credential and none identifies anyone. While the root is at TRACE its
- * own appenders are detached, so that output stays out of the build log. After each test the appender is detached,
- * the root's appenders are attached again and every logger level the test changed is restored; the context, which
- * holds the authorized token slot and the listener port, is discarded after the class.
+ * <p>The sentinels are dummy values: none is a credential and none identifies anyone. The {@code state} is not one of
+ * them: it is a one-time correlation value, not a credential, that travels in the authorization URL and the callback
+ * URL by design, and the loggers that would write the callback's query are the ones capped for the code. While the
+ * root is at TRACE its own appenders are detached, so that output stays out of the build log. After each test the
+ * appender is detached, the root's appenders are attached again and every logger level the test changed is restored;
+ * the context, which holds the authorized token slot and the listener port, is discarded after the class.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -196,6 +204,10 @@ class SensitiveLogLevelsTest {
 
     private final ListAppender<ILoggingEvent> appender = new FormattingListAppender();
 
+    /** The application's authorization flow, whose shared grant each case clears before it starts at {@code /}. */
+    @Autowired
+    private SalesforceOAuthService oauthService;
+
     /** The root logger's own appenders, detached while the root is at TRACE. */
     private final List<Appender<ILoggingEvent>> detachedAppenders = new ArrayList<>();
 
@@ -269,6 +281,8 @@ class SensitiveLogLevelsTest {
     @MethodSource("levelSetups")
     void rootTraceLogCarriesSentinelsOnlyThroughCategoriesLeftUncapped(Set<String> applied,
             Map<String, Set<Sentinel>> expectedLeaks) throws IOException {
+        String stateCookie = startAuthorization();
+        String state = stateCookie.substring(stateCookie.indexOf('=') + 1);
         Logger root = loggerContext.getLogger(Logger.ROOT_LOGGER_NAME);
         root.iteratorForAppenders().forEachRemaining(detachedAppenders::add);
         detachedAppenders.forEach(root::detachAppender);
@@ -282,7 +296,8 @@ class SensitiveLogLevelsTest {
         SALESFORCE.resetRequests();
 
         HttpTestClient.Response callback = HttpTestClient.localhost(PORT)
-                .get("/oauth2callback?code=" + Sentinel.AUTHORIZATION_CODE.value);
+                .get("/oauth2callback?code=" + Sentinel.AUTHORIZATION_CODE.value + "&state=" + state,
+                        Map.of("Cookie", stateCookie));
 
         assertThat(callback.status()).as("%s", callback).isEqualTo(200);
         assertThat(callback.bodyAsString()).isEqualTo("Salesforce query returned 1 contacts.");
@@ -302,6 +317,27 @@ class SensitiveLogLevelsTest {
                         && ContactQueryService.class.getName().equals(event.getLoggerName())
                         && event.getFormattedMessage().startsWith("contact: {")
                         && event.getFormattedMessage().contains("LastName=" + CONTACT_LAST_NAME));
+    }
+
+    /**
+     * Starts an authorization as a browser does, before the case's levels and capture are set up, so neither the
+     * build log nor the oracle sees it. The application first returns to the state of a fresh deployment: the shared
+     * grant an earlier case stored is cleared, since only an application without a token redirects {@code /} and
+     * issues a state; nothing else in the context changes.
+     *
+     * @return the state cookie as the browser sends it back, {@code sfdc_oauth_state=<state>}
+     */
+    private String startAuthorization() {
+        ((AtomicReference<?>) ReflectionTestUtils.getField(oauthService, "token")).set(null);
+        HttpTestClient.Response redirect = HttpTestClient.localhost(PORT).get("/");
+        assertThat(redirect.status()).as("%s", redirect).isEqualTo(302);
+        assertThat(redirect.headers("Set-Cookie")).as("%s", redirect).singleElement().asString()
+                .startsWith(SalesforceOAuthService.STATE_COOKIE + "=");
+        String setCookie = redirect.header("Set-Cookie");
+        String stateCookie = setCookie.substring(0, setCookie.indexOf(';'));
+        String state = stateCookie.substring(stateCookie.indexOf('=') + 1);
+        assertThat(redirect.header("Location")).as("%s", redirect).endsWith("&state=" + state);
+        return stateCookie;
     }
 
     /** The {@code logging.level} map of the classpath {@code application.yml}, bound as Spring Boot binds it. */

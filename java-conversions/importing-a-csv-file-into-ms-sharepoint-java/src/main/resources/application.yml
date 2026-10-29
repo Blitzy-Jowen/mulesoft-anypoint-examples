@@ -1,4 +1,3 @@
-# importing-a-csv-file-into-ms-sharepoint-java runtime configuration
 # Original: importing-a-csv-file-into-ms-sharepoint/src/main/app/importing-a-csv-file-into-ms-sharepoint.xml
 # (mule-app.properties holds no keys). The original placeholder names are kept unchanged.
 spring:

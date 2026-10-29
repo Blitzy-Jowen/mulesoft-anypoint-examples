@@ -201,9 +201,7 @@ class SoapProxyControllerTest {
         client = HttpTestClient.localhost(port);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Happy path: the envelope is forwarded unparsed and the upstream bytes come back
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void createEnvelopeIsForwardedAndCartIdReturned() {
@@ -462,9 +460,7 @@ class SoapProxyControllerTest {
         assertThat(forwarded()).as("upstream calls").hasSize(1);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // SC-11: the upstream WSDL and its schema published at ?wsdl and ?xsd=, without an upstream call
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void wsdlAndSchemaArePublishedWithReferencesPointingAtTheProxy() throws IOException {
@@ -504,9 +500,7 @@ class SoapProxyControllerTest {
         assertThat(forwarded()).as("upstream calls while publishing metadata").isEmpty();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Errors: the flow declares no exception strategy, so every failure is SC-1's platform default
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** Upstream status, then its Content-Type and body. */
     private static Stream<Arguments> upstreamFailures() {
@@ -667,8 +661,6 @@ class SoapProxyControllerTest {
             assertThat(forwarded()).as("calls reaching the WireMock upstream").isEmpty();
         }
     }
-
-    // ---------------------------------------------------------------------------------------------------------------
 
     private static void stubOk(byte[] body, String contentType) {
         wm.stubFor(post(urlEqualTo(UPSTREAM_PATH)).willReturn(aResponse().withStatus(200)

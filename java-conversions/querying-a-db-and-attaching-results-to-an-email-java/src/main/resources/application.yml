@@ -1,4 +1,3 @@
-# querying-a-db-and-attaching-results-to-an-email-java runtime configuration
 # Replaces querying-a-db-and-attaching-results-to-an-email/src/main/app/mule-app.properties (empty) and the
 # smtp:gmail-connector, db:generic-config, http:listener-config and smtp:outbound-endpoint of attachments.xml
 http:

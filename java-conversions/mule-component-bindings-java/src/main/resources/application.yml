@@ -1,4 +1,3 @@
-# mule-component-bindings-java runtime configuration
 # Original: mule-component-bindings/src/main/app/mule-component-bindings.xml (mule-app.properties holds no keys),
 # so ports and hosts are fixed defaults from the flow's literals and the six secrets keep the flow's placeholder names.
 spring:

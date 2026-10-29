@@ -1,4 +1,3 @@
-# oauth2-client-credentials-using-the-HTTP-connector-java runtime configuration
 # Replaces oauth2-client-credentials-using-the-HTTP-connector/src/main/app/mule-app.properties (empty) and the
 # ${...} placeholders of http-client-credentials.xml. Key names keep the original Mule placeholder names; secrets
 # have no value: supply each through the environment variable named in its placeholder.

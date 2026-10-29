@@ -1,4 +1,3 @@
-# importing-an-email-attachment-using-the-IMAP-connector-java runtime configuration
 # Replaces importing-an-email-attachment-using-the-IMAP-connector/src/main/app/mule-app.properties (empty) and the
 # values imap-to-xml.xml reads or fixes. The original placeholder names imap.host, imap.user and imap.password are
 # kept; the original test's imap.user_enc (a URL-encoded address Mule needed in its endpoint URI) is dropped,

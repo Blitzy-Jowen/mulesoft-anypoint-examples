@@ -17,6 +17,7 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.Sale
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.SalesforceOAuthService.AuthorizeOutcome;
 
 import org.springframework.http.HttpHeaders;
+import org.springframework.web.bind.annotation.CookieValue;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -28,15 +29,18 @@ import org.springframework.web.bind.annotation.RestController;
  * <ul>
  *   <li>{@code /}, the {@code http:listener} of the flow (line 10) on the {@code 0.0.0.0:${http.port}} listener
  *       configuration (line 6): {@code sfdc:authorize} (line 12) redirects a browser to Salesforce while no token is
- *       held, otherwise the flow answers with its {@code set-payload} text (line 17);</li>
+ *       held, with the {@code state} of the authorization it starts in the URL and in the browser's
+ *       {@link SalesforceOAuthService#STATE_COOKIE} cookie, otherwise the flow answers with its {@code set-payload}
+ *       text (line 17);</li>
  *   <li>{@code /oauth2callback}, the callback the connector's {@code sfdc:oauth-callback-config} served on
- *       {@code localhost:8081} (line 4): the code is exchanged, the token stored and the flow resumed, so the callback
+ *       {@code localhost:8081} (line 4): when the {@code state} Salesforce returns matches that cookie and an
+ *       authorization still pending, the code is exchanged, the token stored and the flow resumed, so the callback
  *       answers with the same text.</li>
  * </ul>
  * Both paths share the one listener on {@code ${http.port:8081}}, which keeps
- * {@code http://localhost:8081/oauth2callback} valid with the defaults. The authorize decision, the code exchange, the
- * token and the query belong to {@link SalesforceOAuthService}; this class only binds the request and renders the
- * outcome.
+ * {@code http://localhost:8081/oauth2callback} valid with the defaults. The authorize decision, the {@code state}
+ * and its cookie, the callback's checks, the code exchange, the token and the query belong to
+ * {@link SalesforceOAuthService}; this class only binds the request and renders the outcome.
  *
  * <p>Neither listener declares {@code allowedMethods}, so every method is accepted and answered alike: each path has a
  * method-less mapping plus an explicit {@code OPTIONS} mapping, and no mapping declares a media-type condition, so no
@@ -75,8 +79,9 @@ public class SalesforceOAuthController {
     }
 
     /**
-     * Answers {@code /} for every method except {@code OPTIONS}: 302 to the Salesforce authorization page while no
-     * token is held, otherwise 200 with {@code Salesforce query returned <n> contacts.}.
+     * Answers {@code /} for every method except {@code OPTIONS}: 302 to the Salesforce authorization page, with the
+     * state cookie of the authorization it starts, while no token is held, otherwise 200 with
+     * {@code Salesforce query returned <n> contacts.} and no cookie.
      *
      * @param response the response the redirect or the text is committed to
      * @throws Exception every failure of the authorize step or the query, unchanged, for the advices
@@ -101,21 +106,29 @@ public class SalesforceOAuthController {
 
     /**
      * Answers the callback Salesforce redirects the browser to, for every method except {@code OPTIONS}: 200 with
-     * {@code Salesforce query returned <n> contacts.} once the code has been exchanged.
+     * {@code Salesforce query returned <n> contacts.} once the code has been exchanged. The service exchanges a code
+     * only for the browser that started the authorization at {@code /}: {@code state} must equal its state cookie and
+     * name an authorization still pending, otherwise the callback fails before any token request.
      *
      * @param code             the {@code code} parameter Salesforce issues, or {@code null}
      * @param error            the {@code error} parameter of a refused authorization, or {@code null}
      * @param errorDescription the {@code error_description} parameter of a refused authorization, or {@code null}
+     * @param state            the {@code state} parameter Salesforce returns from the authorization URL, or
+     *                         {@code null}
+     * @param stateCookie      the browser's {@link SalesforceOAuthService#STATE_COOKIE} cookie, or {@code null}
      * @param response         the response the text is committed to
-     * @throws Exception a refused authorization ({@code IllegalStateException}), a failed exchange or a failed query,
-     *                   unchanged, for the advices
+     * @throws Exception a refused authorization or a callback the browser did not start
+     *                   ({@code IllegalStateException}), a failed exchange or a failed query, unchanged, for the
+     *                   advices
      */
     @RequestMapping(CALLBACK_PATH)
     public void callback(@RequestParam(name = "code", required = false) String code,
                          @RequestParam(name = "error", required = false) String error,
                          @RequestParam(name = "error_description", required = false) String errorDescription,
+                         @RequestParam(name = "state", required = false) String state,
+                         @CookieValue(name = SalesforceOAuthService.STATE_COOKIE, required = false) String stateCookie,
                          HttpServletResponse response) throws Exception {
-        text(service.completeAuthorization(code, error, errorDescription), response);
+        text(service.completeAuthorization(code, error, errorDescription, state, stateCookie), response);
     }
 
     /**
@@ -125,6 +138,9 @@ public class SalesforceOAuthController {
      * @param code             the {@code code} parameter Salesforce issues, or {@code null}
      * @param error            the {@code error} parameter of a refused authorization, or {@code null}
      * @param errorDescription the {@code error_description} parameter of a refused authorization, or {@code null}
+     * @param state            the {@code state} parameter Salesforce returns from the authorization URL, or
+     *                         {@code null}
+     * @param stateCookie      the browser's {@link SalesforceOAuthService#STATE_COOKIE} cookie, or {@code null}
      * @param response         the response the text is committed to
      * @throws Exception every failure of the callback, unchanged
      */
@@ -132,22 +148,28 @@ public class SalesforceOAuthController {
     public void callbackOptions(@RequestParam(name = "code", required = false) String code,
                                 @RequestParam(name = "error", required = false) String error,
                                 @RequestParam(name = "error_description", required = false) String errorDescription,
+                                @RequestParam(name = "state", required = false) String state,
+                                @CookieValue(name = SalesforceOAuthService.STATE_COOKIE, required = false)
+                                String stateCookie,
                                 HttpServletResponse response) throws Exception {
-        callback(code, error, errorDescription, response);
+        callback(code, error, errorDescription, state, stateCookie, response);
     }
 
     /**
-     * Renders the outcome of the authorize step: a redirect as 302 with {@code Location} and an empty body, no
-     * Content-Type; a completed query as the text of {@link #text(String, HttpServletResponse)}.
+     * Renders the outcome of the authorize step: a redirect as 302 with {@code Location}, the {@code Set-Cookie} of
+     * its state cookie and an empty body, no Content-Type; a completed query as the text of
+     * {@link #text(String, HttpServletResponse)}, which sets no cookie.
      *
      * <p>Every reply is committed here with its {@code Content-Length} rather than returned as a
      * {@code ResponseEntity}: Spring MVC leaves a bodiless entity uncommitted, and {@code FrameworkServlet} then
      * completes an uncommitted reply with an {@code Allow} header for {@code OPTIONS} and, because
      * {@code spring.mvc.dispatch-trace-request} routes {@code TRACE} here, with the servlet's {@code message/http} echo
      * for {@code TRACE}, so those methods would not get the answer every other method gets. {@code Location} is set as
-     * a plain header, not through {@code sendRedirect}, which may rewrite the value.
+     * a plain header, not through {@code sendRedirect}, which may rewrite the value, and the state cookie as the
+     * {@code Set-Cookie} header its {@code ResponseCookie} renders, with every attribute the service gave it.
      *
-     * @param outcome  the authorize step's outcome: the redirect location, or the completed query's text
+     * @param outcome  the authorize step's outcome: the redirect location and its state cookie, or the completed
+     *                 query's text
      * @param response the response the reply is committed to
      * @throws IOException when committing the reply fails
      */
@@ -155,6 +177,7 @@ public class SalesforceOAuthController {
         if (outcome.isRedirect()) {
             response.setStatus(HttpServletResponse.SC_FOUND);
             response.setHeader(HttpHeaders.LOCATION, outcome.redirectLocation().toASCIIString());
+            response.addHeader(HttpHeaders.SET_COOKIE, outcome.stateCookie().toString());
             response.setContentLength(0);
             response.flushBuffer();
             return;

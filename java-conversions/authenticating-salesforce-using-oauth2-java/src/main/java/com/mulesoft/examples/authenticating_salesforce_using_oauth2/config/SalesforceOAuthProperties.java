@@ -8,6 +8,8 @@
 
 package com.mulesoft.examples.authenticating_salesforce_using_oauth2.config;
 
+import java.time.Duration;
+
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
@@ -24,7 +26,8 @@ import org.springframework.stereotype.Component;
  *       authorize redirect and the code exchange;</li>
  *   <li>{@code <sfdc:authorize authorizationUrl="..." accessTokenUrl="..."/>} &rarr; {@link Oauth}.</li>
  * </ul>
- * The URLs and the callback are non-secret values the original fixed, so they are carried as field defaults. The
+ * The URLs and the callback are non-secret values the original fixed, so they are carried as field defaults, as is
+ * the non-secret lifetime {@code sfdc.oauth.state-ttl} of a started authorization, which the conversion adds. The
  * consumer key and secret have no default and are never hard-coded; they come only from configuration
  * ({@code SFDC_KEY}, {@code SFDC_SECRET}, or the git-ignored {@code application-it.yml} of the live test), so the
  * application starts with both empty. {@link #toString()} masks the secret.
@@ -103,8 +106,8 @@ public class SalesforceOAuthProperties {
     }
 
     /**
-     * The Salesforce authorization server endpoints of {@code sfdc:authorize} and the callback of
-     * {@code sfdc:oauth-callback-config}.
+     * The Salesforce authorization server endpoints of {@code sfdc:authorize}, the callback of
+     * {@code sfdc:oauth-callback-config} and the lifetime of a started authorization's {@code state}.
      */
     public static class Oauth {
 
@@ -116,6 +119,13 @@ public class SalesforceOAuthProperties {
 
         /** {@code sfdc.oauth.callback.*}: the local callback Salesforce redirects back to. */
         private Callback callback = new Callback();
+
+        /**
+         * {@code sfdc.oauth.state-ttl}: how long the {@code state} of an authorization started at {@code /}, and the
+         * browser cookie that carries it, stay valid for the callback. Not a key of the original, whose DevKit
+         * connector handled the callback internally.
+         */
+        private Duration stateTtl = Duration.ofMinutes(10);
 
         /**
          * @return the authorization endpoint URL
@@ -159,11 +169,27 @@ public class SalesforceOAuthProperties {
             this.callback = callback;
         }
 
+        /**
+         * @return how long a started authorization's {@code state} stays valid for the callback
+         */
+        public Duration getStateTtl() {
+            return stateTtl;
+        }
+
+        /**
+         * @param stateTtl how long a started authorization's {@code state} stays valid for the callback; must be
+         *                 positive and at most 400 days, which the authorize step checks when it issues a state
+         */
+        public void setStateTtl(Duration stateTtl) {
+            this.stateTtl = stateTtl;
+        }
+
         @Override
         public String toString() {
             return "Oauth{authorizationUrl=" + authorizationUrl
                     + ", accessTokenUrl=" + accessTokenUrl
                     + ", callback=" + callback
+                    + ", stateTtl=" + stateTtl
                     + "}";
         }
     }
@@ -236,11 +262,25 @@ public class SalesforceOAuthProperties {
          * @return the redirect URI sent as {@code redirect_uri}
          */
         public String redirectUri() {
+            return "http://" + domain + ":" + localPort + requestPath();
+        }
+
+        /**
+         * The path of {@link #redirectUri()}, {@code /<path>} with one leading {@code /} of {@code path} dropped first
+         * ({@code /oauth2callback} with the defaults), so that {@code /oauth2callback} and {@code oauth2callback}
+         * yield the same path; an unset path yields {@code /}. It is also the {@code Path} of the cookie that binds a
+         * started authorization to the browser, so the browser sends that cookie to the callback alone.
+         *
+         * <p>Named without a {@code get} prefix so that the binder treats it as derived, not as a property.
+         *
+         * @return the callback's request path
+         */
+        public String requestPath() {
             String relative = path == null ? "" : path;
             if (relative.startsWith("/")) {
                 relative = relative.substring(1);
             }
-            return "http://" + domain + ":" + localPort + "/" + relative;
+            return "/" + relative;
         }
 
         @Override

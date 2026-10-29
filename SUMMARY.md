@@ -22,6 +22,8 @@ The rows of `hello-world-java` and `mule-component-bindings-java`, and the Tier 
 The rows of `importing-a-csv-file-into-ms-sharepoint-java` and `upload-to-ftp-after-converting-json-to-xml-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose SharePoint import logs failed steps by status code and exception class only and whose FTP client reports failures by operation and reply code or failure category only.
 The rows of `importing-an-email-attachment-using-the-POP3-connector-java`, `mule-expression-language-basics-java`, `scatter-gather-flow-control-java`, `sending-a-csv-file-through-email-using-smtp-java` and `websphere-mq-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree that adds their framework- and mail-logging caps and the required SMTP STARTTLS, with their tests; only their test counts changed.
 The rows of `document-integration-using-the-cmis-connector-java`, `implementing-a-choice-exception-strategy-java`, `login-form-using-the-http-connector-java`, `mule-component-bindings-java`, `service-orchestration-and-choice-routing-java` and `soap-webservice-security-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree that adds the CMIS discovered-URL and Stocklytics redirect origin checks, the linear email-filter check, the log output escaping of the login and orchestration loggers and the WS-Security replay caches, with their tests.
+The evidence row of `authenticating-salesforce-using-oauth2-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean verify` on the tree that binds each started OAuth authorization to the browser with a one-time `state` and checks it before the code exchange; its coverage cell stays 100.0%.
+The row of `proxying-a-soap-api-java` and the Tier 1 tests total under Totals were re-measured on 2026-10-29 with `mvn -B clean install` and `mvn -B test` on the tree that puts the request-framing guard in front of its Undertow listener and adds the guard's tests, including its tests under Undertow's idle-timeout, read-timeout and statistics conduits.
 
 ## Status
 
@@ -130,7 +132,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 24,355 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 24,637 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 85.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -153,7 +155,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | salesforce-data-retrieval-java | 1059 / 0 / 0 / 1 | 357 of 361 | 95.8% (1107 of 1155) | 2 run, 2 skipped, 0 failed, 0 errors |
 | import-contacts-into-salesforce-java | 701 / 0 / 0 / 1 | 92 of 92 | 91.7% (697 of 760) | 1 run, 1 skipped, 0 failed, 0 errors |
 | import-leads-into-salesforce-java | 800 / 0 / 0 / 1 | 341 of 346 | 96.4% (995 of 1032) | 1 run, 1 skipped, 0 failed, 0 errors |
-| authenticating-salesforce-using-oauth2-java | 898 / 0 / 0 / 1 | 93 of 93 | 96.2% (920 of 956) | 1 run, 1 skipped, 0 failed, 0 errors |
+| authenticating-salesforce-using-oauth2-java | 959 / 0 / 0 / 1 | 156 of 156 | 96.6% (990 of 1025) | 1 run, 1 skipped, 0 failed, 0 errors |
 | get-customer-list-from-netsuite-java | 708 / 0 / 0 / 1 | 257 of 261 | 95.5% (1302 of 1363) | 1 run, 1 skipped, 0 failed, 0 errors |
 | netsuite-data-retrieval-java | 1524 / 0 / 0 / 0 | 438 of 441 | 93.2% (2043 of 2191) | 3 run, 3 skipped, 0 failed, 0 errors |
 | salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 766 / 0 / 0 / 1 | 339 of 350 | 96.6% (932 of 965) | 1 run, 1 skipped, 0 failed, 0 errors |
@@ -186,7 +188,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | oauth2-authorization-code-using-the-HTTP-connector-java | 479 / 0 / 0 / 1 | 176 of 176 | 95.3% (958 of 1005) | — |
 | oauth2-client-credentials-using-the-HTTP-connector-java | 432 / 0 / 0 / 1 | 40 of 40 | 90.7% (909 of 1002) | — |
 | proxying-a-rest-api-java | 641 / 0 / 0 / 1 | 41 of 41 | 94.3% (1213 of 1287) | — |
-| proxying-a-soap-api-java | 326 / 0 / 0 / 1 | 54 of 54 | 92.8% (837 of 902) | — |
+| proxying-a-soap-api-java | 547 / 0 / 0 / 1 | 54 of 54 | 92.7% (1468 of 1583) | — |
 | querying-a-db-and-attaching-results-to-an-email-java | 285 / 0 / 0 / 1 | 137 of 139 | 98.2% (427 of 435) | — |
 | querying-a-mysql-database-java | 147 / 0 / 0 / 1 | 9 of 9 | 96.4% (214 of 222) | — |
 | scatter-gather-flow-control-java | 230 / 0 / 0 / 1 | 160 of 163 | 97.1% (409 of 421) | — |

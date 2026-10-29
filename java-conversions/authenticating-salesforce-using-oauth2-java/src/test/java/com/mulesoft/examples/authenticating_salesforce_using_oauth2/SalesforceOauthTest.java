@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 
 import java.net.URI;
@@ -31,6 +32,8 @@ import java.util.Map;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -45,6 +48,7 @@ import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.client.SalesforcePartnerClient;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.config.SalesforceOAuthProperties;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.ContactQueryService;
+import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.SalesforceOAuthService;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.HttpTestClient;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.HttpTestClient.Response;
 
@@ -56,12 +60,17 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.Http
  * <p>The original drove a PhantomJS browser through the live Salesforce login page with the credentials of the
  * never-committed {@code mule.test.properties}, then requested {@code /}. Here the whole application runs on its
  * Undertow listener and a WireMock server stands in for {@code login.salesforce.com}: its authorize endpoint
- * approves at once by redirecting to the callback with a code, and its token endpoint answers the code exchange with
- * a Salesforce-shaped token response. The browser is replaced by walking the redirect chain hop by hop with ST-1
- * {@link HttpTestClient}, which never follows redirects, so every {@code Location} is asserted on the wire. A
- * Mockito {@link SalesforcePartnerClient} returns three contacts for the original SOQL, recorded from the original
- * README's log lines. Everything between the HTTP requests and those two stand-ins (the controller, the authorize
- * decision, the token client, the stored token and the contact count) is the production code.
+ * approves at once by redirecting to the callback with a code and, as Salesforce does, the {@code state} the
+ * authorization URL carried, and its token endpoint answers the code exchange with a Salesforce-shaped token
+ * response. The browser is replaced by walking the redirect chain hop by hop with ST-1 {@link HttpTestClient}, which
+ * never follows redirects, so every {@code Location} is asserted on the wire, and by carrying the state cookie the
+ * application set on its redirect to the callback, as a browser does. A Mockito {@link SalesforcePartnerClient}
+ * returns three contacts for the original SOQL, recorded from the original README's log lines. Everything between
+ * the HTTP requests and those two stand-ins (the controller, the authorize decision, the state and its checks, the
+ * token client, the stored token and the contact count) is the production code.
+ *
+ * <p>Beside the original assertion, a callback with a code that this browser never started at {@code /} is refused
+ * on the wire with SC-1's 500 before any token request reaches the stand-in.
  *
  * <p>The listener binds a random port. The production code reads the {@code redirect_uri} from
  * {@link SalesforceOAuthProperties} at each authorize redirect and code exchange, so once the listener is bound each
@@ -88,6 +97,9 @@ class SalesforceOauthTest {
     private static final String CONSUMER_SECRET = "test-consumer-secret";
 
     private static final String CODE = "test-code";
+
+    /** The start of the state cookie's {@code Set-Cookie} and {@code Cookie} forms. */
+    private static final String STATE_COOKIE_PREFIX = SalesforceOAuthService.STATE_COOKIE + "=";
 
     /**
      * Stand-in for {@code login.salesforce.com}: the authorize and token endpoints of the authorization-code flow.
@@ -142,8 +154,9 @@ class SalesforceOauthTest {
 
     /**
      * Aims the callback at the bound listener, then has the authorize stub approve by redirecting the browser there
-     * with a code. The production code reads the callback's port each time it builds the {@code redirect_uri}, so the
-     * authorize redirect and the code exchange of this test both carry the listener port.
+     * with a code and the {@code state} of the authorization URL, returned unchanged through WireMock's response
+     * templating as Salesforce returns it. The production code reads the callback's port each time it builds the
+     * {@code redirect_uri}, so the authorize redirect and the code exchange of this test both carry the listener port.
      */
     @BeforeEach
     void bindCallbackToListener() {
@@ -151,7 +164,8 @@ class SalesforceOauthTest {
         WIREMOCK.stubFor(get(urlPathEqualTo(AUTHORIZE_PATH))
                 .willReturn(aResponse()
                         .withStatus(302)
-                        .withHeader("Location", callbackUri() + "?code=" + CODE)));
+                        .withHeader("Location", callbackUri() + "?code=" + CODE + "&state={{{request.query.state}}}")
+                        .withTransformers("response-template")));
     }
 
     @BeforeEach
@@ -166,27 +180,32 @@ class SalesforceOauthTest {
     void testAuthentication() throws Exception {
         HttpTestClient app = HttpTestClient.localhost(port);
 
-        // No token yet: / redirects the browser to the Salesforce authorization page.
+        // No token yet: / redirects the browser to the Salesforce authorization page, with the state of the
+        // authorization it starts in the URL and in the browser's state cookie.
         Response first = app.get("/");
         assertEquals(302, first.status(), () -> "unexpected response: " + first);
         assertEquals(0, first.body().length, () -> "redirect must have an empty body: " + first);
+        String stateCookie = stateCookieOf(first);
+        String state = stateCookie.substring(STATE_COOKIE_PREFIX.length());
+        assertTrue(state.matches("[A-Za-z0-9_-]{43}"), () -> "unexpected state: " + first);
         String location = first.header("Location");
         assertEquals(WIREMOCK.baseUrl() + AUTHORIZE_PATH
                         + "?response_type=code&client_id=" + CONSUMER_KEY
                         + "&redirect_uri=" + URLEncoder.encode(callbackUri(), StandardCharsets.UTF_8)
-                        + "&display=page",
+                        + "&display=page&state=" + state,
                 location);
 
-        // The login: the authorization server sends the browser back to the callback with a code.
+        // The login: the authorization server sends the browser back to the callback with a code and the state.
         URI authorize = URI.create(location);
         Response login = HttpTestClient.localhost(WIREMOCK.port())
                 .get(authorize.getRawPath() + "?" + authorize.getRawQuery());
         assertEquals(302, login.status(), () -> "unexpected response: " + login);
-        assertEquals(callbackUri() + "?code=" + CODE, login.header("Location"));
+        assertEquals(callbackUri() + "?code=" + CODE + "&state=" + state, login.header("Location"));
 
-        // The callback exchanges the code, stores the token and resumes the flow with the contact query.
+        // The callback, sent with the browser's state cookie, exchanges the code, stores the token and resumes the
+        // flow with the contact query.
         URI callback = URI.create(login.header("Location"));
-        Response done = app.get(callback.getRawPath() + "?" + callback.getRawQuery());
+        Response done = app.get(callback.getRawPath() + "?" + callback.getRawQuery(), Map.of("Cookie", stateCookie));
         assertEquals(200, done.status(), () -> "unexpected response: " + done);
         assertUntypedText(done);
         assertTrue(done.bodyAsString().contains(MESSAGE), () -> "unexpected body: " + done);
@@ -213,13 +232,57 @@ class SalesforceOauthTest {
     }
 
     /**
-     * The flow's text as the Mule listener sent its untyped {@code set-payload}: no {@code Content-Type}, and the
-     * {@code Content-Length} of the body bytes.
+     * Callbacks with a valid-looking code that this browser never started at {@code /}, as a page of another site can
+     * make a browser send: without any state or cookie, and with a state and matching cookie the application never
+     * issued. Each gets SC-1's 500 with the refusal, and no token request reaches the stand-in, so no grant can be
+     * replaced by a code the user did not ask for.
+     */
+    @ParameterizedTest(name = "{0}")
+    @CsvSource({
+            "'no state, no cookie', , , Salesforce authorization failed: no state parameter",
+            "'forged state and cookie', forged-state, sfdc_oauth_state=forged-state, "
+                    + "Salesforce authorization failed: unknown or already used state"})
+    void unsolicitedCallbackIsRefusedBeforeAnyTokenRequest(String label, String state, String cookie,
+            String message) throws Exception {
+        WIREMOCK.resetRequests();
+        HttpTestClient app = HttpTestClient.localhost(port);
+
+        Response refused = app.get("/oauth2callback?code=" + CODE + (state == null ? "" : "&state=" + state),
+                cookie == null ? Map.of() : Map.of("Cookie", cookie));
+
+        assertEquals("HTTP/1.1 500 Internal Server Error", refused.statusLine(),
+                () -> "unexpected response: " + refused);
+        assertEquals("application/json", refused.header("Content-Type"), () -> "unexpected response: " + refused);
+        assertEquals("{ \"message\": \"" + message + "\" }", refused.bodyAsString());
+        assertNull(refused.header("Set-Cookie"), () -> "unexpected cookie: " + refused);
+        WIREMOCK.verify(0, postRequestedFor(urlPathEqualTo(TOKEN_PATH)));
+        Mockito.verify(partnerClient, never()).query(ContactQueryService.CONTACT_QUERY);
+    }
+
+    /**
+     * The flow's text as the Mule listener sent its untyped {@code set-payload}: no {@code Content-Type}, the
+     * {@code Content-Length} of the body bytes, and no cookie.
      */
     private static void assertUntypedText(Response response) {
         assertNull(response.header("Content-Type"), () -> "unexpected Content-Type: " + response);
         assertEquals(String.valueOf(response.body().length), response.header("Content-Length"),
                 () -> "unexpected Content-Length: " + response);
+        assertNull(response.header("Set-Cookie"), () -> "unexpected Set-Cookie: " + response);
+    }
+
+    /**
+     * The state cookie a browser keeps from the redirect, {@code sfdc_oauth_state=<state>}, as it sends it back in its
+     * {@code Cookie} header: the {@code name=value} pair before the attributes of the one {@code Set-Cookie}, which
+     * also scopes it to the callback path and marks it {@code HttpOnly} and {@code SameSite=Lax}.
+     */
+    private static String stateCookieOf(Response redirect) {
+        List<String> setCookies = redirect.headers("Set-Cookie");
+        assertEquals(1, setCookies.size(), () -> "expected one Set-Cookie: " + redirect);
+        String setCookie = setCookies.get(0);
+        assertTrue(setCookie.startsWith(STATE_COOKIE_PREFIX), () -> "unexpected Set-Cookie: " + redirect);
+        assertTrue(setCookie.contains("; Path=/oauth2callback;") && setCookie.contains("; HttpOnly")
+                && setCookie.endsWith("; SameSite=Lax"), () -> "unexpected Set-Cookie attributes: " + redirect);
+        return setCookie.substring(0, setCookie.indexOf(';'));
     }
 
     /** The {@code redirect_uri} the application registers: the callback on this test's listener port. */

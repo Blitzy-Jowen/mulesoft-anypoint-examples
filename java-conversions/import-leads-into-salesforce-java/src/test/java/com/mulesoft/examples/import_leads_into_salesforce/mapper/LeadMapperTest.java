@@ -53,7 +53,7 @@ class LeadMapperTest {
 
     private final LeadMapper mapper = new LeadMapper();
 
-    // ---------------------------------------------------------------- records, key names and order
+    // records, key names and order
 
     @Test
     @DisplayName("One LinkedHashMap record per row, in input order: Ishmael Alexander, then Cole Burks")
@@ -92,7 +92,7 @@ class LeadMapperTest {
         assertThat(lead).hasToString(ISHMAEL_RECORD);
     }
 
-    // ---------------------------------------------------------------- absent values
+    // absent values
 
     @ParameterizedTest(name = "row without {0} -> {1}")
     @CsvSource({
@@ -139,7 +139,7 @@ class LeadMapperTest {
         assertThat(lead.values()).doesNotContainNull();
     }
 
-    // ---------------------------------------------------------------- value fidelity
+    // value fidelity
 
     @Test
     @DisplayName("Values are the reader's own Strings: no trimming, re-casing or type coercion")
@@ -160,7 +160,7 @@ class LeadMapperTest {
                 "{Company=  Eu Odio PC , Email=Sem.Egestas@Mollis.ORG, FirstName=007, LastName=12/16/2013}");
     }
 
-    // ---------------------------------------------------------------- collection handling
+    // collection handling
 
     @Test
     @DisplayName("An empty input, immutable or mutable, gives an empty, non-null list")
@@ -199,7 +199,7 @@ class LeadMapperTest {
         assertThat(new ArrayList<>(row.keySet())).isEqualTo(keysBefore);
     }
 
-    // ---------------------------------------------------------------- carried leads.csv
+    // carried leads.csv
 
     @Test
     @DisplayName("The CR-only classpath leads.csv maps to Ishmael Alexander and Cole Burks (original IT targets)")
@@ -221,7 +221,7 @@ class LeadMapperTest {
         assertThat(leads.get(1)).containsEntry("Email", "sem.egestas@mollis.org").containsEntry("LastName", "Burks");
     }
 
-    // ---------------------------------------------------------------- fixtures and assertions
+    // fixtures and assertions
 
     /** A CSV row keyed by the {@code leads.csv} header, in header order. */
     private static Map<String, String> csvRow(String company, String firstName, String lastName, String birthday,

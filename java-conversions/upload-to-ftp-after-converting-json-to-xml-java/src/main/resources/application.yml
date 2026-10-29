@@ -1,4 +1,3 @@
-# upload-to-ftp-after-converting-json-to-xml-java runtime configuration
 # Replaces upload-to-ftp-after-converting-json-to-xml/src/main/app/mule-app.properties (empty) and the
 # http:listener-config and ftp:outbound-endpoint of upload-to-ftp.xml. The ftp.* keys are the names the
 # original test read from mule.test.properties; the original flow hard-coded the FTP host and credentials.

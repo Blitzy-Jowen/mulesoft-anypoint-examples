@@ -1,6 +1,4 @@
-# oauth2-authorization-code-using-the-HTTP-connector-java runtime configuration
-# Converted from oauth2-authorization-code-using-the-HTTP-connector/src/main/app/http-authorization-code-web.xml
-# (mule-app.properties holds no keys). Key names keep the original Mule placeholder names; secrets have no value:
+# Key names keep the original Mule placeholder names; secrets have no value:
 # supply each through the environment variable named in its placeholder. Without the store passwords the HTTPS
 # listener cannot open keystore.jks and trust-store, so the application does not start, as the original did not.
 server:

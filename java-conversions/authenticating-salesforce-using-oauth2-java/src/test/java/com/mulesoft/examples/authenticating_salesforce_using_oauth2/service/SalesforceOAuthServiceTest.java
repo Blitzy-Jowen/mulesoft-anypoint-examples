@@ -31,9 +31,25 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BinaryOperator;
 import java.util.stream.Stream;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -48,6 +64,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import org.springframework.http.ResponseCookie;
 import org.springframework.web.client.RestClient;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
@@ -80,11 +97,14 @@ import com.sforce.ws.ConnectionException;
  * against a Mockito-mocked {@link SalesforceTokenClient} and {@link ContactQueryService}; no Spring context, external
  * network or credentials.
  *
- * <p>It fixes the flow contract: the authorize redirect built from the original connector settings, the code exchange
- * on {@code /oauth2callback} that stores the token and answers with the contact query text, the session supplied to
+ * <p>It fixes the flow contract: the authorize redirect built from the original connector settings, with the
+ * {@code state} of the authorization it starts and the cookie that binds it to the browser, the code exchange on
+ * {@code /oauth2callback} that stores the token and answers with the contact query text, the session supplied to
  * the Partner API client, and the refresh grant that renews it. Every failure branch is pinned: a callback without a
- * code, a rejected or unreachable token endpoint, an incomplete token response, a refused refresh that clears the
- * token, and the upstream failures that pass through unchanged and keep it.
+ * code, a callback with a code but without the state and cookie of an authorization still pending (unsolicited,
+ * mismatched, reused, expired or forgotten), a rejected or unreachable token endpoint, an incomplete token response,
+ * a refused refresh that clears the token, and the upstream failures that pass through unchanged and keep it. A
+ * {@link MutableClock} lets a pending authorization expire without waiting.
  *
  * <p>One case leaves the mocked query service aside and drives the real {@link ContactQueryService} and SC-15
  * {@link SalesforcePartnerClient} against a local WireMock Partner API, so the session each completed grant stores is
@@ -130,6 +150,29 @@ class SalesforceOAuthServiceTest {
 
     private static final String TOKEN_PATH = "/services/oauth2/token";
 
+    /** A fixed {@code state} for the URL-building cases, which take the state as given. */
+    private static final String STATE = "test-state";
+
+    /** 32 random bytes in base64url without padding: 43 characters of the URL- and cookie-safe alphabet. */
+    private static final String STATE_PATTERN = "[A-Za-z0-9_-]{43}";
+
+    /** The default {@code sfdc.oauth.state-ttl}. */
+    private static final Duration STATE_TTL = Duration.ofMinutes(10);
+
+    private static final String NO_STATE = "Salesforce authorization failed: no state parameter";
+
+    private static final String NO_STATE_COOKIE = "Salesforce authorization failed: no state cookie";
+
+    private static final String STATE_MISMATCH =
+            "Salesforce authorization failed: state does not match this browser's authorization request";
+
+    private static final String UNKNOWN_STATE = "Salesforce authorization failed: unknown or already used state";
+
+    private static final String EXPIRED_STATE = "Salesforce authorization failed: authorization request expired";
+
+    private static final String INVALID_STATE_TTL =
+            "sfdc.oauth.state-ttl must be a positive duration of at most 400 days";
+
     /**
      * A 400 whose status line, headers and first body bytes arrive while the rest of its declared 200-byte body
      * never does: the start of Salesforce's error object, cut off in transit.
@@ -148,6 +191,8 @@ class SalesforceOAuthServiceTest {
 
     private SalesforceOAuthProperties properties;
 
+    private final MutableClock clock = new MutableClock(Instant.parse("2024-01-02T03:04:05Z"));
+
     private SalesforceOAuthService service;
 
     @BeforeEach
@@ -155,24 +200,24 @@ class SalesforceOAuthServiceTest {
         properties = new SalesforceOAuthProperties();
         properties.setKey("test-key");
         properties.setSecret("test-secret");
-        service = new SalesforceOAuthService(properties, tokenClient, contactQueryService);
+        service = new SalesforceOAuthService(properties, tokenClient, contactQueryService, clock);
     }
 
     @Test
     void authorizationUrlAndRedirectUriFollowTheOriginalConnectorSettings() throws Exception {
         assertThat(service.redirectUri()).isEqualTo(REDIRECT_URI);
-        assertThat(service.authorizationUrl())
-                .hasToString(AUTHORIZATION_URL)
-                .isEqualTo(URI.create(AUTHORIZATION_URL));
+        assertThat(service.authorizationUrl(STATE))
+                .hasToString(AUTHORIZATION_URL + "&state=" + STATE)
+                .isEqualTo(URI.create(AUTHORIZATION_URL + "&state=" + STATE));
     }
 
     @Test
     void authorizationUrlJoinsAConfiguredQueryStringWithAnAmpersand() throws Exception {
         properties.getOauth().setAuthorizationUrl("  " + AUTHORIZE_ENDPOINT + "?prompt=login  ");
 
-        assertThat(service.authorizationUrl()).hasToString(AUTHORIZE_ENDPOINT
+        assertThat(service.authorizationUrl(STATE)).hasToString(AUTHORIZE_ENDPOINT
                 + "?prompt=login&response_type=code&client_id=test-key&redirect_uri=" + ENCODED_REDIRECT_URI
-                + "&display=page");
+                + "&display=page&state=" + STATE);
     }
 
     @ParameterizedTest
@@ -181,8 +226,15 @@ class SalesforceOAuthServiceTest {
             throws Exception {
         properties.setKey(key);
 
-        assertThat(service.authorizationUrl()).hasToString(AUTHORIZE_ENDPOINT + "?response_type=code&client_id="
-                + encodedKey + "&redirect_uri=" + ENCODED_REDIRECT_URI + "&display=page");
+        assertThat(service.authorizationUrl(STATE)).hasToString(AUTHORIZE_ENDPOINT + "?response_type=code&client_id="
+                + encodedKey + "&redirect_uri=" + ENCODED_REDIRECT_URI + "&display=page&state=" + STATE);
+    }
+
+    @Test
+    void authorizationUrlFormEncodesTheStateAndRequiresOne() throws Exception {
+        assertThat(service.authorizationUrl("a b&c=d")).hasToString(AUTHORIZATION_URL + "&state=a+b%26c%3Dd");
+        assertThat(assertThrows(NullPointerException.class, () -> service.authorizationUrl(null)))
+                .hasMessage("state");
     }
 
     @ParameterizedTest
@@ -191,11 +243,13 @@ class SalesforceOAuthServiceTest {
     void authorizationUrlFailsWhenNoAuthorizationEndpointIsConfigured(String configured) throws Exception {
         properties.getOauth().setAuthorizationUrl(configured);
 
-        IllegalStateException direct = assertThrows(IllegalStateException.class, service::authorizationUrl);
+        IllegalStateException direct = assertThrows(IllegalStateException.class,
+                () -> service.authorizationUrl(STATE));
         IllegalStateException viaAuthorize = assertThrows(IllegalStateException.class, service::authorize);
 
         assertThat(direct).hasMessage("sfdc.oauth.authorization-url is not configured");
         assertThat(viaAuthorize).hasMessage("sfdc.oauth.authorization-url is not configured");
+        assertThat(pendingAuthorizations(service)).as("authorizations remembered").isZero();
         verifyNoInteractions(tokenClient, contactQueryService);
     }
 
@@ -205,14 +259,96 @@ class SalesforceOAuthServiceTest {
     }
 
     @Test
-    void authorizeWithoutATokenRedirectsTheBrowserToSalesforce() throws Exception {
+    void authorizeWithoutATokenRedirectsWithAFreshStateInTheUrlAndInTheStateCookie() throws Exception {
         AuthorizeOutcome outcome = service.authorize();
 
         assertThat(outcome.isRedirect()).isTrue();
+        ResponseCookie cookie = outcome.stateCookie();
+        String state = cookie.getValue();
+        assertThat(state).matches(STATE_PATTERN);
+        assertThat(Base64.getUrlDecoder().decode(state)).hasSize(32);
         assertThat(outcome.redirectLocation())
-                .isEqualTo(service.authorizationUrl())
-                .hasToString(AUTHORIZATION_URL);
+                .isEqualTo(service.authorizationUrl(state))
+                .hasToString(AUTHORIZATION_URL + "&state=" + state);
         assertThat(outcome.body()).isNull();
+        assertThat(cookie.getName()).isEqualTo(SalesforceOAuthService.STATE_COOKIE).isEqualTo("sfdc_oauth_state");
+        assertThat(cookie.getPath()).isEqualTo("/oauth2callback");
+        assertThat(cookie.getMaxAge()).isEqualTo(STATE_TTL);
+        assertThat(cookie.isHttpOnly()).isTrue();
+        assertThat(cookie.isSecure()).isFalse();
+        assertThat(cookie.getSameSite()).isEqualTo("Lax");
+        assertThat(cookie.getDomain()).isNull();
+        assertThat(pendingAuthorizations(service)).isEqualTo(1);
+        verifyNoInteractions(tokenClient, contactQueryService);
+    }
+
+    @Test
+    void everyRedirectStartsAnAuthorizationWithADistinctState() throws Exception {
+        Set<String> states = new HashSet<>();
+        for (int i = 0; i < 200; i++) {
+            AuthorizeOutcome outcome = service.authorize();
+            String state = outcome.stateCookie().getValue();
+            assertThat(state).matches(STATE_PATTERN);
+            assertThat(outcome.redirectLocation()).hasToString(AUTHORIZATION_URL + "&state=" + state);
+            states.add(state);
+        }
+
+        assertThat(states).hasSize(200);
+        assertThat(pendingAuthorizations(service)).isEqualTo(200);
+    }
+
+    @ParameterizedTest(name = "sfdc.oauth.callback.path {0} -> Path {1}")
+    @CsvSource({"oauth2callback, /oauth2callback", "/oauth2callback, /oauth2callback",
+            "sfdc/callback, /sfdc/callback", "'', /", ", /"})
+    void stateCookieIsScopedToTheCallbackPath(String configuredPath, String cookiePath) throws Exception {
+        properties.getOauth().getCallback().setPath(configuredPath);
+
+        AuthorizeOutcome outcome = service.authorize();
+
+        assertThat(outcome.stateCookie().getPath()).isEqualTo(cookiePath);
+        assertThat(service.redirectUri()).isEqualTo("http://localhost:8081" + cookiePath);
+    }
+
+    @ParameterizedTest(name = "sfdc.oauth.state-ttl {0} ms -> Max-Age {1}")
+    @CsvSource({"600000, 600", "90000, 90", "1500, 2", "1, 1", "34560000000, 34560000"})
+    void stateCookieLivesForTheStateLifetimeRoundedUpToWholeSeconds(long ttlMillis, long maxAgeSeconds)
+            throws Exception {
+        properties.getOauth().setStateTtl(Duration.ofMillis(ttlMillis));
+
+        ResponseCookie cookie = service.authorize().stateCookie();
+
+        assertThat(cookie.getMaxAge()).isEqualTo(Duration.ofSeconds(maxAgeSeconds));
+    }
+
+    @ParameterizedTest(name = "{0} -> Secure {1}")
+    @CsvSource({"https://app.example.invalid:8443/oauth2callback, true",
+            "HTTPS://app.example.invalid/oauth2callback, true",
+            "http://localhost:8081/oauth2callback, false"})
+    void stateCookieIsSecureOnlyForAnHttpsRedirectUri(String redirectUri, boolean secure) throws Exception {
+        properties.getOauth().setCallback(new SalesforceOAuthProperties.Callback() {
+            @Override
+            public String redirectUri() {
+                return redirectUri;
+            }
+        });
+
+        assertThat(service.authorize().stateCookie().isSecure()).isEqualTo(secure);
+    }
+
+    static Stream<Duration> invalidStateLifetimes() {
+        return Stream.of(null, Duration.ZERO, Duration.ofSeconds(-1), Duration.ofDays(400).plusNanos(1));
+    }
+
+    @ParameterizedTest(name = "sfdc.oauth.state-ttl {0}")
+    @MethodSource("invalidStateLifetimes")
+    void authorizeFailsOnAStateLifetimeThatIsNotPositiveOrLongerThan400DaysAndRemembersNothing(Duration ttl)
+            throws Exception {
+        properties.getOauth().setStateTtl(ttl);
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class, service::authorize);
+
+        assertThat(thrown).hasMessage(INVALID_STATE_TTL);
+        assertThat(pendingAuthorizations(service)).isZero();
         verifyNoInteractions(tokenClient, contactQueryService);
     }
 
@@ -259,10 +395,12 @@ class SalesforceOAuthServiceTest {
     @ParameterizedTest
     @MethodSource("queryFailures")
     void callbackPropagatesAQueryFailureUnchangedAndKeepsTheExchangedToken(Exception failure) throws Exception {
+        String state = initiate(service);
         when(tokenClient.exchangeCode(CODE, REDIRECT_URI)).thenReturn(token("access-1", "refresh-1"));
         when(contactQueryService.queryContacts()).thenThrow(failure);
 
-        Exception thrown = assertThrows(Exception.class, () -> service.completeAuthorization(CODE, null, null));
+        Exception thrown = assertThrows(Exception.class,
+                () -> service.completeAuthorization(CODE, null, null, state, state));
 
         assertSame(failure, thrown);
         assertThat(service.isAuthorized()).isTrue();
@@ -325,12 +463,14 @@ class SalesforceOAuthServiceTest {
     void refreshKeepsAGrantCompletedWhileTheRefreshExchangeWasInFlight() throws Exception {
         String instanceB = "https://na2.salesforce.com";
         Session grantB = new Session("access-b", instanceB + SalesforceOAuthService.SOAP_ENDPOINT_PATH);
+        // A second browser starts its authorization at / before the first one completes.
+        String stateB = initiate(service);
         authorizeWith(token("access-1", "refresh-1"));
         when(tokenClient.exchangeCode("code-b", REDIRECT_URI))
                 .thenReturn(response("access-b", "refresh-b", instanceB));
         when(tokenClient.refresh("refresh-1")).thenAnswer(invocation -> {
             // A browser completes a new authorization while Salesforce is still answering the refresh of grant A.
-            assertThat(service.completeAuthorization("code-b", null, null)).isEqualTo(QUERY_TEXT);
+            assertThat(service.completeAuthorization("code-b", null, null, stateB, stateB)).isEqualTo(QUERY_TEXT);
             return token("access-2", null);
         });
         when(tokenClient.refresh("refresh-b")).thenReturn(response("access-b2", null, null));
@@ -369,14 +509,17 @@ class SalesforceOAuthServiceTest {
             when(tokenClient.exchangeCode("code-b", REDIRECT_URI))
                     .thenReturn(response("access-b", "refresh-b", base + "/b"));
             SalesforceOAuthService flow = sessionModeFlow(base);
+            // Two browsers start their authorization at / before either one completes.
+            String stateA = initiate(flow);
+            String stateB = initiate(flow);
 
-            assertThat(flow.completeAuthorization("code-a", null, null)).isEqualTo(ONE_CONTACT_TEXT);
+            assertThat(flow.completeAuthorization("code-a", null, null, stateA, stateA)).isEqualTo(ONE_CONTACT_TEXT);
             assertThat(partnerApi.findAll(postRequestedFor(urlEqualTo(instanceA))))
                     .singleElement()
                     .satisfies(request -> assertContactQueryUnder(request, "access-a", "access-b"));
             assertThat(partnerApi.findAll(postRequestedFor(urlEqualTo(instanceB)))).isEmpty();
 
-            assertThat(flow.completeAuthorization("code-b", null, null)).isEqualTo(ONE_CONTACT_TEXT);
+            assertThat(flow.completeAuthorization("code-b", null, null, stateB, stateB)).isEqualTo(ONE_CONTACT_TEXT);
             assertThat(flow.authorize()).isEqualTo(AuthorizeOutcome.completed(ONE_CONTACT_TEXT));
 
             // Grant A's session was never rejected, yet nothing reached its instance after grant B completed.
@@ -419,7 +562,8 @@ class SalesforceOAuthServiceTest {
                     .willReturn(invalidSessionFault()));
             properties.getOauth().setAccessTokenUrl(tokenEndpoint.baseUrl() + TOKEN_PATH);
             SalesforceOAuthService flow = sessionModeFlow(partnerApi.baseUrl(), realTokenClient(timeout));
-            assertThat(flow.completeAuthorization(CODE, null, null)).isEqualTo(ONE_CONTACT_TEXT);
+            String state = initiate(flow);
+            assertThat(flow.completeAuthorization(CODE, null, null, state, state)).isEqualTo(ONE_CONTACT_TEXT);
             Session authorized = flow.current();
 
             UpstreamUnavailableException thrown = assertThrows(UpstreamUnavailableException.class, flow::authorize);
@@ -489,7 +633,10 @@ class SalesforceOAuthServiceTest {
         assertThat(failure).hasMessage(expectedMessage);
         assertSame(refused, failure.getCause());
         assertThat(service.isAuthorized()).isFalse();
-        assertThat(service.authorize()).isEqualTo(AuthorizeOutcome.redirect(URI.create(AUTHORIZATION_URL)));
+        AuthorizeOutcome next = service.authorize();
+        assertThat(next.isRedirect()).isTrue();
+        assertThat(next.redirectLocation())
+                .hasToString(AUTHORIZATION_URL + "&state=" + next.stateCookie().getValue());
         verify(tokenClient, times(1)).refresh("refresh-1");
     }
 
@@ -545,7 +692,7 @@ class SalesforceOAuthServiceTest {
     void callbackWithAnAuthorizationErrorFailsWithoutAnExchange(String error, String description,
             String expectedMessage) throws Exception {
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                () -> service.completeAuthorization(null, error, description));
+                () -> service.completeAuthorization(null, error, description, null, null));
 
         assertThat(thrown).hasMessage(expectedMessage);
         assertThat(thrown.getMessage()).startsWith("Salesforce authorization failed: ");
@@ -558,20 +705,217 @@ class SalesforceOAuthServiceTest {
     @ValueSource(strings = "   ")
     void callbackWithoutACodeFailsWithoutAnExchange(String code) throws Exception {
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                () -> service.completeAuthorization(code, null, null));
+                () -> service.completeAuthorization(code, null, null, null, null));
 
         assertThat(thrown).hasMessage("Salesforce authorization failed: no authorization code");
         verifyNoInteractions(tokenClient, contactQueryService);
         assertThat(service.isAuthorized()).isFalse();
     }
 
+    /**
+     * A refused login that Salesforce sends back with the state and cookie of a pending authorization gets the same
+     * message as one without them, and that authorization is discarded, so its state cannot complete a login later.
+     */
+    @Test
+    void callbackWithAnAuthorizationErrorDiscardsTheMatchingPendingAuthorization() throws Exception {
+        String state = initiate(service);
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> service
+                .completeAuthorization(null, "access_denied", "end-user denied authorization", state, state));
+        IllegalStateException later = assertThrows(IllegalStateException.class,
+                () -> service.completeAuthorization(CODE, null, null, state, state));
+
+        assertThat(refused)
+                .hasMessage("Salesforce authorization failed: access_denied: end-user denied authorization");
+        assertThat(later).hasMessage(UNKNOWN_STATE);
+        assertThat(pendingAuthorizations(service)).isZero();
+        verifyNoInteractions(tokenClient, contactQueryService);
+        assertThat(service.isAuthorized()).isFalse();
+    }
+
+    /** The state and cookie a refused login carries, from a state the browser was issued and one issued elsewhere. */
+    static Stream<StateCase> statesThatDoNotDiscard() {
+        return Stream.of(
+                new StateCase("cookie of another browser", (issued, other) -> issued, (issued, other) -> other, null),
+                new StateCase("no state cookie", (issued, other) -> issued, (issued, other) -> null, null),
+                new StateCase("no state parameter", (issued, other) -> null, (issued, other) -> issued, null));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("statesThatDoNotDiscard")
+    void callbackWithAnAuthorizationErrorKeepsAPendingAuthorizationItDoesNotMatch(StateCase presented)
+            throws Exception {
+        String issued = initiate(service);
+        String other = initiate(service);
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> service.completeAuthorization(
+                null, "access_denied", null, presented.state(issued, other), presented.cookie(issued, other)));
+
+        assertThat(refused).hasMessage("Salesforce authorization failed: access_denied");
+        assertThat(pendingAuthorizations(service)).isEqualTo(2);
+        verifyNoInteractions(tokenClient, contactQueryService);
+        assertThat(completeWithIssuedState(issued)).isEqualTo(QUERY_TEXT);
+    }
+
+    /**
+     * Every way a callback with a code can fail to prove that this browser started a pending authorization, from a
+     * state issued to the browser and one issued to another, with the reason it is refused.
+     */
+    static Stream<StateCase> unprovenStates() {
+        return Stream.of(
+                new StateCase("unsolicited: no state, no cookie", (issued, other) -> null, (issued, other) -> null,
+                        NO_STATE),
+                new StateCase("no state parameter", (issued, other) -> null, (issued, other) -> issued, NO_STATE),
+                new StateCase("blank state parameter", (issued, other) -> "   ", (issued, other) -> issued, NO_STATE),
+                new StateCase("no state cookie", (issued, other) -> issued, (issued, other) -> null, NO_STATE_COOKIE),
+                new StateCase("empty state cookie", (issued, other) -> issued, (issued, other) -> "", NO_STATE_COOKIE),
+                new StateCase("cookie of another browser", (issued, other) -> issued, (issued, other) -> other,
+                        STATE_MISMATCH),
+                new StateCase("state of another browser", (issued, other) -> other, (issued, other) -> issued,
+                        STATE_MISMATCH),
+                new StateCase("state differing in one character", (issued, other) -> lastCharacterChanged(issued),
+                        (issued, other) -> issued, STATE_MISMATCH),
+                new StateCase("forged state and matching cookie", (issued, other) -> "forged-state",
+                        (issued, other) -> "forged-state", UNKNOWN_STATE));
+    }
+
+    /**
+     * The unsolicited callback of the finding and its variants: refused with a reason before any token request, no
+     * token stored, and the browser's own pending authorization left intact, so the real login still completes.
+     */
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("unprovenStates")
+    void callbackWithACodeButWithoutProofOfAPendingAuthorizationFailsBeforeAnyTokenRequest(StateCase presented)
+            throws Exception {
+        String issued = initiate(service);
+        String other = initiate(service);
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> service.completeAuthorization(
+                "attacker-code", null, null, presented.state(issued, other), presented.cookie(issued, other)));
+
+        assertThat(refused).hasMessage(presented.reason());
+        verifyNoInteractions(tokenClient, contactQueryService);
+        assertThat(service.isAuthorized()).isFalse();
+        assertThat(pendingAuthorizations(service)).isEqualTo(2);
+        assertThat(completeWithIssuedState(issued)).isEqualTo(QUERY_TEXT);
+        verify(tokenClient).exchangeCode(CODE, REDIRECT_URI);
+        verify(tokenClient, never()).exchangeCode("attacker-code", REDIRECT_URI);
+    }
+
+    @Test
+    void callbackCannotCompleteTheSameAuthorizationTwice() throws Exception {
+        String state = initiate(service);
+        assertThat(completeWithIssuedState(state)).isEqualTo(QUERY_TEXT);
+
+        IllegalStateException replayed = assertThrows(IllegalStateException.class,
+                () -> service.completeAuthorization("code-2", null, null, state, state));
+
+        assertThat(replayed).hasMessage(UNKNOWN_STATE);
+        verify(tokenClient, times(1)).exchangeCode(any(), any());
+        verify(tokenClient, never()).exchangeCode("code-2", REDIRECT_URI);
+        assertThat(service.current()).isEqualTo(new Session("access-1", SOAP_ENDPOINT));
+    }
+
+    @ParameterizedTest(name = "{0} ms after the state lifetime")
+    @ValueSource(longs = {0, 1, 600_000})
+    void callbackAfterTheStateLifetimeFailsBeforeAnyTokenRequestAndConsumesTheState(long millisLate)
+            throws Exception {
+        String state = initiate(service);
+        clock.advance(STATE_TTL.plusMillis(millisLate));
+
+        IllegalStateException expired = assertThrows(IllegalStateException.class,
+                () -> service.completeAuthorization(CODE, null, null, state, state));
+
+        assertThat(expired).hasMessage(EXPIRED_STATE);
+        assertThat(pendingAuthorizations(service)).isZero();
+        verifyNoInteractions(tokenClient, contactQueryService);
+        assertThat(service.isAuthorized()).isFalse();
+    }
+
+    @Test
+    void callbackJustBeforeTheStateLifetimeEndsCompletes() throws Exception {
+        String state = initiate(service);
+        clock.advance(STATE_TTL.minusMillis(1));
+
+        assertThat(completeWithIssuedState(state)).isEqualTo(QUERY_TEXT);
+        assertThat(service.isAuthorized()).isTrue();
+    }
+
+    @Test
+    void expiredAuthorizationsAreForgottenWhenTheNextOneStarts() throws Exception {
+        String first = initiate(service);
+        clock.advance(STATE_TTL);
+        String second = initiate(service);
+
+        IllegalStateException forgotten = assertThrows(IllegalStateException.class,
+                () -> service.completeAuthorization(CODE, null, null, first, first));
+
+        assertThat(forgotten).hasMessage(UNKNOWN_STATE);
+        assertThat(pendingAuthorizations(service)).isEqualTo(1);
+        verifyNoInteractions(tokenClient, contactQueryService);
+        assertThat(completeWithIssuedState(second)).isEqualTo(QUERY_TEXT);
+    }
+
+    @Test
+    void pendingAuthorizationsAreBoundedAndTheOldestIsForgottenFirst() throws Exception {
+        List<String> states = new ArrayList<>();
+        for (int i = 0; i <= SalesforceOAuthService.MAX_PENDING_AUTHORIZATIONS; i++) {
+            states.add(initiate(service));
+        }
+
+        assertThat(pendingAuthorizations(service)).isEqualTo(SalesforceOAuthService.MAX_PENDING_AUTHORIZATIONS);
+        IllegalStateException forgotten = assertThrows(IllegalStateException.class,
+                () -> service.completeAuthorization(CODE, null, null, states.get(0), states.get(0)));
+        assertThat(forgotten).hasMessage(UNKNOWN_STATE);
+        verifyNoInteractions(tokenClient, contactQueryService);
+        assertThat(completeWithIssuedState(states.get(1))).isEqualTo(QUERY_TEXT);
+        assertThat(pendingAuthorizations(service))
+                .isEqualTo(SalesforceOAuthService.MAX_PENDING_AUTHORIZATIONS - 1);
+    }
+
+    /** Browsers racing with the same state and cookie: exactly one exchanges its code, every other is refused. */
+    @Test
+    void concurrentCallbacksWithOneStateExchangeOnlyOnce() throws Exception {
+        String state = initiate(service);
+        when(tokenClient.exchangeCode(CODE, REDIRECT_URI)).thenReturn(token("access-1", "refresh-1"));
+        when(contactQueryService.queryContacts()).thenReturn(QUERY_TEXT);
+        int callers = 8;
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(callers);
+        List<String> outcomes = new ArrayList<>();
+        try {
+            List<Future<String>> calls = new ArrayList<>();
+            for (int i = 0; i < callers; i++) {
+                calls.add(pool.submit(() -> {
+                    start.await();
+                    return service.completeAuthorization(CODE, null, null, state, state);
+                }));
+            }
+            start.countDown();
+            for (Future<String> call : calls) {
+                try {
+                    outcomes.add(call.get(10, TimeUnit.SECONDS));
+                } catch (ExecutionException refused) {
+                    outcomes.add(refused.getCause().getMessage());
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(outcomes).filteredOn(QUERY_TEXT::equals).hasSize(1);
+        assertThat(outcomes).filteredOn(UNKNOWN_STATE::equals).hasSize(callers - 1);
+        verify(tokenClient, times(1)).exchangeCode(CODE, REDIRECT_URI);
+    }
+
     @ParameterizedTest
     @MethodSource("exchangeFailures")
     void callbackExchangeFailureIsRethrownUnchangedAndStoresNothing(RuntimeException failure) throws Exception {
+        String state = initiate(service);
         when(tokenClient.exchangeCode(CODE, REDIRECT_URI)).thenThrow(failure);
 
         RuntimeException thrown = assertThrows(RuntimeException.class,
-                () -> service.completeAuthorization(CODE, null, null));
+                () -> service.completeAuthorization(CODE, null, null, state, state));
 
         assertSame(failure, thrown);
         assertThat(service.isAuthorized()).isFalse();
@@ -582,10 +926,11 @@ class SalesforceOAuthServiceTest {
     @MethodSource("incompleteCodeExchangeResponses")
     void callbackWithAnIncompleteTokenResponseFailsAndStoresNothing(TokenResponse response, String missingField)
             throws Exception {
+        String state = initiate(service);
         when(tokenClient.exchangeCode(CODE, REDIRECT_URI)).thenReturn(response);
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
-                () -> service.completeAuthorization(CODE, null, null));
+                () -> service.completeAuthorization(CODE, null, null, state, state));
 
         assertThat(thrown).hasMessage("Salesforce token response is missing " + missingField);
         assertThat(service.isAuthorized()).isFalse();
@@ -594,21 +939,26 @@ class SalesforceOAuthServiceTest {
 
     @Test
     void authorizeOutcomeTellsARedirectFromACompletedFlow() throws Exception {
-        URI location = URI.create(AUTHORIZATION_URL);
+        URI location = URI.create(AUTHORIZATION_URL + "&state=" + STATE);
+        ResponseCookie cookie = ResponseCookie.from(SalesforceOAuthService.STATE_COOKIE, STATE).build();
 
-        AuthorizeOutcome redirect = AuthorizeOutcome.redirect(location);
+        AuthorizeOutcome redirect = AuthorizeOutcome.redirect(location, cookie);
         AuthorizeOutcome completed = AuthorizeOutcome.completed(QUERY_TEXT);
 
         assertThat(redirect.isRedirect()).isTrue();
         assertThat(redirect.redirectLocation()).isSameAs(location);
+        assertThat(redirect.stateCookie()).isSameAs(cookie);
         assertThat(redirect.body()).isNull();
-        assertThat(redirect).isEqualTo(new AuthorizeOutcome(location, null));
+        assertThat(redirect).isEqualTo(new AuthorizeOutcome(location, cookie, null));
         assertThat(completed.isRedirect()).isFalse();
         assertThat(completed.redirectLocation()).isNull();
+        assertThat(completed.stateCookie()).isNull();
         assertThat(completed.body()).isEqualTo(QUERY_TEXT);
-        assertThat(completed).isEqualTo(new AuthorizeOutcome(null, QUERY_TEXT));
-        assertThat(assertThrows(NullPointerException.class, () -> AuthorizeOutcome.redirect(null)))
+        assertThat(completed).isEqualTo(new AuthorizeOutcome(null, null, QUERY_TEXT));
+        assertThat(assertThrows(NullPointerException.class, () -> AuthorizeOutcome.redirect(null, cookie)))
                 .hasMessage("location");
+        assertThat(assertThrows(NullPointerException.class, () -> AuthorizeOutcome.redirect(location, null)))
+                .hasMessage("stateCookie");
     }
 
     @Test
@@ -619,6 +969,9 @@ class SalesforceOAuthServiceTest {
                 () -> new SalesforceOAuthService(properties, null, contactQueryService))).hasMessage("tokenClient");
         assertThat(assertThrows(NullPointerException.class,
                 () -> new SalesforceOAuthService(properties, tokenClient, null))).hasMessage("contactQueryService");
+        assertThat(assertThrows(NullPointerException.class,
+                () -> new SalesforceOAuthService(properties, tokenClient, contactQueryService, null)))
+                .hasMessage("clock");
     }
 
     @ParameterizedTest
@@ -683,11 +1036,58 @@ class SalesforceOAuthServiceTest {
                 Arguments.of(response("access-1", "refresh-1", "   "), "instance_url"));
     }
 
-    /** Runs the callback for {@link #CODE} with Salesforce answering {@code response} and the query returning 3. */
+    /**
+     * Starts an authorization at {@code /} and runs its callback for {@link #CODE}, with the state and cookie the
+     * redirect issued, Salesforce answering {@code response} and the query returning 3.
+     */
     private String authorizeWith(TokenResponse response) throws Exception {
+        String state = initiate(service);
         when(tokenClient.exchangeCode(CODE, service.redirectUri())).thenReturn(response);
         when(contactQueryService.queryContacts()).thenReturn(QUERY_TEXT);
-        return service.completeAuthorization(CODE, null, null);
+        return service.completeAuthorization(CODE, null, null, state, state);
+    }
+
+    /**
+     * Runs the callback for {@link #CODE} with {@code state} as both the parameter and the cookie, as Salesforce's
+     * redirect back to the browser that started the authorization does, Salesforce answering the exchange with
+     * {@code access-1} and the query returning 3.
+     */
+    private String completeWithIssuedState(String state) throws Exception {
+        when(tokenClient.exchangeCode(CODE, REDIRECT_URI)).thenReturn(token("access-1", "refresh-1"));
+        when(contactQueryService.queryContacts()).thenReturn(QUERY_TEXT);
+        return service.completeAuthorization(CODE, null, null, state, state);
+    }
+
+    /**
+     * Starts an authorization on {@code flow} as a browser without a stored token does at {@code /}.
+     *
+     * @return the state of the redirect, which its cookie also carries
+     */
+    private static String initiate(SalesforceOAuthService flow) throws Exception {
+        AuthorizeOutcome outcome = flow.authorize();
+        assertThat(outcome.isRedirect()).as("authorize without a stored token redirects").isTrue();
+        String state = outcome.stateCookie().getValue();
+        assertThat(outcome.redirectLocation().getRawQuery()).endsWith("&state=" + state);
+        return state;
+    }
+
+    /** {@code state} with its last character replaced by another one of the base64url alphabet. */
+    private static String lastCharacterChanged(String state) {
+        char last = state.charAt(state.length() - 1);
+        return state.substring(0, state.length() - 1) + (last == 'A' ? 'B' : 'A');
+    }
+
+    /**
+     * Counts the authorizations {@code flow} holds as pending, read from its private store under the store's own lock,
+     * so the bound and the purge can be asserted on the store itself.
+     */
+    private static int pendingAuthorizations(SalesforceOAuthService flow) throws Exception {
+        Field store = SalesforceOAuthService.class.getDeclaredField("pendingStates");
+        store.setAccessible(true);
+        Map<?, ?> pending = (Map<?, ?>) store.get(flow);
+        synchronized (pending) {
+            return pending.size();
+        }
     }
 
     /** A token response on {@link #INSTANCE_URL}, as Salesforce answers both grants. */
@@ -810,5 +1210,65 @@ class SalesforceOAuthServiceTest {
         Field slot = SalesforceOAuthService.class.getDeclaredField("token");
         slot.setAccessible(true);
         return String.valueOf(((AtomicReference<?>) slot.get(service)).get());
+    }
+
+    /**
+     * The {@code state} parameter and the state cookie a callback presents, each derived from the state issued to this
+     * browser and one issued to another browser, with the refusal message expected, or {@code null} where the case
+     * asserts none.
+     */
+    record StateCase(String label, BinaryOperator<String> stateOf, BinaryOperator<String> cookieOf, String reason) {
+
+        String state(String issued, String other) {
+            return stateOf.apply(issued, other);
+        }
+
+        String cookie(String issued, String other) {
+            return cookieOf.apply(issued, other);
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
+    /**
+     * A clock that stands still until the test advances it, so a pending authorization expires on demand. A copy for
+     * another zone shares the same instant.
+     */
+    private static final class MutableClock extends Clock {
+
+        private final AtomicReference<Instant> now;
+
+        private final ZoneId zone;
+
+        MutableClock(Instant start) {
+            this(new AtomicReference<>(start), ZoneOffset.UTC);
+        }
+
+        private MutableClock(AtomicReference<Instant> now, ZoneId zone) {
+            this.now = now;
+            this.zone = zone;
+        }
+
+        void advance(Duration duration) {
+            now.updateAndGet(instant -> instant.plus(duration));
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return zone;
+        }
+
+        @Override
+        public Clock withZone(ZoneId newZone) {
+            return new MutableClock(now, newZone);
+        }
+
+        @Override
+        public Instant instant() {
+            return now.get();
+        }
     }
 }

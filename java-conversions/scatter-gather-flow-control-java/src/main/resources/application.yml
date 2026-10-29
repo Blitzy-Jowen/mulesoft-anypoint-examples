@@ -1,4 +1,3 @@
-# scatter-gather-flow-control-java runtime configuration
 # Replaces scatter-gather-flow-control/src/main/app/mule-app.properties (empty) and the http:listener-config,
 # smtp:gmail-connector and smtp:outbound-endpoint of scatter-gather.xml
 http:

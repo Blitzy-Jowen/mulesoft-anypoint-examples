@@ -145,7 +145,7 @@ class WorkdayCustomerControllerTest {
         http = HttpTestClient.localhost(port).withReadTimeout(CLIENT_READ_TIMEOUT_MILLIS);
     }
 
-    // ---------------------------------------------------------------- POST / (add-customer-flow)
+    // POST / (add-customer-flow)
 
     @ParameterizedTest(name = "{0} {1}")
     @CsvSource({"POST, /", "post, /", "Post, /", "pOsT, /", "post, /?source=test"})
@@ -174,7 +174,7 @@ class WorkdayCustomerControllerTest {
                 .withRequestBody(containing("PasswordText")));
     }
 
-    // ---------------------------------------------------------------- listener defaults (SC-1)
+    // listener defaults (SC-1)
 
     /**
      * Spellings of methods other than {@code POST}, each with the headers it is sent with: a lower-case
@@ -232,7 +232,7 @@ class WorkdayCustomerControllerTest {
         assertNoUpstreamCall();
     }
 
-    // ---------------------------------------------------------------- Workday failures
+    // Workday failures
 
     @Test
     void workdaySoapFaultIsServerError() throws IOException {
@@ -296,7 +296,7 @@ class WorkdayCustomerControllerTest {
         WIREMOCK.verify(1, postRequestedFor(urlEqualTo(WORKDAY_PATH)));
     }
 
-    // ---------------------------------------------------------------- helpers
+    // helpers
 
     /** The original test resource {@code customer.xml}: {@code root/Account} with {@code CustomerName} {@code NAME}. */
     private byte[] customerXml() throws IOException {

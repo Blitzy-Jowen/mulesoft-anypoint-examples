@@ -1,4 +1,3 @@
-# importing-a-CSV-file-into-Mongo-DB-java runtime configuration
 # Original: importing-a-CSV-file-into-Mongo-DB/src/main/app/csv-to-mongodb.xml
 # (its app properties file is empty). The original placeholder names are kept unchanged.
 spring:

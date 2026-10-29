@@ -33,6 +33,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.http.ResponseCookie;
 
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.SalesforceOAuthService;
 import com.mulesoft.examples.authenticating_salesforce_using_oauth2.service.SalesforceOAuthService.AuthorizeOutcome;
@@ -43,9 +44,9 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.Http
  * of flow {@code salesforce-oauthFlow1} and {@code /oauth2callback} of its {@code sfdc:oauth-callback-config}
  * (authenticating-salesforce-using-oauth2/src/main/app/salesforce-oauth.xml:3-4,10). Neither declares
  * {@code allowedMethods} and the Mule listener applied no CORS policy, so a CORS pre-flight runs the flow and is
- * answered exactly as a plain {@code OPTIONS} request is: the 302 to the Salesforce authorization page while no token
- * is held, otherwise the 200 text, both without a {@code Content-Type}, and in neither case with an
- * {@code Access-Control-*} or {@code Vary} header.
+ * answered exactly as a plain {@code OPTIONS} request is: the 302 to the Salesforce authorization page with its state
+ * cookie while no token is held, otherwise the 200 text without a cookie, both without a {@code Content-Type}, and in
+ * neither case with an {@code Access-Control-*} or {@code Vary} header.
  *
  * <p>The whole application runs on Undertow on a random port with {@link SalesforceOAuthService} mocked, as in
  * {@code controller/SalesforceOAuthControllerTest}, so the real handler mapping, controller and advices answer while
@@ -58,10 +59,28 @@ class PreflightDispatchListenerTest {
 
     private static final String ORIGIN = "https://example.invalid";
 
-    /** The authorization URL the service builds for {@code sfdc.key=test-key} with the original callback settings. */
+    /** A {@code state} in the form the service issues: 43 base64url characters. */
+    private static final String STATE = "q6Y1oXk3c0bJ9r2LwT8vZ4mN7pS5dF0gH1jK3lA2s_-";
+
+    /**
+     * The authorization URL the service builds for {@code sfdc.key=test-key} with the original callback settings and
+     * {@link #STATE}.
+     */
     private static final String AUTHORIZE_URI = "https://login.salesforce.com/services/oauth2/authorize"
             + "?response_type=code&client_id=test-key"
-            + "&redirect_uri=http%3A%2F%2Flocalhost%3A8081%2Foauth2callback&display=page";
+            + "&redirect_uri=http%3A%2F%2Flocalhost%3A8081%2Foauth2callback&display=page&state=" + STATE;
+
+    /**
+     * The redirect's state cookie, here without {@code Max-Age}: a rendered {@code Expires} date would make the
+     * replies to the plain and the pre-flight request differ by the second that passed between them, while this test
+     * compares their every other header byte for byte. Its attributes are asserted by
+     * {@code controller/SalesforceOAuthControllerTest}.
+     */
+    private static final ResponseCookie STATE_COOKIE = ResponseCookie.from(SalesforceOAuthService.STATE_COOKIE, STATE)
+            .path("/oauth2callback")
+            .httpOnly(true)
+            .sameSite("Lax")
+            .build();
 
     /** The {@code set-payload} text of the original flow for a query returning two contacts. */
     private static final String QUERY_TEXT = "Salesforce query returned 2 contacts.";
@@ -77,11 +96,12 @@ class PreflightDispatchListenerTest {
     /** Each answer of the listener's flow, with the request target that selects it and the reply it writes. */
     private enum Flow {
 
-        /** {@code /} while no token is held: the authorize redirect, committed with an empty body. */
-        ROOT_UNAUTHORIZED("/", "HTTP/1.1 302 Found", AUTHORIZE_URI, "") {
+        /** {@code /} while no token is held: the authorize redirect with its state cookie, and an empty body. */
+        ROOT_UNAUTHORIZED("/", "HTTP/1.1 302 Found", AUTHORIZE_URI, STATE_COOKIE.toString(), "") {
             @Override
             void stub(SalesforceOAuthService service) throws Exception {
-                given(service.authorize()).willReturn(AuthorizeOutcome.redirect(URI.create(AUTHORIZE_URI)));
+                given(service.authorize())
+                        .willReturn(AuthorizeOutcome.redirect(URI.create(AUTHORIZE_URI), STATE_COOKIE));
             }
 
             @Override
@@ -91,7 +111,7 @@ class PreflightDispatchListenerTest {
         },
 
         /** {@code /} with a token held: the query's {@code set-payload} text. */
-        ROOT_AUTHORIZED("/", "HTTP/1.1 200 OK", null, QUERY_TEXT) {
+        ROOT_AUTHORIZED("/", "HTTP/1.1 200 OK", null, null, QUERY_TEXT) {
             @Override
             void stub(SalesforceOAuthService service) throws Exception {
                 given(service.authorize()).willReturn(AuthorizeOutcome.completed(QUERY_TEXT));
@@ -103,28 +123,34 @@ class PreflightDispatchListenerTest {
             }
         },
 
-        /** The callback with a code: the exchange, then the same text as an authorized {@code /}. */
-        CALLBACK_WITH_CODE("/oauth2callback?code=" + CODE, "HTTP/1.1 200 OK", null, QUERY_TEXT) {
+        /**
+         * The callback with a code and the {@code state} Salesforce returns: the exchange, then the same text as an
+         * authorized {@code /}. A pre-flight carries no cookie, so the service receives none.
+         */
+        CALLBACK_WITH_CODE("/oauth2callback?code=" + CODE + "&state=" + STATE, "HTTP/1.1 200 OK", null, null,
+                QUERY_TEXT) {
             @Override
             void stub(SalesforceOAuthService service) throws Exception {
-                given(service.completeAuthorization(CODE, null, null)).willReturn(QUERY_TEXT);
+                given(service.completeAuthorization(CODE, null, null, STATE, null)).willReturn(QUERY_TEXT);
             }
 
             @Override
             void verifyRuns(SalesforceOAuthService service, int count) throws Exception {
-                verify(service, times(count)).completeAuthorization(CODE, null, null);
+                verify(service, times(count)).completeAuthorization(CODE, null, null, STATE, null);
             }
         };
 
         private final String target;
         private final String statusLine;
         private final String location;
+        private final String setCookie;
         private final String body;
 
-        Flow(String target, String statusLine, String location, String body) {
+        Flow(String target, String statusLine, String location, String setCookie, String body) {
             this.target = target;
             this.statusLine = statusLine;
             this.location = location;
+            this.setCookie = setCookie;
             this.body = body;
         }
 
@@ -215,14 +241,16 @@ class PreflightDispatchListenerTest {
     }
 
     /**
-     * The flow's reply as the controller writes it: status line, {@code Location}, no {@code Content-Type}, as the
-     * Mule listener sent the redirect and the untyped {@code set-payload}, the {@code Content-Length} of the body and
-     * the body bytes.
+     * The flow's reply as the controller writes it: status line, {@code Location}, the redirect's state cookie and no
+     * other {@code Set-Cookie}, no {@code Content-Type}, as the Mule listener sent the redirect and the untyped
+     * {@code set-payload}, the {@code Content-Length} of the body and the body bytes.
      */
     private static void assertFlowReply(Flow flow, HttpTestClient.Response response) {
         byte[] body = flow.body.getBytes(StandardCharsets.UTF_8);
         assertEquals(flow.statusLine, response.statusLine(), response::toString);
         assertEquals(flow.location, response.header("Location"), response::toString);
+        assertEquals(flow.setCookie == null ? List.of() : List.of(flow.setCookie), response.headers("Set-Cookie"),
+                response::toString);
         assertNull(response.header("Content-Type"), response::toString);
         assertEquals(List.of(String.valueOf(body.length)), response.headers("Content-Length"), response::toString);
         assertArrayEquals(body, response.body(), response::toString);

@@ -47,7 +47,7 @@ class DynamicsContactMapperTest {
 
     private final DynamicsContactMapper mapper = new DynamicsContactMapper();
 
-    // ---------------------------------------------------------------- map
+    // map
 
     @Test
     @DisplayName("The contacts.csv rows map to one record per row, in row order, with the script's keys and values")
@@ -144,7 +144,7 @@ class DynamicsContactMapperTest {
         assertThat(records.get(0)).isNotSameAs(row);
     }
 
-    // ---------------------------------------------------------------- toContactAttributes
+    // toContactAttributes
 
     @Test
     @DisplayName("Each mapped contact, in For Each order, becomes firstname, lastname, emailaddress1, telephone1")
@@ -203,7 +203,7 @@ class DynamicsContactMapperTest {
                 .withMessage("record");
     }
 
-    // ---------------------------------------------------------------- names
+    // names
 
     @Test
     @DisplayName("Key constants carry the original CSV columns, script keys and Dataverse contact columns")
@@ -222,7 +222,7 @@ class DynamicsContactMapperTest {
         assertThat(DynamicsContactMapper.ATTRIBUTE_TELEPHONE1).isEqualTo("telephone1");
     }
 
-    // ---------------------------------------------------------------- helpers
+    // helpers
 
     /** The first record of {@code contacts.csv}, the original IT's {@code EMAIL1} contact. */
     private static Map<String, String> john() {

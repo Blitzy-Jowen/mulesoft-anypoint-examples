@@ -128,9 +128,7 @@ class DynamicsFailureClassifierTest {
         executor = new UpstreamCallExecutor(List.of(classifier));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // system()
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void servesMicrosoftDynamics365() {
@@ -138,9 +136,7 @@ class DynamicsFailureClassifierTest {
         assertThat(classifier.system().displayName()).isEqualTo("Microsoft Dynamics 365");
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // HTTP status: 401 → authentication, 429 → rate limit
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void unauthorizedIsAuthentication() {
@@ -174,9 +170,7 @@ class DynamicsFailureClassifierTest {
         assertThat(kind.retryAfterValue()).isEmpty();
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Entra token rejection → authentication
-    // ---------------------------------------------------------------------------------------------------------------
 
     /** Entra rejecting the client or grant, as Spring Security reports the token request's OAuth 2.0 error. */
     static Stream<Named<OAuth2AuthorizationException>> entraRejections() {
@@ -202,9 +196,7 @@ class DynamicsFailureClassifierTest {
                 .isEqualTo(UpstreamFailureKind.AUTHENTICATION);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Timeouts and connectivity failures → unavailable, never retried
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Every timeout and connectivity cause of the approved failure handling, each built afresh on every use, so no
@@ -274,9 +266,7 @@ class DynamicsFailureClassifierTest {
         assertThat(reauths).hasValue(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Everything else → OTHER, rethrown unchanged
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Dataverse and Entra failures outside the three approved modes, the OAuth 2.0 codes of a failed token exchange
@@ -333,9 +323,7 @@ class DynamicsFailureClassifierTest {
         });
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // upstreamMessage: Dataverse's or Entra's own error text, else the interface default
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void upstreamMessageIsTheDataverseErrorMessage() {
@@ -423,9 +411,7 @@ class DynamicsFailureClassifierTest {
         assertThatNullPointerException().isThrownBy(() -> classifier.upstreamMessage(null));
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Through the executor: one token eviction and retry for authentication, no retry otherwise
-    // ---------------------------------------------------------------------------------------------------------------
 
     @Test
     void tooManyRequestsIsNeverRetriedAndCarriesRetryAfter() {
@@ -505,9 +491,7 @@ class DynamicsFailureClassifierTest {
         assertThat(reauths).hasValue(0);
     }
 
-    // ---------------------------------------------------------------------------------------------------------------
     // Fixtures
-    // ---------------------------------------------------------------------------------------------------------------
 
     /**
      * Runs a Dataverse call through the executor with a counting re-authentication (token eviction) step.

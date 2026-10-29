@@ -1,5 +1,3 @@
-# Spring Boot configuration of sending-a-csv-file-through-email-using-smtp-java,
-# converted from the Mule 3.8 flow csv-to-smtpFlow (src/main/app/csv-to-smtp.xml).
 # Original placeholder names are kept (smtp.*, mail.*). Secrets, hosts and addresses
 # have no value here: supply them through the environment variables named below.
 spring:

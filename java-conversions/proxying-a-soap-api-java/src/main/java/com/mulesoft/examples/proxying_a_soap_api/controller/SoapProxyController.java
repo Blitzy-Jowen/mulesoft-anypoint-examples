@@ -9,7 +9,6 @@
 package com.mulesoft.examples.proxying_a_soap_api.controller;
 
 import java.io.IOException;
-import java.util.Collections;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -22,6 +21,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.mulesoft.examples.proxying_a_soap_api.config.ForwardedRequestHeaders;
 import com.mulesoft.examples.proxying_a_soap_api.service.SoapProxyService;
 
 /**
@@ -30,10 +30,11 @@ import com.mulesoft.examples.proxying_a_soap_api.service.SoapProxyService;
  * every method is accepted at the root path, and only there: any other path, {@code /x/} included, is answered by the
  * generic 404 advice with {@code No listener for endpoint: <path>}.
  *
- * <p>The class only binds the caller's request and writes the answer back. The envelope handling of
- * {@code cxf:proxy-service} and {@code cxf:proxy-client}, the header copying, the upstream {@code POST} to
- * {@code shop/ShopService} and the treatment of the upstream status belong to {@link SoapProxyService}. The request is
- * read raw, never as parameters or parts, so the envelope bytes, the caller's {@code Authorization} header and any
+ * <p>The class only binds the caller's request and writes the answer back. Reading the caller's headers as sent
+ * belongs to {@link ForwardedRequestHeaders}; the envelope handling of {@code cxf:proxy-service} and
+ * {@code cxf:proxy-client}, the header copying, the upstream {@code POST} to {@code shop/ShopService} and the
+ * treatment of the upstream status belong to {@link SoapProxyService}. The request is read raw, never as parameters
+ * or parts, so the envelope bytes, the caller's {@code Authorization} header and any
  * WS-Security header inside the envelope reach the service exactly as sent. The query string is not read: the
  * upstream address is fixed by {@code proxy.upstream-url}, as the original {@code http:request} path was. The handlers
  * write the response themselves instead of returning a value, so Spring MVC adds no {@code Content-Type} from
@@ -59,7 +60,18 @@ import com.mulesoft.examples.proxying_a_soap_api.service.SoapProxyService;
  *   <li>the response is written with a fixed {@code Content-Length}, never chunked;</li>
  *   <li>{@code POST /?wsdl} is forwarded rather than answered with the WSDL, a Tier 2A verification point;</li>
  *   <li>{@code DEBUG} logging of {@code org.springframework.web.servlet.DispatcherServlet} reads the request
- *       parameters to log them, which consumes a form body before it can be forwarded.</li>
+ *       parameters to log them, which consumes a form body before it can be forwarded;</li>
+ *   <li>a request header value reaches the upstream without its leading and trailing SP and HTAB, and an obs-fold
+ *       in it as one SP. Every other byte arrives as sent, inner runs of SP and HTAB included, so a value
+ *       {@code a  b} or {@code a<HTAB>b}, in {@code Authorization} or {@code SOAPAction} too, is forwarded
+ *       unchanged: {@link ForwardedRequestHeaders} puts back the values the request-framing guard recorded before
+ *       Undertow's parser turned every such run into one SP. Several {@code Cookie} lines are forwarded as the one
+ *       {@code Cookie} value Undertow joins them into, with {@code ; } (Tier 2A verification point);</li>
+ *   <li>a request whose head holds a CR not followed by LF, an LF not preceded by CR, a control character other
+ *       than HTAB in a header value, whitespace before a header colon, or more than one or conflicting body framing
+ *       headers is answered with an empty 400 by
+ *       {@link com.mulesoft.examples.proxying_a_soap_api.config.RequestFramingGuardConfig}'s guard before Undertow
+ *       parses it, so neither it nor its envelope is forwarded (Tier 2A verification point).</li>
  * </ul>
  */
 @RestController
@@ -86,12 +98,7 @@ public class SoapProxyController {
      */
     @RequestMapping("/")
     public void proxy(HttpServletRequest request, HttpServletResponse response) throws IOException {
-        HttpHeaders headers = new HttpHeaders();
-        for (String name : Collections.list(request.getHeaderNames())) {
-            for (String value : Collections.list(request.getHeaders(name))) {
-                headers.add(name, value);
-            }
-        }
+        HttpHeaders headers = ForwardedRequestHeaders.from(request);
         byte[] body = request.getInputStream().readAllBytes();
 
         ResponseEntity<byte[]> result = soapProxyService.forward(headers, body);

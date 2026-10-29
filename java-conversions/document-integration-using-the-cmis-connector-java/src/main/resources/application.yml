@@ -1,4 +1,3 @@
-# document-integration-using-the-cmis-connector-java runtime configuration
 # Replaces document-integration-using-the-cmis-connector/src/main/app/mule-app.properties (empty) and the
 # http:listener-config and cmis:config of cmis-document-integration.xml
 http:
