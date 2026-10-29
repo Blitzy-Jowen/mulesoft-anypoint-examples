@@ -21,8 +21,6 @@ import static org.junit.jupiter.api.Named.named;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
@@ -37,6 +35,7 @@ import java.util.stream.Stream;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
@@ -50,6 +49,7 @@ import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.boot.logging.LogLevel;
 import org.springframework.boot.logging.LoggingSystem;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.core.env.PropertySource;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.test.annotation.DirtiesContext;
@@ -103,9 +103,15 @@ import com.mulesoft.examples.authenticating_salesforce_using_oauth2.support.Http
  * URL by design, and the loggers that would write the callback's query are the ones capped for the code. While the
  * root is at TRACE its own appenders are detached, so that output stays out of the build log. After each test the
  * appender is detached, the root's appenders are attached again and every logger level the test changed is restored;
- * the context, which holds the authorized token slot and the listener port, is discarded after the class.
+ * the context, which holds the authorized token slot and the callback port this class sets, is discarded after the
+ * class.
+ *
+ * <p>The listener binds a random port. The production code reads the {@code redirect_uri} from
+ * {@link SalesforceOAuthProperties} at each authorize redirect and code exchange, so once the listener is bound each
+ * test points the callback's {@code sfdc.oauth.callback.local-port} at that port. No port is chosen before the bind,
+ * so no other process can take it in between.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.DEFINED_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 class SensitiveLogLevelsTest {
 
@@ -189,9 +195,6 @@ class SensitiveLogLevelsTest {
     /** How long the captured log must stay as asserted, for lines written after the reply. */
     private static final Duration SETTLE = Duration.ofMillis(300);
 
-    /** The listener port, fixed before the context starts: the callback's {@code redirect_uri} is built from it. */
-    private static final int PORT = freePort();
-
     /** Stand-in for {@code login.salesforce.com} and for the user's instance. */
     private static final WireMockServer SALESFORCE = salesforce();
 
@@ -208,17 +211,23 @@ class SensitiveLogLevelsTest {
     @Autowired
     private SalesforceOAuthService oauthService;
 
+    /** The port the listener bound, which the callback is aimed at. */
+    @LocalServerPort
+    private int port;
+
+    /** The application's OAuth settings, whose callback supplies the {@code redirect_uri} at each use. */
+    @Autowired
+    private SalesforceOAuthProperties oauthProperties;
+
     /** The root logger's own appenders, detached while the root is at TRACE. */
     private final List<Appender<ILoggingEvent>> detachedAppenders = new ArrayList<>();
 
     /**
-     * Moves the listener and every Salesforce URL to the test's servers and supplies the sentinel consumer secret
-     * here, never inline: the test framework's TRACE lines print inlined {@code @SpringBootTest} properties.
+     * Moves every Salesforce URL to the test's stand-in and supplies the sentinel consumer secret here, never inline:
+     * the test framework's TRACE lines print inlined {@code @SpringBootTest} properties.
      */
     @DynamicPropertySource
     static void properties(DynamicPropertyRegistry registry) {
-        registry.add("http.port", () -> PORT);
-        registry.add("sfdc.oauth.callback.local-port", () -> PORT);
         registry.add("sfdc.key", () -> CONSUMER_KEY);
         registry.add("sfdc.secret", () -> Sentinel.CLIENT_SECRET.value);
         registry.add("sfdc.oauth.authorization-url", () -> SALESFORCE.baseUrl() + AUTHORIZE_PATH);
@@ -228,6 +237,15 @@ class SensitiveLogLevelsTest {
     @AfterAll
     static void stopSalesforce() {
         SALESFORCE.stop();
+    }
+
+    /**
+     * Aims the callback at the bound listener. The production code reads the callback's port each time it builds the
+     * {@code redirect_uri}, so the authorize redirect and the code exchange of each case carry the listener port.
+     */
+    @BeforeEach
+    void bindCallbackToListener() {
+        oauthProperties.getOauth().getCallback().setLocalPort(port);
     }
 
     @AfterEach
@@ -295,14 +313,15 @@ class SensitiveLogLevelsTest {
                 setLevel(category, applied.contains(category) ? level : null));
         SALESFORCE.resetRequests();
 
-        HttpTestClient.Response callback = HttpTestClient.localhost(PORT)
+        HttpTestClient.Response callback = HttpTestClient.localhost(port)
                 .get("/oauth2callback?code=" + Sentinel.AUTHORIZATION_CODE.value + "&state=" + state,
                         Map.of("Cookie", stateCookie));
 
         assertThat(callback.status()).as("%s", callback).isEqualTo(200);
         assertThat(callback.bodyAsString()).isEqualTo("Salesforce query returned 1 contacts.");
         SALESFORCE.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH))
-                .withFormParam("grant_type", equalTo("authorization_code")));
+                .withFormParam("grant_type", equalTo("authorization_code"))
+                .withFormParam("redirect_uri", equalTo(callbackUri())));
         SALESFORCE.verify(1, postRequestedFor(urlPathEqualTo(TOKEN_PATH))
                 .withFormParam("grant_type", equalTo("refresh_token")));
         SALESFORCE.verify(2, postRequestedFor(urlEqualTo(PARTNER_PATH)));
@@ -329,7 +348,7 @@ class SensitiveLogLevelsTest {
      */
     private String startAuthorization() {
         ((AtomicReference<?>) ReflectionTestUtils.getField(oauthService, "token")).set(null);
-        HttpTestClient.Response redirect = HttpTestClient.localhost(PORT).get("/");
+        HttpTestClient.Response redirect = HttpTestClient.localhost(port).get("/");
         assertThat(redirect.status()).as("%s", redirect).isEqualTo(302);
         assertThat(redirect.headers("Set-Cookie")).as("%s", redirect).singleElement().asString()
                 .startsWith(SalesforceOAuthService.STATE_COOKIE + "=");
@@ -338,6 +357,11 @@ class SensitiveLogLevelsTest {
         String state = stateCookie.substring(stateCookie.indexOf('=') + 1);
         assertThat(redirect.header("Location")).as("%s", redirect).endsWith("&state=" + state);
         return stateCookie;
+    }
+
+    /** The {@code redirect_uri} the application registers: the callback on this test's listener port. */
+    private String callbackUri() {
+        return "http://localhost:" + port + "/oauth2callback";
     }
 
     /** The {@code logging.level} map of the classpath {@code application.yml}, bound as Spring Boot binds it. */
@@ -391,15 +415,6 @@ class SensitiveLogLevelsTest {
             }
         }
         return leaks;
-    }
-
-    private static int freePort() {
-        try (ServerSocket socket = new ServerSocket(0)) {
-            socket.setReuseAddress(true);
-            return socket.getLocalPort();
-        } catch (IOException e) {
-            throw new UncheckedIOException("Could not reserve a port for the listener", e);
-        }
     }
 
     /**
