@@ -554,9 +554,7 @@ class FixtureParityTest {
         return Assumptions.abort(message);
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Loading: SCENARIOS.md, fixtures, placeholders and embedded servers, computed once per test class.
-    // ---------------------------------------------------------------------------------------------------------
 
     static synchronized void load() {
         if (loadFailure != null) {
@@ -789,10 +787,8 @@ class FixtureParityTest {
         return resolved;
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Placeholders: ${wiremock.baseUrl}, ${wiremock.port}, ${dir:<name>}, ${freePort:<name>},
     // ${greenmail.<protocol>.port}, ${mongo.uri} and ${ldap.port}.
-    // ---------------------------------------------------------------------------------------------------------
 
     static String resolve(String value, String fixture) {
         Matcher matcher = PLACEHOLDER.matcher(value);
@@ -839,7 +835,7 @@ class FixtureParityTest {
     }
 
     /**
-     * A directory key or {@code request.file.directory}: a value without {@code ${} means {@code ${dir:<value>}}.
+     * A directory key or {@code request.file.directory}: a value without <code>$&#123;</code> means {@code ${dir:<value>}}.
      * The directory it resolves to must lie inside the temporary root; it is created and emptied per scenario.
      */
     static Path resolveDirectory(String spec, String fixture) {
@@ -1484,9 +1480,7 @@ class FixtureParityTest {
     }
 
 
-    // ---------------------------------------------------------------------------------------------------------
     // Embedded servers, started in load() only when a fixture needs them and stopped after the class.
-    // ---------------------------------------------------------------------------------------------------------
 
     private static void startServers() throws Exception {
         Needs union = Needs.NONE;
@@ -1796,9 +1790,7 @@ class FixtureParityTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Replay boundary: no trigger runs by itself, and every target the configuration names belongs to replay.
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * Removes Spring's {@code @Scheduled} processor from {@code beanFactory} before it is instantiated, so neither a
@@ -2519,9 +2511,7 @@ class FixtureParityTest {
     }
 
 
-    // ---------------------------------------------------------------------------------------------------------
     // Summary: target/fixture-parity/summary.properties, written without timestamp so reruns compare equal.
-    // ---------------------------------------------------------------------------------------------------------
 
     private static void writeSummaryFile() {
         int verified = 0;
@@ -2566,9 +2556,7 @@ class FixtureParityTest {
         return row.unreachable() ? UNREACHABLE : UNVERIFIED_UNCAPTURED;
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // SCENARIOS.md: the pipe table under "## Scenarios".
-    // ---------------------------------------------------------------------------------------------------------
 
     static final class ScenarioTable {
 
@@ -2689,9 +2677,7 @@ class FixtureParityTest {
     }
 
 
-    // ---------------------------------------------------------------------------------------------------------
     // Replay of one scenario.
-    // ---------------------------------------------------------------------------------------------------------
 
     /**
      * One scenario's replay: resets, installs its upstream stubs, seeds its state, drives its trigger, compares every
@@ -2970,7 +2956,7 @@ class FixtureParityTest {
             }
         }
 
-        // ----- drivers and servers the fixture needs -------------------------------------------------------
+        // Drivers and servers the fixture needs
 
         /**
          * A polled trigger replays only through the single-run method its fixture names: scheduling is suppressed, so
@@ -3047,7 +3033,7 @@ class FixtureParityTest {
             return abort(name, UNVERIFIED_MISSING_DRIVER, row.trigger() + " replay needs " + what);
         }
 
-        // ----- state -----------------------------------------------------------------------------------------
+        // State
 
         private void seedState() throws Exception {
             for (Map.Entry<String, JsonNode> entry : entries(state.get("directories"), at("state.directories"))) {
@@ -3386,7 +3372,7 @@ class FixtureParityTest {
             return file;
         }
 
-        // ----- upstream recording ----------------------------------------------------------------------------
+        // Upstream recording
 
         /** Serves the recording in order: stub {@code i} answers only in scenario state {@code step-<i>}. */
         private void registerUpstream() {
@@ -3526,7 +3512,7 @@ class FixtureParityTest {
         }
 
 
-        // ----- triggers --------------------------------------------------------------------------------------
+        // Triggers
 
         /** A reply ST-1 read, with the response type its {@code send} declares and the replay port it was sent to. */
         private record HttpExchange(Class<?> responseType, Object reply, int port) {
@@ -3871,7 +3857,7 @@ class FixtureParityTest {
             invokeIfPresent();
         }
 
-        // ----- messages --------------------------------------------------------------------------------------
+        // Messages
 
         /**
          * Opens the broker side before the trigger runs, for every destination of {@code response.destinations},
@@ -4228,7 +4214,7 @@ class FixtureParityTest {
                     ? Reflect.call(messageProperties, getter) : null;
         }
 
-        // ----- seeded broker behaviour -----------------------------------------------------------------------
+        // Seeded broker behaviour
 
         /**
          * Makes the application's embedded Artemis server refuse every send to a destination of
@@ -4547,7 +4533,7 @@ class FixtureParityTest {
         }
 
 
-        // ----- side effects ----------------------------------------------------------------------------------
+        // Side effects
 
         private void verifySideEffects() throws Exception {
             if (response.has("directories")) {
@@ -5017,9 +5003,7 @@ class FixtureParityTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Mail: the fields a mail comparison reads, through Jakarta Mail by reflection.
-    // ---------------------------------------------------------------------------------------------------------
 
     /** One leaf MIME part; the decoded bytes are kept as Base64 so the record compares by value. */
     record MailPart(String contentType, String fileName, String contentBase64) {
@@ -5092,9 +5076,7 @@ class FixtureParityTest {
     }
 
 
-    // ---------------------------------------------------------------------------------------------------------
     // Content comparison: bytes for deterministic scenarios, structure for nondeterministic ones.
-    // ---------------------------------------------------------------------------------------------------------
 
     static final class Content {
 
@@ -5395,9 +5377,7 @@ class FixtureParityTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Reflection: the only access path to libraries that some projects carry and others lack.
-    // ---------------------------------------------------------------------------------------------------------
 
     static final class Reflect {
 
@@ -5584,9 +5564,7 @@ class FixtureParityTest {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------------
     // Fixture JSON and value helpers.
-    // ---------------------------------------------------------------------------------------------------------
 
     private static JsonNode object(JsonNode node, String what) {
         if (node == null || !node.isObject()) {
