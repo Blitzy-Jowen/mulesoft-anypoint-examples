@@ -8,6 +8,9 @@ spring:
       add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404
   mvc:
     dispatch-trace-request: true   # TRACE on 8081 / reaches TwitterSearchController (original listener accepts every method)
+    formcontent:
+      filter:
+        enabled: false   # 8180 /api/stockStats checks the method before reading the body and 8081 / ignores the body: a form body on PUT/PATCH/DELETE gets SC-1's 405 on /api/stockStats, and the search on /, unread instead of being buffered whole by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # SC-1 owns every platform-default error

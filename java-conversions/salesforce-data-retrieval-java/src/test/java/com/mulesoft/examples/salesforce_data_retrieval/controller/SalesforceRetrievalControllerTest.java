@@ -12,6 +12,7 @@ import static java.nio.charset.StandardCharsets.ISO_8859_1;
 import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -21,11 +22,15 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import java.io.BufferedInputStream;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -45,7 +50,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.web.filter.FormContentFilter;
 
 import com.mulesoft.examples.salesforce_data_retrieval.SalesforceDataRetrievalApplication;
 import com.mulesoft.examples.salesforce_data_retrieval.client.SalesforcePartnerClient;
@@ -77,7 +84,8 @@ import com.sforce.ws.ConnectionException;
  *
  * <p>Covered: the form page and the record text, both branches of the original {@code field} ternary, the catch
  * branch for hostile, missing and non-form input (none of which reaches Salesforce), the platform-default 404, 405
- * and 500, {@code GET} and {@code POST} matched ignoring case as the Mule listener matched {@code allowedMethods}
+ * and 500, the 405 sent before a large form body on {@code PUT}, {@code PATCH} or {@code DELETE} has been read,
+ * {@code GET} and {@code POST} matched ignoring case as the Mule listener matched {@code allowedMethods}
  * while every other spelling keeps the 405, and the approved connector failure modes, which take precedence over
  * both the GET flow's 500 and the POST flow's catch-all. The expected page and record text are computed by the real
  * mapper and renderer beans from the stubbed describe and query results; their own byte layout is fixed by the
@@ -108,8 +116,18 @@ class SalesforceRetrievalControllerTest {
     /** The original MEL concatenation of xml:27 for {@link #ORIGINAL_FORM}. */
     private static final String ORIGINAL_SOQL = "SELECT id, name ,email from user where name like '%mule%'";
 
+    /** A form body large enough that reading it whole before dispatch keeps the response back measurably. */
+    private static final int LARGE_FORM_BYTES = 300_000;
+
+    /** Bytes of a large form body written before its response is read; the rest is written only afterwards. */
+    private static final int LARGE_FORM_PREFIX_BYTES = 1024;
+
     @MockBean
     SalesforcePartnerClient client;
+
+    /** The running application's context, inspected for the servlet filters it registers. */
+    @Autowired
+    ApplicationContext applicationContext;
 
     @Autowired
     SObjectOptionsMapper optionsMapper;
@@ -255,6 +273,60 @@ class SalesforceRetrievalControllerTest {
         assertContentType(response, "text/plain");
         assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: /");
         verifyNoInteractions(client);
+    }
+
+    /**
+     * The {@code /} listeners checked the method before they read the body, so a large form body on a method neither
+     * accepts is never read: a form declaring {@value #LARGE_FORM_BYTES} bytes, of which only the first
+     * {@value #LARGE_FORM_PREFIX_BYTES} are written, gets SC-1's whole 405 before the rest is sent, and Salesforce is
+     * never called. Boot's form-content filter, which {@code spring.mvc.formcontent.filter.enabled: false} switches
+     * off, would read the whole body into memory before dispatch, so no response would arrive until the last byte had
+     * been sent.
+     *
+     * @param method a method whose form body Boot's form-content filter would read
+     * @throws IOException when the connection fails
+     */
+    @ParameterizedTest(name = "{0} /")
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void largeFormOnMethodNeitherListenerAcceptsGetsThe405BeforeItsBodyIsSent(String method) throws IOException {
+        byte[] form = ("searchValue=" + "x".repeat(LARGE_FORM_BYTES - "searchValue=".length())).getBytes(UTF_8);
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " / HTTP/1.1\r\nHost: localhost:" + port + "\r\nContent-Type: " + FORM_URLENCODED
+                    + "\r\nContent-Length: " + form.length + "\r\n\r\n").getBytes(US_ASCII));
+            out.write(form, 0, LARGE_FORM_PREFIX_BYTES);
+            out.flush();
+
+            RawResponse refused;
+            try {
+                refused = readResponse(in);
+            } catch (SocketTimeoutException timeout) {
+                refused = fail(String.format("No response to %s / within %d ms while %d of its %d form bytes were "
+                        + "sent: the body was buffered before dispatch", method, HttpTestClient.TIMEOUT_MILLIS,
+                        LARGE_FORM_PREFIX_BYTES, form.length), timeout);
+            }
+            writeRemainderIgnoringFailure(out, form, LARGE_FORM_PREFIX_BYTES);
+
+            assertThat(refused.statusLine()).as(refused.toString()).isEqualTo("HTTP/1.1 405 Method Not Allowed");
+            assertThat(refused.headers("Content-Type")).as(refused.toString()).containsExactly("text/plain");
+            assertThat(refused.body()).as(refused.toString())
+                    .isEqualTo("Method not allowed for endpoint: /".getBytes(UTF_8));
+        }
+        verifyNoInteractions(client);
+    }
+
+    /**
+     * The application registers no {@link FormContentFilter}, the filter that reads a {@code PUT}, {@code PATCH} or
+     * {@code DELETE} form body before dispatch, because {@code spring.mvc.formcontent.filter.enabled} is
+     * {@code false}.
+     */
+    @Test
+    void contextHoldsNoFormContentFilter() {
+        assertThat(applicationContext.getBeanNamesForType(FormContentFilter.class)).as("FormContentFilter beans")
+                .isEmpty();
     }
 
     // method letter case (config/ListenerMethodFilter)
@@ -537,6 +609,80 @@ class SalesforceRetrievalControllerTest {
             out.write(requestHead.getBytes(US_ASCII));
             out.flush();
             return socket.getInputStream().readAllBytes();
+        }
+    }
+
+    /**
+     * Writes the bytes of {@code body} from {@code offset} to its end once the response has been read, so the server
+     * can finish the exchange; a failed write is ignored, because the server may close a connection whose body it
+     * refused unread.
+     */
+    private static void writeRemainderIgnoringFailure(OutputStream out, byte[] body, int offset) {
+        try {
+            out.write(body, offset, body.length - offset);
+            out.flush();
+        } catch (IOException closedByServer) {
+            // The response is already read; the server need not take the rest of a body it never reads.
+        }
+    }
+
+    /**
+     * Reads one response off the connection: its status line, its header lines and the {@code Content-Length} bytes
+     * of its body.
+     */
+    private static RawResponse readResponse(InputStream in) throws IOException {
+        String statusLine = readLine(in);
+        List<String> headerLines = new ArrayList<>();
+        for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+            headerLines.add(line);
+        }
+        RawResponse head = new RawResponse(statusLine, headerLines, new byte[0]);
+        List<String> contentLength = head.headers("Content-Length");
+        assertThat(contentLength).as(head.toString()).hasSize(1);
+        int length = Integer.parseInt(contentLength.get(0));
+        byte[] body = in.readNBytes(length);
+        assertThat(body).as(head.toString()).hasSize(length);
+        return new RawResponse(statusLine, headerLines, body);
+    }
+
+    /** One line of a response head without its CRLF, one character per byte; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
+    /**
+     * A response read off a raw connection.
+     *
+     * @param statusLine  the status line, such as {@code HTTP/1.1 405 Method Not Allowed}
+     * @param headerLines the header lines in arrival order
+     * @param body        the body bytes
+     */
+    private record RawResponse(String statusLine, List<String> headerLines, byte[] body) {
+
+        /** The trimmed values, in arrival order, of the header lines named {@code name}, compared ignoring case. */
+        List<String> headers(String name) {
+            List<String> values = new ArrayList<>();
+            for (String line : headerLines) {
+                int colon = line.indexOf(':');
+                if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase(name)) {
+                    values.add(line.substring(colon + 1).trim());
+                }
+            }
+            return values;
+        }
+
+        @Override
+        public String toString() {
+            return statusLine + " " + headerLines + " " + new String(body, UTF_8);
         }
     }
 }

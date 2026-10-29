@@ -37,6 +37,7 @@ The rows of `get-customer-list-from-netsuite-java` and `netsuite-data-retrieval-
 The rows of `foreach-processing-and-choice-routing-java`, `legacy-modernization-java`, `soap-webservice-security-java`, `xml-only-soap-webservice-java`, `web-service-consumer-java` and `adding-a-new-customer-to-workday-revenue-management-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose `config/WebServiceConfig` sets SAAJ's `saaj.use.default.transformer.factory` switch unless it is already set, as `service-orchestration-and-choice-routing-java` does, and adds the tests of that switch; each project gained 5 tests, its total LINE coverage cell changed and its service + mapper cell did not.
 The rows of `legacy-modernization-java` and `service-orchestration-and-choice-routing-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B -ntp clean verify` on the tree that turns off Spring Boot's form content filter (`spring.mvc.formcontent.filter.enabled: false`), so that a `PUT`, `PATCH` or `DELETE` form body gets the listener's 405 unread, and adds the wire tests of that 405; `legacy-modernization-java` gained 3 tests and `service-orchestration-and-choice-routing-java` 15, and neither project's coverage cells changed.
 The rows of `websphere-mq-java`, `filtering-a-message-java`, `sending-json-data-to-a-amqp-queue-java`, `login-form-using-the-http-connector-java`, `http-multipart-request-java`, `munit-short-tutorial-java` and `exposing-a-restful-resource-using-the-HTTP-connector-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` and `mvn -B test` on the tree that disables Boot's form-content filter (`spring.mvc.formcontent.filter.enabled: false`) and adds the large-form `PUT`/`PATCH`/`DELETE` wire tests; only their test counts changed.
+The rows of `http-oauth-provider-java`, `mule-component-bindings-java`, `salesforce-data-retrieval-java`, `sending-json-data-to-a-jms-queue-java` and `adding-a-new-customer-to-workday-revenue-management-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` and `mvn -B test` on the tree that disables Boot's form-content filter (`spring.mvc.formcontent.filter.enabled: false`) and adds the large-form `PUT`/`PATCH`/`DELETE` wire tests; only their test counts changed.
 
 ## Status
 
@@ -145,7 +146,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 28,020 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 28,044 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 86.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -163,9 +164,9 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | xml-only-soap-webservice-java | 620 / 0 / 0 / 1 | 700 of 713 | 91.9% (1519 of 1652) | — |
 | service-orchestration-and-choice-routing-java | 1313 / 0 / 0 / 1 | 1481 of 1494 | 93.8% (3412 of 3636) | — |
 | jms-message-rollback-and-redelivery-java | 123 / 0 / 0 / 1 | 77 of 78 | 98.7% (226 of 229) | — |
-| sending-json-data-to-a-jms-queue-java | 308 / 0 / 0 / 1 | 163 of 163 | 98.1% (421 of 429) | — |
+| sending-json-data-to-a-jms-queue-java | 312 / 0 / 0 / 1 | 163 of 163 | 98.1% (421 of 429) | — |
 | using-transactional-scope-in-jms-to-database-java | 97 / 0 / 0 / 1 | 115 of 119 | 96.6% (229 of 237) | — |
-| salesforce-data-retrieval-java | 1252 / 0 / 0 / 1 | 413 of 417 | 96.0% (1163 of 1211) | 2 run, 2 skipped, 0 failed, 0 errors |
+| salesforce-data-retrieval-java | 1256 / 0 / 0 / 1 | 413 of 417 | 96.0% (1163 of 1211) | 2 run, 2 skipped, 0 failed, 0 errors |
 | import-contacts-into-salesforce-java | 770 / 0 / 0 / 1 | 92 of 92 | 89.7% (875 of 976) | 1 run, 1 skipped, 0 failed, 0 errors |
 | import-leads-into-salesforce-java | 881 / 0 / 0 / 1 | 341 of 346 | 94.0% (1173 of 1248) | 1 run, 1 skipped, 0 failed, 0 errors |
 | authenticating-salesforce-using-oauth2-java | 959 / 0 / 0 / 1 | 156 of 156 | 96.6% (990 of 1025) | 1 run, 1 skipped, 0 failed, 0 errors |
@@ -173,7 +174,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | netsuite-data-retrieval-java | 1525 / 0 / 0 / 0 | 438 of 441 | 93.3% (2053 of 2201) | 3 run, 3 skipped, 0 failed, 0 errors |
 | salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 766 / 0 / 0 / 1 | 339 of 350 | 96.6% (932 of 965) | 1 run, 1 skipped, 0 failed, 0 errors |
 | salesforce-to-MySQL-DB-using-Batch-Processing-java | 818 / 0 / 0 / 1 | 363 of 374 | 96.7% (1007 of 1041) | 1 run, 1 skipped, 0 failed, 0 errors |
-| adding-a-new-customer-to-workday-revenue-management-java | 582 / 0 / 0 / 1 | 73 of 73 | 96.4% (675 of 700) | 1 run, 1 skipped, 0 failed, 0 errors |
+| adding-a-new-customer-to-workday-revenue-management-java | 586 / 0 / 0 / 1 | 73 of 73 | 96.4% (675 of 700) | 1 run, 1 skipped, 0 failed, 0 errors |
 | import-contacts-into-ms-dynamics-java | 521 / 0 / 0 / 1 | 106 of 106 | 89.6% (884 of 987) | 1 run, 1 skipped, 0 failed, 0 errors |
 | dataweave-with-flowreflookup-java | 858 / 0 / 0 / 1 | 128 of 128 | 90.0% (911 of 1012) | 1 run, 1 skipped, 0 failed, 0 errors |
 | addition-using-javascript-transformer-java | 652 / 0 / 0 / 1 | 893 of 894 | 99.2% (1124 of 1133) | — |
@@ -186,7 +187,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | foreach-processing-and-choice-routing-java | 536 / 0 / 0 / 1 | 77 of 78 | 88.5% (1459 of 1648) | — |
 | hello-world-java | 521 / 0 / 0 / 1 | 2 of 2 | 96.9% (221 of 228) | — |
 | http-multipart-request-java | 426 / 0 / 0 / 1 | 407 of 471 | 90.2% (643 of 713) | — |
-| http-oauth-provider-java | 493 / 0 / 0 / 1 | 206 of 206 | 96.3% (797 of 828) | — |
+| http-oauth-provider-java | 501 / 0 / 0 / 1 | 206 of 206 | 96.3% (797 of 828) | — |
 | http-request-response-with-logger-java | 175 / 0 / 0 / 1 | 5 of 5 | 96.8% (215 of 222) | — |
 | implementing-a-choice-exception-strategy-java | 202 / 0 / 0 / 1 | 51 of 51 | 97.9% (323 of 330) | — |
 | importing-a-CSV-file-into-Mongo-DB-java | 177 / 0 / 0 / 1 | 96 of 96 | 84.0% (478 of 569) | — |
@@ -195,7 +196,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | importing-an-email-attachment-using-the-POP3-connector-java | 519 / 0 / 0 / 1 | 679 of 739 | 92.0% (812 of 883) | — |
 | legacy-modernization-java | 464 / 0 / 0 / 1 | 473 of 533 | 88.5% (1409 of 1592) | — |
 | login-form-using-the-http-connector-java | 364 / 0 / 0 / 1 | 121 of 125 | 95.0% (479 of 504) | — |
-| mule-component-bindings-java | 535 / 0 / 0 / 1 | 104 of 104 | 88.4% (1109 of 1254) | — |
+| mule-component-bindings-java | 539 / 0 / 0 / 1 | 104 of 104 | 88.4% (1109 of 1254) | — |
 | mule-expression-language-basics-java | 740 / 0 / 0 / 1 | 515 of 577 | 91.7% (753 of 821) | — |
 | munit-short-tutorial-java | 168 / 0 / 0 / 1 | 16 of 16 | 97.1% (236 of 243) | — |
 | oauth2-authorization-code-using-the-HTTP-connector-java | 479 / 0 / 0 / 1 | 176 of 176 | 95.3% (958 of 1005) | — |

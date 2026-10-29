@@ -14,17 +14,22 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -49,9 +54,11 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockReset;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
 import org.springframework.http.MediaType;
 import org.springframework.jms.UncategorizedJmsException;
 import org.springframework.jms.core.JmsTemplate;
+import org.springframework.web.filter.FormContentFilter;
 
 import com.mulesoft.examples.sending_json_data_to_a_jms_queue.service.SalesQueueService;
 import com.mulesoft.examples.sending_json_data_to_a_jms_queue.support.HttpTestClient;
@@ -77,6 +84,10 @@ import com.mulesoft.examples.sending_json_data_to_a_jms_queue.support.HttpTestCl
  *
  * <p>{@link SalesQueueService} is a spy: its real decoding, send and logging run in every case except the broker
  * failure, which stubs the send.
+ *
+ * <p>A large form body on {@code PUT}, {@code PATCH} or {@code DELETE} is written to a raw socket in two parts, so the
+ * 405 is shown to arrive before the body has been sent: the context holds no {@link FormContentFilter} to read it
+ * first.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class SalesControllerTest {
@@ -109,11 +120,21 @@ class SalesControllerTest {
     /** Size of the example's sample body, which is deliberately not valid JSON and is never parsed. */
     private static final int MESSAGE_JSON_LENGTH = 73;
 
+    /** A form body large enough that reading it whole before dispatch keeps the response back measurably. */
+    private static final int LARGE_FORM_BYTES = 300_000;
+
+    /** Bytes of a large form body written before its response is read; the rest is written only afterwards. */
+    private static final int LARGE_FORM_PREFIX_BYTES = 1024;
+
     @LocalServerPort
     private int port;
 
     @Autowired
     private ConnectionFactory connectionFactory;
+
+    /** The running application's context, inspected for the servlet filters it registers. */
+    @Autowired
+    private ApplicationContext applicationContext;
 
     @SpyBean(reset = MockReset.AFTER)
     private SalesQueueService salesQueueService;
@@ -194,6 +215,68 @@ class SalesControllerTest {
                 response::toString);
         verifyNoInteractions(salesQueueService);
         assertNothingQueued();
+    }
+
+    /**
+     * The listener checked the method before it read the body, so a large form body on a method outside
+     * {@code allowedMethods} is never read: a form declaring {@value #LARGE_FORM_BYTES} bytes, of which only the first
+     * {@value #LARGE_FORM_PREFIX_BYTES} are written, gets the whole 405 before the rest is sent, and nothing reaches
+     * the transformer, the queue or the logger. Boot's form-content filter, which
+     * {@code spring.mvc.formcontent.filter.enabled: false} switches off, would read the whole body into memory before
+     * dispatch, so no response would arrive until the last byte had been sent.
+     *
+     * @param method a method whose form body Boot's form-content filter would read
+     * @throws IOException when the connection fails
+     */
+    @ParameterizedTest(name = "{0}")
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void largeFormOnOtherMethodIsMethodNotAllowedBeforeItsBodyIsSent(String method) throws IOException {
+        byte[] form = ("sale=" + "x".repeat(LARGE_FORM_BYTES - "sale=".length())).getBytes(StandardCharsets.US_ASCII);
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(LOOPBACK, port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " " + PATH + " HTTP/1.1" + CRLF
+                    + "Host: " + LOOPBACK + ":" + port + CRLF
+                    + "Content-Type: " + FORM + CRLF
+                    + "Content-Length: " + form.length + CRLF
+                    + CRLF).getBytes(StandardCharsets.US_ASCII));
+            out.write(form, 0, LARGE_FORM_PREFIX_BYTES);
+            out.flush();
+
+            byte[] refused;
+            try {
+                refused = readResponse(in);
+            } catch (SocketTimeoutException timeout) {
+                refused = fail(String.format("No response to %s %s within %d ms while %d of its %d form bytes were "
+                        + "sent: the body was buffered before dispatch", method, PATH, HttpTestClient.TIMEOUT_MILLIS,
+                        LARGE_FORM_PREFIX_BYTES, form.length), timeout);
+            }
+            writeRemainderIgnoringFailure(out, form, LARGE_FORM_PREFIX_BYTES);
+
+            String text = new String(refused, StandardCharsets.ISO_8859_1);
+            assertTrue(text.startsWith("HTTP/1.1 405 Method Not Allowed" + CRLF), text);
+            RawResponse response = RawResponse.parse(refused);
+            List<String> contentTypes = response.headers("Content-Type");
+            assertEquals(1, contentTypes.size(), response::toString);
+            assertMediaType(contentTypes.get(0), MediaType.TEXT_PLAIN);
+            assertArrayEquals(("Method not allowed for endpoint: " + PATH).getBytes(StandardCharsets.UTF_8),
+                    response.body(), response::toString);
+        }
+        verifyNoInteractions(salesQueueService);
+        assertNothingQueued();
+    }
+
+    /**
+     * The application registers no {@link FormContentFilter}, the filter that reads a {@code PUT}, {@code PATCH} or
+     * {@code DELETE} form body before dispatch, because {@code spring.mvc.formcontent.filter.enabled} is
+     * {@code false}.
+     */
+    @Test
+    void contextHoldsNoFormContentFilter() {
+        assertArrayEquals(new String[0], applicationContext.getBeanNamesForType(FormContentFilter.class),
+                "FormContentFilter beans");
     }
 
     /**
@@ -450,6 +533,63 @@ class SalesControllerTest {
         return RawResponse.parse(raw);
     }
 
+    /**
+     * Writes the bytes of {@code body} from {@code offset} to its end once the response has been read, so the server
+     * can finish the exchange; a failed write is ignored, because the server may close a connection whose body it
+     * refused unread.
+     */
+    private static void writeRemainderIgnoringFailure(OutputStream out, byte[] body, int offset) {
+        try {
+            out.write(body, offset, body.length - offset);
+            out.flush();
+        } catch (IOException closedByServer) {
+            // The response is already read; the server need not take the rest of a body it never reads.
+        }
+    }
+
+    /**
+     * Reads one response off a connection that stays open, without waiting for its end: the head up to the blank
+     * line, then the {@code Content-Length} bytes of the body. Returns them with their CRLFs, as
+     * {@link RawResponse#parse(byte[])} takes them; a connection that ends first fails the read.
+     */
+    private static byte[] readResponse(InputStream in) throws IOException {
+        ByteArrayOutputStream raw = new ByteArrayOutputStream();
+        List<String> contentLengths = new ArrayList<>();
+        String line = readLine(in);
+        while (!line.isEmpty()) {
+            raw.writeBytes((line + CRLF).getBytes(StandardCharsets.ISO_8859_1));
+            line = readLine(in);
+            int colon = line.indexOf(':');
+            if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase("Content-Length")) {
+                contentLengths.add(line.substring(colon + 1).trim());
+            }
+        }
+        raw.writeBytes(CRLF.getBytes(StandardCharsets.US_ASCII));
+        String head = raw.toString(StandardCharsets.ISO_8859_1);
+        assertEquals(1, contentLengths.size(), () -> "response not framed by one Content-Length: " + head);
+        int length = Integer.parseInt(contentLengths.get(0));
+        byte[] body = in.readNBytes(length);
+        if (body.length < length) {
+            throw new EOFException("connection closed after " + body.length + " of " + length + " body bytes: " + head);
+        }
+        raw.writeBytes(body);
+        return raw.toByteArray();
+    }
+
+    /** One line of a response head without its CRLF; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
     private JmsTemplate newTemplate(long receiveTimeoutMillis) {
         JmsTemplate template = new JmsTemplate(connectionFactory);
         template.setReceiveTimeout(receiveTimeoutMillis);
@@ -504,8 +644,9 @@ class SalesControllerTest {
     }
 
     /**
-     * A response read from a raw socket by {@link #postChunkedEmptyBody(String)}: the code and reason phrase of its
-     * status line, its header lines in arrival order, and its {@code Content-Length} body.
+     * A response read from a raw socket by {@link #postChunkedEmptyBody(String)} or {@link #readResponse(InputStream)}:
+     * the code and reason phrase of its status line, its header lines in arrival order, and its {@code Content-Length}
+     * body.
      */
     private record RawResponse(int status, String reason, List<Map.Entry<String, String>> headerLines, byte[] body) {
 

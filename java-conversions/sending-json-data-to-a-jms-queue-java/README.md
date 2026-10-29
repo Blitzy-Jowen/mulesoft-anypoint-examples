@@ -75,6 +75,7 @@ Every key of `src/main/resources/application.yml`, with the Java type each value
 | `spring.application.name` | `String` | `sending-json-data-to-a-jms-queue-java` | none | fixed | name in log lines |
 | `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | unserved paths reach SC-1's 404 |
 | `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE` gets the 405, not the servlet's 200 echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | the listener accepts `POST` only and `POST` reads the body itself, so a form body on `PUT`, `PATCH` or `DELETE` reaches the controller and gets the 405 unread, instead of being read whole by Boot's form-content filter before dispatch |
 | `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the 404 |
 | `spring.artemis.mode` | `ArtemisMode` (`embedded` or `native`) | `embedded` | none | fixed | in-VM broker in place of Mule's in-VM ActiveMQ |
 | `spring.artemis.embedded.enabled` | `boolean` | `true` | none | fixed | starts the in-VM broker; `false` with `mode: native` |
@@ -143,7 +144,7 @@ java -jar target/sending-json-data-to-a-jms-queue-java-1.0.0-SNAPSHOT.jar
 | Test class | What it asserts |
 |---|---|
 | `SendingJsonDataToJMSQueueTest` | the ported original assertions (`SendingJsonDataToJMSQueueIT.java:49-55`): `POST /sales` with `message.json` answers, with a non-empty payload and status `200`, and a message with a payload is received from `sales` within 1500 ms |
-| `controller/SalesControllerTest` | on the wire through ST-1: the echoed body equals the sent bytes and the queued `TextMessage` (`NON_PERSISTENT`) equals the sent text; ISO-8859-1 round trip; empty body; no `Content-Type`; form rendering and every listener rejection; `GET`, `OPTIONS`, `PUT`, `DELETE`, `PATCH`, `HEAD` and an unknown token → 405; `/unknown` → 404; `/sales;x=1`, `/sales;jsessionid=ABC` and `/sales;` → 404 `No listener for endpoint: <path>` with nothing queued for `POST` (and `post`) with a JSON body, `GET`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `TRACE` and an unknown token; broker failure → JSON 500 |
+| `controller/SalesControllerTest` | on the wire through ST-1: the echoed body equals the sent bytes and the queued `TextMessage` (`NON_PERSISTENT`) equals the sent text; ISO-8859-1 round trip; empty body; no `Content-Type`; form rendering and every listener rejection; `GET`, `OPTIONS`, `PUT`, `DELETE`, `PATCH`, `HEAD` and an unknown token → 405; a form declaring 300000 bytes sent with `PUT`, `PATCH` or `DELETE` → the whole 405 while only its first 1024 bytes have been written, nothing queued, with no `FormContentFilter` bean in the context; `/unknown` → 404; `/sales;x=1`, `/sales;jsessionid=ABC` and `/sales;` → 404 `No listener for endpoint: <path>` with nothing queued for `POST` (and `post`) with a JSON body, `GET`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `TRACE` and an unknown token; broker failure → JSON 500 |
 | `service/SalesQueueServiceTest` | decoding and encoding per charset, the response `Content-Type`, form detection, decoding, rendering and rejections, one send to the configured queue, the INFO description logged after the send and never the body, failures propagated with nothing logged |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: 404, 405 and 500 status lines, `Content-Type` and body bytes; `ErrorResponse` escaping; one escaped ERROR line per unhandled exception |
 | `config/ListenerMethodFilterTest` | `post`, `Post` and other spellings of `POST` run the flow; every other method keeps the 405 |
@@ -175,8 +176,8 @@ java -jar target/sending-json-data-to-a-jms-queue-java-1.0.0-SNAPSHOT.jar
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 308 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 308 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; 312 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 312 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 163 of 163 lines of `service/SalesQueueService` and its nested tokenizer (the project has no `mapper` package). Total project LINE coverage: 98.1% (421 of 429 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=7`, `failed=0`.
 

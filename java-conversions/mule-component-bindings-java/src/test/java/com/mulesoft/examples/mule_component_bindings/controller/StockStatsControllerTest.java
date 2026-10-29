@@ -10,6 +10,7 @@ package com.mulesoft.examples.mule_component_bindings.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.assertj.core.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
@@ -20,6 +21,13 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+import java.io.BufferedInputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
@@ -28,6 +36,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.TreeMap;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -39,6 +48,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.context.ApplicationContext;
 import org.springframework.http.HttpStatus;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.annotation.DirtiesContext;
@@ -47,6 +57,7 @@ import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.util.TestSocketUtils;
+import org.springframework.web.filter.FormContentFilter;
 import org.springframework.web.server.ResponseStatusException;
 
 import com.mulesoft.examples.mule_component_bindings.exception.InvalidStockSymbol;
@@ -99,6 +110,12 @@ class StockStatsControllerTest {
 
     private static final String UNSUPPORTED_MEDIA_TYPE = "HTTP/1.1 415 Unsupported Media Type";
 
+    /** A form body large enough that reading it whole before dispatch keeps the response back measurably. */
+    private static final int LARGE_FORM_BYTES = 300_000;
+
+    /** Bytes of a large form body written before its response is read; the rest is written only afterwards. */
+    private static final int LARGE_FORM_PREFIX_BYTES = 1024;
+
     @MockBean
     private StockService stockService;
 
@@ -110,6 +127,10 @@ class StockStatsControllerTest {
 
     @Autowired
     private StockStatsService stockStatsService;
+
+    /** The running application's context, inspected for the servlet filters it registers. */
+    @Autowired
+    private ApplicationContext applicationContext;
 
     /** Port of this context's stock-statistics listener. */
     @Value("${ports.stock-stats}")
@@ -543,6 +564,61 @@ class StockStatsControllerTest {
         verifyNoInteractions(stockService, twitterSearchService, sentimentService);
     }
 
+    /**
+     * The resource answers {@code GET} only and its listener checks the method before the body is read, so a large
+     * form body on another method is never read: a form declaring {@value #LARGE_FORM_BYTES} bytes, of which only the
+     * first {@value #LARGE_FORM_PREFIX_BYTES} are written, gets SC-1's whole 405 before the rest is sent, without any
+     * upstream call. Boot's form-content filter, which {@code spring.mvc.formcontent.filter.enabled: false} switches
+     * off, would read the whole body into memory before dispatch, so no response would arrive until the last byte had
+     * been sent.
+     *
+     * @param method a method whose form body Boot's form-content filter would read
+     * @throws IOException when the connection fails
+     */
+    @ParameterizedTest(name = "[{index}] {0} " + STOCK_STATS)
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void largeFormOnAMethodOtherThanGetIsAnswered405BeforeItsBodyIsSent(String method) throws IOException {
+        String target = STOCK_STATS + "?stock=AAPL&date=" + DAY;
+        byte[] form = ("stock=" + "x".repeat(LARGE_FORM_BYTES - "stock=".length())).getBytes(StandardCharsets.US_ASCII);
+        try (Socket socket = new Socket("localhost", stockStatsPort)) {
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " " + target + " HTTP/1.1\r\nHost: localhost:" + stockStatsPort
+                    + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + form.length
+                    + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            out.write(form, 0, LARGE_FORM_PREFIX_BYTES);
+            out.flush();
+
+            RawResponse refused;
+            try {
+                refused = readResponse(in);
+            } catch (SocketTimeoutException timeout) {
+                refused = fail(String.format("No response to %s %s within %d ms while %d of its %d form bytes were "
+                        + "sent: the body was buffered before dispatch", method, target, HttpTestClient.TIMEOUT_MILLIS,
+                        LARGE_FORM_PREFIX_BYTES, form.length), timeout);
+            }
+            writeRemainderIgnoringFailure(out, form, LARGE_FORM_PREFIX_BYTES);
+
+            assertThat(refused.statusLine()).as(refused.toString()).isEqualTo("HTTP/1.1 405 Method Not Allowed");
+            assertThat(refused.header("Content-Type")).as(refused.toString()).isEqualTo("text/plain");
+            assertThat(refused.body()).as(refused.toString())
+                    .isEqualTo("Method not allowed for endpoint: " + STOCK_STATS);
+        }
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    /**
+     * The application registers no {@link FormContentFilter}, the filter that reads a {@code PUT}, {@code PATCH} or
+     * {@code DELETE} form body before dispatch, because {@code spring.mvc.formcontent.filter.enabled} is
+     * {@code false}.
+     */
+    @Test
+    void contextHoldsNoFormContentFilter() {
+        assertThat(applicationContext.getBeanNamesForType(FormContentFilter.class)).as("FormContentFilter beans")
+                .isEmpty();
+    }
+
     @Test
     void optionsIsAnsweredWithTheAllowedMethods() {
         Response response = stockStats.send("OPTIONS", STOCK_STATS, null, null);
@@ -583,5 +659,67 @@ class StockStatsControllerTest {
 
     private static Date day(String text) throws ParseException {
         return new SimpleDateFormat("yyyy-MM-dd").parse(text);
+    }
+
+    /**
+     * Writes the bytes of {@code body} from {@code offset} to its end once the response has been read, so the server
+     * can finish the exchange; a failed write is ignored, because the server may close a connection whose body it
+     * refused unread.
+     */
+    private static void writeRemainderIgnoringFailure(OutputStream out, byte[] body, int offset) {
+        try {
+            out.write(body, offset, body.length - offset);
+            out.flush();
+        } catch (IOException closedByServer) {
+            // The response is already read; the server need not take the rest of a body it never reads.
+        }
+    }
+
+    /**
+     * Reads one response off the connection: its status line, its headers and the {@code Content-Length} bytes of its
+     * body.
+     */
+    private static RawResponse readResponse(InputStream in) throws IOException {
+        String statusLine = readLine(in);
+        Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+            int colon = line.indexOf(':');
+            assertThat(colon).as("header line %s", line).isPositive();
+            headers.put(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
+        }
+        String contentLength = headers.get("Content-Length");
+        assertThat(contentLength).as("Content-Length of %s %s", statusLine, headers).isNotNull();
+        int length = Integer.parseInt(contentLength);
+        byte[] body = in.readNBytes(length);
+        assertThat(body).as("body of %s %s", statusLine, headers).hasSize(length);
+        return new RawResponse(statusLine, headers, new String(body, StandardCharsets.UTF_8));
+    }
+
+    /** One line of a response head without its CRLF, one character per byte; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
+    /**
+     * A response read off a raw connection.
+     *
+     * @param statusLine the status line, such as {@code HTTP/1.1 405 Method Not Allowed}
+     * @param headers    the headers, names compared case-insensitively
+     * @param body       the body as UTF-8 text
+     */
+    private record RawResponse(String statusLine, Map<String, String> headers, String body) {
+
+        String header(String name) {
+            return headers.get(name);
+        }
     }
 }

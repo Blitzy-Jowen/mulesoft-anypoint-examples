@@ -266,6 +266,8 @@ class RequestBodyDrainFilterTest {
             "5,     0",
             "5,     2",
             "5,     5",
+            // the handler reads to the end of the stream, so the drain finds it finished and reads nothing
+            "5,     6",
             "20000, 0",
             "20000, 9000"
     })

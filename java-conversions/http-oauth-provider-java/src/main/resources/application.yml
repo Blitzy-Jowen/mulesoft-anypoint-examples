@@ -11,6 +11,12 @@ spring:
     # /resources and /redirect declare no allowedMethods, so TRACE runs their flow (token check, 302), and on /authorize and
     # /token (GET and POST only) it gets SC-1's 405, instead of the servlet's TRACE echo of the request and its Authorization header.
     dispatch-trace-request: true
+    # /authorize and /token check the method before reading the body, and /resources and /redirect ignore the body: a form
+    # body on PUT/PATCH/DELETE gets SC-1's 405 on /authorize and /token, and the flow on /resources and /redirect, before
+    # it is read (RequestBodyDrainFilter discards it afterwards) instead of being buffered whole by Boot's filter before dispatch.
+    formcontent:
+      filter:
+        enabled: false
 
 http:
   provider:
