@@ -15,6 +15,7 @@ import com.mulesoft.examples.legacy_modernization.model.soap.PutShippingOrder;
 import com.mulesoft.examples.legacy_modernization.model.soap.PutShippingOrderResponse;
 
 import org.glassfish.jaxb.runtime.marshaller.NamespacePrefixMapper;
+import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.beans.factory.config.BeanPostProcessor;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
 import org.springframework.context.annotation.Bean;
@@ -44,7 +45,8 @@ import org.springframework.ws.soap.server.SoapMessageDispatcher;
  *       {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME} and {@value #MESSAGE_RECEIVER_BEAN_NAME}. The
  *       listener accepts POST only, so the boundary answers every other method, {@code GET ?wsdl} included, with the
  *       listener's 405: no WSDL or schema is published, and {@code wsdl/IFulfillmentService.wsdl} stays a reference
- *       document nothing reads.</li>
+ *       document nothing reads. {@link #saajDefaultTransformerFactory()} makes SAAJ use the JDK's transformer
+ *       factory directly rather than look one up for every message it parses or writes.</li>
  *   <li>The {@code PutShippingOrder} request and {@code PutShippingOrderResponse} reply are read and written by
  *       {@link #fulfillmentMarshaller()} through one {@link MarshallingPayloadMethodProcessor}. Verified on the
  *       running endpoint: it is the first resolver and the first handler that supports the operation's parameter and
@@ -78,6 +80,9 @@ public class WebServiceConfig implements WsConfigurer {
 
     /** The SOAP listener paths whose {@code http:listener} declares {@code allowedMethods="POST"}. */
     public static final List<String> POST_ONLY_PATHS = List.of(LISTENER_PATH);
+
+    /** JVM system property under which SAAJ creates the JDK's transformer factory instead of looking one up. */
+    public static final String SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY = "saaj.use.default.transformer.factory";
 
     /** Namespace of the operation wrappers, the one JAX-WS derived from the original {@code org.ordermgmt}. */
     private static final String ORDERMGMT_NAMESPACE_URI = "http://ordermgmt.org/";
@@ -141,6 +146,32 @@ public class WebServiceConfig implements WsConfigurer {
         messageFactory.setSoapVersion(SoapVersion.SOAP_11);
         messageFactory.setLangAttributeOnSoap11FaultString(false);
         return messageFactory;
+    }
+
+    /**
+     * Makes SAAJ create the JDK's built-in transformer factory directly. Unless
+     * {@value #SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY} is {@code true}, SAAJ looks a factory up through the JAXP
+     * service mechanism for every transformer it builds, that is for every envelope it parses and every envelope it
+     * writes, and each lookup scans every jar of the application's class path under one lock, so concurrent SOAP
+     * requests queue behind one another; the original CXF/StAX stack made no lookup per message. No dependency
+     * registers a {@code javax.xml.transform.TransformerFactory} service, so that lookup ends at the same JDK XSLTC
+     * factory this switch selects, and every message is read and written exactly as before. The raw UTF-8 write of
+     * SC-11's {@link SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory} messages honours the same switch.
+     * <p>
+     * A bean factory post-processor runs before any regular bean is instantiated, and so before any SAAJ message is
+     * created; it is static so that this configuration class is not instantiated that early. A value already set,
+     * such as an operator's {@code -Dsaaj.use.default.transformer.factory=false}, is left unchanged.
+     *
+     * @return the post-processor that sets {@value #SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY} to {@code true}
+     */
+    @Bean
+    public static BeanFactoryPostProcessor saajDefaultTransformerFactory() {
+        return beanFactory -> {
+            if (System.getProperty(SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY) != null) {
+                return;
+            }
+            System.setProperty(SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY, Boolean.TRUE.toString());
+        };
     }
 
     /**

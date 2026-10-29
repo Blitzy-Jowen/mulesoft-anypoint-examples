@@ -175,6 +175,7 @@ Status: `default` — a non-secret value, overridable; `TODO` — no value (`${E
 | DataWeave script at line 12, `ns0#OrderTshirt: payload` | `mapper/OrderTshirtRequestMapper`, writing through `mapper/DwXmlWriter` |
 | DataWeave script at line 17, `dw:set-property propertyName="soap.header"` (`ns0#AuthenticationHeader`) | `client/TshirtServiceClient`, which builds the header from `tshirt.api-key` |
 | `ws:consumer operation="OrderTshirt"` (line 25) and `operation="ListInventory"` (line 38) | `client/TshirtServiceClient.orderTshirt` and `listInventory`: `WebServiceTemplate` over a SOAP 1.1 `SaajSoapMessageFactory` and `HttpUrlConnectionMessageSender` |
+| The `ws:consumer` SOAP runtime (CXF over StAX, no transformer-factory lookup per message) | `config/WebServiceConfig`, which sets SAAJ's `saaj.use.default.transformer.factory` to `true` ([Behaviours stubbed or externalized](#behaviours-stubbed-or-externalized)) |
 | DataWeave script at line 28, `payload` as JSON | `mapper/OrderTshirtResponseMapper`, reading through `mapper/DwXmlToJson` and writing through `mapper/DwJsonWriter` |
 | DataWeave script at line 41, `payload.ns0#ListInventoryResponse` as JSON | `mapper/ListInventoryResponseMapper`, over the same reader and writer |
 | `ws:consumer-config` (line 3): `serviceAddress`, `wsdlLocation`, `service`, `port` | `config/TshirtServiceProperties` (prefix `tshirt`), bound by `@EnableConfigurationProperties` on the application class; `src/main/resources/tshirt.wsdl` |
@@ -194,6 +195,7 @@ The four DataWeave scripts are each owned by exactly the class named above (AAP 
 
 - The API key the original hard-coded is externalized to `tshirt.api-key`, with no value in production configuration (AAP 0.4.6). Without it, `/orders` answers `500` and does not call the service. The original always sent its literal, so it never met this case. `/inventory` is unaffected.
 - The service address keeps its original value as an overridable default (`tshirt.service-address`).
+- Set in code rather than in keys: `config/WebServiceConfig` sets the JVM system property `saaj.use.default.transformer.factory` to `true` at start-up unless it is already set, so SAAJ uses the JDK's transformer factory directly instead of running a service lookup over every jar for each message it parses or writes (the lookup finds the same factory, so no byte changes), and `-Dsaaj.use.default.transformer.factory=false` keeps the lookup. The original's CXF/StAX stack made no such lookup.
 - External dependency: `http://tshirt-service.cloudhub.io` is a public demo service that may no longer be reachable; from the build host it answers `502`, and `DECISIONS.md` section 6.9 records the risk. The converted code is verified against WireMock stubs that answer with the original example's sample responses. Live behaviour can be verified only through Tier 2A capture of the original.
 - A DOCTYPE in an `/inventory` request body fails the parse (`500`) and nothing is sent. This XML hardening is registered in `DECISIONS.md` section 8.
 - An `/orders` member name that becomes an element and is not an XML element name fails the request (`500`) before the XML is written, so it never becomes markup in the SOAP body, and nothing is sent; a member whose value is an empty array becomes no element, so its name is not checked. How DataWeave treated such a key is not documented; this hardening is registered in `DECISIONS.md` section 8.
@@ -233,6 +235,7 @@ TSHIRT_API_KEY='<key>' java -jar target/web-service-consumer-java-1.0.0-SNAPSHOT
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the `404`, `405` and `500` status lines, `Content-Type` headers and body bytes, `ErrorResponse` escaping and the bounded ERROR log line |
 | `config/PreflightDispatchConfigTest` | the pre-flight handler mapping: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request and gets no CORS processing |
 | `config/PreflightDispatchListenerTest` | on the wire: a pre-flight to `/inventory` or `/orders` is answered exactly as a plain `OPTIONS` request, with no `Access-Control-*` or `Vary` header; a pre-flight to `/unknown`, `/orders;x=1` or `/inventory;x=1` gets the no-listener `404` |
+| `config/WebServiceConfigTest` | `saaj.use.default.transformer.factory` set to `true` when absent, at context refresh as well, and left unchanged when already `true` or `false`; the factory it selects is the one the JAXP service lookup finds |
 | `SensitiveLogLevelsTest` | under a root `TRACE` level and under `--trace`, neither the API key nor the order's personal data reaches the console, for every outcome: accepted order, inventory, SOAP fault, HTTP error, connection reset, unreadable order and missing key |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no fixture is captured |
 
@@ -273,11 +276,11 @@ No scenario of this project is `unreachable` or `nondeterministic`.
 |---|---|---|---|---|---|---|---|
 | web-service-consumer-java | web-service-consumer | SOAP/WSDL-based service | PASS | PASS | 98.1% | PARITY: UNVERIFIED — Mule runtime unavailable | N/A |
 
-Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-28 with `mvn -B clean verify`, which runs the same surefire tests and JaCoCo check, on the tree whose SC-4 `DwXmlWriter` refuses element, prefix and attribute names that are not XML names:
+Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9); the test counts and coverage figures below were re-measured on 2026-10-29 with `mvn -B clean install`, which runs the same surefire tests and JaCoCo check, on the tree whose `config/WebServiceConfig` sets SAAJ's `saaj.use.default.transformer.factory` switch:
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 744 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 744 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 503 of 513 lines. `service/TshirtOrderService` covers 13 of 13. The `mapper` package covers 490 of 500: `DwXmlWriter` 226 of 226, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `OrderTshirtRequestMapper` 74 of 80, `OrderTshirtResponseMapper` 7 of 7 and `ListInventoryResponseMapper` 5 of 5. Total project LINE coverage: 97.6% (862 of 883 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 749 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 749 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 503 of 513 lines. `service/TshirtOrderService` covers 13 of 13. The `mapper` package covers 490 of 500: `DwXmlWriter` 226 of 226, `DwJsonWriter` 86 of 86, `DwXmlToJson` 92 of 96, `OrderTshirtRequestMapper` 74 of 80, `OrderTshirtResponseMapper` 7 of 7 and `ListInventoryResponseMapper` 5 of 5. Total project LINE coverage: 97.6% (868 of 889 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)

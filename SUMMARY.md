@@ -34,6 +34,7 @@ The rows of `processing-orders-with-dataweave-and-APIkit-java`, `mule-expression
 The rows of `service-orchestration-and-choice-routing-java` and `websphere-mq-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose SC-12 broker binds each reply channel to its client, accepts client publications on inbound channels only and bounds clients, subscriptions, retained bytes and request size, and again on the later tree whose handler payload reservations last until the handler exits and whose Bayeux batch is counted while it is parsed. On the tree that joins these changes with the ones the lines above record, both rows were measured again with `mvn -B clean install`.
 The row of `querying-a-db-and-attaching-results-to-an-email-java` and the Tier 1 tests total under Totals were re-measured on 2026-10-29 with `mvn -B -ntp clean install` on the tree that adds its mail-logging cap and the required SMTP STARTTLS, with their tests; only its test count changed.
 The rows of `get-customer-list-from-netsuite-java` and `netsuite-data-retrieval-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B -ntp clean install` on the tree whose NetSuite token provider logs an unloadable private-key setting by its kind and length and its cause's class only, with the test of key text configured as the path; only their test counts and total LINE coverage changed.
+The rows of `foreach-processing-and-choice-routing-java`, `legacy-modernization-java`, `soap-webservice-security-java`, `xml-only-soap-webservice-java`, `web-service-consumer-java` and `adding-a-new-customer-to-workday-revenue-management-java`, and the Tier 1 tests total under Totals, were re-measured on 2026-10-29 with `mvn -B clean install` on the tree whose `config/WebServiceConfig` sets SAAJ's `saaj.use.default.transformer.factory` switch unless it is already set, as `service-orchestration-and-choice-routing-java` does, and adds the tests of that switch; each project gained 5 tests, its total LINE coverage cell changed and its service + mapper cell did not.
 
 ## Status
 
@@ -142,7 +143,7 @@ mvn spring-boot:run    # start the application; supply the TODO placeholders of 
 
 - Folders: 56 found (3 RAML/APIkit-driven REST API, 3 SOAP/WSDL-based service, 3 JMS/messaging-based flow, 12 third-party connector, 35 General); 55 delivered; 1 excluded (`sap-data-retrieval`).
 - Tier 1 build: 55 `PASS`, 0 `FAIL`.
-- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 27,941 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
+- Tier 1 tests: 55 `PASS`, 0 `FAIL`; 27,971 tests run, 0 failures, 0 errors, 51 skipped (`FixtureParityTest` in each of the 51 non-RAML projects).
 - Coverage (service + mapper): every delivered project at or above the 80% gate; lowest 86.4%, highest 100.0%.
 - Parity evidence: 51 `PARITY: UNVERIFIED — Mule runtime unavailable`, 4 `RAML DIFF: 1:1 (Tier 1 static)`, 0 `PARITY: VERIFIED — Tier 2A fixtures`, 0 `PARITY: PARTIAL — Tier 2A fixtures`, 0 `PARITY: FAIL — Tier 2A fixtures`, 1 `EXCLUDED — pending sapjco3.jar`.
 - Tier 2B live sandbox: 11 `NOT RUN — sandbox credentials not supplied` (14 `*IT` tests, 14 skipped), 0 `PASS`, 0 `FAIL`, 44 `N/A`, 1 `EXCLUDED — pending sapjco3.jar`.
@@ -156,8 +157,8 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | rest-api-with-apikit-java | 663 / 0 / 0 / 0 | 131 of 131 | 89.7% (1204 of 1342) | — |
 | testing-apikit-with-munit-java | 443 / 0 / 0 / 0 | 13 of 13 | 83.3% (686 of 824) | — |
 | processing-orders-with-dataweave-and-APIkit-java | 900 / 0 / 0 / 0 | 670 of 747 | 88.3% (1736 of 1965) | — |
-| web-service-consumer-java | 744 / 0 / 0 / 1 | 503 of 513 | 97.6% (862 of 883) | — |
-| xml-only-soap-webservice-java | 615 / 0 / 0 / 1 | 700 of 713 | 91.9% (1513 of 1647) | — |
+| web-service-consumer-java | 749 / 0 / 0 / 1 | 503 of 513 | 97.6% (868 of 889) | — |
+| xml-only-soap-webservice-java | 620 / 0 / 0 / 1 | 700 of 713 | 91.9% (1519 of 1652) | — |
 | service-orchestration-and-choice-routing-java | 1298 / 0 / 0 / 1 | 1481 of 1494 | 93.8% (3412 of 3636) | — |
 | jms-message-rollback-and-redelivery-java | 123 / 0 / 0 / 1 | 77 of 78 | 98.7% (226 of 229) | — |
 | sending-json-data-to-a-jms-queue-java | 308 / 0 / 0 / 1 | 163 of 163 | 98.1% (421 of 429) | — |
@@ -170,7 +171,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | netsuite-data-retrieval-java | 1525 / 0 / 0 / 0 | 438 of 441 | 93.3% (2053 of 2201) | 3 run, 3 skipped, 0 failed, 0 errors |
 | salesforce-data-synchronization-using-watermarking-and-batch-processing-java | 766 / 0 / 0 / 1 | 339 of 350 | 96.6% (932 of 965) | 1 run, 1 skipped, 0 failed, 0 errors |
 | salesforce-to-MySQL-DB-using-Batch-Processing-java | 818 / 0 / 0 / 1 | 363 of 374 | 96.7% (1007 of 1041) | 1 run, 1 skipped, 0 failed, 0 errors |
-| adding-a-new-customer-to-workday-revenue-management-java | 577 / 0 / 0 / 1 | 73 of 73 | 96.4% (669 of 694) | 1 run, 1 skipped, 0 failed, 0 errors |
+| adding-a-new-customer-to-workday-revenue-management-java | 582 / 0 / 0 / 1 | 73 of 73 | 96.4% (675 of 700) | 1 run, 1 skipped, 0 failed, 0 errors |
 | import-contacts-into-ms-dynamics-java | 521 / 0 / 0 / 1 | 106 of 106 | 89.6% (884 of 987) | 1 run, 1 skipped, 0 failed, 0 errors |
 | dataweave-with-flowreflookup-java | 858 / 0 / 0 / 1 | 128 of 128 | 90.0% (911 of 1012) | 1 run, 1 skipped, 0 failed, 0 errors |
 | addition-using-javascript-transformer-java | 652 / 0 / 0 / 1 | 893 of 894 | 99.2% (1124 of 1133) | — |
@@ -180,7 +181,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | exposing-a-restful-resource-using-the-HTTP-connector-java | 323 / 0 / 0 / 1 | 23 of 23 | 98.0% (349 of 356) | — |
 | extracting-data-from-LDAP-directory-java | 132 / 0 / 0 / 1 | 17 of 17 | 95.4% (334 of 350) | — |
 | filtering-a-message-java | 172 / 0 / 0 / 1 | 36 of 36 | 96.7% (265 of 274) | — |
-| foreach-processing-and-choice-routing-java | 531 / 0 / 0 / 1 | 77 of 78 | 88.4% (1453 of 1643) | — |
+| foreach-processing-and-choice-routing-java | 536 / 0 / 0 / 1 | 77 of 78 | 88.5% (1459 of 1648) | — |
 | hello-world-java | 521 / 0 / 0 / 1 | 2 of 2 | 96.9% (221 of 228) | — |
 | http-multipart-request-java | 422 / 0 / 0 / 1 | 407 of 471 | 90.2% (643 of 713) | — |
 | http-oauth-provider-java | 493 / 0 / 0 / 1 | 206 of 206 | 96.3% (797 of 828) | — |
@@ -190,7 +191,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | importing-a-csv-file-into-ms-sharepoint-java | 157 / 0 / 0 / 1 | 51 of 51 | 79.4% (596 of 751) | — |
 | importing-an-email-attachment-using-the-IMAP-connector-java | 577 / 0 / 0 / 1 | 677 of 737 | 92.9% (848 of 913) | — |
 | importing-an-email-attachment-using-the-POP3-connector-java | 519 / 0 / 0 / 1 | 679 of 739 | 92.0% (812 of 883) | — |
-| legacy-modernization-java | 456 / 0 / 0 / 1 | 473 of 533 | 88.4% (1403 of 1587) | — |
+| legacy-modernization-java | 461 / 0 / 0 / 1 | 473 of 533 | 88.5% (1409 of 1592) | — |
 | login-form-using-the-http-connector-java | 360 / 0 / 0 / 1 | 121 of 125 | 95.0% (479 of 504) | — |
 | mule-component-bindings-java | 535 / 0 / 0 / 1 | 104 of 104 | 88.4% (1109 of 1254) | — |
 | mule-expression-language-basics-java | 740 / 0 / 0 / 1 | 515 of 577 | 91.7% (753 of 821) | — |
@@ -204,7 +205,7 @@ The counts behind the measured cells. Tests are those of the `mvn -B test` run, 
 | scatter-gather-flow-control-java | 243 / 0 / 0 / 1 | 160 of 163 | 97.2% (418 of 430) | — |
 | sending-a-csv-file-through-email-using-smtp-java | 188 / 0 / 0 / 1 | 107 of 107 | 84.6% (461 of 545) | — |
 | sending-json-data-to-a-amqp-queue-java | 185 / 0 / 0 / 1 | 42 of 42 | 97.5% (394 of 404) | — |
-| soap-webservice-security-java | 597 / 0 / 0 / 1 | 2 of 2 | 88.9% (1815 of 2041) | — |
+| soap-webservice-security-java | 602 / 0 / 0 / 1 | 2 of 2 | 89.0% (1821 of 2046) | — |
 | track-a-custom-business-event-java | 237 / 0 / 0 / 1 | 129 of 129 | 98.3% (354 of 360) | — |
 | upload-to-ftp-after-converting-json-to-xml-java | 542 / 0 / 0 / 1 | 347 of 350 | 93.4% (635 of 680) | — |
 | websphere-mq-java | 431 / 0 / 0 / 1 | 660 of 668 | 97.0% (1378 of 1420) | — |

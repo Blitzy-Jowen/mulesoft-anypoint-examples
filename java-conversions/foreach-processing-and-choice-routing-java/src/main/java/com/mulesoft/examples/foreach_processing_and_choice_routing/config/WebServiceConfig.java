@@ -29,6 +29,7 @@ import com.mulesoft.examples.foreach_processing_and_choice_routing.model.soap.Ge
 import com.mulesoft.examples.foreach_processing_and_choice_routing.model.soap.GetLoanQuoteResponse;
 
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.boot.web.servlet.FilterRegistrationBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -73,7 +74,9 @@ import org.w3c.dom.Node;
  *       {@code <ns2:getLoanQuoteResponse xmlns:ns2="http://bank.loanbroker.example.mule.org/">} as CXF wrote it.</li>
  *   <li>{@code MessageDispatcherServlet} resolves the SOAP 1.1 message factory, the listener boundary and the
  *       message receiver by their bean names, {@value #MESSAGE_FACTORY_BEAN_NAME},
- *       {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME} and {@value #MESSAGE_RECEIVER_BEAN_NAME}.</li>
+ *       {@value #MESSAGE_RECEIVER_HANDLER_ADAPTER_BEAN_NAME} and {@value #MESSAGE_RECEIVER_BEAN_NAME}.
+ *       {@link #saajDefaultTransformerFactory()} makes SAAJ use the JDK's transformer factory directly rather than
+ *       look one up for every message it parses or writes.</li>
  *   <li>One {@link WebServiceTemplate} carries every outbound credit-agency and bank call; callers pass each URI per
  *       call, because a bank URI is chosen per quote. It sends each request exactly once
  *       ({@link SingleAttemptMessageSender}), so a failed call is never silently repeated.</li>
@@ -112,6 +115,9 @@ public class WebServiceConfig implements WsConfigurer {
 
     /** Classpath location of the WSDL every bank publishes. */
     public static final String BANK_WSDL = "wsdl/BankService.wsdl";
+
+    /** JVM system property under which SAAJ creates the JDK's transformer factory instead of looking one up. */
+    public static final String SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY = "saaj.use.default.transformer.factory";
 
     /** Matches every path below a listener path, so {@code <listener path>/<anything>?wsdl} is answered as well. */
     private static final String SUB_PATHS = "/**";
@@ -165,6 +171,32 @@ public class WebServiceConfig implements WsConfigurer {
         messageFactory.setLangAttributeOnSoap11FaultString(false);
         messageFactory.afterPropertiesSet();
         return messageFactory;
+    }
+
+    /**
+     * Makes SAAJ create the JDK's built-in transformer factory directly. Unless
+     * {@value #SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY} is {@code true}, SAAJ looks a factory up through the JAXP
+     * service mechanism for every transformer it builds, that is for every envelope it parses and every envelope it
+     * writes, and each lookup scans every jar of the application's class path under one lock, so concurrent SOAP
+     * requests queue behind one another; the original CXF/StAX stack made no lookup per message. No dependency
+     * registers a {@code javax.xml.transform.TransformerFactory} service, so that lookup ends at the same JDK XSLTC
+     * factory this switch selects, and every message is read and written exactly as before. The raw UTF-8 write of
+     * SC-11's {@link SoapEnvelopeStyleInterceptor.CxfStyleMessageFactory} messages honours the same switch.
+     * <p>
+     * A bean factory post-processor runs before any regular bean is instantiated, and so before any SAAJ message is
+     * created; it is static so that this configuration class is not instantiated that early. A value already set,
+     * such as an operator's {@code -Dsaaj.use.default.transformer.factory=false}, is left unchanged.
+     *
+     * @return the post-processor that sets {@value #SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY} to {@code true}
+     */
+    @Bean
+    public static BeanFactoryPostProcessor saajDefaultTransformerFactory() {
+        return beanFactory -> {
+            if (System.getProperty(SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY) != null) {
+                return;
+            }
+            System.setProperty(SAAJ_DEFAULT_TRANSFORMER_FACTORY_PROPERTY, Boolean.TRUE.toString());
+        };
     }
 
     /**

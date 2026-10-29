@@ -172,6 +172,7 @@ Every key of `src/main/resources/application.yml`, with the Java type its value 
 | `mulexml:xml-to-dom-transformer` (xml:9) | the namespace-aware, hardened DOM parse inside `WorkdayCustomerService` |
 | `dw:transform-message` "XML to Workday PutCustomerRequest XML" (`%dw 1.0` at xml:12) | `mapper/PutCustomerRequestMapper#map`, which builds the generated `Put_Customer_Request` element |
 | `wd-connector:invoke type="Revenue_Management\|\|Put_Customer"` (xml:42) | `client/WorkdayRevenueManagementClient#putCustomer`: a SOAP 1.1 `WebServiceTemplate` with a `Jaxb2Marshaller` over the XJC-generated package `com.mulesoft.examples.adding_a_new_customer_to_workday_revenue_management.generated`, and a `Wss4jSecurityInterceptor` adding a UsernameToken with a `PasswordText` password, without nonce or creation time, for the user `wday.user@wday.tenant`; 10 s connect and read timeouts |
+| The Workday connector's SOAP runtime (CXF over StAX, no transformer-factory lookup per message) | `config/WebServiceConfig`, which sets SAAJ's `saaj.use.default.transformer.factory` to `true` ([Behaviours stubbed or externalized](#behaviours-stubbed-or-externalized)) |
 | `dw:transform-message` "Extract Customer Name" (`%dw 1.0` at xml:44) | `mapper/PutCustomerResponseMapper#descriptor`: `Put_Customer_Response/Customer_Reference/@Descriptor`, `null` when absent |
 | `set-payload value="Added customer: #[payload]"` (xml:52) | `WorkdayCustomerService.RESPONSE_PREFIX` followed by the descriptor; the controller writes its UTF-8 bytes with a `Content-Length` and no `Content-Type`, as the listener sent the untyped payload |
 | (no original construct) failure classification | `client/WorkdayFailureClassifier`, the Workday implementation of SC-9's `client/UpstreamFailureClassifier` |
@@ -205,6 +206,7 @@ Shared components (AAP 0.4.4), each copied with its tests and with only the pack
 ## Behaviours stubbed or externalized
 
 - Externalized: the Workday host, tenant, user and password, which the original also read from placeholders, are `TODO` keys with environment-variable fallbacks. The service URL and the timeouts, which the original connector derived or defaulted, are configurable keys.
+- Set in code rather than in keys: `config/WebServiceConfig` sets the JVM system property `saaj.use.default.transformer.factory` to `true` at start-up unless it is already set, so SAAJ uses the JDK's transformer factory directly instead of running a service lookup over every jar for each message it parses or writes, the UsernameToken securement of `Wss4jSecurityInterceptor` included (the lookup finds the same factory, so no byte changes), and `-Dsaaj.use.default.transformer.factory=false` keeps the lookup. The original connector's CXF/StAX stack made no such lookup.
 - Stubbed in tests only: the unit tier replaces Workday with an in-process WireMock SOAP stub (`AddingANewCustomerToWorkdayTest`, the controller and client tests) or a Mockito-mocked client (`service/WorkdayCustomerServiceTest`). At run time nothing is stubbed and no behaviour was dropped.
 - Not carried: Studio metadata (`catalog/**`, `mule-project.xml`), `src/test/resources/log4j2-test.xml` and the Studio samples `src/test/resources/sample_data/root.xml` and `root_1.xml` (AAP 0.2.2).
 
@@ -272,6 +274,7 @@ While `application-it.yml` or one of the six keys is missing, blank, still `TODO
 | `config/ListenerMethodFilterTest` | the filter alone: `post`, `Post`, `pOsT` and `POSt` to `/` reach the chain as `POST` with everything else of the request unchanged, also under a context path; `POST` itself, other methods in any letter case (`get`, `options`, `trace`, `postx`, `poſt` with a long s), a case variant of `POST` to any other path (`/other`, `//`, `/%2F`) and a request without method or URI pass unchanged |
 | `config/PreflightDispatchConfigTest` | (copied) the handler mapping alone: a pre-flight without CORS configuration selects the handler of a plain `OPTIONS` request with no CORS processing, a `@CrossOrigin` handler is still answered by Spring, other requests are dispatched as Spring dispatches them |
 | `config/PreflightDispatchListenerTest` | on the wire, the whole application against WireMock: a pre-flight to `/` from two origins asking for `POST`, `GET`, `PUT`, `DELETE`, `PATCH`, `OPTIONS` or `post`, with or without `Access-Control-Request-Headers`, gets the bytes of a plain `OPTIONS /` (405 `text/plain` `Method not allowed for endpoint: /`, no `Access-Control-*` or `Vary` header) and runs no flow step; a pre-flight to `/other` gets the plain no-listener 404; a cross-origin `POST /` gets the same reply as a same-origin one, without CORS headers |
+| `config/WebServiceConfigTest` | `saaj.use.default.transformer.factory` set to `true` when absent, at context refresh as well, and left unchanged when already `true` or `false`; the factory it selects is the one the JAXP service lookup finds |
 | `FixtureParityTest` | ST-2 fixture replay (next section); skipped while no Tier 2A fixture is captured |
 
 `support/HttpTestClient` is ST-1: an HTTP/1.1 client over a raw socket that returns the status line with its reason phrase, the headers in arrival order and the body bytes. `support/WorkdayTestRequests` holds the MUnit suite's three request scripts and its `Total_Results` read.
@@ -301,10 +304,10 @@ While `application-it.yml` or one of the six keys is missing, blank, still `TODO
 
 This row equals the project's row in the root `SUMMARY.md`. Evidence of the run behind it (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`. Surefire ran 577 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`.
-- `mvn -B clean install`: `BUILD SUCCESS`; the same 577 surefire tests; failsafe ran 1 test, skipped (`AddingANewCustomerToWorkdayIT`, no `application-it.yml`).
-- `mvn -B test`: `BUILD SUCCESS`; 577 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 73 of 73 lines (100.0%) of `service/WorkdayCustomerService` (with its nested `RethrowingErrorHandler`), `mapper/PutCustomerRequestMapper` and `mapper/PutCustomerResponseMapper`. Total project LINE coverage, the generated classes excluded: 96.4% (669 of 694 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`. Surefire ran 582 tests: 0 failures, 0 errors, 1 skipped (`FixtureParityTest`). JaCoCo reported `All coverage checks have been met.`.
+- `mvn -B clean install`: `BUILD SUCCESS`; the same 582 surefire tests; failsafe ran 1 test, skipped (`AddingANewCustomerToWorkdayIT`, no `application-it.yml`).
+- `mvn -B test`: `BUILD SUCCESS`; 582 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 73 of 73 lines (100.0%) of `service/WorkdayCustomerService` (with its nested `RethrowingErrorHandler`), `mapper/PutCustomerRequestMapper` and `mapper/PutCustomerResponseMapper`. Total project LINE coverage, the generated classes excluded: 96.4% (675 of 700 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=5`, `failed=0`.
 - Tier 2B: no sandbox credentials were supplied, so `AddingANewCustomerToWorkdayIT` was skipped; the cell becomes `PASS` or `FAIL` only after a run with `application-it.yml` present.
 

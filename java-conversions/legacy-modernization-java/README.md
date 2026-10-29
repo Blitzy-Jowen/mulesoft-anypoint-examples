@@ -145,6 +145,7 @@ No JAX-WS or CXF type is used anywhere. The enforcer ban covers `javax.xml.ws`, 
 - Export failures follow the script, which navigates `shippingOrder.order.orderItemList` and joins the street lines with `++`. DataWeave 1.0's `++` rejects a `null` operand, so a request whose address, `line1` or `line2` is missing fails the export with an `IllegalArgumentException` naming the missing part. No file is written, the failure is logged at ERROR, and the SOAP reply is unaffected. A missing `order`, or an `order` without `orderItem` elements (which unmarshals to no item list), fails the same way. The exact DataWeave error and whether the original wrote a partial file are Tier 2A verification points. Other `null` values, such as an address `name`, become empty CSV fields.
 - Output directory: the default `src/main/resources/Output` is relative, so it resolves against the working directory, as the original's `file:outbound-endpoint path` did. Run the application from `java-conversions/legacy-modernization-java/` to write where the original wrote, or set `fulfillment.output-dir`. Files written there at run time are output, not sources, and are never committed. Tests never write there (see [Build, run and test](#build-run-and-test)).
 - File names have millisecond resolution, so two exports in the same millisecond write the same name and the later overwrites the earlier, as Mule's file endpoint overwrote by default.
+- Set in code rather than in keys: `config/WebServiceConfig` sets the JVM system property `saaj.use.default.transformer.factory` to `true` at start-up unless it is already set, so SAAJ uses the JDK's transformer factory directly instead of running a service lookup over every jar for each message it parses or writes (the lookup finds the same factory, so no byte changes), and `-Dsaaj.use.default.transformer.factory=false` keeps the lookup.
 - Externalized or stubbed: nothing. The original reaches no external system and holds no credential; the legacy system is the output directory, as in the original.
 - Not carried (AAP 0.2.2): `mule-project.xml`, `catalog/**`, `src/main/resources/log4j2.xml`, `src/test/resources/log4j2-test.xml`, and the Studio preview sample data.
 
@@ -184,6 +185,7 @@ ls src/main/resources/Output    # ShippingOrder-<dd-MM-yy_HH-mm-ss.SSS>.txt
 | `mapper/ShippingOrderCsvMapperTest` | the script's CSV for a three-item confirmation and for the JAXB-unmarshalled original test message, one ordered row per item, billing and shipping columns from their own addresses, `null` names as empty fields, each `null` navigated part rejected, and no rows for an empty item list |
 | `mapper/DwCsvWriterTest`, `service/FileOutboundWriterTest` | SC-4 and SC-6, copied with their classes: DataWeave CSV bytes, quoting and empty fields; directory creation, overwrite, UTF-8 encoding, whole-file replacement, the in-place write of a named pipe and, run by a user a read-only directory refuses (not root), the in-place overwrite of an existing file in it and the refusal of a new one, and failure reporting |
 | `config/SoapEnvelopeStyleInterceptorTest`, `config/SoapFaultConfigTest`, `config/SoapListenerBoundaryAdapterTest`, `config/WsdlQueryPublisherTest` | SC-11: CXF envelope bytes, `soap:Server`, `soap:Client` and `soap:MustUnderstand` faults inside dispatch, the boundary faults and the POST-only 405, and `?wsdl`/`?xsd=` publication as a component (registered for no path here) |
+| `config/WebServiceConfigTest` | `saaj.use.default.transformer.factory` set to `true` when absent, at context refresh as well, and left unchanged when already `true` or `false`; the factory it selects is the one the JAXP service lookup finds |
 | `exception/GlobalExceptionHandlerTest` | SC-1: the 404, 405 and 500 status lines, `Content-Type` headers and body bytes |
 | `FixtureParityTest` | ST-2 fixture replay (section below); skipped while no fixture is captured |
 
@@ -227,9 +229,9 @@ No scenario is `unreachable`: `FulfillmentImpl.putShippingOrder` has a single pa
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 456 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); enforcer ban passed; JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 456 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
-- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 473 of 533 lines. `service/ShippingOrderExportService` 18 of 18, `service/FulfillmentService` 10 of 10, `service/FileOutboundWriter` 343 of 403 (its nested classes included), `mapper/ShippingOrderCsvMapper` 47 of 47, `mapper/DwCsvWriter` 55 of 55. Total project LINE coverage: 88.4% (1403 of 1587 lines).
+- `mvn -B clean package`: `BUILD SUCCESS`; 461 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); enforcer ban passed; JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 461 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 473 of 533 lines. `service/ShippingOrderExportService` 18 of 18, `service/FulfillmentService` 10 of 10, `service/FileOutboundWriter` 343 of 403 (its nested classes included), `mapper/ShippingOrderCsvMapper` 47 of 47, `mapper/DwCsvWriter` 55 of 55. Total project LINE coverage: 88.5% (1409 of 1592 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=6`, `failed=0`.
 
 ## Fallback evidence (AAP 0.8.4)
