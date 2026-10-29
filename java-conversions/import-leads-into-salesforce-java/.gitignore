@@ -1,0 +1,5 @@
+# import-leads-into-salesforce-java
+# Maven build output
+target/
+# Live Salesforce sandbox credentials for ImportLeadsToSfdcIT (sfdc.username, sfdc.password, sfdc.securityToken); never committed. application-it.yml.example is the committed template
+src/test/resources/application-it.yml

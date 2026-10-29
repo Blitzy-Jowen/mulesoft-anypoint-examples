@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.12</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.mulesoft.examples</groupId>
+    <artifactId>service-orchestration-and-choice-routing-java</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>service-orchestration-and-choice-routing-java</name>
+    <description>Spring Boot conversion of the Mule 3.8 example service-orchestration-and-choice-routing: SOAP order orchestration with content-based routing, XA JMS/Derby transactions, price cache and the Mule Ajax UI</description>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <!-- Spring WS 4.1.4 is pinned over the Boot 3.2.12 BOM's 4.0.11. The BOM imports spring-ws-bom
+             through this property, so spring-ws-core, spring-ws-test and spring-xml move together while
+             Spring Framework stays at the BOM's 6.1.15. -->
+        <spring-ws.version>4.1.4</spring-ws.version>
+    </properties>
+
+    <!-- Artemis 2.31.2 brings commons-beanutils 1.9.4 and commons-logging 1.2, neither managed by the Boot BOM.
+         These entries align them with the 1.11.0 and 1.3.2 used across the converted projects (the versions
+         Salesforce WSC 65.0.0 declares), leaving Artemis at the BOM's 2.31.2. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>commons-beanutils</groupId>
+                <artifactId>commons-beanutils</artifactId>
+                <version>1.11.0</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-logging</groupId>
+                <artifactId>commons-logging</artifactId>
+                <version>1.3.2</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- HTTP serving on Undertow: Tomcat 10.1 drops custom reason phrases. Undertow also carries the
+             extra listeners on 8090, 8091, 9090 and 9999 beside the primary 1080 listener. The Undertow
+             starter's own tomcat-embed-el is the Expression Language library, not the Tomcat server, and stays. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-tomcat</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-undertow</artifactId>
+        </dependency>
+
+        <!-- Spring WS endpoints (1080 /orders, 9090 /samsung/orders) and the WebServiceTemplate Samsung client. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web-services</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-tomcat</artifactId>
+                </exclusion>
+                <!-- The starter pulls in jakarta.xml.ws-api, which the JAX-WS ban below rejects. Spring WS
+                     needs only SAAJ, whose API saaj-impl supplies. -->
+                <exclusion>
+                    <groupId>jakarta.xml.ws</groupId>
+                    <artifactId>jakarta.xml.ws-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- Jakarta JAXB for the model/orders, model/samsung and model/soap bindings and Jaxb2Marshaller. -->
+        <dependency>
+            <groupId>jakarta.xml.bind</groupId>
+            <artifactId>jakarta.xml.bind-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.glassfish.jaxb</groupId>
+            <artifactId>jaxb-runtime</artifactId>
+        </dependency>
+
+        <!-- SOAP message factory and WSDL handling for the SOAP envelope, fault and WSDL support classes. -->
+        <dependency>
+            <groupId>com.sun.xml.messaging.saaj</groupId>
+            <artifactId>saaj-impl</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>wsdl4j</groupId>
+            <artifactId>wsdl4j</artifactId>
+        </dependency>
+
+        <!-- The embedded in-VM Artemis broker replaces the original's embedded ActiveMQ XA broker
+             (vm://localhost) at run time, so the server is a compile-scope dependency. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-artemis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.activemq</groupId>
+            <artifactId>artemis-jakarta-server</artifactId>
+        </dependency>
+
+        <!-- JdbcTemplate over embedded Derby XA; derbytools holds org.apache.derby.jdbc.EmbeddedXADataSource. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.derby</groupId>
+            <artifactId>derby</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.derby</groupId>
+            <artifactId>derbytools</artifactId>
+        </dependency>
+
+        <!-- Narayana JTA (7.0.2.Final) enlists the Artemis and Derby XA resources, replacing JBossTS. -->
+        <dependency>
+            <groupId>dev.snowdrop</groupId>
+            <artifactId>narayana-spring-boot-starter</artifactId>
+            <version>3.2.0</version>
+        </dependency>
+
+        <!-- Price cache keyed by productId, replacing ee:cache with the in-memory object-store strategy. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
+        <!-- ProductPriceClient transport: it can disable automatic retries, which neither JDK HTTP client can, so a
+             price GET that fails on a reset or premature EOF is never re-sent. Version from the Boot BOM. -->
+        <dependency>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ws</groupId>
+            <artifactId>spring-ws-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.xmlunit</groupId>
+            <artifactId>xmlunit-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>3.13.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Replaces the parent's @-delimiter filtering of application*.yml: application.yml, the XSLTs,
+             static/orders/** and mule-resource/js/** are packaged byte-for-byte. -->
+        <resources>
+            <resource>
+                <directory>${basedir}/src/main/resources</directory>
+                <filtering>false</filtering>
+            </resource>
+        </resources>
+
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <release>${java.version}</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.1.2</version>
+                <configuration>
+                    <excludes>
+                        <!-- Setting excludes replaces surefire's default, so the nested-class default is restated. -->
+                        <exclude>**/*$*</exclude>
+                        <exclude>**/*IT.java</exclude>
+                    </excludes>
+                    <!-- Derby (muleEmbeddedDB, derby.log) and the Narayana object store would otherwise be
+                         created in the project root during tests. argLine is left to JaCoCo's prepare-agent. -->
+                    <systemPropertyVariables>
+                        <derby.system.home>${project.build.directory}/derby-test</derby.system.home>
+                        <narayana.log-dir>${project.build.directory}/narayana-test</narayana.log-dir>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.15</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>check</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>com/mulesoft/examples/service_orchestration_and_choice_routing/service/**</include>
+                                <include>com/mulesoft/examples/service_orchestration_and_choice_routing/mapper/**</include>
+                            </includes>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.80</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>3.2.12</version>
+                <executions>
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <mainClass>com.mulesoft.examples.service_orchestration_and_choice_routing.ServiceOrchestrationAndChoiceRoutingApplication</mainClass>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <execution>
+                        <id>ban-jaxws-cxf</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <searchTransitive>true</searchTransitive>
+                                    <excludes>
+                                        <exclude>javax.xml.ws:*</exclude>
+                                        <exclude>jakarta.xml.ws:*</exclude>
+                                        <exclude>javax.jws:*</exclude>
+                                        <exclude>jakarta.jws:*</exclude>
+                                        <exclude>javax.xml:jaxws-api</exclude>
+                                        <exclude>org.apache.cxf:*</exclude>
+                                        <exclude>com.sun.xml.ws:*</exclude>
+                                        <exclude>org.glassfish.metro:*</exclude>
+                                    </excludes>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

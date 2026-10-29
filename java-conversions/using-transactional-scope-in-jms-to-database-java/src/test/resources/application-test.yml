@@ -1,0 +1,44 @@
+# Spring profile "test" of using-transactional-scope-in-jms-to-database-java.
+# Replaces what the original UsingTransactionalScopeInJMStoDatabaseIT needed outside the repository:
+# - the never-committed mule.test.properties read by MySQLDbCreator, and the live MySQL database
+#   company<millis> it created and passed in as jdbc.url: an in-memory H2 database in MySQL mode,
+#   created from the unchanged src/main/resources/order.sql;
+# - the ActiveMQ broker of connector Active_MQ (transactions.xml line 3): an embedded Artemis broker.
+# Holds no credentials or hosts. Every key not set here (jms.*, spring.jms.cache.enabled,
+# spring.main.web-application-type) is inherited from src/main/resources/application.yml.
+jdbc:
+  # Original placeholder name (transactions.xml line 4); main binds spring.datasource.url to it.
+  # - ${random.uuid}: one database per Spring test context, so order.sql's CREATE TABLE orders always
+  #   runs against an empty database, as the original's per-run company<millis> database did.
+  # - MODE=MySQL: accepts order.sql as written (int(11), AUTO_INCREMENT, ENGINE=InnoDB ... CHARSET=utf8).
+  # - DB_CLOSE_DELAY=-1: keeps the database alive between pooled connections.
+  url: "jdbc:h2:mem:company-${random.uuid};MODE=MySQL;DB_CLOSE_DELAY=-1"
+spring:
+  sql:
+    init:
+      # Runs order.sql once per context; a DDL failure fails the context (no continue-on-error).
+      mode: always
+      schema-locations: classpath:order.sql
+  artemis:
+    # In-VM broker per context. No server-id: Boot's auto-incremented default keeps the brokers of
+    # several cached contexts in one JVM apart. No address settings: with Artemis's defaults the 4th
+    # delivery reaches OrderQueueListener's maxRedelivery guard (redelivery count 3 > 2), which logs
+    # the redelivery-exceeded error and consumes the message, as the original connector did.
+    mode: embedded
+    embedded:
+      enabled: true
+      persistent: false
+      queues: in,out
+
+# Contract for the tests that use this profile:
+# - Activation: surefire sets spring.profiles.active=test (pom.xml) and test classes also declare
+#   @ActiveProfiles("test"), so the verbatim fixture-replay FixtureParityTest loads this file too.
+# - Reach the database only through the context's DataSource or JdbcTemplate. Re-reading jdbc.url or
+#   spring.datasource.url (@Value, Environment) resolves a new ${random.uuid}: an empty database
+#   without the orders table.
+# - @JdbcTest classes (client/OrderRepositoryTest) must declare
+#   @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE); otherwise Boot swaps in
+#   a plain-mode H2 that rejects order.sql's ENGINE=InnoDB and int(11).
+# - The original parity result [{count(*)=0}] comes from JdbcTemplate.queryForList with
+#   SELECT COUNT(*) AS "count(*)" FROM orders (UsingTransactionalScopeInJMStoDatabaseTest).
+# - An environment variable JDBC_URL outranks profile files; tests assume it is unset.

@@ -1,0 +1,34 @@
+# Live-sandbox credentials template for NetsuiteApiIT (netsuite-data-retrieval-java).
+#
+# Copy this file to src/test/resources/application-it.yml and replace every TODO.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it.
+#
+# NetsuiteApiIT runs under failsafe (mvn -B verify, Spring profile "it"); mvn -B test never reads this file.
+# The test is skipped by assumption, never failed, while application-it.yml is missing or while any key below
+# is missing, blank or still TODO.
+#
+# The test creates its own customer (nets.customer.companyName, subsidiary nets.customer.subsidiary.internalId),
+# asserts that GET /api/customers?name=<companyName> answers 200 with "companyName": "<companyName>", and deletes
+# the customer in finally. The GET /api/opportunities?title= and GET /api/items?quantity= searches are read-only.
+#
+# The NetSuite account needs an OAuth 2.0 client credentials (M2M) integration record with an uploaded certificate
+# mapped to an entity and role. The requester registers it inside the existing account; no new sandbox is procured.
+#
+# netsuite.* replaces mule.test.properties nets.account/email/password/roleId/applicationId (M2M, not SuiteTalk login).
+# The nets.* test-data keys keep the names the original MUnit suite (src/test/munit/netsuite-api-test-suite.xml) read.
+netsuite:
+  account: TODO              # TODO: supply the NetSuite account ID
+  oauth:
+    client-id: TODO          # TODO: supply the client ID of the M2M integration record
+    certificate-id: TODO     # TODO: supply the certificate ID of the uploaded certificate (JWT kid header)
+    private-key-path: TODO   # TODO: supply the file path of the PKCS#8 PEM private key matching that certificate
+nets:
+  customer:
+    companyName: TODO        # TODO: supply the company name of the test customer the IT creates and deletes
+    subsidiary:
+      internalId: TODO       # TODO: supply the subsidiary internal ID of that test customer
+  opportunity:
+    title: TODO              # TODO: supply the title prefix of the read-only opportunity search
+  item:
+    quantity: TODO           # TODO: supply the integer quantity of the read-only item search

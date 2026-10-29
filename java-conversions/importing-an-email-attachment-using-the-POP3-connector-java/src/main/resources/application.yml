@@ -1,0 +1,23 @@
+spring:
+  main:
+    web-application-type: none
+pop3:
+  host: ${POP3_HOST:}          # TODO: supply the POP3S server host (original README: pop.gmail.com)
+  port: 995
+  user: ${POP3_USER:}          # TODO: supply the mailbox address (plain form, e.g. receiver@gmail.com; the original %40 URI encoding is no longer needed)
+  password: ${POP3_PASSWORD:}  # TODO: supply the mailbox password
+  folder: INBOX
+  check-frequency: 100         # pop3s:connector checkFrequency
+  response-timeout: 10000      # inbound-endpoint responseTimeout
+  ssl-trust: ""                # test-only trust override; leave empty in production
+orders:
+  output-dir: src/test/resources/output   # file:outbound-endpoint path (original value)
+  output-file-name: orders.xml            # outputPattern
+# The original logs only the orders XML it builds from the attachment ("Received: <xml>", AttachmentImportService):
+# a root DEBUG/TRACE override, or --debug/--trace, must not reach the Angus Mail category, which below INFO writes
+# every polled mail. A logger's own level outranks logging.level.root and the --debug/--trace groups; Angus Mail logs
+# through java.util.logging, which Spring Boot bridges and holds at the same level.
+logging:
+  level:
+    com.mulesoft.examples.importing_an_email_attachment_using_the_pop3_connector: INFO
+    org.eclipse.angus.mail: INFO   # .pop3.protocol TRACE writes the whole POP3 dialogue: every RETR reply, with the message's headers (Return-Path, From, To, Subject) and the attachment's content

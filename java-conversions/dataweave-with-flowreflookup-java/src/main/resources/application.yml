@@ -1,0 +1,28 @@
+# dataweave-with-flowreflookup-java runtime configuration
+# Replaces dataweave-with-flowreflookup/src/main/app/mule-app.properties (comments only, no keys) and the
+# sfdc:config placeholders and file:inbound-endpoint values of dataweave-with-flowref.xml; the original sfdc.user is now sfdc.username.
+spring:
+  application:
+    name: dataweave-with-flowreflookup-java
+  main:
+    web-application-type: none          # no HTTP listener in the original (AAP 0.5.1 list)
+
+# The endpoint's responseTimeout is not carried: a one-way file inbound sends no reply.
+companies:
+  input-dir: src/main/resources/input       # original file:inbound-endpoint path (l.7)
+  move-to-dir: src/main/resources/output    # original moveToDirectory (l.7)
+  polling-frequency: 10000                  # original pollingFrequency in ms (l.7)
+
+# Secrets are never committed: each has no value here, and its TODO names what the operator supplies through the
+# environment variable shown (the live tests read them from the git-ignored application-it.yml).
+sfdc:
+  # TODO: supply the Salesforce username (original key: sfdc.user)
+  username: ${SFDC_USERNAME:}
+  # TODO: supply the Salesforce password
+  password: ${SFDC_PASSWORD:}
+  # TODO: supply the Salesforce security token
+  securityToken: ${SFDC_SECURITYTOKEN:}
+  auth-endpoint: https://login.salesforce.com/services/Soap/u/65.0   # Partner SOAP login, API 65.0 (force-partner-api 65.0.0)
+  # Connect and read timeouts: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s

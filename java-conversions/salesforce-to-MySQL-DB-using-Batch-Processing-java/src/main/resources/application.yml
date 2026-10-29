@@ -1,0 +1,62 @@
+# salesforce-to-MySQL-DB-using-Batch-Processing-java runtime configuration
+# Converted from salesforce-to-MySQL-DB-using-Batch-Processing/src/main/app/salesforce-to-database.xml;
+# the original mule-app.properties is empty. Keys keep the original placeholder names (AAP 0.4.6).
+# Live credentials for the *IT tests go in the git-ignored src/test/resources/application-it.yml.
+spring:
+  application:
+    name: salesforce-to-MySQL-DB-using-Batch-Processing-java
+  main:
+    # The original has no HTTP listener; its only trigger is the poll of flow triggerFlow.
+    web-application-type: none
+  datasource:
+    # Original db:mysql-config (l.7): host ${mysql.host}, port 3306, database company.
+    url: jdbc:mysql://${mysql.host}:${mysql.port}/${mysql.database}
+    username: ${mysql.user}
+    password: ${mysql.password}
+  sql:
+    init:
+      # The original never created the schema: apply contact.sql to the MySQL company database by hand (README).
+      mode: never
+
+mysql:
+  # TODO: supply the MySQL server host name
+  host: ${MYSQL_HOST:}
+  port: 3306
+  database: company
+  # TODO: supply the MySQL user with access to the company database
+  user: ${MYSQL_USER:}
+  # TODO: supply the MySQL user's password
+  password: ${MYSQL_PASSWORD:}
+
+# The sfdc:connection-pooling-profile (l.5) is not carried: SC-15 keeps one cached PartnerConnection.
+sfdc:
+  # Replaces the original placeholder sfdc.user (l.4); the request's key names govern (AAP 0.4.6).
+  # TODO: supply the Salesforce username
+  username: ${SFDC_USERNAME:}
+  # TODO: supply the Salesforce password
+  password: ${SFDC_PASSWORD:}
+  # TODO: supply the Salesforce security token
+  securityToken: ${SFDC_SECURITYTOKEN:}
+  auth-endpoint: https://login.salesforce.com/services/Soap/u/65.0   # Partner SOAP login, API 65.0 (force-partner-api 65.0.0)
+  # Connect and read timeouts: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s
+
+# The poll is the only trigger; ContactPollScheduler runs it with @Scheduled(fixedRate).
+poll:
+  # Original fixed-frequency-scheduler frequency="60" timeUnit="SECONDS" (l.62).
+  frequency: 60000
+  initial-delay: 0                      # ms; Mule polls as soon as the application starts
+
+# Original watermark (l.63): variable "timestamp", selector MAX of payload.LastModifiedDate.
+watermark:
+  # File-backed store of the watermark "timestamp" (Mule persistent object store equivalent).
+  # Its default (now - 10 s, UTC, yyyy-MM-dd'T'HH:mm:ss.SSS'Z') is computed in code.
+  store-path: .mule/objectstore/watermark.properties
+
+# The original logs a contact's e-mail address only on the error branch of upsertContactInDbStep ("Error with <email>
+# contact"): a root DEBUG/TRACE override, or --debug/--trace, must not reach this category, which below INFO writes
+# every contact. A logger's own level outranks logging.level.root and the --debug/--trace groups.
+logging:
+  level:
+    org.springframework.jdbc.core.StatementCreatorUtils: INFO   # TRACE writes every bound parameter value: each lookup's e-mail address and the first name, last name and e-mail address of each INSERT and UPDATE

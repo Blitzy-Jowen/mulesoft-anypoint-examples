@@ -1,0 +1,40 @@
+# Spring profile "test" for the credential-free unit tier, activated by @ActiveProfiles("test") in NetsuiteApiTest,
+# controller/CustomersControllerTest, ItemsControllerTest and OpportunitiesControllerTest,
+# config/ApiKitAcceptNegotiationListenerTest, config/PreflightDispatchListenerTest and the nested RequestLogging
+# tests of config/ApplicationLogLevelsTest.
+#
+# Every value below is a test dummy that fills a placeholder left empty in src/main/resources/application.yml;
+# none is a NetSuite credential and none authenticates anywhere.
+#
+# Deliberately absent, because only config/ApplicationLogLevelsTest, the one test under this profile that calls the
+# real SC-16 client, needs them, and it registers both through its @DynamicPropertySource:
+#   netsuite.base-url               the base URL of the test's in-process WireMock server
+#   netsuite.oauth.private-key-path an RSA key the test generates into a temporary file
+# NetsuiteApiTest (@MockBean NetsuiteRestClient) and the other tests (@MockBean NetsuiteSearchService) need neither.
+#
+# The production read timeout stays 10 s in application.yml; it is 2 s here, which bounds the WireMock calls of
+# config/ApplicationLogLevelsTest. No test under this profile waits for a delayed reply: the read-timeout 503 of
+# controller/CustomersControllerTest is thrown by its mocked NetsuiteSearchService.
+#
+# Live NetSuite credentials belong only in the git-ignored src/test/resources/application-it.yml
+# (template: application-it.yml.example).
+netsuite:
+  account: TSTDRV1234567
+  read-timeout: 2s
+  oauth:
+    client-id: test-client-id
+    certificate-id: test-certificate-id
+
+# Test data of the original MUnit suite (netsuite-api-test-suite.xml), under its original key names. The company
+# name and opportunity title are those of the committed api/customers-response.json and
+# api/opportunities-response.json, so the ported assertion that the GET /api/customers?name=<companyName> payload
+# contains "companyName": "<companyName>" holds against the recorded records; quantity is the RAML default.
+nets:
+  customer:
+    companyName: "Ramsey Inc. Wholesale Distribution V2011.1"
+    subsidiary:
+      internalId: "1"
+  opportunity:
+    title: Short wave
+  item:
+    quantity: 0

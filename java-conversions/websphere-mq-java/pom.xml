@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.12</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.mulesoft.examples</groupId>
+    <artifactId>websphere-mq-java</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>websphere-mq-java</name>
+    <description>
+        Spring Boot 3.2 conversion of the Mule 3.8 EE example "WebSphere MQ" (websphere-mq): the browser page
+        on port 8086 publishes through the Mule Ajax (Bayeux) channel /services/wmqExample/enqueue to IBM MQ
+        queue "in"; a transacted listener appends " - processed" after a 15 s wait and sends the text to queue
+        "out", whose listener delivers it to the page on the Ajax channel /services/wmqExample/dequeue.
+    </description>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <!-- Artemis 2.31.2 brings commons-beanutils 1.9.4 and commons-logging 1.2, neither managed by the Boot BOM.
+         These entries align them with the 1.11.0 and 1.3.2 used across the converted projects (the versions
+         Salesforce WSC 65.0.0 declares), leaving Artemis at the BOM's 2.31.2. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>commons-beanutils</groupId>
+                <artifactId>commons-beanutils</artifactId>
+                <version>1.11.0</version>
+            </dependency>
+            <dependency>
+                <groupId>commons-logging</groupId>
+                <artifactId>commons-logging</artifactId>
+                <version>1.3.2</version>
+            </dependency>
+            <!-- The IBM MQ client 9.3.5.0 brings Bouncy Castle bcprov, bcpkix and bcutil 1.77, which the Boot BOM does not
+                 manage. The three move together to 1.86 for the certificate, signature and ASN.1 advisories fixed from
+                 1.78 to 1.86 (CVE-2024-29857, CVE-2024-30172, CVE-2025-8916 and later); 1.86 is also the version
+                 WSS4J 4.0.2 is built with, the one the Spring WS security projects manage. The IBM MQ client stays at
+                 9.3.5.0. Root DECISIONS.md section 11.3.2. -->
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>1.86</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcpkix-jdk18on</artifactId>
+                <version>1.86</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcutil-jdk18on</artifactId>
+                <version>1.86</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Tomcat 10.1 never sends a custom reason phrase; every HTTP-serving conversion runs on Undertow instead.
+             Port 8086 serves the page, the Mule Ajax JavaScript and the Bayeux endpoint /ajax/cometd. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-tomcat</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- tomcat-embed-el only serves Bean Validation message interpolation, which this project does not use;
+             excluding it keeps every Tomcat artefact off the Undertow classpath. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-undertow</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.tomcat.embed</groupId>
+                    <artifactId>tomcat-embed-el</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- @JmsListener containers and the transacted JmsTemplate over the IBM MQ factory. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-jms</artifactId>
+        </dependency>
+        <!-- IBM MQ Jakarta JMS client (MQConnectionFactory, WMQConstants), configured by hand from the wmq.* keys
+             rather than through IBM's starter; replaces the EE WMQ transport and the IBM 5.3 client jars. -->
+        <dependency>
+            <groupId>com.ibm.mq</groupId>
+            <artifactId>com.ibm.mq.jakarta.client</artifactId>
+            <version>9.3.5.0</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Embedded Artemis stands in for the IBM MQ queue manager in tests: the test profile sets wmq.enabled
+             false, so the MQ factory is skipped and Boot's Artemis auto-configuration supplies an in-VM ConnectionFactory.
+             Test scope only, so production never falls back to a local broker instead of IBM MQ. -->
+        <dependency>
+            <groupId>org.apache.activemq</groupId>
+            <artifactId>artemis-jakarta-client</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.activemq</groupId>
+            <artifactId>artemis-jakarta-server</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Shaded edition, so its Jetty and Jackson cannot clash with Undertow or the Boot-managed Jackson. -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>3.13.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <execution>
+                        <id>enforce-banned-dependencies</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <searchTransitive>true</searchTransitive>
+                                    <excludes>
+                                        <exclude>javax.xml.ws:*</exclude>
+                                        <exclude>jakarta.xml.ws:*</exclude>
+                                        <exclude>javax.jws:*</exclude>
+                                        <exclude>jakarta.jws:*</exclude>
+                                        <exclude>javax.xml:jaxws-api</exclude>
+                                        <exclude>org.apache.cxf:*</exclude>
+                                        <exclude>com.sun.xml.ws:*</exclude>
+                                        <exclude>org.glassfish.metro:*</exclude>
+                                    </excludes>
+                                    <message>JAX-WS and CXF (APIs and providers) are banned in every converted project; SOAP is implemented with Spring WS only.</message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <release>${java.version}</release>
+                </configuration>
+            </plugin>
+
+            <!-- *IT classes are reserved for failsafe live-sandbox tests, which only connector projects have. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.1.2</version>
+                <configuration>
+                    <excludes>
+                        <exclude>**/*IT.java</exclude>
+                        <!-- Declaring excludes replaces surefire's default, so nested classes stay excluded explicitly. -->
+                        <exclude>**/*$*</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.15</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>check</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <!-- The class filter sits on the execution: inside a BUNDLE rule, includes would match bundle names, not classes.
+                             This project has no mapper package; the pattern is kept so every conversion gates the same layers. -->
+                        <configuration>
+                            <includes>
+                                <include>com/mulesoft/examples/websphere_mq/service/**</include>
+                                <include>com/mulesoft/examples/websphere_mq/mapper/**</include>
+                            </includes>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.80</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>3.2.12</version>
+                <executions>
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <mainClass>com.mulesoft.examples.websphere_mq.WebsphereMqApplication</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

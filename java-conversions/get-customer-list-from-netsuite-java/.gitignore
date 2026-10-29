@@ -1,0 +1,5 @@
+# get-customer-list-from-netsuite-java
+# Maven build output
+target/
+# Live NetSuite sandbox credentials (Tier 2B: netsuite.account, netsuite.oauth.*, nets.customer.subsidiary.internalId); never committed
+src/test/resources/application-it.yml

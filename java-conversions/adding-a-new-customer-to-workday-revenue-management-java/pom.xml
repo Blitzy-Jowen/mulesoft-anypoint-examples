@@ -1,0 +1,495 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.12</version>
+        <!-- Empty on purpose: the repository-root pom.xml is the Mule examples aggregator, not this project's parent. -->
+        <relativePath/>
+    </parent>
+
+    <groupId>com.mulesoft.examples</groupId>
+    <artifactId>adding-a-new-customer-to-workday-revenue-management-java</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>adding-a-new-customer-to-workday-revenue-management-java</name>
+    <description>Spring Boot 3.2 conversion of the Mule 3.8 example adding-a-new-customer-to-workday-revenue-management: an HTTP POST / listener that maps the posted customer XML to a Put_Customer_Request and adds the customer to Workday Revenue Management v25.0 over SOAP with a UsernameToken.</description>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!-- Overrides the Boot 3.2.12 managed 4.0.11; the BOM's spring-ws-bom import reads it, so spring-ws-core,
+             spring-ws-security, spring-ws-test and spring-xml move together. Spring Framework stays at the BOM's 6.1.15. -->
+        <spring-ws.version>4.1.4</spring-ws.version>
+
+        <!-- Package of the JAXB classes XJC generates from the Workday WSDL into target/generated-sources/jaxb (never committed). -->
+        <workday.generated.package>com.mulesoft.examples.adding_a_new_customer_to_workday_revenue_management.generated</workday.generated.package>
+
+        <!-- Artefacts outside the Boot BOM -->
+        <wiremock.version>3.13.2</wiremock.version>
+        <!-- WS-Security transitives outside the Boot BOM, managed in <dependencyManagement> below. -->
+        <bouncycastle.version>1.86</bouncycastle.version>
+        <opensaml.version>5.2.3</opensaml.version>
+        <shibboleth.version>9.2.3</shibboleth.version>
+        <guava.version>33.7.2-jre</guava.version>
+
+        <!-- Build plugins, every version explicit. The compiler, surefire, failsafe and enforcer properties reuse
+             Boot's names with Boot's own values, so the parent's pluginManagement resolves the same versions. -->
+        <maven-enforcer-plugin.version>3.4.1</maven-enforcer-plugin.version>
+        <maven-compiler-plugin.version>3.11.0</maven-compiler-plugin.version>
+        <maven-surefire-plugin.version>3.1.2</maven-surefire-plugin.version>
+        <maven-failsafe-plugin.version>3.1.2</maven-failsafe-plugin.version>
+        <jaxb2-maven-plugin.version>4.2.0</jaxb2-maven-plugin.version>
+        <jacoco.version>0.8.15</jacoco.version>
+        <spring-boot-maven-plugin.version>3.2.12</spring-boot-maven-plugin.version>
+    </properties>
+
+    <repositories>
+        <!-- spring-ws-security 4.1.4 brings WSS4J 4.0.1, whose OpenSAML 5.x compile dependencies are published only to
+             Shibboleth's repository; WSS4J initialises OpenSAML in WSProviderConfig.init(), so they cannot be excluded.
+             Maven Central stays the default repository for every other artefact. -->
+        <repository>
+            <id>shibboleth-releases</id>
+            <url>https://build.shibboleth.net/maven/releases/</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
+
+    <!-- Fixed releases of the transitives WSS4J 4.0.1 brings, none managed by the Boot BOM; each family moves as one:
+         - Bouncy Castle bcprov, bcpkix and bcutil 1.77 (from OpenSAML 5.1.6) to 1.86: the certificate, signature and
+           ASN.1 advisories fixed from 1.78 to 1.86 (CVE-2024-29857, CVE-2024-30172, CVE-2025-8916 and later).
+         - The OpenSAML 5.1.6 modules to 5.2.3 and their Shibboleth 9.1.6 support modules to 9.2.3: Shibboleth advisory
+           secadv_20260513a (crafted-XML resource exhaustion), fixed in 5.2.2.
+         - Guava 33.5.0-jre to 33.7.2-jre: CVE-2026-102554 (GHSA-xxph-c9ww-hj94), fixed in 33.7.2.
+         Bouncy Castle 1.86 and OpenSAML 5.2.3 are the versions WSS4J 4.0.2 is built and tested with. spring-ws-security
+         4.1.4, WSS4J 4.0.1 and xmlsec 4.0.4 stay unchanged. Every module is listed: the OpenSAML BOM is not imported,
+         because its parent would also manage xmlsec, Guava and other libraries. Root DECISIONS.md section 11.3. -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcprov-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcpkix-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.bouncycastle</groupId>
+                <artifactId>bcutil-jdk18on</artifactId>
+                <version>${bouncycastle.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-core-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-core-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-profile-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-saml-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-saml-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-security-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-security-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-soap-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xmlsec-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xmlsec-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-saml-api</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.opensaml</groupId>
+                <artifactId>opensaml-xacml-saml-impl</artifactId>
+                <version>${opensaml.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-networking</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-security</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-support</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>net.shibboleth</groupId>
+                <artifactId>shib-velocity</artifactId>
+                <version>${shibboleth.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.guava</groupId>
+                <artifactId>guava</artifactId>
+                <version>${guava.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Tomcat 10.1 never sends a custom reason phrase; every HTTP-serving conversion runs on Undertow instead. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-tomcat</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <!-- tomcat-embed-el only serves Bean Validation message interpolation, which this project does not use;
+             excluding it keeps every Tomcat artefact off the Undertow classpath. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-undertow</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.tomcat.embed</groupId>
+                    <artifactId>tomcat-embed-el</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <!-- Client side of Spring WS only (WebServiceTemplate, SaajSoapMessageFactory, HttpUrlConnectionMessageSender).
+             spring-boot-starter-web-services is deliberately absent because this project hosts no SOAP endpoint. Because
+             spring-ws-core carries MessageDispatcherServlet, Boot's WebServicesAutoConfiguration would still map it at
+             /services/*; the application class excludes that auto-configuration so unknown paths keep the no-listener 404. -->
+        <dependency>
+            <groupId>org.springframework.ws</groupId>
+            <artifactId>spring-ws-core</artifactId>
+        </dependency>
+        <!-- Wss4jSecurityInterceptor (WSS4J 4.0.1) for the Workday UsernameToken with PasswordText. -->
+        <dependency>
+            <groupId>org.springframework.ws</groupId>
+            <artifactId>spring-ws-security</artifactId>
+        </dependency>
+        <!-- Jaxb2Marshaller over the generated Workday classes. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-oxm</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>jakarta.xml.bind</groupId>
+            <artifactId>jakarta.xml.bind-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.glassfish.jaxb</groupId>
+            <artifactId>jaxb-runtime</artifactId>
+        </dependency>
+        <!-- SAAJ implementation behind SaajSoapMessageFactory; also supplies jakarta.xml.soap-api. -->
+        <dependency>
+            <groupId>com.sun.xml.messaging.saaj</groupId>
+            <artifactId>saaj-impl</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.ws</groupId>
+            <artifactId>spring-ws-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Shaded edition, so its Jetty and Jackson cannot clash with Undertow or the Boot-managed Jackson. -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>${wiremock.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.xmlunit</groupId>
+            <artifactId>xmlunit-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>${maven-enforcer-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>ban-jaxws-cxf</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <searchTransitive>true</searchTransitive>
+                                    <excludes>
+                                        <exclude>javax.xml.ws:*</exclude>
+                                        <exclude>jakarta.xml.ws:*</exclude>
+                                        <exclude>javax.jws:*</exclude>
+                                        <exclude>jakarta.jws:*</exclude>
+                                        <exclude>javax.xml:jaxws-api</exclude>
+                                        <exclude>org.apache.cxf:*</exclude>
+                                        <exclude>com.sun.xml.ws:*</exclude>
+                                        <exclude>org.glassfish.metro:*</exclude>
+                                    </excludes>
+                                    <message>JAX-WS and CXF (APIs and providers) are banned in every converted project; SOAP is implemented with Spring WS only.</message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                    <!-- Once earlier XJC output exists, XJC's staleness check skips generation even after the WSDL is gone, so
+                         this check, which runs ahead of XJC in the same phase, fails generate-sources whenever the WSDL is missing. -->
+                    <execution>
+                        <id>require-workday-wsdl</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireFilesExist>
+                                    <files>
+                                        <file>${project.basedir}/src/main/resources/wsdl/Revenue_Management_v25.0.wsdl</file>
+                                    </files>
+                                    <message>The Workday Revenue_Management v25.0 WSDL is the mandatory contract the JAXB classes are generated from.</message>
+                                </requireFilesExist>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- Generates the Jakarta JAXB classes of the Workday Revenue_Management v25.0 schema. In WSDL mode XJC binds
+                 only the embedded schema and never emits JAX-WS service stubs. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>jaxb2-maven-plugin</artifactId>
+                <version>${jaxb2-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>xjc</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>xjc</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <sourceType>wsdl</sourceType>
+                    <sources>
+                        <source>${project.basedir}/src/main/resources/wsdl/Revenue_Management_v25.0.wsdl</source>
+                    </sources>
+                    <packageName>${workday.generated.package}</packageName>
+                    <outputDirectory>${project.build.directory}/generated-sources/jaxb</outputDirectory>
+                    <clearOutputDir>true</clearOutputDir>
+                    <noGeneratedHeaderComments>true</noGeneratedHeaderComments>
+                    <!-- The Revenue_Management v25.0 WSDL is the mandatory contract: without it XJC fails the build at generate-sources. -->
+                    <failOnNoSchemas>true</failOnNoSchemas>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <release>${java.version}</release>
+                </configuration>
+            </plugin>
+
+            <!-- Unit tier (mvn test): credential-free; live-sandbox *IT classes belong to failsafe only.
+                 No literal argLine, which would drop the JaCoCo agent. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
+                <configuration>
+                    <excludes>
+                        <exclude>**/*IT.java</exclude>
+                        <!-- Declaring excludes replaces surefire's default, so nested classes stay excluded explicitly. -->
+                        <exclude>**/*$*</exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+
+            <!-- Tier 2B (mvn verify): the live Workday test; AddingANewCustomerToWorkdayIT skips itself by assumption when
+                 src/test/resources/application-it.yml or a key is absent. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>${maven-failsafe-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!-- Test against the compiled classes, not the repackaged Spring Boot jar. -->
+                    <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <!-- Whole-project report, so total coverage is recorded beside the gated figure; the XJC classes are
+                         left out so they never dilute it. -->
+                    <execution>
+                        <id>report</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                        <configuration>
+                            <excludes>
+                                <exclude>**/generated/**</exclude>
+                            </excludes>
+                        </configuration>
+                    </execution>
+                    <!-- Gate: LINE coverage >= 80% over service and mapper classes. The class filter sits on the execution,
+                         because inside a BUNDLE rule includes would match bundle names, not classes. -->
+                    <execution>
+                        <id>check</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>com/mulesoft/examples/adding_a_new_customer_to_workday_revenue_management/service/**</include>
+                                <include>com/mulesoft/examples/adding_a_new_customer_to_workday_revenue_management/mapper/**</include>
+                            </includes>
+                            <excludes>
+                                <exclude>**/generated/**</exclude>
+                            </excludes>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.80</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>${spring-boot-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <mainClass>com.mulesoft.examples.adding_a_new_customer_to_workday_revenue_management.AddingANewCustomerToWorkdayRevenueManagementApplication</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

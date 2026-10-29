@@ -1,0 +1,5 @@
+# netsuite-data-retrieval-java
+# Maven build output
+target/
+# Live NetSuite sandbox credentials (Tier 2B: netsuite.account, netsuite.oauth.*, nets.customer.*, nets.opportunity.title, nets.item.quantity); never committed
+src/test/resources/application-it.yml

@@ -1,0 +1,91 @@
+# soap-webservice-security-java runtime configuration
+# Originals: soap-webservice-security/src/main/app/mule-config.xml (six Greeter SOAP listeners) and service-clients.xml
+# (the /client front); mule-app.properties holds no keys. Every credential the original hard-coded is a TODO placeholder
+# here; the unit tests supply the demo values through src/test/resources/application-test.yml (profile test).
+spring:
+  application:
+    name: soap-webservice-security-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404
+  mvc:
+    dispatch-trace-request: true   # TRACE on 63080 reaches GreeterClientController (listener path client accepts every method)
+  webservices:
+    path: /services                # MessageDispatcherServlet registered as "messageDispatcherServlet" at /services/* (basePath="services", mule-config.xml:6)
+    servlet:
+      init:                        # bracketed so the case-sensitive servlet init parameter names keep their camelCase
+        "[dispatchOptionsRequest]": "true"   # OPTIONS and TRACE on a SOAP path are read as messages, as every method was
+        "[dispatchTraceRequest]": "true"
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # /error is no original path
+
+server:
+  port: 63081                      # mule-config.xml:6, HTTP_Listener_Configuration1 (fixed port)
+  address: 0.0.0.0
+
+# A scalar, so the port can be overridden (--ports.client=<port>) without replacing the listeners.additional list,
+# which Spring Boot binds from a single property source.
+ports:
+  client: 63080                    # service-clients.xml:6, HTTP_Listener_Configuration
+
+listeners:
+  host: 0.0.0.0
+  disallowed-methods: []           # neither original listener declares allowedMethods, so every method is accepted
+  main:
+    routes:
+      - servlet: messageDispatcherServlet
+        patterns:                  # exact listener paths under basePath services (mule-config.xml:9,16,29,43,57,72);
+          - /services/unsecure     # ?wsdl and ?xsd= are queries, so they match too
+          - /services/username
+          - /services/signed
+          - /services/encrypted
+          - /services/saml
+          - /services/signedsaml
+  additional:
+    - name: client
+      port: ${ports.client}
+      host: 0.0.0.0                # service-clients.xml:6
+      routes:
+        - servlet: dispatcherServlet
+          patterns: ["/client"]    # listener path client exactly (service-clients.xml:9)
+
+# Bound by config/SoapSecurityProperties. An empty value means "not configured": the context still starts, and a client
+# type that needs the missing value fails into the catch branch "There has been an Error processing the request".
+soap-security:
+  users:                           # WS-Security users the original PasswordCallback knew (PasswordCallback.java:25-31)
+    # TODO: supply the password of WS-Security user joe (also the private-key password of alias joe in keystore.jks)
+    joe: ${SOAP_SECURITY_USERS_JOE:}
+    # TODO: supply the password of WS-Security user stan
+    stan: ${SOAP_SECURITY_USERS_STAN:}
+  keystore:
+    properties: classpath:wssecurity.properties   # Merlin crypto settings; its store-password line is not carried
+    # TODO: supply the store password of keystore.jks (the original org.apache.ws.security.crypto.merlin.keystore.password)
+    password: ${SOAP_SECURITY_KEYSTORE_PASSWORD:}
+  saml:
+    properties: classpath:saml.properties         # SAML issuer settings; its issuer key-password line is not carried
+    # TODO: supply the SAML issuer key password (the original org.apache.ws.security.saml.issuer.key.password)
+    issuer-key-password: ${SOAP_SECURITY_SAML_ISSUER_KEY_PASSWORD:}
+  client:
+    # TODO: supply the outbound UsernameToken and signature user (service-clients.xml:50,63,76,103)
+    user: ${SOAP_SECURITY_CLIENT_USER:}
+    encryption-user: joe           # certificate alias of the committed demo keystore (service-clients.xml:77)
+    host: 0.0.0.0                  # HTTP_Request_Configuration host (service-clients.xml:7)
+    base-url: ""                   # empty: the client derives http://<host>:<actual server port>/services
+    response-timeout: 10000        # milliseconds, the Mule default response timeout
+
+logging:
+  level:
+    # mule-config.xml and service-clients.xml declare no logger, so no WS-Security header is logged at any level:
+    # below INFO these loggers write the wsse:Security tokens (UsernameToken, SAML assertion, signature) and the
+    # plaintext that signing and encryption cover. A logger's own level outranks logging.level.root and the --debug
+    # and --trace logger groups, so neither reaches them.
+    org.springframework.ws.client.MessageTracing: INFO   # .sent TRACE writes each request after WSS4J secured it, the whole wsse:Security header included; .received the reply
+    org.springframework.ws.server.MessageTracing: INFO   # the same envelopes as the six Greeter paths receive and answer them
+    org.apache.wss4j: INFO   # DEBUG writes the SAML assertion each SAMLTokenProcessor reads and the UsernameToken user name
+    org.apache.jcp.xml.dsig.internal.DigesterOutputStream: INFO   # DEBUG "Pre-digested input" writes every signed part: the Body and, through the STR-Transform, the SAML assertion
+    # WSS4J's STR-Transform writes the referenced SAML assertion straight into the digest and returns no data, which
+    # Santuario reports as a WARN on every signed SAML request, once when the client signs and once when the server
+    # validates, although that digest covers the assertion.
+    org.apache.jcp.xml.dsig.internal.dom.DOMReference: ERROR   # "The input bytes to the digest operation are null": the STR-Transform artefact. ERROR, not WARN: its only other WARN, a dereferenced reference it cannot cache, leaves WSS4J's validation without the signed element, which it rejects as FAILED_CHECK and PathScopedSecurityInterceptor logs
+    org.apache.xml.security.encryption: INFO   # DEBUG "Serialized octets"/"Decrypted octets" write the plaintext of every encrypted part, a UsernameToken a caller encrypts included

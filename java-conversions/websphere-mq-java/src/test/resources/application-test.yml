@@ -1,0 +1,16 @@
+# Spring profile "test" of websphere-mq-java, activated by @ActiveProfiles("test") and layered over
+# src/main/resources/application.yml. An embedded Artemis broker stands in for the IBM MQ queue manager
+# the original WebsphereMQIT pointed at with empty wmq.* settings. Holds no credentials or hosts.
+wmq:
+  enabled: false              # IbmMqConfig.WmqEnabledCondition skips the IBM MQ connectionFactory bean
+  processing:
+    wait-ms: 0                # MqProcessingService: no 15000 ms test:component wait in tests
+spring:
+  artemis:                    # Boot's ArtemisAutoConfiguration supplies the ConnectionFactory IbmMqConfig's beans use
+    mode: embedded
+    embedded:
+      enabled: true           # Boot default, stated explicitly as in the sibling JMS projects
+      persistent: false
+      queues: in,out          # WMQ queues of websphere-mq.xml (flows Input, MessageProcessor, Output)
+ajax:
+  connect-timeout-ms: 1000    # BayeuxLongPollingController: a held /meta/connect returns quickly while tests poll

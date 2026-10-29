@@ -1,0 +1,90 @@
+# http-oauth-provider-java runtime configuration
+# Replaces http-oauth-provider/src/main/app/mule-app.properties (the two ports) and the literals of
+# http-oauth-provider/src/main/app/http-oauth-provider.xml (oauth2-provider:config, ss:user-service, http:listener-config).
+spring:
+  application:
+    name: http-oauth-provider-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    # /resources and /redirect declare no allowedMethods, so TRACE runs their flow (token check, 302), and on /authorize and
+    # /token (GET and POST only) it gets SC-1's 405, instead of the servlet's TRACE echo of the request and its Authorization header.
+    dispatch-trace-request: true
+    # /authorize and /token check the method before reading the body, and /resources and /redirect ignore the body: a form
+    # body on PUT/PATCH/DELETE gets SC-1's 405 on /authorize and /token, and the flow on /resources and /redirect, before
+    # it is read (RequestBodyDrainFilter discards it afterwards) instead of being buffered whole by Boot's filter before dispatch.
+    formcontent:
+      filter:
+        enabled: false
+
+http:
+  provider:
+    port: 8081   # OAuth provider listener (/authorize, /token) <- mule-app.properties http.provider.port
+  listener:
+    port: 8082   # resource listener (/resources, /redirect) <- mule-app.properties http.listener.port
+
+server:
+  port: ${http.listener.port}   # the resource listener is the main Undertow port; the provider port is an SC-10 additional listener
+  address: localhost            # http:listener-config host="localhost" (xml:43); the provider module also served localhost
+
+# SC-10: each port answers only for the paths its original listener served; any other path gets the no-listener 404.
+listeners:
+  host: localhost
+  disallowed-methods: []        # neither listener restricts methods
+  main:
+    routes:
+      - patterns:               # exact paths, as the Mule listener paths (xml:45, :54); /resources/payroll is not served
+          - /resources
+          - /redirect
+  additional:
+    - name: provider
+      port: ${http.provider.port}
+      host: localhost
+      routes:
+        - patterns:             # the provider module's authorization and token endpoints
+            - /authorize
+            - /token
+
+# oauth2-provider:config "oauth2Provider" (xml:26-41), its validate scope (xml:46) and the resource owner (xml:16)
+oauth:
+  provider:
+    provider-name: SampleAPI
+    # TODO: supply the OAuth client id (original hard-coded myclientid)
+    client-id: ${OAUTH_PROVIDER_CLIENT_ID:}
+    # TODO: supply the OAuth client secret
+    client-secret: ${OAUTH_PROVIDER_CLIENT_SECRET:}
+    client-name: Mule Bookstore
+    client-description: Mule-powered On-line Bookstore
+    client-type: CONFIDENTIAL
+    redirect-uris:
+      - "http://localhost*"
+    authorized-grant-types:
+      - AUTHORIZATION_CODE
+    scopes:                     # provider scopes (xml:26) and client scopes (xml:36-37) are the same set
+      - READ_RESOURCE
+      - POST_RESOURCE
+    resource-scope: READ_RESOURCE   # scope /resources validates (xml:46)
+    token-ttl-seconds: 86400
+    authorization-code-ttl-seconds: 600
+    owner:
+      # TODO: supply the resource-owner username
+      username: ${OAUTH_PROVIDER_OWNER_USERNAME:}
+      # TODO: supply the resource-owner password
+      password: ${OAUTH_PROVIDER_OWNER_PASSWORD:}
+      authorities:
+        - RESOURCE_OWNER
+
+# Below INFO these loggers write the client secret, authorization codes, access tokens and the resource owner's
+# password, which the original never logged. A logger's own level outranks logging.level.root and the groups that
+# --debug and --trace raise, so pinning each at INFO, or WARN where noted, keeps them out of the log at every root level.
+logging:
+  level:
+    # request lines with their query (client_secret, code, access_token), the redirect view's URL with its code,
+    # and, with spring.mvc.log-request-details, the parameters and headers (Authorization, Location).
+    # WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    # response bodies written, the token JSON among them, and resolved exception messages
+    org.springframework.web.servlet.mvc.method.annotation: INFO
+    org.springframework.web.method.HandlerMethod: INFO   # handler arguments: owner password, client secret, code, Authorization
+    io.undertow.request.io: INFO                         # request-parse failures quoting a query value that does not decode

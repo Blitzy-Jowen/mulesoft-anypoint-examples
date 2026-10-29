@@ -1,0 +1,250 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.12</version>
+        <!-- Empty on purpose: the repository-root pom.xml is the Mule examples aggregator, not this project's parent. -->
+        <relativePath/>
+    </parent>
+
+    <groupId>com.mulesoft.examples</groupId>
+    <artifactId>import-leads-into-salesforce-java</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>import-leads-into-salesforce-java</name>
+    <description>Spring Boot 3.2 conversion of the Mule 3.8 example import-leads-into-salesforce: a polled CSV file feeds the batch job CreateLeadsBatch, which creates a Salesforce Lead through the SOAP Partner API for every email not already present.</description>
+
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+        </license>
+    </licenses>
+
+    <properties>
+        <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!-- Artefacts outside the Spring Boot 3.2.12 BOM -->
+        <force-partner-api.version>65.0.0</force-partner-api.version>
+        <wiremock.version>3.13.2</wiremock.version>
+
+        <!-- Build plugins. The compiler, surefire, failsafe and enforcer properties reuse Boot's names with Boot's own values, so the parent's pluginManagement resolves the same versions. -->
+        <maven-compiler-plugin.version>3.11.0</maven-compiler-plugin.version>
+        <maven-surefire-plugin.version>3.1.2</maven-surefire-plugin.version>
+        <maven-failsafe-plugin.version>3.1.2</maven-failsafe-plugin.version>
+        <maven-enforcer-plugin.version>3.4.1</maven-enforcer-plugin.version>
+        <jacoco-maven-plugin.version>0.8.15</jacoco-maven-plugin.version>
+        <spring-boot-maven-plugin.version>3.2.12</spring-boot-maven-plugin.version>
+    </properties>
+
+    <dependencies>
+        <!-- No web starter: the original flow has no HTTP listener (application.yml sets spring.main.web-application-type: none). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- Keep WSC's runtime dependencies, including commons-logging; only Jackson follows Boot's BOM (2.15.4). -->
+        <dependency>
+            <groupId>com.force.api</groupId>
+            <artifactId>force-partner-api</artifactId>
+            <version>${force-partner-api.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Test scope only; the application stays non-web. Spring Boot 3.2 registers a TestRestTemplate for every
+             @SpringBootTest(webEnvironment = RANDOM_PORT), including the shared FixtureParityTest, and that test
+             context cannot load without spring-web. No server or servlet API comes with it, so test contexts start
+             non-web as well. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- Shaded standalone artefact, so WireMock's Jetty and Jackson never clash with Boot's Jackson. -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>${wiremock.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Replaces the parent's @-delimiter filtering of application*.yml, so every resource is packaged byte-for-byte. -->
+        <resources>
+            <resource>
+                <directory>${basedir}/src/main/resources</directory>
+                <filtering>false</filtering>
+            </resource>
+        </resources>
+
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <version>${maven-enforcer-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>ban-jaxws-cxf</id>
+                        <phase>validate</phase>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <bannedDependencies>
+                                    <searchTransitive>true</searchTransitive>
+                                    <excludes>
+                                        <exclude>javax.xml.ws:*</exclude>
+                                        <exclude>jakarta.xml.ws:*</exclude>
+                                        <exclude>javax.jws:*</exclude>
+                                        <exclude>jakarta.jws:*</exclude>
+                                        <exclude>javax.xml:jaxws-api</exclude>
+                                        <exclude>org.apache.cxf:*</exclude>
+                                        <exclude>com.sun.xml.ws:*</exclude>
+                                        <exclude>org.glassfish.metro:*</exclude>
+                                    </excludes>
+                                    <message>JAX-WS and CXF are banned in every converted project; SOAP is served and consumed through Spring WS, and Salesforce through WSC's own XML stack.</message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <release>${java.version}</release>
+                    <parameters>true</parameters>
+                </configuration>
+            </plugin>
+
+            <!-- Unit tier (mvn test): credential-free; live-sandbox *IT classes belong to failsafe only. No literal argLine, which would drop the JaCoCo agent. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
+                <configuration>
+                    <excludes>
+                        <exclude>**/*IT.java</exclude>
+                    </excludes>
+                    <!-- Isolate scheduled polling from source resources and space out runs after the initial poll.
+                         Tests can override these paths with @DynamicPropertySource. -->
+                    <systemPropertyVariables>
+                        <leads.input-dir>${project.build.directory}/test-leads/input</leads.input-dir>
+                        <leads.move-to-dir>${project.build.directory}/test-leads/output</leads.move-to-dir>
+                        <leads.polling-frequency>3600000</leads.polling-frequency>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+
+            <!-- Tier 2B (mvn verify): live Salesforce tests; each *IT skips itself by assumption when src/test/resources/application-it.yml or a key is absent. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <version>${maven-failsafe-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
+                    <systemPropertyVariables>
+                        <leads.input-dir>${project.build.directory}/it-leads/input</leads.input-dir>
+                        <leads.move-to-dir>${project.build.directory}/it-leads/output</leads.move-to-dir>
+                        <leads.polling-frequency>3600000</leads.polling-frequency>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <!-- Whole-project report, so total coverage is recorded beside the gated figure. -->
+                    <execution>
+                        <id>report</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <!-- Gate: LINE coverage >= 80% over service and mapper classes. The includes sit on the execution, because rule-level includes filter bundle names, not classes. -->
+                    <execution>
+                        <id>check</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>com/mulesoft/examples/import_leads_into_salesforce/service/**</include>
+                                <include>com/mulesoft/examples/import_leads_into_salesforce/mapper/**</include>
+                            </includes>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.80</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>${spring-boot-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <mainClass>com.mulesoft.examples.import_leads_into_salesforce.ImportLeadsIntoSalesforceApplication</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

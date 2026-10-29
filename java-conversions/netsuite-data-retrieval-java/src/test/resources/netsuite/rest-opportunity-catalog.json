@@ -1,0 +1,435 @@
+{
+  "type": "object",
+  "properties": {
+    "links": {
+      "title": "Links",
+      "type": "array",
+      "nullable": true,
+      "items": {
+        "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+      }
+    },
+    "id": {
+      "title": "Internal ID",
+      "type": "string",
+      "nullable": true
+    },
+    "refName": {
+      "title": "Reference Name",
+      "type": "string",
+      "nullable": true
+    },
+    "billingAddress": {
+      "title": "Billing Address",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "nullable": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        },
+        "id": {
+          "title": "Internal ID",
+          "type": "string",
+          "nullable": true
+        },
+        "addr1": {
+          "title": "Address 1",
+          "type": "string",
+          "nullable": true
+        },
+        "addr2": {
+          "title": "Address 2",
+          "type": "string",
+          "nullable": true
+        },
+        "addr3": {
+          "title": "Address 3",
+          "type": "string",
+          "nullable": true
+        },
+        "addrPhone": {
+          "title": "Phone",
+          "type": "string",
+          "nullable": true
+        },
+        "addrText": {
+          "title": "Address",
+          "type": "string",
+          "nullable": true
+        },
+        "addressee": {
+          "title": "Addressee",
+          "type": "string",
+          "nullable": true
+        },
+        "attention": {
+          "title": "Attention",
+          "type": "string",
+          "nullable": true
+        },
+        "city": {
+          "title": "City",
+          "type": "string",
+          "nullable": true
+        },
+        "country": {
+          "title": "Country",
+          "type": "object",
+          "nullable": true,
+          "properties": {
+            "id": {
+              "title": "Internal Identifier",
+              "type": "string"
+            },
+            "refName": {
+              "title": "Reference Name",
+              "type": "string"
+            }
+          }
+        },
+        "override": {
+          "title": "Override",
+          "type": "boolean",
+          "nullable": true
+        },
+        "state": {
+          "title": "State",
+          "type": "string",
+          "nullable": true
+        },
+        "zip": {
+          "title": "Zip",
+          "type": "string",
+          "nullable": true
+        }
+      }
+    },
+    "createdDate": {
+      "title": "Date Created",
+      "type": "string",
+      "format": "date-time",
+      "nullable": true
+    },
+    "currency": {
+      "title": "Currency",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "currencyName": {
+      "title": "Currency Name",
+      "type": "string",
+      "nullable": true
+    },
+    "daysOpen": {
+      "title": "Days Open",
+      "type": "integer",
+      "format": "int64",
+      "nullable": true
+    },
+    "entity": {
+      "title": "Customer",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "entityStatus": {
+      "title": "Customer Status",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "estGrossProfit": {
+      "title": "Est. Gross Profit",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "estGrossProfitPercent": {
+      "title": "Est. Gross Profit Percent",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "exchangeRate": {
+      "title": "Exchange Rate",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "expectedCloseDate": {
+      "title": "Expected Close",
+      "type": "string",
+      "format": "date",
+      "nullable": true
+    },
+    "forecastType": {
+      "title": "Forecast Type",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "isBudgetApproved": {
+      "title": "Budget Approved",
+      "type": "boolean",
+      "nullable": true
+    },
+    "lastModifiedDate": {
+      "title": "Date Last Modified",
+      "type": "string",
+      "format": "date-time",
+      "nullable": true
+    },
+    "leadSource": {
+      "title": "Lead Source",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "location": {
+      "title": "Location",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "probability": {
+      "title": "Probability",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "projectedTotal": {
+      "title": "Projected Total",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "salesRep": {
+      "title": "Sales Rep",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "shipIsResidential": {
+      "title": "Ship Is Residential",
+      "type": "boolean",
+      "nullable": true
+    },
+    "shippingAddress": {
+      "title": "Shipping Address",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "links": {
+          "title": "Links",
+          "type": "array",
+          "nullable": true,
+          "items": {
+            "$ref": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/metadata-catalog/nsLink"
+          }
+        },
+        "id": {
+          "title": "Internal ID",
+          "type": "string",
+          "nullable": true
+        },
+        "addr1": {
+          "title": "Address 1",
+          "type": "string",
+          "nullable": true
+        },
+        "addr2": {
+          "title": "Address 2",
+          "type": "string",
+          "nullable": true
+        },
+        "addr3": {
+          "title": "Address 3",
+          "type": "string",
+          "nullable": true
+        },
+        "addrPhone": {
+          "title": "Phone",
+          "type": "string",
+          "nullable": true
+        },
+        "addrText": {
+          "title": "Address",
+          "type": "string",
+          "nullable": true
+        },
+        "addressee": {
+          "title": "Addressee",
+          "type": "string",
+          "nullable": true
+        },
+        "attention": {
+          "title": "Attention",
+          "type": "string",
+          "nullable": true
+        },
+        "city": {
+          "title": "City",
+          "type": "string",
+          "nullable": true
+        },
+        "country": {
+          "title": "Country",
+          "type": "object",
+          "nullable": true,
+          "properties": {
+            "id": {
+              "title": "Internal Identifier",
+              "type": "string"
+            },
+            "refName": {
+              "title": "Reference Name",
+              "type": "string"
+            }
+          }
+        },
+        "override": {
+          "title": "Override",
+          "type": "boolean",
+          "nullable": true
+        },
+        "state": {
+          "title": "State",
+          "type": "string",
+          "nullable": true
+        },
+        "zip": {
+          "title": "Zip",
+          "type": "string",
+          "nullable": true
+        }
+      }
+    },
+    "status": {
+      "title": "Status",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "subsidiary": {
+      "title": "Subsidiary",
+      "type": "object",
+      "nullable": true,
+      "properties": {
+        "id": {
+          "title": "Internal Identifier",
+          "type": "string"
+        },
+        "refName": {
+          "title": "Reference Name",
+          "type": "string"
+        }
+      }
+    },
+    "title": {
+      "title": "Title",
+      "type": "string",
+      "nullable": true
+    },
+    "totalCostEstimate": {
+      "title": "Est. Cost",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    },
+    "tranDate": {
+      "title": "Date",
+      "type": "string",
+      "format": "date",
+      "nullable": true
+    },
+    "tranId": {
+      "title": "Opportunity #",
+      "type": "string",
+      "nullable": true
+    },
+    "weightedTotal": {
+      "title": "Weighted Total",
+      "type": "number",
+      "format": "double",
+      "nullable": true
+    }
+  }
+}

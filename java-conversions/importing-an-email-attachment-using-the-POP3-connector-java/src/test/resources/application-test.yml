@@ -1,0 +1,12 @@
+# Spring profile "test": GreenMail demo values for the surefire tests.
+# These are not real credentials. GreenMail runs on dynamic ports, so pop3.port is
+# not set here; each polling test supplies it (and any other override) through
+# @DynamicPropertySource or by constructing Pop3MailPoller directly.
+pop3:
+  host: localhost
+  user: receiver@localhost
+  password: secret
+  ssl-trust: "*"
+  check-frequency: 3600000
+orders:
+  output-dir: target/test-output/orders

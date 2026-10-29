@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Authored offline test stand-in for predic8's ShopService WSDL. NOT a copy of predic8's published document. -->
+<wsdl:definitions xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/"
+                  xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+                  xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                  xmlns:tns="http://predic8.com/wsdl/shop/1/"
+                  targetNamespace="http://predic8.com/wsdl/shop/1/">
+    <wsdl:types>
+        <xsd:schema>
+            <xsd:import namespace="http://predic8.com/wsdl/shop/1/" schemaLocation="ShopService.xsd"/>
+        </xsd:schema>
+    </wsdl:types>
+    <wsdl:message name="createRequest">
+        <wsdl:part name="parameters" element="tns:create"/>
+    </wsdl:message>
+    <wsdl:message name="createResponse">
+        <wsdl:part name="parameters" element="tns:createResponse"/>
+    </wsdl:message>
+    <wsdl:portType name="ShopServicePT">
+        <wsdl:operation name="create">
+            <wsdl:input message="tns:createRequest"/>
+            <wsdl:output message="tns:createResponse"/>
+        </wsdl:operation>
+    </wsdl:portType>
+    <wsdl:binding name="ShopServicePTBinding" type="tns:ShopServicePT">
+        <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
+        <wsdl:operation name="create">
+            <soap:operation soapAction=""/>
+            <wsdl:input><soap:body use="literal"/></wsdl:input>
+            <wsdl:output><soap:body use="literal"/></wsdl:output>
+        </wsdl:operation>
+    </wsdl:binding>
+    <wsdl:service name="ShopService">
+        <wsdl:port name="ShopServicePTPort" binding="tns:ShopServicePTBinding">
+            <soap:address location="http://www.predic8.com:8080/shop/ShopService"/>
+        </wsdl:port>
+    </wsdl:service>
+</wsdl:definitions>

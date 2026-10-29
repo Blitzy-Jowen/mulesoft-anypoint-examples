@@ -1,0 +1,43 @@
+# Replaces importing-an-email-attachment-using-the-IMAP-connector/src/main/app/mule-app.properties (empty) and the
+# values imap-to-xml.xml reads or fixes. The original placeholder names imap.host, imap.user and imap.password are
+# kept; the original test's imap.user_enc (a URL-encoded address Mule needed in its endpoint URI) is dropped,
+# because Jakarta Mail takes the plain address.
+spring:
+  main:
+    web-application-type: none     # the original flow has no HTTP listener
+
+imap:
+  # TODO: supply the IMAPS server host name
+  host: ${IMAP_HOST:}
+  # TODO: supply the mailbox user (plain address, e.g. user@example.com)
+  user: ${IMAP_USER:}
+  # TODO: supply the mailbox password
+  password: ${IMAP_PASSWORD:}
+  port: 993                        # fixed on the original imaps:inbound-endpoint (imap-to-xml.xml:10), implicit TLS
+  folder: INBOX                    # Mule's default mailboxFolder
+  check-frequency: 100             # ms between polls; original imaps:connector checkFrequency (imap-to-xml.xml:5)
+  initial-delay: 0                 # ms before the first poll
+  # Socket deadlines of every poll's IMAPS connection, in ms: connecting (TLS handshake excluded), each read (TLS
+  # handshake, greeting, LOGIN, SELECT and FETCH replies) and each write. 10000 is the original endpoint's
+  # responseTimeout="10000" (imap-to-xml.xml:10), the 10 s convention of the POP3 and SMTP conversions. Each must be
+  # a positive whole number: 0 or a negative value would mean no deadline, so the poller refuses to start with one.
+  connect-timeout: 10000
+  read-timeout: 10000
+  write-timeout: 10000
+  # Extra jakarta.mail session properties, none by default. A key containing dots must be written in bracket
+  # notation so the dots stay inside the map key, e.g. "[mail.imaps.ssl.trust]": "*". An entry for
+  # mail.imaps.connectiontimeout, mail.imaps.timeout or mail.imaps.writetimeout replaces the matching deadline above
+  # and must likewise be a positive whole number of ms.
+  properties: {}
+
+orders:
+  output-dir: src/test/resources/output   # original file:outbound-endpoint path, relative to the working directory (imap-to-xml.xml:32)
+  output-file-name: orders.xml            # original outputPattern (imap-to-xml.xml:32)
+
+# The original logs only the orders XML it builds from the attachment ("Received: <xml>", AttachmentImportService):
+# a root DEBUG/TRACE override, or --debug/--trace, must not reach this category, which below INFO writes the mailbox
+# account and every polled mail. A logger's own level outranks logging.level.root and the --debug/--trace groups;
+# Angus Mail logs through java.util.logging, which Spring Boot bridges and holds at the same level.
+logging:
+  level:
+    org.eclipse.angus.mail: INFO   # .imap DEBUG writes the mailbox user; .imap.protocol TRACE the whole IMAP dialogue: the envelope, every header (Return-Path, From, To, Subject) and the attachment's content

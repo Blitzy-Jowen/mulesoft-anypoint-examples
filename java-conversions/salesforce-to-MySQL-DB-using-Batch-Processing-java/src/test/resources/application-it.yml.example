@@ -1,0 +1,34 @@
+# Live-sandbox (Tier 2B) credentials template for salesforce-to-MySQL-DB-using-Batch-Processing-java.
+#
+# Copy this file to application-it.yml in this same directory (src/test/resources/) and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore (src/test/resources/application-it.yml) and by
+# the repository-root .gitignore (**/src/test/resources/application-it.yml). Never commit it. Reuse the existing
+# Salesforce sandbox credentials of the original salesforce-to-MySQL-DB-using-Batch-Processing example; no new
+# sandbox is procured. sfdc.username replaces the sfdc.user key that the original test read from
+# src/test/resources/mule.test.properties; sfdc.password and sfdc.securityToken keep their names.
+#
+# SalesforceToMySQLDBUsingBatchProcessingIT runs under failsafe (mvn -B verify) and loads application-it.yml as
+# Spring profile "it"; mvn -B test never reads it. It is skipped by JUnit assumption while application-it.yml is
+# missing, or while any of the three keys below is missing, blank or still TODO, so mvn -B verify and
+# mvn -B clean install pass without credentials, with the IT reported as skipped, never as passed.
+#
+# No MySQL or database key is needed. The IT also activates Spring profile "test", whose in-memory H2 database in
+# MySQL mode (src/test/resources/application-test.yml, initialised from classpath:contact.sql) replaces the
+# original mule.test.properties keys database.host, database.user, database.password and database.url, and the
+# mysql.host, mysql.user and mysql.password values the original test derived from them.
+#
+# The live test writes data. Its single live write is one Salesforce Contact with a unique LastName
+# (Contact Test Name<millis>) and Email (Contact<millis>@test.com), built as the original test built it. One poll
+# (ContactPollScheduler.pollOnce()) synchronises it into H2; the test asserts that the batch job completed
+# successfully and that exactly one contact row has that last_name, as the original test did. The poll only reads
+# Salesforce Contacts. The Contact is deleted in @AfterEach together with its H2 row. Use a sandbox org, never
+# production.
+#
+# Run with: mvn -B verify
+sfdc:
+  username:        # TODO: supply the Salesforce sandbox username (replaces the original sfdc.user)
+  password:        # TODO: supply the Salesforce sandbox user's password, without the security token
+  securityToken:   # TODO: supply the security token of that Salesforce user
+  # Optional, for a sandbox org, whose users log in at test.salesforce.com: add auth-endpoint to this sfdc block
+  # with the value https://test.salesforce.com/services/Soap/u/65.0. Without it, the default from
+  # src/main/resources/application.yml applies, https://login.salesforce.com/services/Soap/u/65.0.

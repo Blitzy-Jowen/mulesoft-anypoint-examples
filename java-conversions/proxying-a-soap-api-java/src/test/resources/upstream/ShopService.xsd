@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Authored offline test stand-in for the ShopService schema of proxying-a-soap-api-java. NOT a copy of predic8's published document. -->
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            targetNamespace="http://predic8.com/wsdl/shop/1/"
+            elementFormDefault="unqualified">
+    <xsd:element name="create">
+        <xsd:complexType>
+            <xsd:sequence>
+                <xsd:element name="customerId" type="xsd:string"/>
+            </xsd:sequence>
+        </xsd:complexType>
+    </xsd:element>
+    <xsd:element name="createResponse">
+        <xsd:complexType>
+            <xsd:sequence>
+                <xsd:element name="cartId" type="xsd:string"/>
+            </xsd:sequence>
+        </xsd:complexType>
+    </xsd:element>
+</xsd:schema>

@@ -1,0 +1,21 @@
+# Spring profile "test" for the credential-free unit tier, activated by @ActiveProfiles("test") in
+# controller/NetsuiteCustomerControllerTest and GetCustomersListFromNetsuiteTest.
+#
+# Every value below is a test dummy that fills a placeholder left empty in src/main/resources/application.yml;
+# none is a NetSuite credential and none authenticates anywhere.
+#
+# Deliberately absent, because each test registers them through its @DynamicPropertySource:
+#   netsuite.base-url               the base URL of the test's in-process WireMock server
+#   netsuite.oauth.private-key-path an RSA key the test generates into a temporary file
+#
+# The production read timeout stays 10 s in application.yml; it is shortened here only so that the
+# upstream-timeout (503) case against WireMock's fixed delay finishes quickly.
+#
+# Live NetSuite credentials belong only in the git-ignored src/test/resources/application-it.yml
+# (template: application-it.yml.example).
+netsuite:
+  account: TSTDRV1234567
+  read-timeout: 2s
+  oauth:
+    client-id: test-client-id
+    certificate-id: test-certificate-id

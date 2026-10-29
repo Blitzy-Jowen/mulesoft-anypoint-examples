@@ -1,0 +1,31 @@
+{
+  "name": "Broker",
+  "modelVersion": "8.0",
+  "authenticationproviders": [ {
+    "name": "plain",
+    "type": "Plain",
+    "secureOnlyMechanisms": [],
+    "users": [ {
+      "name": "guest",
+      "password": "guest",
+      "type": "managed"
+    } ]
+  } ],
+  "ports": [ {
+    "name": "AMQP",
+    "port": "${qpid.amqp_port}",
+    "bindingAddress": "127.0.0.1",
+    "authenticationProvider": "plain",
+    "virtualhostaliases": [
+      { "name": "nameAlias", "type": "nameAlias" },
+      { "name": "defaultAlias", "type": "defaultAlias" },
+      { "name": "hostnameAlias", "type": "hostnameAlias" }
+    ]
+  } ],
+  "virtualhostnodes": [ {
+    "name": "default",
+    "type": "Memory",
+    "defaultVirtualHostNode": "true",
+    "virtualHostInitialConfiguration": "{\"type\":\"Memory\"}"
+  } ]
+}

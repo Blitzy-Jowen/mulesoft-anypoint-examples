@@ -1,0 +1,24 @@
+# jms-message-rollback-and-redelivery-java runtime configuration
+# Original: jms-message-rollback-and-redelivery/src/main/app/jms-redelivery.xml (mule-app.properties holds no keys),
+# so every value is a fixed default taken from the flow's literals. The broker connection is anonymous.
+# The Artemis deployment type is deliberately left to Boot: it deduces the in-VM broker in tests
+# (artemis-jakarta-server is test-scoped) and the native client at runtime, which connects to broker-url.
+spring:
+  application:
+    name: jms-message-rollback-and-redelivery-java
+  main:
+    web-application-type: none        # no HTTP listener in the original (AAP 0.5.1)
+  artemis:
+    broker-url: tcp://localhost:61616  # replaces failover:(tcp://localhost:61616) [jms-redelivery.xml:14]
+jms:
+  inbound-queue: in                    # [jms-redelivery.xml:22]
+  outbound-topic: topic1               # [jms-redelivery.xml:35]
+  concurrent-consumers: 4              # Mule 3.8 default transacted receivers
+# ActiveMQ RedeliveryPolicy [jms-redelivery.xml:6-12], without exponential back-off (useExponentialBackOff=false);
+# the broker-side address settings for "in" (redelivery-delay 0, max-delivery-attempts 6) are documented in README.md.
+# The listener's consumers run with consumerWindowSize 0 and each is closed before its delivery is processed, both set in
+# config/JmsConfig, so the timing holds for any broker-url.
+redelivery:
+  initial-redelivery-delay: 5000       # [jms-redelivery.xml:8]
+  redelivery-delay: 2000               # [jms-redelivery.xml:9]
+  maximum-redeliveries: 5              # [jms-redelivery.xml:7]

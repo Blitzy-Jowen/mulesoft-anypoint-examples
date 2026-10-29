@@ -1,0 +1,7 @@
+# import-contacts-into-ms-dynamics-java
+# Maven build output
+target/
+# Live Dataverse / Entra credentials for ImportContactsIntoMSDynamicsIT (dynamics.oauth.tenant-id,
+# dynamics.oauth.client-id, dynamics.oauth.client-secret, dynamics.service-url); never committed
+# (template: application-it.yml.example)
+src/test/resources/application-it.yml

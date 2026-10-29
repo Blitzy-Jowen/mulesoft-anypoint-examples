@@ -1,0 +1,34 @@
+# Spring profile "test" for the surefire tests of oauth2-client-credentials-using-the-HTTP-connector-java.
+# Supplies placeholder values for the TODO keys that src/main/resources/application.yml leaves blank; none of
+# them is a real credential, host or account. Only these keys are overridden; every other key keeps its main default.
+# Upstream URLs point at 127.0.0.1:9 (discard port, which refuses connections), so a test that forgets its
+# WireMock override fails fast and never reaches app.box.com or tfim01.demos.ibm.com. They use plain http, so no
+# TLS context is built from the blank store passwords.
+
+# Box OAuth 2.0 client-credentials grant
+oauth:
+  client:
+    id: test-client-id
+    secret: test-client-secret
+
+# IBM FIM proxy client_id
+client:
+  id: test-fim-client-id
+
+# TLS stores (paths keep the main defaults)
+keystore:
+  password: ""
+  key:
+    password: ""
+
+truststore:
+  password: ""
+
+box:
+  oauth:
+    token-url: http://127.0.0.1:9/api/oauth2/token
+  api:
+    base-url: http://127.0.0.1:9
+
+fim:
+  base-url: http://127.0.0.1:9

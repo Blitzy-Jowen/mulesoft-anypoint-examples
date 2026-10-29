@@ -1,0 +1,85 @@
+# Key names keep the original Mule placeholder names; secrets have no value:
+# supply each through the environment variable named in its placeholder. Without the store passwords the HTTPS
+# listener cannot open keystore.jks and trust-store, so the application does not start, as the original did not.
+server:
+  address: localhost                 # http:listener-config host="localhost" (HTTP_Listener_Configuration)
+  port: 8081                         # http:listener-config port="8081", fixed in the original
+spring:
+  application:
+    name: oauth2-authorization-code-using-the-HTTP-connector-java
+  web:
+    resources:
+      # No static resource handler: a path the routes admit but no controller maps would get SC-1's no-listener 404.
+      add-mappings: false            # every admitted path has a controller; SC-10 answers every other path first
+  mvc:
+    dispatch-trace-request: true     # the listeners declare no allowedMethods: TRACE is accepted too
+
+# Box OAuth 2.0 authorization-code grant (oauth2:authorization-code-grant-type of HTTP_Request_Configuration_HTTPS).
+# The local URLs are built from the listener ports, so moving a port moves the URLs that point at it, as the Mule
+# OAuth module opened its local listener from localAuthorizationUrl and redirectionUrl. Defaults are the original
+# literals; a test on a random main port (server.port 0) overrides login-redirect-location.
+box:
+  # TODO: supply the Box OAuth client ID (authorization-code-grant-type clientId="${box.id}")
+  id: ${BOX_ID:}
+  # TODO: supply the Box OAuth client secret (authorization-code-grant-type clientSecret="${box.secret}")
+  secret: ${BOX_SECRET:}
+  authorization-url: https://www.box.com/api/oauth2/authorize                  # authorization-request authorizationUrl
+  local-authorization-url: https://localhost:${ports.box-oauth}/authorization  # authorization-request localAuthorizationUrl
+  redirect-url: https://localhost:${ports.box-oauth}/redirectUrl               # authorization-code-grant-type redirectionUrl
+  token-url: https://www.box.com/api/oauth2/token                              # token-request tokenUrl
+  api-base-url: https://api.box.com:443/2.0                                    # http:request-config protocol, host, port, basePath
+  # boxUserLoginFlow response-builder Location header (statusCode 302)
+  login-redirect-location: https://localhost:${ports.box-oauth}/authorization?onCompleteRedirectTo=http://localhost:${server.port}/web/loginDone
+
+# TLS_Context: used by the Box requests and by the HTTPS listener. A path is read from the file system when such a
+# file exists and from the classpath otherwise, as Mule resolved tls store paths.
+keystore:
+  path: keystore.jks                 # tls:key-store path
+  # TODO: supply the key store password (tls:key-store password="${keystore.password}")
+  password: ${KEYSTORE_PASSWORD:}
+  # TODO: supply the private key password (tls:key-store keyPassword="${keystore.keyPassword}")
+  keyPassword: ${KEYSTORE_KEYPASSWORD:}
+truststore:
+  path: trust-store                  # tls:trust-store path
+  # TODO: supply the trust store password (tls:trust-store password="${truststore.password}")
+  password: ${TRUSTSTORE_PASSWORD:}
+
+# Port of the HTTPS listener, kept as its own scalar key: setting listeners.additional[0].port in a higher-priority
+# source (command line, test profile, @DynamicPropertySource) replaces the whole listeners.additional list and drops
+# its ssl and routes, so the port is overridden here instead.
+ports:
+  box-oauth: 8082                    # port of localAuthorizationUrl and redirectionUrl
+
+# SC-10 config/ListenerPorts.Properties. Neither listener declares allowedMethods, so disallowed-methods stays unset.
+listeners:
+  host: localhost
+  main:                              # server.port (HTTP_Listener_Configuration)
+    routes:
+      - patterns: ["/web", "/web/loginDone"]           # boxUserLoginFlow path="web", userLoginDoneFlow path="web/loginDone"
+  additional:
+    - name: box-oauth                # the OAuth module's local listener behind localAuthorizationUrl and redirectionUrl
+      port: ${ports.box-oauth}
+      host: localhost
+      ssl:                           # TLS_Context; its trust store makes the listener require a client certificate
+        key-store: ${keystore.path}
+        key-store-password: ${keystore.password}
+        key-password: ${keystore.keyPassword}
+        key-store-type: JKS
+        trust-store: ${truststore.path}
+        trust-store-password: ${truststore.password}
+      routes:
+        - patterns: ["/authorization", "/redirectUrl"]
+
+# Below INFO these loggers write the authorization code, the Box client secret and the Box tokens, which the original
+# never logged. A logger's own level outranks logging.level.root and the groups that --debug and --trace raise, so
+# pinning each at INFO, or WARN where noted, keeps them out of the log at every root level. The application's own
+# packages are not pinned: the original "Redirecting user to Box login page" logger still writes at INFO.
+logging:
+  level:
+    # the callback's request line with its query (/redirectUrl?code=<code>&state=...) and, with
+    # spring.mvc.log-request-details, its parameters. WARN, not INFO: its only INFO lines are the servlet start-up pair,
+    # which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    # httpclient5 under BoxApiClient: the Authorization: Bearer header of each search, and the wire bytes of every
+    # exchange, the token forms (code or refresh_token, with client_secret) and the token responses included
+    org.apache.hc: INFO

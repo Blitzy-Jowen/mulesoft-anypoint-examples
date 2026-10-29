@@ -1,0 +1,27 @@
+spring:
+  application:
+    name: using-transactional-scope-in-jms-to-database-java
+  main:
+    web-application-type: none          # the original has no HTTP listener (AAP 0.5.1)
+  datasource:
+    url: ${jdbc.url}                    # original db:generic-config url; driver inferred from the URL
+  artemis:
+    mode: native                        # external broker; the test profile switches to embedded
+    broker-url: tcp://localhost:61616   # broker the original README has the user start (default acceptor)
+  jms:
+    cache:
+      enabled: false                    # listener container and JmsTemplate share the native Artemis ConnectionFactory
+  sql:
+    init:
+      mode: never                       # the original README has the user run order.sql
+
+# Original key jdbc.url (db:generic-config url="${jdbc.url}", transactions.xml line 4)
+jdbc:
+  # TODO: supply the MySQL JDBC URL, e.g. jdbc:mysql://<host>:3306/<database>?user=<user>&password=<password>
+  url: ${JDBC_URL:}
+
+# Connector Active_MQ and the flow's JMS endpoints (transactions.xml lines 3, 7, 18)
+jms:
+  max-redelivery: 2   # maxRedelivery of connector Active_MQ
+  inbound-queue: in
+  outbound-queue: out

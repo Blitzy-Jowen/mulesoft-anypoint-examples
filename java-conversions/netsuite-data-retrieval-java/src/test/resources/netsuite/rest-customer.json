@@ -1,0 +1,136 @@
+{
+  "links": [
+    {
+      "rel": "self",
+      "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/customer/-5"
+    }
+  ],
+  "lastName": "Wolfe",
+  "isInactive": false,
+  "companyName": "Ramsey Inc. Wholesale Distribution V2011.1",
+  "receivablesAccount": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/account/-10"
+      }
+    ],
+    "id": "-10",
+    "refName": "Use System Preference"
+  },
+  "consolBalance": -32.3,
+  "isPerson": true,
+  "lastPageVisited": "Shopping Cart",
+  "consolAging2": 0,
+  "consolAging3": 0,
+  "id": "-5",
+  "visits": 31,
+  "billPay": false,
+  "consolAging4": -32.3,
+  "dateCreated": "2013-07-22",
+  "aging2": 0,
+  "consolDepositBalance": 0,
+  "aging3": 0,
+  "accessRole": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/role/14"
+      }
+    ],
+    "id": "14",
+    "refName": "Customer Center"
+  },
+  "altEmail": "awolfe@huffmanmfg.com",
+  "consolAging1": 0,
+  "aging1": 0,
+  "unbilledOrders": 49.98,
+  "consolUnbilledOrders": 49.98,
+  "currency": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/currency/1"
+      }
+    ],
+    "id": "1",
+    "refName": "USA"
+  },
+  "aging4": -32.3,
+  "consolOverdueBalance": 0,
+  "firstVisit": "2015-01-02T16:03:20Z",
+  "email": "suchi.deshpande@mulesoft.com",
+  "giveAccess": true,
+  "custentity_fmt_customer_credit_on_hold": false,
+  "custentity8": {
+    "links": [],
+    "id": "3",
+    "refName": "Less than $5 million"
+  },
+  "custentity_cust_priority": 50,
+  "custentity7": {
+    "links": [],
+    "id": "1",
+    "refName": "1 - 99 Employees"
+  },
+  "custentity_fmt_cur_sales_order": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/salesorder/2570"
+      }
+    ],
+    "id": "2570",
+    "refName": "Sales Order #SLS00000452"
+  },
+  "custentity_fmt_cust_credit_on_hold": false,
+  "custentity6": {
+    "links": [],
+    "id": "4",
+    "refName": "Computers, Peripherals, and Software"
+  },
+  "custentity_2663_direct_debit": false,
+  "custentity18": false,
+  "custentity_2663_customer_refund": false,
+  "taxable": false,
+  "lastModifiedDate": "2015-01-23T04:10:20Z",
+  "lastVisit": "2016-02-24T19:41:36Z",
+  "externalId": "entity-5",
+  "entityId": "Alex Wolfe",
+  "subsidiary": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/subsidiary/1"
+      }
+    ],
+    "id": "1",
+    "refName": "Honeycomb Mfg."
+  },
+  "clickStream": "HOME",
+  "shipComplete": false,
+  "firstName": "Alex",
+  "stage": {
+    "id": "CUSTOMER",
+    "refName": "Customer"
+  },
+  "creditHoldOverride": {
+    "id": "AUTO",
+    "refName": "Auto"
+  },
+  "phone": "650-555-9788",
+  "consolAging": 0,
+  "entityStatus": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/customerstatus/13"
+      }
+    ],
+    "id": "13",
+    "refName": "CUSTOMER-Closed Won"
+  },
+  "aging": 0,
+  "startDate": "2015-04-19",
+  "defaultAddress": "US"
+}

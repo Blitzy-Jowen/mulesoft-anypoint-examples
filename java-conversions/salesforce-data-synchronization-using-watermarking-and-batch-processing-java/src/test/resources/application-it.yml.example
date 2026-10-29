@@ -1,0 +1,27 @@
+# Live-sandbox (Tier 2B) credentials template for salesforce-data-synchronization-using-watermarking-and-batch-processing-java.
+#
+# Copy this file to application-it.yml in this same directory (src/test/resources/) and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it.
+#
+# SalesforceDataSynchronizationUsingWatermarkingAndBatchProcessingIT runs under failsafe (mvn -B verify) and
+# loads application-it.yml as Spring profile "it"; mvn -B test never reads it. It is skipped by assumption while
+# application-it.yml is missing, or while any of the three keys below is missing, blank or still TODO, so
+# mvn -B verify and mvn -B clean install pass without credentials.
+#
+# The live test writes data. It creates one Salesforce Contact with a unique LastName (WatermarkIT<millis>),
+# runs one poll (ContactPollScheduler.pollOnce()), asserts that the batch job completed successfully, as the
+# original test did, and deletes the Contact in @AfterEach. The poll itself only reads Contacts; no other record
+# is changed. Use a sandbox org, never production.
+#
+# Reuse the existing Salesforce sandbox credentials of the original
+# salesforce-data-synchronization-using-watermarking-and-batch-processing example; no new sandbox is procured.
+# sfdc.username replaces the sfdc.user key that the original test read from src/test/resources/mule.test.properties;
+# sfdc.password and sfdc.securityToken keep their names.
+sfdc:
+  username:        # TODO: supply the Salesforce sandbox username (replaces the original sfdc.user)
+  password:        # TODO: supply the Salesforce sandbox user's password, without the security token
+  securityToken:   # TODO: supply the security token of that Salesforce user
+  # Optional, for a sandbox org, whose users log in at test.salesforce.com: add auth-endpoint to this sfdc block
+  # with the value https://test.salesforce.com/services/Soap/u/65.0. Without it, the default from
+  # src/main/resources/application.yml applies, https://login.salesforce.com/services/Soap/u/65.0.

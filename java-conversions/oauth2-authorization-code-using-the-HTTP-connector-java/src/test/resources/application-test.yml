@@ -1,0 +1,9 @@
+# Spring profile "test": demo values only (carried demo store passwords, placeholder Box client); no real credentials.
+keystore:
+  password: mule123
+  keyPassword: mule123
+truststore:
+  password: mule123
+box:
+  id: test-box-client-id
+  secret: test-box-client-secret

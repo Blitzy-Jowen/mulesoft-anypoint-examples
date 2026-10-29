@@ -1,0 +1,35 @@
+# salesforce-data-synchronization-using-watermarking-and-batch-processing-java runtime configuration
+# Replaces salesforce-data-synchronization-using-watermarking-and-batch-processing/src/main/app/mule-app.properties
+# (empty, no keys) and the sfdc:config placeholders, poll scheduler and watermark values of watermarking.xml.
+# Live credentials for the *IT tests go in the git-ignored src/test/resources/application-it.yml.
+spring:
+  application:
+    name: salesforce-data-synchronization-using-watermarking-and-batch-processing-java
+  main:
+    web-application-type: none          # no HTTP listener in the original (AAP 0.5.1 list)
+
+# The poll is the only trigger; ContactPollScheduler runs it with @Scheduled(fixedRate).
+poll:
+  frequency: 10000                      # ms; original fixed-frequency-scheduler frequency="10" timeUnit="SECONDS" (l.17)
+  initial-delay: 0                      # ms; Mule polls as soon as the application starts
+
+# Original watermark: variable "timestamp", selector MAX of payload.LastModifiedDate (l.18).
+watermark:
+  store-path: .mule/objectstore/watermark.properties   # file-backed watermark store; ignored by the root .gitignore (**/.mule/)
+  # Original default-expression (l.18), used while the store holds no value. Substituted unquoted into
+  # "WHERE LastModifiedDate > <timestamp>", so it is a SOQL date literal or an ISO-8601 UTC datetime
+  # such as 2015-06-17T10:00:00.000Z.
+  default-value: YESTERDAY
+
+# The sfdc:connection-pooling-profile (l.4) is not carried: SC-15 keeps one cached PartnerConnection.
+sfdc:
+  # TODO: supply the Salesforce username (original key: sfdc.user, watermarking.xml l.3)
+  username: ${SFDC_USERNAME:}
+  # TODO: supply the Salesforce password
+  password: ${SFDC_PASSWORD:}
+  # TODO: supply the Salesforce security token
+  securityToken: ${SFDC_SECURITYTOKEN:}
+  auth-endpoint: https://login.salesforce.com/services/Soap/u/65.0   # Partner SOAP login, API 65.0 (force-partner-api 65.0.0)
+  # Connect and read timeouts: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s

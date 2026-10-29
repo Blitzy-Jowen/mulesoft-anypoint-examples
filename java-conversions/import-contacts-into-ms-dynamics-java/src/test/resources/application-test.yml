@@ -1,0 +1,27 @@
+# Spring profile "test" for the credential-free unit tier of import-contacts-into-ms-dynamics-java, activated by
+# @ActiveProfiles("test") on the tests that start the application context.
+#
+# Every value below is an obvious dummy that fills a placeholder left blank in src/main/resources/application.yml;
+# none is a Microsoft Entra or Dataverse credential, and none authenticates anywhere.
+#
+# dynamics.service-url and dynamics.oauth.token-uri point at the unroutable http://localhost:1 on purpose, so a test
+# that forgets its override fails fast instead of reaching Microsoft. Each test replaces both with the base URL of
+# its WireMock server through @DynamicPropertySource. dynamics.oauth.scope is not set: application.yml derives it
+# from dynamics.service-url, so it follows that override. The 10 s timeouts of application.yml stay in force.
+#
+# Live values belong only in the git-ignored src/test/resources/application-it.yml (template:
+# application-it.yml.example).
+dynamics:
+  service-url: http://localhost:1
+  oauth:
+    tenant-id: test-tenant
+    client-id: test-client-id
+    client-secret: test-client-secret
+    token-uri: http://localhost:1/test-tenant/oauth2/v2.0/token
+
+# With an hour-long fixed delay the scheduled ContactsFileTrigger.poll() runs only once, at startup, so tests call
+# ContactsFileTrigger.pollOnce() themselves. contacts.input-dir and contacts.move-to-dir are deliberately not set
+# here: surefire's system properties in pom.xml and each test's @TempDir with @DynamicPropertySource supply them,
+# and both outrank this profile file.
+contacts:
+  polling-frequency: 3600000

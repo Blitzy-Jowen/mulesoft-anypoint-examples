@@ -1,0 +1,39 @@
+{
+  "links": [
+    {
+      "rel": "self",
+      "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/itemsupplyplan/9"
+    }
+  ],
+  "id": "9",
+  "item": {
+    "id": "702",
+    "refName": "CUS00001"
+  },
+  "location": {
+    "id": "1",
+    "refName": "02: Boston"
+  },
+  "order": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/itemsupplyplan/9/order"
+      }
+    ],
+    "count": 1,
+    "hasMore": false,
+    "items": [
+      {
+        "links": [],
+        "quantity": 10
+      }
+    ],
+    "offset": 0,
+    "totalResults": 1
+  },
+  "subsidiary": {
+    "id": "1",
+    "refName": "Honeycomb Mfg."
+  }
+}

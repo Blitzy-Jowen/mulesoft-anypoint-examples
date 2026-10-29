@@ -1,0 +1,26 @@
+# Original: importing-a-CSV-file-into-Mongo-DB/src/main/app/csv-to-mongodb.xml
+# (its app properties file is empty). The original placeholder names are kept unchanged.
+spring:
+  main:
+    web-application-type: none          # no HTTP listener in the original (AAP 0.5.1 list)
+  data:
+    mongodb:
+      host: localhost                   # Mule MongoDB connector default; the original flow sets none
+      port: 27017                       # Mule MongoDB connector default; the original flow sets none
+      database: ${database.name}
+      # No username or password here: config/MongoConfig applies database.user and database.password as
+      # the client's credential when both are set, so an empty value is never bound to a Boot key.
+
+# Original mongo:config placeholders (l.4). The application starts while any of them is empty:
+# config/MongoConfig then logs one WARN naming the missing key, opens no MongoDB connection, and
+# every import fails until it is supplied. The user and password are supplied together or not at all
+# (a server without access control). Once spring.data.mongodb.uri is set, it alone gives the server
+# and credentials, as in Spring Boot, while database.name, when set, still selects the database.
+database:
+  name: ${DATABASE_NAME:}               # TODO: supply the MongoDB database name
+  user: ${DATABASE_USER:}               # TODO: supply the MongoDB user
+  password: ${DATABASE_PASSWORD:}       # TODO: supply the MongoDB user's password
+
+csv-import:
+  input-dir: src/main/resources/input   # original file:inbound-endpoint path (l.9)
+  polling-frequency: 1000               # Mule file-connector default in ms; the original declares none

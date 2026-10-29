@@ -1,0 +1,4 @@
+# Maven build output (surefire/failsafe/JaCoCo reports, target/fixture-parity/)
+target/
+# Live Salesforce sandbox credentials for SalesforceOauthIT (sfdc.key, sfdc.secret, sfdc.username, sfdc.password); never committed. application-it.yml.example is the committed template
+src/test/resources/application-it.yml

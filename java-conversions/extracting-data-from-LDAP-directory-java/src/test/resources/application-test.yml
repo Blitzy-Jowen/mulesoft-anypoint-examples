@@ -1,0 +1,15 @@
+# Test-only values for Spring profile "test", activated by @ActiveProfiles("test") in the surefire suite.
+# They are the original example's demo directory values (README steps 6 and 12), which the original test
+# read from the uncommitted src/test/resources/mule.test.properties. Never used in production, where
+# ldap.dn and ldap.password come from the TODO placeholders of application.yml.
+# ldap.port is deliberately absent: the test registers it through @DynamicPropertySource from the in-memory
+# server's actual listen port, and ldap.url of application.yml resolves through it.
+ldap:
+  # Bind DN of the in-memory directory (original mule.test.properties ldap.admin; README step 6)
+  admin: "cn=Manager,dc=my-domain,dc=com"
+  # Bind password (original demo value; overrides ${LDAP_PASSWORD:} of application.yml)
+  password: "root"
+  # Base DN the UnboundID InMemoryDirectoryServer is created with (original ldap.root)
+  root: "dc=my-domain,dc=com"
+  # Mirrors System.setProperty("ldap.dn", LDAP_ADMIN) of the original IT (line 73)
+  dn: "${ldap.admin}"

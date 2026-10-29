@@ -1,0 +1,26 @@
+# Original: testing-apikit-with-munit/src/main/app/mule-app.properties is empty, so http.port has no value.
+# The original fixes no port; 8081 is the default and -Dhttp.port / --http.port / HTTP_PORT overrides it.
+
+# http:listener-config host="0.0.0.0" port="${http.port}"; Undertow (AAP 0.4.9)
+server:
+  port: ${http.port:8081}
+
+# apikit:config raml="api.raml" consoleEnabled="true" consolePath="console"; listener path /api/*
+apikit:
+  base-path: /api
+  raml: api/api.raml
+  console-path: console
+
+# No static resource handler: unknown paths raise NoHandlerFoundException / NoResourceFoundException,
+# answered by ApiKitExceptionHandler under /api and GlobalExceptionHandler elsewhere (AAP 0.4.7)
+spring:
+  application:
+    name: testing-apikit-with-munit-java
+  web:
+    resources:
+      add-mappings: false
+  mvc:
+    dispatch-trace-request: true   # /api/* listener has no allowedMethods: TRACE reaches the APIkit 405 mapping
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404

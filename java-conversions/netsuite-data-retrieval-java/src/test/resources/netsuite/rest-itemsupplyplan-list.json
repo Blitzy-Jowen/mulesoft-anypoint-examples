@@ -1,0 +1,32 @@
+{
+  "links": [
+    {
+      "rel": "self",
+      "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/itemsupplyplan?limit=1000&offset=0"
+    }
+  ],
+  "count": 2,
+  "hasMore": false,
+  "items": [
+    {
+      "links": [
+        {
+          "rel": "self",
+          "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/itemsupplyplan/9"
+        }
+      ],
+      "id": "9"
+    },
+    {
+      "links": [
+        {
+          "rel": "self",
+          "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/itemsupplyplan/18"
+        }
+      ],
+      "id": "18"
+    }
+  ],
+  "offset": 0,
+  "totalResults": 2
+}

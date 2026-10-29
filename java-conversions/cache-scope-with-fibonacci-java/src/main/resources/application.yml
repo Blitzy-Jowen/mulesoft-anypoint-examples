@@ -1,0 +1,45 @@
+# cache-scope-with-fibonacci-java runtime configuration
+# Replaces cache-scope-with-fibonacci/src/main/app/mule-app.properties (empty), the http:listener-config of
+# cache-scope.xml:40 (host localhost, port ${http.port}) and the ee:object-store-caching-strategy of cache-scope.xml:35
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: localhost    # http:listener-config host (cache-scope.xml:40)
+spring:
+  application:
+    name: cache-scope-with-fibonacci-java
+  web:
+    resources:
+      # SC-1: every path but /fibonacci, /favicon.ico included, must raise NoHandlerFoundException
+      # -> 404 text/plain "No listener for endpoint: <path>"
+      add-mappings: false
+  mvc:
+    dispatch-trace-request: true   # the /fibonacci listener has no allowedMethods: TRACE reaches FibonacciController like every other method instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        # FormContentFilter would consume PUT/PATCH/DELETE form bodies before controller/FibonacciController
+        # reads the raw body it builds the listener payload from (a form body's decoded map, or the listener's
+        # 400 for one it cannot decode), the payload the favicon wildcard-filter is evaluated on (cache-scope.xml:45-49)
+        enabled: false
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+  cache:
+    # ee:cache scope -> Spring Cache over Caffeine; service/FibonacciCacheService uses the single cache
+    # "fibonacci", keyed by n. Listing cache names makes the CaffeineCacheManager static.
+    type: caffeine
+    cache-names: fibonacci
+    caffeine:
+      # The caching strategy declares no objectStore (cache-scope.xml:35). Since Mule 3.5.0 such a strategy uses an
+      # object-store-manager store shared by all cluster nodes ("Object Stores and Clustering",
+      # archive.docs.mulesoft.com/mule-runtime/3.8/cache-scope); its limits in a standalone runtime are not
+      # documented and the EE source is not public. The bound applied here is the Mule 3.8.0 in-memory store default
+      # (github.com/mulesoft/mule tag mule-3.8.0, core/src/main/java/org/mule/util/store/
+      # AbstractMonitoredObjectStore.java:41,47,55, InMemoryObjectStore.java:143-152) and the docs' per-node
+      # in-memory configuration: maxEntries 4000, entryTTL -1, expirationInterval 1000 ms. No expiry is set.
+      # Each spelling of n (007, 7, 7.0) is its own key, as in the original, so without a bound caller-chosen keys
+      # would grow the heap without limit. Whether the original store applied this bound, and Caffeine's
+      # frequency-and-recency eviction against the in-memory store's oldest-first trim, are Tier 2A verification
+      # points (DECISIONS.md section 6.10).
+      spec: maximumSize=4000

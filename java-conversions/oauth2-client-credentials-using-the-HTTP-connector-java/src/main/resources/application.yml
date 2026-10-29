@@ -1,0 +1,89 @@
+# Replaces oauth2-client-credentials-using-the-HTTP-connector/src/main/app/mule-app.properties (empty) and the
+# ${...} placeholders of http-client-credentials.xml. Key names keep the original Mule placeholder names; secrets
+# have no value: supply each through the environment variable named in its placeholder.
+spring:
+  application:
+    name: oauth2-client-credentials-using-the-HTTP-connector-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  # The /oauth and /FIM/* listeners declare no allowedMethods (xml:32,40), so they serve every method and no other path:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the /oauth and /FIM/* mappings instead of the servlet's default TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the /FIM/* flow forwards and the /oauth flow logs the request body unchanged: FimProxyController and OAuthController read it from the request stream, which Boot's filter would consume for a PUT/PATCH/DELETE form body before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+
+http:
+  port: 8081            # http:listener-config port (xml:9), hard-coded in the original; ${http.port} is the AAP 0.4.6 key
+
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (xml:9)
+  undertow:
+    # The /FIM/* flow forwards http.request.uri raw (xml:41). With ALLOW_UNESCAPED_CHARACTERS_IN_URL on, Undertow's
+    # URL decoding also rewrites HttpServletRequest.getRequestURI() of any percent-encoded target to its decoded form
+    # (/FIM/a%20b becomes "/FIM/a b"), so it stays off: the request URI and query reach the controller as sent.
+    # Spring MVC decodes path segments itself for mapping, and form bodies are still decoded; only query-string
+    # values read through getParameter stay percent-encoded, and no handler in this project reads them. A path whose
+    # "%" is not followed by two hex digits, which Undertow then no longer rejects, is answered 400 with an empty body
+    # by config/InvalidPercentEncodingFilter before Spring MVC's path parsing can fail on it outside any handler.
+    decode-url: false
+    options:
+      server:
+        # The /FIM/* flow forwards the raw http.request.uri, whose literal {client_id} placeholders the uri-param
+        # fills (xml:41-43). Mule's Grizzly listener accepted "{" and "}" unescaped in the request target; Undertow
+        # answers such a request 400 unless this option is on. Tier 2A verification point.
+        ALLOW_UNESCAPED_CHARACTERS_IN_URL: true
+
+# Box OAuth 2.0 client-credentials grant (original ${oauth.client.id} / ${oauth.client.secret}, xml:14)
+oauth:
+  client:
+    # TODO: supply the client_id of your Box application
+    id: ${OAUTH_CLIENT_ID:}
+    # TODO: supply the client_secret of your Box application
+    secret: ${OAUTH_CLIENT_SECRET:}
+
+# IBM FIM proxy (original ${client.id}, sent as the client_id parameter, xml:43)
+client:
+  # TODO: supply the per-user client id sent to IBM FIM as client_id
+  id: ${CLIENT_ID:}
+
+# TLS context of the Box request configuration (original TLS_Context, xml:25-28); store paths are classpath names
+keystore:
+  path: keystore.jks
+  # TODO: supply the store password of keystore.jks
+  password: ${KEYSTORE_PASSWORD:}
+  key:
+    # TODO: supply the private-key password inside keystore.jks
+    password: ${KEYSTORE_KEY_PASSWORD:}
+
+truststore:
+  path: trust-store
+  # TODO: supply the store password of trust-store
+  password: ${TRUSTSTORE_PASSWORD:}
+
+# Public service URLs hard-coded in the original flow
+box:
+  oauth:
+    token-url: https://app.box.com/api/oauth2/token   # oauth2:token-request tokenUrl (xml:16)
+  api:
+    base-url: https://app.box.com:443                 # http:request-config host, port and protocol (xml:12-13)
+    base-path: /api/oauth2/authorize                  # http:request-config basePath (xml:12)
+
+fim:
+  base-url: https://tfim01.demos.ibm.com:443          # http:request-config HTTP_Request_Configuration1 (xml:29)
+
+logging:
+  level:
+    # Below INFO these loggers write the Box client credentials, the Box tokens or the configured client.id, which
+    # the original never logged: client.id travels in the outbound FIM URI, which a FIM I/O failure's exception
+    # message names. A named level wins over logging.level.root, so a root DEBUG or TRACE does not reach them.
+    org.apache.hc: INFO                                  # httpclient5 transport: Authorization: Basic <oauth.client.id:oauth.client.secret> and Bearer headers, token response bytes, FIM request line with the substituted client_id
+    org.springframework.web.servlet.DispatcherServlet: INFO   # a request failure no exception handler resolved, message included
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # each resolved exception, message included
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO          # the 500 body carrying that message
+    org.springframework.web.method.HandlerMethod: INFO   # exception-handler arguments: the exception, message included

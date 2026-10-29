@@ -1,0 +1,3 @@
+# Original demo API key, hard-coded at web-service-consumer/src/main/app/tshirt-service-consumer.xml:22; Spring profile "test" only.
+tshirt:
+  api-key: abc12345

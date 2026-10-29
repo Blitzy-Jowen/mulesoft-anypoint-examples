@@ -1,0 +1,76 @@
+# Replaces scatter-gather-flow-control/src/main/app/mule-app.properties (empty) and the http:listener-config,
+# smtp:gmail-connector and smtp:outbound-endpoint of scatter-gather.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (scatter-gather.xml:4)
+spring:
+  application:
+    name: scatter-gather-flow-control-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the /scatterGather listener has no allowedMethods: TRACE reaches ScatterGatherController like every other method instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false   # the flow reads no form fields: a form body on PUT/PATCH/DELETE reaches ScatterGatherController as it does on POST instead of being parsed by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+  mail:
+    # JavaMailSender of client/AggregationReportMailer, fed by the original smtp.* placeholders below
+    host: ${smtp.host}
+    port: ${smtp.port}
+    username: ${smtp.user}
+    password: ${smtp.password}
+    default-encoding: UTF-8
+    properties:
+      # smtp:gmail-connector (scatter-gather.xml:3): STARTTLS and authentication for smtp and smtps. STARTTLS is
+      # required, so a server that does not offer it fails the send before AUTH or any mail data.
+      "[mail.smtp.starttls.enable]": true
+      "[mail.smtp.starttls.required]": true
+      "[mail.smtp.auth]": true
+      "[mail.smtps.starttls.enable]": true
+      "[mail.smtps.starttls.required]": true
+      "[mail.smtps.auth]": true
+      # smtp:outbound-endpoint responseTimeout="10000" (scatter-gather.xml:64)
+      "[mail.smtp.connectiontimeout]": 10000
+      "[mail.smtp.timeout]": 10000
+      "[mail.smtp.writetimeout]": 10000
+  # Bounds the applicationTaskExecutor the scatter-gather routes run on, like the original's ScatterGatherWorkManager
+  task:
+    execution:
+      pool:
+        core-size: 1                       # Mule 3.8 default threading profile maxThreadsIdle 1
+        max-size: 16                       # maxThreadsActive 16
+        queue-capacity: 0                  # maxBufferSize 0 -> no queue, a route is handed straight to a thread
+        keep-alive: 60s                    # threadTTL 60000 ms
+        allow-core-thread-timeout: false   # the core thread is kept, as Mule's pool never timed it out
+# smtp:outbound-endpoint attributes (scatter-gather.xml:64) under their original placeholder names
+smtp:
+  # TODO: supply the SMTP server host (the original README suggests smtp.gmail.com)
+  host: ${SMTP_HOST:}
+  port: ${SMTP_PORT:587}   # submission port of the original README and Gmail (AAP 0.6.6)
+  # TODO: supply the SMTP account as a plain address; the %40 encoding the original README shows was needed only
+  # inside Mule's endpoint URI
+  user: ${SMTP_USER:}
+  # TODO: supply the SMTP password
+  password: ${SMTP_PASSWORD:}
+# smtp:outbound-endpoint from, to and subject (scatter-gather.xml:64), read by client/AggregationReportMailer
+mail:
+  # TODO: supply the sender address
+  from: ${MAIL_FROM:}
+  # TODO: supply the recipient address(es), comma-separated allowed
+  to: ${MAIL_TO:}
+  # subject literal of smtp:outbound-endpoint (scatter-gather.xml:64), the default; an empty value is sent as given
+  subject: ${MAIL_SUBJECT:Scatter gather example - aggregation}
+# scatter-gather.xml has no logger, so neither the aggregated contacts nor the report mail is logged at any level: a
+# root DEBUG/TRACE override, or --debug/--trace, must not reach this category, which below INFO writes them. A
+# logger's own level outranks logging.level.root and the --debug/--trace groups; Angus Mail logs through
+# java.util.logging, which Spring Boot bridges and holds at the same level. The /scatterGather response needs no cap:
+# it is the constant "Please find attached your Aggregation Report", written past the Spring MVC body writers.
+logging:
+  level:
+    org.eclipse.angus.mail: INFO   # .smtp DEBUG writes the SMTP account and the recipient addresses; .smtp.protocol TRACE the whole SMTP dialogue: MAIL FROM, RCPT TO, the headers and the CSV report of contact names and e-mail addresses

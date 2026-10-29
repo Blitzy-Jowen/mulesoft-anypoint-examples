@@ -1,0 +1,31 @@
+# Live-sandbox credentials template for GetCustomersListFromNetsuiteIT.
+#
+# Copy this file to src/test/resources/application-it.yml and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it.
+#
+# GetCustomersListFromNetsuiteIT runs under failsafe (mvn -B verify). It is skipped by assumption while
+# application-it.yml is missing, or while any key below is missing, blank or still TODO.
+#
+# The test creates a customer with a unique last name, lists it through GET /customers, asserts the
+# "<h1>Netsuite Customer List</h1>" heading and the customer's row, and deletes the customer in finally.
+#
+# These keys replace netsuite.email, netsuite.password, netsuite.account and netsuite.roleId, which the
+# original get-customer-list-from-netsuite test read from src/test/resources/mule.test.properties.
+# NetSuite REST with OAuth 2.0 machine-to-machine authentication (client credentials grant with a
+# PS256-signed JWT client assertion) replaces the SuiteTalk email/password/role login; netsuite.account
+# keeps its name, and the role is bound to the certificate mapping in NetSuite rather than to a key.
+# See DECISIONS.md at the repository root.
+#
+# The requester creates the integration record, uploads the certificate and maps it to an entity and role
+# inside the existing NetSuite account; no new sandbox is procured.
+netsuite:
+  account: TODO              # TODO: supply the NetSuite account ID, e.g. sandbox 1234567_SB1
+  oauth:
+    client-id: TODO          # TODO: supply the integration record's client ID (OAuth 2.0 client credentials / M2M)
+    certificate-id: TODO     # TODO: supply the M2M certificate ID (used as the JWT "kid" header)
+    private-key-path: TODO   # TODO: supply the absolute path of the PKCS#8 PEM private key matching the uploaded certificate
+nets:
+  customer:
+    subsidiary:
+      internalId: TODO       # TODO: supply the subsidiary internal ID used for the test customer

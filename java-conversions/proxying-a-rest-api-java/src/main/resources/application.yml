@@ -1,0 +1,57 @@
+# proxying-a-rest-api-java runtime configuration, from proxying-a-rest-api/src/main/app/proxying-a-rest-api.xml
+# (the original mule-app.properties was empty). The keystore.* keys keep their Mule placeholder names and meanings:
+# keystore.key is the store password and keystore.password the private-key password, as in the original tls:key-store.
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); port used throughout the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (proxying-a-rest-api.xml:3)
+  undertow:
+    # The raw request target reaches the proxy undecoded, so the caller's percent-encoding is forwarded as sent;
+    # config.RequestTargetEscapingFilter escapes whatever the upstream URI cannot carry.
+    decode-url: false
+    options:
+      server:
+        # The original Grizzly listener accepted targets with raw | { } ^ " < > ` \ and the like and forwarded them;
+        # Undertow answers them with a bare 400 unless this option is on.
+        ALLOW_UNESCAPED_CHARACTERS_IN_URL: true
+        # No request body size limit, as the original listener had none. Undertow 2.3.17 sets none by default, later
+        # releases (2.3.25 among them) cap a body at 2 MB, and server.undertow.max-http-post-size only passes positive
+        # values, so -1 is set here explicitly.
+        MAX_ENTITY_SIZE: -1
+spring:
+  application:
+    name: proxying-a-rest-api-java
+  web:
+    resources:
+      add-mappings: false   # SC-1, and no static-resource handler competes with the /** proxy mapping
+  mvc:
+    dispatch-trace-request: true   # the /* listener has no allowedMethods: TRACE reaches RestProxyController and is forwarded upstream like every other method instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false      # FormContentFilter would consume PUT/PATCH/DELETE form bodies before they are forwarded
+  servlet:
+    multipart:
+      enabled: false        # multipart/form-data is forwarded as raw bytes, never parsed
+  autoconfigure:
+    # No BasicErrorController: the listener path is /*, so /error is proxied like any other path
+    exclude: org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration
+proxy:
+  upstream-url: https://api.box.com:443   # http:request-config host, port and protocol (proxying-a-rest-api.xml:5)
+  response-timeout-ms: 10000              # Mule default response timeout
+keystore:
+  # TODO: supply the path of the keystore created with keytool (README); the original read keystore.jks from the application classpath
+  path: ${KEYSTORE_PATH:}
+  # TODO: supply the keystore (store) password — Mule tls:key-store password
+  key: ${KEYSTORE_KEY:}
+  # TODO: supply the private-key password — Mule tls:key-store keyPassword
+  password: ${KEYSTORE_PASSWORD:}
+logging:
+  level:
+    # Below INFO these loggers write the caller's Authorization, cookies, other headers, query and body, which the
+    # original never logged. Pinned here so a root DEBUG or TRACE does not reach them; an explicit DEBUG or TRACE for
+    # one of them has no effect either, because config.SensitiveLogGuard denies their DEBUG and TRACE events.
+    org.apache.hc: INFO                                  # httpclient5 transport: headers, wire bytes, request line, redirect Location, cookies
+    org.springframework.web.servlet.DispatcherServlet: INFO   # request line with query; parameters (consuming a form body) and headers
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # handled exception messages
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO          # the 500 body carrying that message

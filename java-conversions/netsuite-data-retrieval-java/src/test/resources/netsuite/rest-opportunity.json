@@ -1,0 +1,135 @@
+{
+  "links": [
+    {
+      "rel": "self",
+      "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/opportunity/1271"
+    }
+  ],
+  "billingAddress": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/opportunity/1271/billingAddress"
+      }
+    ],
+    "addr1": "123 Main St.",
+    "addr2": "Suite 700",
+    "addrText": "Williams Electronics and Communications\n<br>123 Main St.\n<br>Suite 700\n<br>San Mate CA 94002\n<br>United States",
+    "addressee": "Williams Electronics and Communications",
+    "city": "San Mate",
+    "country": {
+      "id": "US",
+      "refName": "United States"
+    },
+    "state": "CA",
+    "zip": "94002"
+  },
+  "createdDate": "2015-05-03T17:55:10Z",
+  "currency": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/currency/1"
+      }
+    ],
+    "id": "1",
+    "refName": "USA"
+  },
+  "currencyName": "USA",
+  "daysOpen": 349,
+  "entity": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/customer/1066"
+      }
+    ],
+    "id": "1066",
+    "refName": "Williams Electronics and Communications"
+  },
+  "entityStatus": {
+    "links": [],
+    "id": "10",
+    "refName": "Proposal"
+  },
+  "estGrossProfit": 3875.85,
+  "estGrossProfitPercent": 100,
+  "exchangeRate": 1,
+  "expectedCloseDate": "2014-12-05",
+  "forecastType": {
+    "links": [],
+    "id": "0",
+    "refName": "Omitted"
+  },
+  "id": "1271",
+  "isBudgetApproved": false,
+  "lastModifiedDate": "2015-01-01T20:13:44Z",
+  "leadSource": {
+    "links": [],
+    "id": "100003",
+    "refName": "Electronics Retail Trade Show"
+  },
+  "location": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/location/2"
+      }
+    ],
+    "id": "2",
+    "refName": "01: San Francisco"
+  },
+  "probability": 50,
+  "projectedTotal": 3875.85,
+  "salesRep": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/employee/23"
+      }
+    ],
+    "id": "23",
+    "refName": "Clark Koozer"
+  },
+  "shipIsResidential": false,
+  "shippingAddress": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/opportunity/1271/shippingAddress"
+      }
+    ],
+    "addr1": "123 Main St.",
+    "addr2": "Suite 700",
+    "addrText": "Williams Electronics and Communications\n<br>123 Main St.\n<br>Suite 700\n<br>San Mate CA 94002\n<br>United States",
+    "addressee": "Williams Electronics and Communications",
+    "city": "San Mate",
+    "country": {
+      "id": "US",
+      "refName": "United States"
+    },
+    "id": "2475",
+    "override": false,
+    "state": "CA",
+    "zip": "94002"
+  },
+  "status": {
+    "id": "B",
+    "refName": "Issued Quote"
+  },
+  "subsidiary": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/subsidiary/1"
+      }
+    ],
+    "id": "1",
+    "refName": "Honeycomb Mfg."
+  },
+  "title": "Short wave",
+  "totalCostEstimate": 0,
+  "tranDate": "2015-04-03",
+  "tranId": "OPP00000044",
+  "weightedTotal": 1937.93
+}

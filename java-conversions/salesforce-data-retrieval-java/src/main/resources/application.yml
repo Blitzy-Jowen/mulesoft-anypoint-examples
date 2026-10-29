@@ -1,0 +1,36 @@
+# salesforce-data-retrieval-java runtime configuration
+# Replaces salesforce-data-retrieval/src/main/app/mule-app.properties (empty) and the placeholders of the
+# sfdc:config and http:listener-config of salesforce-id-retrieval.xml; key names keep the original placeholder names.
+http:
+  port: 8081
+
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0
+
+spring:
+  application:
+    name: salesforce-data-retrieval-java
+  web:
+    resources:
+      add-mappings: false   # unknown paths raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the / listeners accept GET and POST only: TRACE reaches the dispatcher and gets SC-1's 405 instead of the servlet's 200 TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the / listeners accept GET and POST only and POST reads the body itself: a form body on PUT/PATCH/DELETE gets SC-1's 405 unread instead of being buffered whole by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+
+sfdc:
+  # TODO: supply the Salesforce username
+  username: ${SFDC_USERNAME:}
+  # TODO: supply the Salesforce password
+  password: ${SFDC_PASSWORD:}
+  # TODO: supply the Salesforce security token
+  securityToken: ${SFDC_SECURITYTOKEN:}
+  auth-endpoint: https://login.salesforce.com/services/Soap/u/65.0   # Partner SOAP login, API 65.0 (force-partner-api 65.0.0)
+  # Connect and read timeouts: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s

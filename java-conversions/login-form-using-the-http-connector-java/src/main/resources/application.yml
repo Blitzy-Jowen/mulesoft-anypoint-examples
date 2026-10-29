@@ -1,0 +1,39 @@
+# login-form-using-the-http-connector-java runtime configuration
+# Replaces login-form-using-the-http-connector/src/main/app/mule-app.properties (empty) and the
+# http:listener-config / http:request-config of login-form-using-the-http-connector.xml
+http:
+  port: 8081            # original placeholder ${http.port} (login-form-using-the-http-connector.xml:4-5)
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (xml:4)
+spring:
+  application:
+    name: login-form-using-the-http-connector-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # /login accepts GET and POST only, /requesterLogin every method: TRACE gets SC-1's 405 on /login and reaches LoginController on /requesterLogin instead of the servlet's TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # /login checks the method before reading the body and /requesterLogin ignores the body: a form body on PUT/PATCH/DELETE gets SC-1's 405 on /login, and the relayed login on /requesterLogin, unread instead of being buffered whole by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+login:
+  # TODO: supply the login form username
+  username: ${LOGIN_USERNAME:}
+  # TODO: supply the login form password
+  password: ${LOGIN_PASSWORD:}
+  requester-host: localhost   # replaces http:request-config host="0.0.0.0" (xml:5); 0.0.0.0 is a bind address
+
+# Below the pinned levels these loggers write what the caller submitted, the password included, which the original
+# never logged. A logger's own level outranks logging.level.root and the groups that --debug and --trace raise, so
+# pinning each keeps the password out of the log at every root level.
+logging:
+  level:
+    # the request line with its query and, with spring.mvc.log-request-details, every form parameter; to log them it
+    # reads the form through the servlet parameters, consuming the body LoginController reads.
+    # WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    io.undertow.request.io: INFO   # request-parse failures quoting a query value that does not decode

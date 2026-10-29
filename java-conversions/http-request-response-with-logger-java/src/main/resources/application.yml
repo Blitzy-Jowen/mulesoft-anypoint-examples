@@ -1,0 +1,23 @@
+# http-request-response-with-logger-java runtime configuration
+# Replaces http-request-response-with-logger/src/main/app/mule-app.properties and the http:listener-config of echo.xml
+http:
+  port: 8081            # original placeholder name ${http.port}; 8084 in the original README is only an example value
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (echo.xml:3)
+spring:
+  application:
+    name: http-request-response-with-logger-java
+  web:
+    resources:
+      add-mappings: false   # no static resource handler competes with EchoController's /** echo; SC-1's no-listener 404 relies on it too
+  # The /* listener has no allowedMethods (echo.xml:5), so every path and method is echoed. Two Boot defaults would
+  # otherwise answer requests the Mule listener echoed:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches EchoController and is echoed instead of getting the servlet's message/http TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the flow reads no form fields: a form body on PUT/PATCH/DELETE is echoed as on POST instead of being parsed by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error is echoed like any other path

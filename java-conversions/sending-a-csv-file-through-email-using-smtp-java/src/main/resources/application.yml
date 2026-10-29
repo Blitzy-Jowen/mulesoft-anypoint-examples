@@ -1,0 +1,64 @@
+# Original placeholder names are kept (smtp.*, mail.*). Secrets, hosts and addresses
+# have no value here: supply them through the environment variables named below.
+spring:
+  application:
+    name: sending-a-csv-file-through-email-using-smtp-java
+  main:
+    # No HTTP listener in the original: the only trigger is the file poller.
+    web-application-type: none
+  mail:
+    host: ${smtp.host}
+    port: ${smtp.port}
+    username: ${smtp.user}
+    password: ${smtp.password}
+    protocol: smtp
+    default-encoding: UTF-8
+    properties:
+      # smtp:gmail-connector preset: authenticated STARTTLS on port 587, here required, so a
+      # server that does not offer STARTTLS fails the send before AUTH or any mail data.
+      "[mail.smtp.auth]": true
+      "[mail.smtp.starttls.enable]": true
+      "[mail.smtp.starttls.required]": true
+      # responseTimeout="10000" of the original SMTP endpoint.
+      "[mail.smtp.connectiontimeout]": 10000
+      "[mail.smtp.timeout]": 10000
+      "[mail.smtp.writetimeout]": 10000
+
+smtp:
+  # TODO: supply the SMTP server host (Gmail: smtp.gmail.com)
+  host: ${SMTP_HOST:}
+  # Fixed by the original endpoint (port="587").
+  port: 587
+  # TODO: supply the SMTP login (plain address; the %40 encoding the Mule URI needed is not used)
+  user: ${SMTP_USER:}
+  # TODO: supply the SMTP password or app password
+  password: ${SMTP_PASSWORD:}
+
+mail:
+  # TODO: supply the sender address
+  from: ${MAIL_FROM:}
+  # TODO: supply the recipient address (a comma-separated list is allowed)
+  to: ${MAIL_TO:}
+  # TODO: supply the mail subject
+  subject: ${MAIL_SUBJECT:}
+
+# File trigger (trigger/CsvFileTrigger over SC-5 FileInboundPoller). New keys: the
+# original fixed these on the file:inbound-endpoint. No move directory: the original
+# declares no moveToDirectory, so each file is deleted after processing.
+csv-email:
+  input-dir: src/main/resources/input
+  # Mule 3.8 default pollingFrequency (ms); the original declares none.
+  polling-frequency: 1000
+
+# The original logs only the order lines it mails ("Processing objects: <payload>",
+# service/CsvEmailService). A root DEBUG/TRACE override, or --debug/--trace, must not
+# reach the Angus Mail category, which below INFO writes the SMTP account and the mail.
+# A logger's own level outranks logging.level.root and the --debug/--trace groups;
+# Angus Mail logs through java.util.logging, which Spring Boot bridges and holds at the
+# same level.
+logging:
+  level:
+    # .smtp DEBUG writes the SMTP account and the recipient addresses; .smtp.protocol
+    # TRACE the whole SMTP dialogue: MAIL FROM, RCPT TO, the headers and the order lines
+    # read from the CSV file.
+    org.eclipse.angus.mail: INFO

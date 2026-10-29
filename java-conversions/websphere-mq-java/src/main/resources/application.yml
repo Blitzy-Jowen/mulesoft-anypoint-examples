@@ -1,0 +1,90 @@
+# websphere-mq-java runtime configuration
+# Original: websphere-mq/src/main/app/websphere-mq.xml (mule-app.properties holds no keys). The Ajax connector's
+# resourceBase docroot is served from classpath static/services/wmqExample by config/AjaxResourceConfig.
+spring:
+  application:
+    name: websphere-mq-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404; AjaxResourceConfig registers its own resource handlers
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the page, script and /ajax/cometd mappings and gets their 405 instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false   # /ajax/cometd reads at most 200000 body bytes itself: a form body on PUT/PATCH/DELETE gets SC-1's 405 unread instead of being buffered whole by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+  # No JMS connection settings here: config/IbmMqConfig builds the IBM MQ factory from wmq.*, and only with
+  # wmq.enabled false (the test profile) does the tests' embedded broker come from Boot's auto-configuration.
+
+server:
+  port: 8086                       # ajax:connector serverUrl http://0.0.0.0:8086/services/wmqExample (websphere-mq.xml:7), the only listener
+  address: 0.0.0.0                 # host of the same serverUrl
+
+# IBM MQ client connection of wmq:connector (websphere-mq.xml:4), under the original key names, read by
+# config/IbmMqConfig. Its transportType CLIENT_MQ_TCPIP is fixed in IbmMqConfig.
+wmq:
+  enabled: true                    # the MQ connection factory and its start-up connection check (validateConnections="true") exist unless false; then wmq.host is required
+  # TODO: supply the IBM MQ queue manager host name
+  host: ${WMQ_HOST:}
+  port: ${WMQ_PORT:1414}           # the port the original WebsphereMQIT sets, IBM MQ's default listener port
+  # TODO: supply the server-connection (SVRCONN) channel name
+  channel: ${WMQ_CHANNEL:}
+  # TODO: supply the queue manager name
+  # wmq.queue names the queue manager, not a queue: the original maps queueManager="${wmq.queue}".
+  queue: ${WMQ_QUEUE:}
+  # TODO: supply the MQ user name
+  username: ${WMQ_USERNAME:}
+  # TODO: supply the MQ password
+  password: ${WMQ_PASSWORD:}
+  queues:
+    in: "in"                       # queue="in" of flows Input and MessageProcessor (websphere-mq.xml:13,16)
+    out: "out"                     # queue="out" of flows MessageProcessor and Output (websphere-mq.xml:20,25)
+  processing:
+    wait-ms: 15000                 # test:component waitTime (websphere-mq.xml:19), read by service/MqProcessingService
+  # IBM MQ transport budgets in whole seconds (1 to 2147483), read by config/IbmMqConfig, which sets them as JVM-wide
+  # IBM client properties before the first MQ factory is built. The connector sets none; 10 s is the Mule default
+  # response timeout. An operation that exceeds one fails once and is never retried; a write the queue manager or
+  # the network stops reading is not bounded by these (see config/IbmMqConfig).
+  transport:
+    connect-timeout-seconds: 10      # TCP connect to the queue manager's listener (com.ibm.mq.cfg.TCP.Connect_Timeout)
+    negotiation-timeout-seconds: 10  # each reply of the negotiation that opens a connection (com.ibm.mq.cfg.TCP.QmgrNegotiationFlowTimeout)
+    receive-timeout-seconds: 10      # each read once connected; a silent peer is declared broken after about twice this unless a write is blocked (com.ibm.mq.cfg.MQRCVBLKTO)
+  # Directory of the IBM MQ client's own error log (mqjms.log.0 to .2) and, when they run, its trace file and FFDC
+  # directory, which the client otherwise writes to the working directory. config/IbmMqConfig points the JVM-wide IBM
+  # client properties com.ibm.msg.client.commonservices.log.outputName and com.ibm.msg.client.commonservices.trace.outputName
+  # into it before the first MQ factory is built, unless either is already set as a system property or in the client's
+  # jms.config. The directory is created; a blank value means target/mqclient.
+  client:
+    diagnostics-dir: target/mqclient   # under the build directory; a relative path resolves against the working directory
+
+# SC-12: Mule Ajax transport, read by AjaxResourceConfig, BayeuxLongPollingController and AjaxChannelBroker, and by
+# client/MqQueueSender and trigger/OutQueueListener for the channels <server-path>/enqueue and <server-path>/dequeue.
+ajax:
+  server-path: /services/wmqExample   # path of the connector's serverUrl; the docroot is served at <server-path>/
+  disable-reply-to: true           # disableReplyTo="true" (websphere-mq.xml:7): an enqueue publication gets no RPC reply on replyTo
+  cache-messages-channels:         # outbound channel declared with cacheMessages="true" (websphere-mq.xml:26)
+    - /services/wmqExample/dequeue
+  response-timeout-ms: 10000       # responseTimeout of the enqueue inbound endpoint (websphere-mq.xml:9)
+  # Bayeux server-side poll timeout: "The server side poll timeout in milliseconds (default 250000)", Mule tag mule-3.8.0
+  # transports/ajax/src/main/java/org/mule/transport/ajax/embedded/AjaxConnector.java:97-100; the connector sets none.
+  connect-timeout-ms: 250000
+  # Bayeux maxInterval: "The max client side poll timeout in milliseconds (default 30000)", same AjaxConnector.java:80-83;
+  # the connector sets none. AjaxChannelBroker removes a client not heard from for this long.
+  max-interval-ms: 30000
+
+logging:
+  level:
+    # websphere-mq.xml declares no logger: its only log line is the test:component's, which service/MqProcessingService
+    # writes at INFO with the text ("Message Received in service: MessageProcessor. Content is: <text>"). Below INFO
+    # these loggers write the texts sent through the page. A logger's own level outranks logging.level.root and the
+    # --debug and --trace logger groups, so neither reaches them.
+    org.springframework.web.servlet.DispatcherServlet: WARN   # request line with the query: a GET to /ajax/cometd carries the published text in its message parameter. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, the handled exception and its message included; the Bayeux handler takes the servlet request, so no published text
+    org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter: INFO   # TRACE writes the async result a held /meta/connect resumes with: the processed text delivered on the dequeue channel
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # TRACE writes the response body: the same Bayeux delivery
+    org.springframework.jms.core.JmsTemplate: INFO   # DEBUG "Sending created message:" renders each message sent to queues in and out, whose IBM MQ toString() holds the text
+    org.springframework.jms.listener.adapter.MessagingMessageListenerAdapter: INFO   # DEBUG "Processing [...]" renders each message the in and out listeners receive, whose IBM MQ toString() holds the text
+    org.springframework.messaging.handler.HandlerMethod: INFO   # TRACE writes the @JmsListener arguments: each received text, before and after " - processed"
+    io.undertow.request.io: INFO   # DEBUG "Failed to parse request" carries the query Undertow cannot decode: the message parameter of a GET to /ajax/cometd with a malformed percent escape

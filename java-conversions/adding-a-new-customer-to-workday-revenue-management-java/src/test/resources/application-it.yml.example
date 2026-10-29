@@ -1,0 +1,31 @@
+# Live-sandbox credentials template for AddingANewCustomerToWorkdayIT
+# (adding-a-new-customer-to-workday-revenue-management-java).
+#
+# Copy this file to src/test/resources/application-it.yml and fill in the values.
+# application-it.yml is git-ignored by this project's .gitignore and by the repository-root .gitignore
+# (**/src/test/resources/application-it.yml). Never commit it.
+#
+# AddingANewCustomerToWorkdayIT runs under failsafe (mvn -B verify, Spring profile "it"); mvn -B test never
+# reads this file. The test is skipped by assumption, never failed, while application-it.yml is missing or
+# while any key below is missing, blank or still TODO.
+#
+# The test posts a customer named John<millis> to POST /, checks it with Get_Customers (Total_Results 1),
+# and afterwards inactivates it with wday.status.id and wday.reason.id. Workday exposes no customer delete,
+# so the customer is inactivated, as the original MUnit suite did.
+#
+# The keys keep the names of the original Mule example: the Workday connector configuration
+# (src/main/app/add_a_new_customer.xml:5) and the MUnit inactivation request
+# (src/test/munit/integration-test.xml:107,110), which read them from src/test/resources/mule.test.properties.
+# The existing Workday tenant and integration user are reused; no new tenant is procured.
+wday:
+  hostname:     # TODO: supply the Workday host name, e.g. impl-cc.workday.com
+  tenant:       # TODO: supply the tenant ID (usually ends with _pt1)
+  user:         # TODO: supply the integration user name without @tenant; the client sends user@tenant
+  password:     # TODO: supply that user's password
+  status:
+    id:         # TODO: supply the WID of an inactive Business Entity Status Value
+  reason:
+    id:         # TODO: supply the WID of a Reason for Customer Status Change
+  # wday.endpoint is derived as https://<hostname>/ccx/service/<tenant>/Revenue_Management/v25.0
+  # (src/main/resources/application.yml). Optional, only if your tenant uses a different service URL: add
+  # endpoint to this wday block with that URL as its value, which then replaces the derived one.

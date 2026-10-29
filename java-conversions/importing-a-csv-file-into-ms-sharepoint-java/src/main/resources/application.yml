@@ -1,0 +1,24 @@
+# Original: importing-a-csv-file-into-ms-sharepoint/src/main/app/importing-a-csv-file-into-ms-sharepoint.xml
+# (mule-app.properties holds no keys). The original placeholder names are kept unchanged.
+spring:
+  main:
+    web-application-type: none          # no HTTP listener in the original (AAP 0.5.1 list)
+
+Sharepoint:
+  # TODO: supply the SharePoint Online account, format <USERNAME>@<COMPANY_NAME>.onmicrosoft.com
+  Username: ${SHAREPOINT_USERNAME:}
+  # TODO: supply the SharePoint Online account password
+  Password: ${SHAREPOINT_PASSWORD:}
+  # TODO: supply the site URL, format https://<COMPANY_NAME>.sharepoint.com
+  SiteUrl: ${SHAREPOINT_SITEURL:}
+
+# TODO: supply the target folder under 'Shared Documents', e.g. my_folder
+csvImportFolder: ${CSVIMPORTFOLDER:}
+
+csv-import:
+  input-dir: src/main/resources/input        # original file:inbound-endpoint path (l.7)
+  move-to-dir: src/main/resources/output     # original moveToDirectory (l.7)
+  polling-frequency: 10000                   # original pollingFrequency in ms (l.7)
+
+sharepoint-online:
+  sts-url: https://login.microsoftonline.com/extSTS.srf   # Microsoft STS used by the claims sign-in

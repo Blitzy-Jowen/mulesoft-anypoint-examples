@@ -1,0 +1,22 @@
+# Test-only values for Spring profile "test", activated by @ActiveProfiles("test") in the surefire suite.
+# They replace the uncommitted src/test/resources/mule.test.properties the original ProxyingRestApiIT read
+# (line 56). None is a real credential, account or host; production values come from the TODO placeholders
+# of application.yml.
+# proxy.upstream-url is deliberately absent: each test points it at its WireMock server through
+# @DynamicPropertySource, so no request leaves the build host.
+# box.password and phantomjs.binary are intentionally dropped: WireMock stands in for Box, so no browser
+# login to Box happens and no PhantomJS binary is needed.
+keystore:
+  # Blank: BoxProxyClient uses the JVM default TLS context and loads no key store (WireMock speaks plain HTTP)
+  path: ""
+  # Key store (store) password: the original tls:key-store password="${keystore.key}" (proxying-a-rest-api.xml:5-9)
+  key: test-store-password
+  # Private-key password: the original tls:key-store keyPassword="${keystore.password}" (proxying-a-rest-api.xml:5-9)
+  password: test-key-password
+box:
+  # Box account login, asserted as the folder's owned_by.login (original box.user, ProxyingRestApiIT.java:143)
+  user: mule.tester@example.com
+  # OAuth client ID (original box.id)
+  id: test-client-id
+  # OAuth client secret (original box.secret)
+  secret: test-client-secret

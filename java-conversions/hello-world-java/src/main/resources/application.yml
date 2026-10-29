@@ -1,0 +1,21 @@
+# hello-world-java runtime configuration
+# Replaces hello-world/src/main/app/mule-app.properties and the http:listener-config of HelloWorld.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (HelloWorld.xml:3)
+spring:
+  application:
+    name: hello-world-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the /helloWorld listener has no allowedMethods: TRACE reaches HelloWorldController like every other method instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false   # the flow reads no form fields: a form body on PUT/PATCH/DELETE reaches HelloWorldController as it does on POST instead of being parsed by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

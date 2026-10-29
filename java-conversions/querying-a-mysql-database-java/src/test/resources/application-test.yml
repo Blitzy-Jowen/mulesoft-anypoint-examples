@@ -1,0 +1,32 @@
+# Spring profile "test" of querying-a-mysql-database-java (tests activate it with @ActiveProfiles("test")).
+# Replaces the never-committed mule.test.properties and MySQLDbCreator of the original test: the live
+# MySQL server becomes an in-memory H2 database seeded from the unchanged src/main/resources/import.sql.
+# Holds no credentials: Boot defaults the username of an embedded H2 URL to "sa" with an empty password.
+#
+# Notes for the tests that use this profile:
+# - @JdbcTest classes (client/EmployeeRepositoryTest) must declare
+#   @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE); otherwise Boot swaps in
+#   its own embedded H2, which is not in MySQL mode, and ignores this URL.
+# - ${random.uuid} yields a new value on every lookup, so use the injected DataSource or JdbcTemplate and
+#   never re-read jdbc.url or spring.datasource.url through @Value or Environment to open a connection:
+#   that would reach a different, empty database.
+# - FixtureParityTest runs without this profile; each captured fixture's state.properties supplies the
+#   same H2 URL and spring.sql.init.* keys (fixtures/SCENARIOS.md).
+jdbc:
+  # Unique in-memory database per Spring test context; MySQL emulation of the original server.
+  # - ${random.uuid}: one database per context, so the test contexts never share or re-seed one database.
+  # - MODE=MySQL: emulates the original MySQL server.
+  # - DATABASE_TO_LOWER=TRUE: the column label comes back as first_name, the JSON key of the original reply.
+  # - IGNORECASE=TRUE: mirrors MySQL's default case-insensitive collation, so puckett matches Puckett.
+  # - DB_CLOSE_DELAY=-1: keeps the database alive between pooled connections.
+  url: "jdbc:h2:mem:company-${random.uuid};MODE=MySQL;DATABASE_TO_LOWER=TRUE;IGNORECASE=TRUE;DB_CLOSE_DELAY=-1"
+spring:
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:import.sql
+      # Lines 1-9 of import.sql are MySQL-only administration statements that fail on H2 and are skipped:
+      # CREATE DATABASE company, CREATE USER 'generatedata'@'localhost' IDENTIFIED BY ..., GRANT ALL
+      # PRIVILEGES ..., FLUSH PRIVILEGES, USE company. Every CREATE TABLE and INSERT must succeed;
+      # client/EmployeeRepositoryTest's counts (102 employees, 100 roles) guard that.
+      continue-on-error: true

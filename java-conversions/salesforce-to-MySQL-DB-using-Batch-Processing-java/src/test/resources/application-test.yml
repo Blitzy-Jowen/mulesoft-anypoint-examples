@@ -1,0 +1,58 @@
+# Spring profile "test" of salesforce-to-MySQL-DB-using-Batch-Processing-java
+# (tests activate it with @ActiveProfiles("test")). An in-memory H2 database in
+# MySQL mode replaces the never-committed mule.test.properties keys
+# database.host, database.user, database.password and database.url, and the
+# MySQLDbCreator of the original integration test. The unchanged
+# src/main/resources/contact.sql creates the contact table, and every Spring
+# test context gets its own database. Holds no credentials: H2's sa user with
+# an empty password exists only inside the in-memory database.
+#
+# Notes for the tests that use this profile:
+# - @JdbcTest classes (client/ContactRepositoryTest) must declare
+#   @AutoConfigureTestDatabase(replace = Replace.NONE); otherwise Boot swaps
+#   in its own embedded H2, which is not in MySQL mode, and ignores this URL.
+# - ${random.uuid} yields a new value on every lookup, so use the injected
+#   DataSource or JdbcTemplate and never re-read spring.datasource.url through
+#   @Value or Environment to open a connection: that would reach a different,
+#   empty database.
+# - SalesforceToMySQLDBUsingBatchProcessingIT activates "test" and "it": its
+#   Salesforce keys come from the git-ignored application-it.yml, while the
+#   H2 database still comes from this file.
+# - FixtureParityTest runs without this profile; each fixture's
+#   state.properties supplies the same datasource keys (fixtures/SCENARIOS.md).
+---
+spring:
+  datasource:
+    # The main URL is assembled from mysql.host, mysql.port and mysql.database,
+    # so every datasource key is overridden here rather than one jdbc.url.
+    # - company: the original database name (db:mysql-config database).
+    # - ${random.uuid}: one database per Spring test context, so a second
+    #   context never re-runs CREATE TABLE contact against an existing table.
+    # - MODE=MySQL: emulates the original MySQL server and accepts the ENGINE,
+    #   CHARSET and COLLATE table options of contact.sql.
+    # - DATABASE_TO_LOWER=TRUE: column labels come back as first_name,
+    #   last_name and email, as MySQL returns them.
+    # - CASE_INSENSITIVE_IDENTIFIERS=TRUE: quoted identifiers also match in
+    #   any case, as MySQL column names do.
+    # - IGNORECASE=TRUE: mirrors the case-insensitive utf8_slovak_ci collation
+    #   of the email primary key and of the WHERE email = ? lookup.
+    # - DB_CLOSE_DELAY=-1: keeps the database alive between pooled connections.
+    # One line, so the whole URL stays searchable:
+    # yamllint disable-line rule:line-length
+    url: "jdbc:h2:mem:company-${random.uuid};MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE;IGNORECASE=TRUE;DB_CLOSE_DELAY=-1"
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:contact.sql
+      # continue-on-error stays at its default, false: if H2 rejected
+      # contact.sql, every context of this profile fails to start instead of
+      # running without the contact table.
+
+poll:
+  # The scheduled poll must never fire during a test; tests call
+  # ContactPollScheduler.pollOnce() explicitly. Surefire and failsafe set the
+  # same value; this one also covers IDE runs, which bypass them.
+  initial-delay: 3600000

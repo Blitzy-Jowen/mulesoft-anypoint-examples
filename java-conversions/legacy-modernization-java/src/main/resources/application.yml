@@ -1,0 +1,42 @@
+# legacy-modernization-java runtime configuration
+# Original: legacy-modernization/src/main/app/FufillmentWebService.xml (mule-app.properties holds no keys),
+# so every value is a fixed default taken from the flow's literals.
+spring:
+  application:
+    name: legacy-modernization-java
+  web:
+    resources:
+      add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404
+  mvc:
+    dispatch-trace-request: true   # TRACE on any path but /OrderFulfillment reaches the no-listener 404, not the servlet's echo
+    formcontent:
+      filter:
+        enabled: false   # the POST-only listener checks the method before reading the body and no handler reads PUT/PATCH/DELETE form fields: a form body on PUT/PATCH/DELETE gets SoapListenerBoundaryAdapter's 405 unread instead of being buffered whole by Boot's filter before dispatch
+  webservices:
+    path: /OrderFulfillment        # MessageDispatcherServlet registered as "messageDispatcherServlet"; WebServiceConfig narrows it to exactly /OrderFulfillment; dispatcherServlet stays at /
+    servlet:
+      init:                        # bracketed so the case-sensitive servlet init parameter names keep their camelCase
+        "[dispatchOptionsRequest]": "true"   # OPTIONS and TRACE reach SoapListenerBoundaryAdapter, whose 405 answers every
+        "[dispatchTraceRequest]": "true"     # non-POST request: the original listener is POST-only (FufillmentWebService.xml:5)
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no /error page rewrites SC-1/SC-11 response bytes
+  task:
+    execution:
+      thread-name-prefix: legacy-fulfillment-async-   # applicationTaskExecutor behind @Async ShippingOrderExportService (async scope, :9-36); pool sizes stay at Boot's defaults
+
+server:
+  port: 1080                       # FufillmentWebService.xml:3
+  address: 0.0.0.0                 # :3
+
+fulfillment:
+  # file:outbound-endpoint path (:35), relative to the working directory as in Mule. File names follow
+  # outputPattern (:35) as ShippingOrder-<dd-MM-yy_HH-mm-ss.SSS>.txt; they are produced in code, not configured.
+  output-dir: src/main/resources/Output
+
+logging:
+  level:
+    # FufillmentWebService.xml declares no logger, so the order's addresses are not logged at any level. A logger's
+    # own level outranks logging.level.root and the --debug and --trace logger groups, so neither reaches this one.
+    # The application sends no SOAP request, so no client MessageTracing logger is written.
+    org.springframework.ws.server.MessageTracing: INFO   # .received/.sent TRACE write every putShippingOrder envelope and its reply: the billing and shipping addresses

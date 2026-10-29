@@ -1,0 +1,725 @@
+/*
+ * MuleSoft Examples
+ * Copyright 2014 MuleSoft, Inc.
+ *
+ * This product includes software developed at
+ * MuleSoft, Inc. (http://www.mulesoft.com/).
+ */
+
+package com.mulesoft.examples.mule_component_bindings.controller;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.assertj.core.api.Assertions.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.when;
+
+import java.io.BufferedInputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.context.ApplicationContext;
+import org.springframework.http.HttpStatus;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.test.annotation.DirtiesContext;
+import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.util.TestSocketUtils;
+import org.springframework.web.filter.FormContentFilter;
+import org.springframework.web.server.ResponseStatusException;
+
+import com.mulesoft.examples.mule_component_bindings.exception.InvalidStockSymbol;
+import com.mulesoft.examples.mule_component_bindings.model.StockStats;
+import com.mulesoft.examples.mule_component_bindings.model.Tweet;
+import com.mulesoft.examples.mule_component_bindings.service.SentimentService;
+import com.mulesoft.examples.mule_component_bindings.service.StockService;
+import com.mulesoft.examples.mule_component_bindings.service.StockStatsService;
+import com.mulesoft.examples.mule_component_bindings.service.TwitterSearchService;
+import com.mulesoft.examples.mule_component_bindings.service.TwitterService;
+import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient;
+import com.mulesoft.examples.mule_component_bindings.support.HttpTestClient.Response;
+import com.mulesoft.examples.mule_component_bindings.support.PortInUseRetryingContextLoader;
+
+/**
+ * Wire-level test of {@link StockStatsController}, the replacement of the JAX-RS resource
+ * {@code stockstats.StockStatsResource} ({@code @Path("/stockStats")}, {@code @GET search(@QueryParam("stock"),
+ * @QueryParam("date"))}) behind the {@code /api/*} listener of {@code localhost:8180}
+ * (mule-component-bindings/src/main/app/mule-component-bindings.xml:40-54).
+ *
+ * <p>The whole application runs on Undertow under profile {@code test}: the main listener on a random port and the
+ * stock-statistics listener on a free port drawn for each attempt to load the context, because SC-10's
+ * {@code PortRoutingFilter} tells the listeners apart by local port; {@link PortInUseRetryingContextLoader} loads
+ * the context again when another process takes that port first. The real {@link StockStatsService} runs over
+ * mocked {@link StockService}, {@link SentimentService} and {@link TwitterSearchService} (the bound
+ * {@link TwitterService}), so every upstream call is recorded and none leaves the JVM. Requests go through ST-1
+ * {@link HttpTestClient}, which adds no {@code Accept} or {@code Content-Type} of its own, so the status line,
+ * headers and body bytes are asserted as written.
+ *
+ * <p>Expected query bindings and media-selection statuses are those of the JAX-RS runtime the original ran on
+ * (Jersey 2.11: {@code UriComponent.decodeQuery}, which {@code @QueryParam} reads, and the method selection against
+ * the resource's {@code @Consumes} and {@code @Produces("application/json")}), established by running that runtime
+ * on each input.
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@ContextConfiguration(loader = PortInUseRetryingContextLoader.class)
+@ActiveProfiles("test")
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
+class StockStatsControllerTest {
+
+    private static final String STOCK_STATS = "/api/stockStats";
+
+    private static final String DAY = "2012-10-26";
+
+    private static final String NO_CONTENT = "HTTP/1.1 204 No Content";
+
+    private static final String BAD_REQUEST = "HTTP/1.1 400 Bad Request";
+
+    private static final String NOT_ACCEPTABLE = "HTTP/1.1 406 Not Acceptable";
+
+    private static final String UNSUPPORTED_MEDIA_TYPE = "HTTP/1.1 415 Unsupported Media Type";
+
+    /** A form body large enough that reading it whole before dispatch keeps the response back measurably. */
+    private static final int LARGE_FORM_BYTES = 300_000;
+
+    /** Bytes of a large form body written before its response is read; the rest is written only afterwards. */
+    private static final int LARGE_FORM_PREFIX_BYTES = 1024;
+
+    @MockBean
+    private StockService stockService;
+
+    @MockBean
+    private SentimentService sentimentService;
+
+    @MockBean
+    private TwitterSearchService twitterSearchService;
+
+    @Autowired
+    private StockStatsService stockStatsService;
+
+    /** The running application's context, inspected for the servlet filters it registers. */
+    @Autowired
+    private ApplicationContext applicationContext;
+
+    /** Port of this context's stock-statistics listener. */
+    @Value("${ports.stock-stats}")
+    private int stockStatsPort;
+
+    private HttpTestClient stockStats;
+
+    /** The stock-statistics listener ({@code ports.stock-stats}) on a free port drawn for each load attempt. */
+    @DynamicPropertySource
+    static void stockStatsPort(DynamicPropertyRegistry registry) {
+        int drawnPort = TestSocketUtils.findAvailableTcpPort();
+        registry.add("ports.stock-stats", () -> drawnPort);
+    }
+
+    @BeforeEach
+    void client() {
+        stockStats = HttpTestClient.localhost(stockStatsPort);
+    }
+
+    @Test
+    void contextBindsTheMockedServicesIntoTheRealResource() {
+        assertThat(stockStatsService.getStockService()).isSameAs(stockService);
+        assertThat(stockStatsService.getTwitterService()).isSameAs(twitterSearchService);
+        assertThat(stockStatsService.getSentimentService()).isSameAs(sentimentService);
+    }
+
+    @ParameterizedTest(name = "[{index}] ?{0} -> stock {1}")
+    @CsvSource(delimiter = '|', value = {
+        // first occurrence of a repeated parameter wins
+        "stock=AAPL&stock=MSFT&date=2012-10-26 | AAPL",
+        // a percent-encoded name is decoded before it is compared
+        "st%6Fck=AAPL&date=2012-10-26          | AAPL",
+        // '+' and %20 decode to a space
+        "stock=A+B%20C&date=2012-10-26         | A B C",
+        // a term whose name is empty is ignored
+        "=x&stock=AAPL&date=2012-10-26         | AAPL",
+        // empty terms are skipped
+        "&&stock=AAPL&&date=2012-10-26&        | AAPL",
+        // an encoded '&' or '=' stays in the value
+        "stock=A%26B&date=2012-10-26           | A&B",
+    })
+    void queryParametersAreBoundAsTheJaxRsRuntimeBoundThem(String query, String expectedStock)
+            throws Exception {
+        Response response = stockStats.get(STOCK_STATS + "?" + query);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(NO_CONTENT);
+        verify(stockService).getHistoricalPrices(eq(expectedStock), eq(day(DAY)));
+        // the stock is looked up once, so a later value of a repeated parameter is never asked for
+        verifyNoMoreInteractions(stockService);
+    }
+
+    @ParameterizedTest(name = "[{index}] ?{0} -> 400 {1}")
+    @CsvSource(delimiter = '|', value = {
+        // an empty value is blank
+        "stock=&date=2012-10-26                | stock is required",
+        // date absent
+        "stock=AAPL                            | date is required",
+        // a date of another length than yyyy-MM-dd
+        "stock=AAPL&date=2012-1-26             | date format must be YYYY-MM-DD",
+        // a date of the right length that does not parse
+        "stock=AAPL&date=abcd-ef-gh            | date format must be YYYY-MM-DD",
+        // a bare name binds the empty value
+        "stock&date=2012-10-26                 | stock is required",
+        // ';' is not a separator: date is part of the stock value
+        "stock=AAPL;date=2012-10-26            | date is required",
+        // names are compared case-sensitively
+        "Stock=AAPL&date=2012-10-26            | stock is required",
+        // stock absent
+        "date=2012-10-26                       | stock is required",
+    })
+    void queryParametersTheResourceRejectsReachItsValidation(String query, String reason) {
+        Response response = stockStats.get(STOCK_STATS + "?" + query);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 400 Bad Request");
+        assertThat(response.header("Content-Type")).isEqualTo("application/json");
+        assertThat(response.bodyAsString()).isEqualTo(reason);
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    @ParameterizedTest(name = "[{index}] {0} {1} -> {2}")
+    @CsvSource(delimiter = '|', nullValues = "NULL", value = {
+        "NULL                          | stock | NULL",
+        "''                            | stock | NULL",
+        "stock=AAPL&date=2014-11-04    | stock | AAPL",
+        "stock=AAPL&date=2014-11-04    | date  | 2014-11-04",
+        "stock&date=x                  | stock | ''",
+        "stock&date=x                  | date  | x",
+        "=x&stock=a                    | stock | a",
+        "stock=a&stock=b               | stock | a",
+        "st%6Fck=a+b%20c               | stock | a b c",
+        "stock=a;date=b                | stock | a;date=b",
+        "stock=a;date=b                | date  | NULL",
+        "&&stock=a&                    | stock | a",
+        "stock=%E2%82%AC               | stock | \u20ac",
+        "stock==a                      | stock | =a",
+        "stock=a&date                  | date  | ''",
+        "stock=                        | stock | ''",
+        "Stock=a                       | stock | NULL",
+        "stock=a%26b&date=c%3Dd        | stock | a&b",
+        "stock=a%26b&date=c%3Dd        | date  | c=d",
+        "&                             | stock | NULL",
+        "=                             | stock | NULL",
+        "stock=a=b                     | stock | a=b",
+    })
+    void queryParameterDecodesTheRawQueryAsTheJaxRsRuntimeDid(String rawQuery, String name, String expected) {
+        assertThat(StockStatsController.queryParameter(rawQuery, name)).isEqualTo(expected);
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @CsvSource({
+        // a malformed escape fails the whole query, even in a term other than the one asked for
+        "stock=%ZZ",
+        "stock=a%2",
+        "stock=a&date=%",
+        "stock=%u0041",
+    })
+    void queryParameterRejectsMalformedEscapesAnywhereInTheQuery(String rawQuery) {
+        assertThat(catchThrowable(() -> StockStatsController.queryParameter(rawQuery, "stock")))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void formFieldsOfTheRequestBodyAreNotQueryParameters() {
+        // The servlet request exposes the body's form fields as request parameters; @QueryParam never saw them.
+        StockService stocks = mock(StockService.class);
+        TwitterService twitter = mock(TwitterService.class);
+        SentimentService sentiment = mock(SentimentService.class);
+        StockStatsController controller =
+                new StockStatsController(new StockStatsService(stocks, twitter, sentiment));
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", STOCK_STATS);
+        request.addParameter("stock", "AAPL");
+        request.addParameter("date", "2014-11-04");
+        request.setContent("stock=AAPL&date=2014-11-04".getBytes(StandardCharsets.ISO_8859_1));
+
+        Throwable thrown = catchThrowable(() -> controller.search(request));
+
+        assertThat(thrown).isInstanceOfSatisfying(ResponseStatusException.class, e -> {
+            assertThat(e.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+            assertThat(e.getReason()).isEqualTo("stock is required");
+        });
+        verifyNoInteractions(stocks, twitter, sentiment);
+    }
+
+    @Test
+    void getRunsTheResourceAndAnswersTheStatsAsJson() throws Exception {
+        // The original MuleComponentBindingsIT stub: close 1, low 2 and one tweet already counted.
+        StockStats stats = new StockStats();
+        stats.setClosingDate(DAY);
+        stats.getFinancialStats().setClose(1);
+        stats.getFinancialStats().setLow(2);
+        stats.getSocialStats().addTweet(new Tweet());
+        when(stockService.getHistoricalPrices("AAPL", day(DAY))).thenReturn(stats);
+
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 200 OK");
+        assertThat(response.header("Content-Type")).isEqualTo("application/json");
+        assertThat(response.bodyAsString()).isEqualTo("{\"closingDate\":\"2012-10-26\","
+                + "\"financialStats\":{\"open\":0.0,\"close\":1.0,\"high\":0.0,\"low\":2.0,\"volume\":0},"
+                + "\"socialStats\":{\"tweetsLoaded\":1,\"moreTweets\":false,\"negativeTweets\":0,"
+                + "\"neutralTweets\":0,\"positiveTweets\":1}}");
+        verify(twitterSearchService).search(eq("AAPL"), eq(day(DAY)), eq(100), eq(1));
+        verify(sentimentService).classify(anyList());
+    }
+
+    @Test
+    void getWithoutStatsForTheDayAnswers204WithoutBody() throws Exception {
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(NO_CONTENT);
+        assertThat(response.header("Content-Type")).isNull();
+        assertThat(response.body()).isEmpty();
+        verify(stockService).getHistoricalPrices(eq("AAPL"), any(Date.class));
+        verify(twitterSearchService).search(eq("AAPL"), any(Date.class), anyInt(), anyInt());
+    }
+
+    @Test
+    void invalidStockSymbolIsAnswered400NamingTheSymbol() throws Exception {
+        when(stockService.getHistoricalPrices(eq("XYZ"), any())).thenThrow(new InvalidStockSymbol("XYZ"));
+
+        Response response = stockStats.get(STOCK_STATS + "?stock=XYZ&date=" + DAY);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(BAD_REQUEST);
+        assertThat(response.header("Content-Type")).isEqualTo("application/json");
+        assertThat(response.bodyAsString()).isEqualTo("Invalid stock symbol XYZ");
+        verify(stockService).getHistoricalPrices(eq("XYZ"), eq(day(DAY)));
+        verifyNoInteractions(twitterSearchService, sentimentService);
+    }
+
+    @ParameterizedTest(name = "[{index}] RuntimeException({0})")
+    @NullSource
+    @ValueSource(strings = "boom")
+    void unexpectedFailureIsAnswered500WithItsMessageAsTheRawBody(String message) throws Exception {
+        // The resource's catch-all branch, not the { "message": ... } 500 of the generic handler.
+        when(stockService.getHistoricalPrices(eq("AAPL"), any())).thenThrow(new RuntimeException(message));
+
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
+        assertThat(response.header("Content-Type")).isEqualTo("application/json");
+        assertThat(response.bodyAsString()).isEqualTo(message == null ? "" : message);
+        verifyNoInteractions(twitterSearchService, sentimentService);
+    }
+
+    @Test
+    void formBodyWithoutQueryIsRejectedByTheResourceMediaTypeBeforeAnyUpstreamCall() {
+        // @Consumes(application/json) rejects the form entity before the method runs, so its fields never matter.
+        Response response = stockStats.send("GET", STOCK_STATS,
+                Map.of("Content-Type", "application/x-www-form-urlencoded"),
+                "stock=AAPL&date=2014-11-04".getBytes(StandardCharsets.ISO_8859_1));
+
+        assertRejected(response, UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    @ParameterizedTest(name = "[{index}] Accept: {0} -> {1}")
+    @CsvSource(delimiter = '|', value = {
+        "text/html                                              | " + NOT_ACCEPTABLE,
+        "text/html;                                             | " + NOT_ACCEPTABLE,
+        "application/*+json                                     | " + NOT_ACCEPTABLE,
+        "application/vnd.x+json                                 | " + NOT_ACCEPTABLE,
+        "json                                                   | " + NOT_ACCEPTABLE,
+        "text/*;q=0.5, application/xml                          | " + NOT_ACCEPTABLE,
+        "application/json;q=2                                   | " + BAD_REQUEST,
+        "application/json;q=abc                                 | " + BAD_REQUEST,
+        "application/json;q=1.5                                 | " + BAD_REQUEST,
+        "application/json;q=0.5555                              | " + BAD_REQUEST,
+        "/json                                                  | " + BAD_REQUEST,
+        "application/                                           | " + BAD_REQUEST,
+        "a/b/c                                                  | " + BAD_REQUEST,
+        "text/html,,application/json                            | " + BAD_REQUEST,
+        ",                                                      | " + BAD_REQUEST,
+        ", application/json                                     | " + BAD_REQUEST,
+        "application/json; q = 0.5                              | " + BAD_REQUEST,
+        "application / json                                     | " + BAD_REQUEST,
+        "application/json (x)                                   | " + BAD_REQUEST,
+        "application/json;level                                 | " + BAD_REQUEST,
+        // an invalid element fails the list even when another element would be acceptable
+        "text/html, application/json;q=abc                      | " + BAD_REQUEST,
+    })
+    void acceptTheResourceCannotSatisfyIsRejectedBeforeAnyUpstreamCall(String accept, String statusLine) {
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY, Map.of("Accept", accept));
+
+        assertRejected(response, statusLine);
+    }
+
+    @ParameterizedTest(name = "[{index}] Accept: {0}")
+    @CsvSource(delimiter = '|', value = {
+        "application/json",
+        "Application/JSON",
+        "application/json;charset=utf-8",
+        "application/json; charset=\"a,b\"",
+        // the quality of a compatible element does not matter: a single resource method is still selected
+        "application/json;q=0",
+        "text/html;q=1, application/json;q=0",
+        "*/*;q=0.1",
+        "text/html, image/gif, image/jpeg, *; q=.2, */*; q=.2",
+        "*",
+        "application",
+        "*/json",
+        "application/*",
+        "application/json,",
+        "application/json;q=.5555",
+        "application/json;q=1.",
+    })
+    void acceptAdmittingJsonReachesTheResource(String accept) throws Exception {
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY, Map.of("Accept", accept));
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(NO_CONTENT);
+        verify(stockService).getHistoricalPrices(eq("AAPL"), eq(day(DAY)));
+    }
+
+    @ParameterizedTest(name = "[{index}] Accept: {0} + Accept: {1} -> {2}")
+    @CsvSource(delimiter = '|', value = {
+        "text/html | application/json | " + NO_CONTENT,
+        "text/html | image/png        | " + NOT_ACCEPTABLE,
+        // the values are joined with ',', so an empty one leaves an empty list element
+        "''        | text/html        | " + BAD_REQUEST,
+    })
+    void repeatedAcceptHeadersAreReadAsOneList(String first, String second, String statusLine) {
+        Response response = stockStats.sendHeaderPairs("GET", STOCK_STATS + "?stock=AAPL&date=" + DAY,
+                List.of(Map.entry("Accept", first), Map.entry("Accept", second)), null);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(statusLine);
+    }
+
+    @ParameterizedTest(name = "[{index}] Content-Type: {0} -> {1}")
+    @CsvSource(delimiter = '|', value = {
+        "text/plain                                             | " + UNSUPPORTED_MEDIA_TYPE,
+        "text/plain;                                            | " + UNSUPPORTED_MEDIA_TYPE,
+        "application/x-www-form-urlencoded                      | " + UNSUPPORTED_MEDIA_TYPE,
+        "application/*+json                                     | " + UNSUPPORTED_MEDIA_TYPE,
+        "application/vnd.x+json                                 | " + UNSUPPORTED_MEDIA_TYPE,
+        "text/*                                                 | " + UNSUPPORTED_MEDIA_TYPE,
+        // a type that is not JSON is rejected before its parameters are read
+        "text/plain;q=abc                                       | " + UNSUPPORTED_MEDIA_TYPE,
+        "json                                                   | " + BAD_REQUEST,
+        "*                                                      | " + BAD_REQUEST,
+        "''                                                     | " + BAD_REQUEST,
+        "application/                                           | " + BAD_REQUEST,
+        "/json                                                  | " + BAD_REQUEST,
+        "a/b/c                                                  | " + BAD_REQUEST,
+        "application/json;charset                               | " + BAD_REQUEST,
+        "application/json;charset=                              | " + BAD_REQUEST,
+        "application/json;=x                                    | " + BAD_REQUEST,
+        "application/json, text/plain                           | " + BAD_REQUEST,
+        "application / json                                     | " + BAD_REQUEST,
+        "application/json (x)                                   | " + BAD_REQUEST,
+    })
+    void contentTypeTheResourceDoesNotConsumeIsRejectedBeforeAnyUpstreamCall(String contentType, String statusLine) {
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY,
+                Map.of("Content-Type", contentType));
+
+        assertRejected(response, statusLine);
+    }
+
+    @ParameterizedTest(name = "[{index}] Content-Type: {0}")
+    @CsvSource(delimiter = '|', value = {
+        "application/json",
+        "application/json;charset=UTF-8",
+        "Application/Json;Charset=UTF-8",
+        "APPLICATION/JSON",
+        "application/*",
+        "*/*",
+        "*/json",
+        "application/json;charset=\"a\"",
+        "application/json ; charset=utf-8",
+        "application/json;q=0.5",
+    })
+    void contentTypeCompatibleWithJsonReachesTheResource(String contentType) throws Exception {
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY,
+                Map.of("Content-Type", contentType));
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(NO_CONTENT);
+        verify(stockService).getHistoricalPrices(eq("AAPL"), eq(day(DAY)));
+    }
+
+    @Test
+    void repeatedContentTypeHeadersAreRejected() {
+        Response response = stockStats.sendHeaderPairs("GET", STOCK_STATS + "?stock=AAPL&date=" + DAY,
+                List.of(Map.entry("Content-Type", "application/json"), Map.entry("Content-Type", "application/json")),
+                null);
+
+        assertRejected(response, BAD_REQUEST);
+    }
+
+    @ParameterizedTest(name = "[{index}] Content-Type: {0}, Accept: {1} -> {2}")
+    @CsvSource(delimiter = '|', value = {
+        // the Content-Type is judged first, parse and compatibility both, then the Accept
+        "text/plain       | text/html | " + UNSUPPORTED_MEDIA_TYPE,
+        "text/plain       | /json     | " + UNSUPPORTED_MEDIA_TYPE,
+        "json             | text/html | " + BAD_REQUEST,
+        "application/json | /json     | " + BAD_REQUEST,
+        "application/json | text/html | " + NOT_ACCEPTABLE,
+        // the q of the Content-Type is read only once both media types matched
+        "application/json;q=2 | text/html | " + NOT_ACCEPTABLE,
+    })
+    void contentTypeIsJudgedBeforeAccept(String contentType, String accept, String statusLine) {
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", contentType);
+        headers.put("Accept", accept);
+
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY, headers);
+
+        assertRejected(response, statusLine);
+    }
+
+    @Test
+    void contentTypeWithAMalformedQualityFailsAfterSelectionWithoutReachingTheResource() {
+        Response response = stockStats.get(STOCK_STATS + "?stock=AAPL&date=" + DAY,
+                Map.of("Content-Type", "application/json;q=2"));
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 500 Internal Server Error");
+        assertThat(response.header("Content-Type")).isEqualTo("application/json");
+        assertThat(response.bodyAsString()).isEqualTo("{ \"message\": \"java.text.ParseException: Error parsing "
+                + "Quality value: a decimal numeral '0' or '1' is expected rather than '2'\" }");
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    @ParameterizedTest(name = "[{index}] HEAD {0}: {1} -> {2}")
+    @CsvSource(delimiter = '|', value = {
+        "Accept       | text/html  | " + NOT_ACCEPTABLE,
+        "Content-Type | text/plain | " + UNSUPPORTED_MEDIA_TYPE,
+    })
+    void headIsSelectedAsGetIs(String header, String value, String statusLine) {
+        Response response = stockStats.send("HEAD", STOCK_STATS + "?stock=AAPL&date=" + DAY,
+                Map.of(header, value), null);
+
+        assertRejected(response, statusLine);
+    }
+
+    @Test
+    void headAdmittingJsonReachesTheResource() throws Exception {
+        Response response = stockStats.send("HEAD", STOCK_STATS + "?stock=AAPL&date=" + DAY,
+                Map.of("Accept", "application/json"), null);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(NO_CONTENT);
+        verify(stockService).getHistoricalPrices(eq("AAPL"), eq(day(DAY)));
+    }
+
+    @ParameterizedTest(name = "[{index}] Content-Type {0}, Accept {1} -> {2}")
+    @CsvSource(delimiter = '|', nullValues = "NONE", value = {
+        // white space the HTTP listener trims from a header line, judged as the runtime judged it
+        "NONE                 | ' '                   | 406",
+        "NONE                 | '\tapplication/json'  | OK",
+        "NONE                 | 'application/json\t'  | OK",
+        "' application/json'  | NONE                  | OK",
+        "' '                  | NONE                  | 400",
+        // characters outside US-ASCII are not token characters
+        "NONE                 | applicati\u00f3n/json | 400",
+        "applicati\u00f3n/json | NONE                 | 400",
+    })
+    void selectionReadsHeaderValuesWithTheRuntimeGrammar(String contentType, String accept, String expected) {
+        Optional<HttpStatus> rejection = JaxRsMediaSelection.rejection(
+                contentType == null ? List.of() : List.of(contentType), accept == null ? List.of() : List.of(accept));
+
+        assertThat(rejection.map(status -> String.valueOf(status.value())).orElse("OK")).isEqualTo(expected);
+    }
+
+    @Test
+    void selectionPassesARequestWithoutMediaHeaders() {
+        assertThat(JaxRsMediaSelection.rejection(List.of(), List.of())).isEmpty();
+    }
+
+    @Test
+    void postIsAnsweredWithTheListenerMethodNotAllowed() {
+        Response response = stockStats.post(STOCK_STATS + "?stock=AAPL&date=" + DAY, "application/json", "{}");
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 405 Method Not Allowed");
+        assertThat(response.header("Content-Type")).isEqualTo("text/plain");
+        assertThat(response.bodyAsString()).isEqualTo("Method not allowed for endpoint: " + STOCK_STATS);
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    /**
+     * The resource answers {@code GET} only and its listener checks the method before the body is read, so a large
+     * form body on another method is never read: a form declaring {@value #LARGE_FORM_BYTES} bytes, of which only the
+     * first {@value #LARGE_FORM_PREFIX_BYTES} are written, gets SC-1's whole 405 before the rest is sent, without any
+     * upstream call. Boot's form-content filter, which {@code spring.mvc.formcontent.filter.enabled: false} switches
+     * off, would read the whole body into memory before dispatch, so no response would arrive until the last byte had
+     * been sent.
+     *
+     * @param method a method whose form body Boot's form-content filter would read
+     * @throws IOException when the connection fails
+     */
+    @ParameterizedTest(name = "[{index}] {0} " + STOCK_STATS)
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void largeFormOnAMethodOtherThanGetIsAnswered405BeforeItsBodyIsSent(String method) throws IOException {
+        String target = STOCK_STATS + "?stock=AAPL&date=" + DAY;
+        byte[] form = ("stock=" + "x".repeat(LARGE_FORM_BYTES - "stock=".length())).getBytes(StandardCharsets.US_ASCII);
+        try (Socket socket = new Socket("localhost", stockStatsPort)) {
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " " + target + " HTTP/1.1\r\nHost: localhost:" + stockStatsPort
+                    + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + form.length
+                    + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            out.write(form, 0, LARGE_FORM_PREFIX_BYTES);
+            out.flush();
+
+            RawResponse refused;
+            try {
+                refused = readResponse(in);
+            } catch (SocketTimeoutException timeout) {
+                refused = fail(String.format("No response to %s %s within %d ms while %d of its %d form bytes were "
+                        + "sent: the body was buffered before dispatch", method, target, HttpTestClient.TIMEOUT_MILLIS,
+                        LARGE_FORM_PREFIX_BYTES, form.length), timeout);
+            }
+            writeRemainderIgnoringFailure(out, form, LARGE_FORM_PREFIX_BYTES);
+
+            assertThat(refused.statusLine()).as(refused.toString()).isEqualTo("HTTP/1.1 405 Method Not Allowed");
+            assertThat(refused.header("Content-Type")).as(refused.toString()).isEqualTo("text/plain");
+            assertThat(refused.body()).as(refused.toString())
+                    .isEqualTo("Method not allowed for endpoint: " + STOCK_STATS);
+        }
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    /**
+     * The application registers no {@link FormContentFilter}, the filter that reads a {@code PUT}, {@code PATCH} or
+     * {@code DELETE} form body before dispatch, because {@code spring.mvc.formcontent.filter.enabled} is
+     * {@code false}.
+     */
+    @Test
+    void contextHoldsNoFormContentFilter() {
+        assertThat(applicationContext.getBeanNamesForType(FormContentFilter.class)).as("FormContentFilter beans")
+                .isEmpty();
+    }
+
+    @Test
+    void optionsIsAnsweredWithTheAllowedMethods() {
+        Response response = stockStats.send("OPTIONS", STOCK_STATS, null, null);
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 200 OK");
+        assertThat(response.header("Allow")).isEqualTo("GET,HEAD,OPTIONS");
+        assertThat(response.body()).isEmpty();
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    @ParameterizedTest(name = "[{index}] {0} -> {1}")
+    @CsvSource(delimiter = '|', value = {
+        // an unserved path under the listener's /api/* reaches the dispatcher's no-listener answer
+        "/api/unknown | text/plain",
+        // a path outside /api/* on this port is answered by the port routing itself
+        "/            | text/plain",
+    })
+    void pathsTheResourceDoesNotServeAreAnsweredWithTheNoListener404(String path, String contentType) {
+        Response response = stockStats.get(path, Map.of("Accept", "text/html"));
+
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo("HTTP/1.1 404 Not Found");
+        assertThat(response.header("Content-Type")).isEqualTo(contentType);
+        assertThat(response.bodyAsString()).isEqualTo("No listener for endpoint: " + path);
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    /**
+     * Asserts the runtime's answer to a request it did not route to the resource method: the status alone, with the
+     * standard reason phrase, no Content-Type and an empty body, and no upstream call.
+     */
+    private void assertRejected(Response response, String statusLine) {
+        assertThat(response.statusLine()).as(response.toString()).isEqualTo(statusLine);
+        assertThat(response.header("Content-Type")).as(response.toString()).isNull();
+        assertThat(response.header("Content-Length")).as(response.toString()).isEqualTo("0");
+        assertThat(response.body()).isEmpty();
+        verifyNoInteractions(stockService, twitterSearchService, sentimentService);
+    }
+
+    private static Date day(String text) throws ParseException {
+        return new SimpleDateFormat("yyyy-MM-dd").parse(text);
+    }
+
+    /**
+     * Writes the bytes of {@code body} from {@code offset} to its end once the response has been read, so the server
+     * can finish the exchange; a failed write is ignored, because the server may close a connection whose body it
+     * refused unread.
+     */
+    private static void writeRemainderIgnoringFailure(OutputStream out, byte[] body, int offset) {
+        try {
+            out.write(body, offset, body.length - offset);
+            out.flush();
+        } catch (IOException closedByServer) {
+            // The response is already read; the server need not take the rest of a body it never reads.
+        }
+    }
+
+    /**
+     * Reads one response off the connection: its status line, its headers and the {@code Content-Length} bytes of its
+     * body.
+     */
+    private static RawResponse readResponse(InputStream in) throws IOException {
+        String statusLine = readLine(in);
+        Map<String, String> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+            int colon = line.indexOf(':');
+            assertThat(colon).as("header line %s", line).isPositive();
+            headers.put(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
+        }
+        String contentLength = headers.get("Content-Length");
+        assertThat(contentLength).as("Content-Length of %s %s", statusLine, headers).isNotNull();
+        int length = Integer.parseInt(contentLength);
+        byte[] body = in.readNBytes(length);
+        assertThat(body).as("body of %s %s", statusLine, headers).hasSize(length);
+        return new RawResponse(statusLine, headers, new String(body, StandardCharsets.UTF_8));
+    }
+
+    /** One line of a response head without its CRLF, one character per byte; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
+    /**
+     * A response read off a raw connection.
+     *
+     * @param statusLine the status line, such as {@code HTTP/1.1 405 Method Not Allowed}
+     * @param headers    the headers, names compared case-insensitively
+     * @param body       the body as UTF-8 text
+     */
+    private record RawResponse(String statusLine, Map<String, String> headers, String body) {
+
+        String header(String name) {
+            return headers.get(name);
+        }
+    }
+}

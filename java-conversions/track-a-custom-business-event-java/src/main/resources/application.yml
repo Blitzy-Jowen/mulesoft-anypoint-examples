@@ -1,0 +1,34 @@
+# track-a-custom-business-event-java runtime configuration
+# Replaces track-a-custom-business-event/src/main/app/mule-app.properties (empty) and the
+# http:listener-config of custom-business-events.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (custom-business-events.xml:3)
+  servlet:
+    encoding:
+      enabled: false    # the listener took the request charset from its Content-Type alone; Boot's forced UTF-8 request encoding would make Spring reject a wildcard Content-Type such as */* before the controller
+spring:
+  application:
+    name: track-a-custom-business-event-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the /customBusinessEvents listener has no allowedMethods: TRACE reaches BusinessEventController like every other method instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+logging:
+  level:
+    # Below INFO these loggers write what the caller sent: every request header (Authorization, cookies, custom
+    # headers), the Content-Type, the body bytes and the query string. A logger's own level outranks
+    # logging.level.root and the --debug and --trace groups, so none of them reaches these loggers.
+    org.springframework.web.method.HandlerMethod: INFO   # handler arguments, the request's HttpHeaders among them; argument errors quoting a rejected Content-Type
+    org.springframework.web.servlet.DispatcherServlet: WARN   # request line with the query string; headers when request details are logged. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.web.servlet.mvc.method.annotation.RequestResponseBodyMethodProcessor: INFO   # the Content-Type and the body bytes read for the handler
+    org.springframework.web.servlet.mvc.method.annotation.ExceptionHandlerExceptionResolver: INFO   # handled exception messages, which quote a rejected Content-Type
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # the 500 body carrying that message
+  pattern:
+    correlation: "[transactionId=%X{transactionId:-} businessEvent=%X{businessEvent:-}] "   # renders the tracking MDC on every console and file line: transaction id of tracking:transaction / the default events, business event name of tracking:custom-event

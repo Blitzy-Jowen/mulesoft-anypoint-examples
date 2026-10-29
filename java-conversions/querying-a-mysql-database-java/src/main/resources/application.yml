@@ -1,0 +1,44 @@
+# Replaces querying-a-mysql-database/src/main/app/mule-app.properties (empty) and the
+# db:generic-config / http:listener-config of database-to-json.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); port used by the original README
+jdbc:
+  # TODO: supply the MySQL JDBC URL, e.g. jdbc:mysql://<host>:3306/company?user=<user>&password=<password> (env JDBC_URL)
+  url: ${JDBC_URL:}
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (database-to-json.xml:4)
+spring:
+  application:
+    name: querying-a-mysql-database-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the / listener has no allowedMethods: TRACE reaches EmployeeQueryController like every other method instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+  datasource:
+    url: ${jdbc.url}    # original db:generic-config url key bound to Boot's DataSource (AAP 0.6.6); credentials stay inside the URL
+    # db:generic-config declares no pooling profile, so the original's non-pooled data source failed a request as soon
+    # as its connection was refused. HikariCP's 30000 ms default would hold every request 30 s while the database is
+    # unreachable; 1000 ms bounds that and leaves headroom for pool-borrow waits under load. HikariCP rejects values
+    # below 250 ms and reads 0 as no limit.
+    hikari:
+      connection-timeout: 1000   # ms
+      validation-timeout: 500    # ms; below connection-timeout, as HikariCP requires, so checking a dead pooled connection cannot outlast it
+  sql:
+    init:
+      mode: never       # never auto-run import.sql or any schema/data script
+# database-to-json.xml has no logger, so neither the queried last name nor the employees' first names are logged at
+# any level: a root DEBUG/TRACE override, or --debug/--trace, must not reach these categories, which below INFO write
+# them. A logger's own level outranks logging.level.root and the --debug/--trace groups.
+logging:
+  level:
+    org.springframework.web.servlet.DispatcherServlet: WARN   # DEBUG/TRACE write the request line with its ?lastname=<last name> query string. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence
+    org.springframework.jdbc.core.StatementCreatorUtils: INFO   # TRACE writes every bound parameter value: the queried last name
+    org.springframework.web.servlet.mvc.method.annotation.HttpEntityMethodProcessor: INFO   # DEBUG/TRACE write the response body: the matching first names as JSON
+    org.springframework.web.method.HandlerMethod: INFO   # TRACE writes handler arguments, a handled exception and its message included
+    org.springframework.web.HttpLogging: INFO            # the HTTP message converters write through this category wherever their own is held at INFO
+    io.undertow.request.io: INFO                         # DEBUG writes request-parse failures quoting a query value that does not decode: the queried last name

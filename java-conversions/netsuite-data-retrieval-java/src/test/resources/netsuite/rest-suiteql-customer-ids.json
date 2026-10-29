@@ -1,0 +1,18 @@
+{
+  "links": [
+    {
+      "rel": "self",
+      "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/query/v1/suiteql?limit=1000&offset=0"
+    }
+  ],
+  "count": 1,
+  "hasMore": false,
+  "items": [
+    {
+      "links": [],
+      "id": "-5"
+    }
+  ],
+  "offset": 0,
+  "totalResults": 1
+}

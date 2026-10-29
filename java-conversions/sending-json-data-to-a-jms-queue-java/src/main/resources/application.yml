@@ -1,0 +1,54 @@
+# sending-json-data-to-a-jms-queue-java runtime configuration
+# Replaces sending-json-data-to-a-jms-queue/src/main/app/mule-app.properties (empty) and the
+# jms:activemq-connector / http:listener-config of json-to-jms.xml (lines 3-4)
+http:
+  port: 8081            # original placeholder ${http.port} (json-to-jms.xml:4); port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (json-to-jms.xml:4)
+spring:
+  application:
+    name: sending-json-data-to-a-jms-queue-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the /sales listener accepts POST only: TRACE reaches the dispatcher and gets SC-1's 405 instead of the servlet's 200 TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the /sales listener accepts POST only and POST reads the body itself: a form body on PUT/PATCH/DELETE reaches SalesController and gets SC-1's 405 unread instead of being buffered whole by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+  artemis:
+    # The activemq-connector declares no brokerURL, so Mule ran ActiveMQ's in-VM, non-persistent broker
+    # (vm://localhost?broker.persistent=false); an embedded, non-persistent Artemis server takes its place.
+    # To send to an external Artemis broker instead (the original README points at tcp://localhost:61616), override
+    # three keys: spring.artemis.mode=native, spring.artemis.embedded.enabled=false (Boot starts the in-VM broker
+    # whenever embedded.enabled is true, whatever the mode) and spring.artemis.broker-url, whose optional
+    # ?callTimeout=<ms> overrides jms.call-timeout. persistent and queues configure only the in-VM broker. On the
+    # command line:
+    #   --spring.artemis.mode=native --spring.artemis.embedded.enabled=false
+    #   --spring.artemis.broker-url=tcp://localhost:61616
+    # or as environment variables SPRING_ARTEMIS_MODE, SPRING_ARTEMIS_EMBEDDED_ENABLED and SPRING_ARTEMIS_BROKER_URL.
+    # Broker credentials come only from the environment: SPRING_ARTEMIS_USER and SPRING_ARTEMIS_PASSWORD, which Boot
+    # binds to spring.artemis.user and spring.artemis.password.
+    mode: embedded
+    embedded:
+      enabled: true       # starts the in-VM broker in any mode: set it to false when switching to native mode
+      persistent: false
+      queues: sales
+  jms:
+    pub-sub-domain: false   # jms:outbound-endpoint queue= is point-to-point
+    template:
+      # Mule 3.8 JmsConnector.persistentDelivery defaults to false, so the original sent NON_PERSISTENT.
+      # Setting the delivery mode enables explicit QoS; Spring's default priority 4 and time-to-live 0 equal Mule's.
+      delivery-mode: non-persistent
+jms:
+  queue: sales          # jms:outbound-endpoint queue="sales" (json-to-jms.xml:9), read by service/SalesQueueService
+  # ms, positive (0 or less is rejected at start-up): how long each blocking Artemis client call waits for the broker,
+  # set by config/ArtemisClientConfig in both modes instead of Artemis' 30000 default. 10 s is the Mule default
+  # response timeout, the bound the converted connector clients use for connect and read and the sibling AMQP project
+  # uses for every broker wait. A call that times out fails the request once; nothing retries it, because a timeout is
+  # never retried silently. A broker-url ?callTimeout=<ms> other than 30000 takes precedence.
+  call-timeout: 10000

@@ -1,0 +1,51 @@
+{
+  "links": [
+    {
+      "rel": "self",
+      "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/itemsupplyplan/18"
+    }
+  ],
+  "id": "18",
+  "item": {
+    "links": [],
+    "id": "721",
+    "refName": "SHT00001"
+  },
+  "location": {
+    "links": [],
+    "id": "1",
+    "refName": "02: Boston"
+  },
+  "units": {
+    "links": [],
+    "id": "15",
+    "refName": "Square Feet"
+  },
+  "subsidiary": {
+    "links": [],
+    "id": "1",
+    "refName": "Honeycomb Mfg."
+  },
+  "order": {
+    "links": [
+      {
+        "rel": "self",
+        "href": "https://tstdrv1234567.suitetalk.api.netsuite.com/services/rest/record/v1/itemsupplyplan/18/order"
+      }
+    ],
+    "count": 2,
+    "hasMore": false,
+    "items": [
+      {
+        "links": [],
+        "quantity": 5
+      },
+      {
+        "links": [],
+        "quantity": 25
+      }
+    ],
+    "offset": 0,
+    "totalResults": 2
+  }
+}

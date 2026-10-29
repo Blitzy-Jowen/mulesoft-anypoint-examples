@@ -1,0 +1,77 @@
+# Replaces querying-a-db-and-attaching-results-to-an-email/src/main/app/mule-app.properties (empty) and the
+# smtp:gmail-connector, db:generic-config, http:listener-config and smtp:outbound-endpoint of attachments.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (attachments.xml:6); port used by the original README
+jdbc:
+  # TODO: supply the MySQL JDBC URL including credentials, e.g. jdbc:mysql://<host>:3306/company?user=<user>&password=<password> (env JDBC_URL)
+  # db:generic-config url (attachments.xml:5). Its driver com.mysql.jdbc.Driver is replaced by Connector/J 8.3's
+  # com.mysql.cj.jdbc.Driver, which Boot derives from the URL, so no driver-class-name is set.
+  url: ${JDBC_URL:}
+# smtp:outbound-endpoint attributes (attachments.xml:36) under their original placeholder names
+smtp:
+  # TODO: supply the SMTP host, e.g. smtp.gmail.com (env SMTP_HOST)
+  host: ${SMTP_HOST:}
+  port: 587             # Gmail STARTTLS submission port of the original README (step 4)
+  # TODO: supply the SMTP account as a plain address (env SMTP_USER); the %40 encoding Mule's endpoint URI needed
+  # (senderemailid%40gmail.com, smtp.user_enc in the original IT) is not used
+  user: ${SMTP_USER:}
+  # TODO: supply the SMTP password (env SMTP_PASSWORD)
+  password: ${SMTP_PASSWORD:}
+# smtp:outbound-endpoint from, to and subject (attachments.xml:36), read by client/ReportMailSender
+mail:
+  # TODO: supply the sender address (env MAIL_FROM)
+  from: ${MAIL_FROM:}
+  # TODO: supply the recipient address(es), comma-separated allowed (env MAIL_TO)
+  to: ${MAIL_TO:}
+  # TODO: supply the mail subject (env MAIL_SUBJECT)
+  subject: ${MAIL_SUBJECT:}
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (attachments.xml:6)
+spring:
+  application:
+    name: querying-a-db-and-attaching-results-to-an-email-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the / listener has no allowedMethods: TRACE reaches EmployeeReportController like every other method instead of the servlet's message/http echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+  datasource:
+    # original db:generic-config url key bound to Boot's DataSource (AAP 0.6.6); credentials stay inside the URL.
+    # An empty URL makes config/DataSourceConfig supply UnconfiguredDataSource: start-up succeeds, and each database
+    # call fails naming jdbc.url (JDBC_URL).
+    url: ${jdbc.url}
+  sql:
+    init:
+      mode: never       # never auto-run import_orders.sql or any schema/data script
+  mail:
+    # JavaMailSender of client/ReportMailSender, fed by the original smtp.* keys above. No test-connection:
+    # Mule's validateConnections is not reproduced, so start-up never depends on a reachable SMTP server.
+    host: ${smtp.host}
+    port: ${smtp.port}
+    username: ${smtp.user}
+    password: ${smtp.password}
+    default-encoding: UTF-8
+    properties:
+      # smtp:gmail-connector (attachments.xml:4): authentication and STARTTLS, here required, so a server or an
+      # interceptor that does not offer STARTTLS fails the send before AUTH or any mail data.
+      "[mail.smtp.auth]": true
+      "[mail.smtp.starttls.enable]": true
+      "[mail.smtp.starttls.required]": true
+      # smtp:outbound-endpoint responseTimeout="10000" (attachments.xml:36): connect, read and write timeouts
+      "[mail.smtp.connectiontimeout]": 10000
+      "[mail.smtp.timeout]": 10000
+      "[mail.smtp.writetimeout]": 10000
+# The original logs the employees only in the flow's INFO logger of the aggregate (attachments.xml:17,
+# service/EmployeeReportService). A root DEBUG/TRACE override, or --debug/--trace, must not reach the Angus Mail
+# category, which below INFO writes the SMTP account and the mail. A logger's own level outranks logging.level.root
+# and the --debug/--trace groups; Angus Mail logs through java.util.logging, which Spring Boot bridges and holds at
+# the same level.
+logging:
+  level:
+    # .smtp DEBUG writes the SMTP account and the recipient addresses; .smtp.protocol TRACE the whole SMTP dialogue:
+    # MAIL FROM, RCPT TO, the headers and the employees.csv records.
+    org.eclipse.angus.mail: INFO

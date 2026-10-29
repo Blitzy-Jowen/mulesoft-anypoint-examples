@@ -1,0 +1,21 @@
+# filtering-a-message-java runtime configuration
+# Replaces filtering-a-message/src/main/app/mule-app.properties and the http:listener-config of filtering.xml
+http:
+  port: 8081            # original placeholder name ${http.port} (AAP 0.4.6); default port of the original README
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (filtering.xml:3)
+spring:
+  application:
+    name: filtering-a-message-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
+  mvc:
+    dispatch-trace-request: true   # the / listener accepts POST only: TRACE reaches the dispatcher and gets SC-1's 405 instead of the servlet's 200 TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the listener checks the method before reading the body: a form body on PUT/PATCH/DELETE reaches DiscountController and gets SC-1's 405 unread instead of being buffered whole by Boot's filter before dispatch
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

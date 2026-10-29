@@ -1,0 +1,61 @@
+# get-customer-list-from-netsuite-java runtime configuration
+# Replaces get-customer-list-from-netsuite/src/main/app/mule-app.properties and the ${...} placeholders of the
+# netsuite:config and http:listener-config of get-customer-list-from-netsuite.xml (lines 4-5).
+# Live credentials belong only in environment variables or the git-ignored src/test/resources/application-it.yml.
+spring:
+  application:
+    name: get-customer-list-from-netsuite-java
+  web:
+    resources:
+      add-mappings: false   # SC-1: no static resources, so an unknown path reaches GlobalExceptionHandler -> 404 text/plain "No listener for endpoint: <path>"
+  # The /customers listener declares no allowedMethods, so it serves every method and no other path:
+  mvc:
+    dispatch-trace-request: true   # TRACE reaches the /customers mapping instead of the servlet's default TRACE echo
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
+
+http:
+  port: 8081            # original placeholder name ${http.port}; the port of the original README
+
+server:
+  port: ${http.port:8081}
+  address: 0.0.0.0      # http:listener-config host (get-customer-list-from-netsuite.xml:5)
+
+netsuite:
+  # TODO: supply the NetSuite account ID (Setup > Company > Company Information), e.g. 1234567 or 1234567_SB1
+  account: ${NETSUITE_ACCOUNT:}
+  # Empty: the clients derive https://<account>.suitetalk.api.netsuite.com from netsuite.account
+  # (lower-cased, '_' -> '-'); tests point it at WireMock.
+  # TODO: supply the NetSuite base URL (scheme and host, no path) only when overriding the account-derived URL
+  base-url: ${NETSUITE_BASE_URL:}
+  # Connect and read timeouts of every NetSuite call: the Mule default response timeout
+  connect-timeout: 10s
+  read-timeout: 10s
+  # Account time zone used to render NetSuite dates; SC-16 NetsuiteProperties carries it for both NetSuite projects
+  time-zone: America/Los_Angeles
+  # Original SuiteTalk login keys -> OAuth 2.0 M2M keys (client credentials grant, PS256 JWT client assertion):
+  #   netsuite.email, netsuite.password -> netsuite.oauth.client-id + netsuite.oauth.certificate-id + netsuite.oauth.private-key-path
+  #   netsuite.roleId                   -> the role is bound to the M2M certificate mapping in NetSuite; there is no key
+  #   netsuite.account                  -> unchanged
+  oauth:
+    # TODO: supply the client ID of the NetSuite integration record (OAuth 2.0 client credentials / M2M)
+    client-id: ${NETSUITE_OAUTH_CLIENT_ID:}
+    # TODO: supply the certificate ID from Setup > Integration > OAuth 2.0 Client Credentials (M2M) Setup (JWT header kid)
+    certificate-id: ${NETSUITE_OAUTH_CERTIFICATE_ID:}
+    # TODO: supply the path to the PKCS#8 PEM private key of that certificate (file path or classpath: location)
+    private-key-path: ${NETSUITE_OAUTH_PRIVATE_KEY_PATH:}
+
+# get-customer-list-from-netsuite.xml has no logger, so no NetSuite data is logged at any level: a root DEBUG/TRACE
+# override must not reach these categories, which below INFO write the access token, the customers' data and the
+# lastName query value the request searches for
+logging:
+  level:
+    org.springframework.core.codec: INFO                          # StringDecoder: the token response and the SuiteQL response bodies
+    org.springframework.http.codec: INFO                          # Jackson2JsonEncoder: the SuiteQL request body with its lastName filter
+    org.springframework.web.HttpLogging: INFO                     # the codec loggers above fall back to this category when their own is held at INFO
+    org.springframework.web.servlet.mvc.method.annotation: INFO   # HttpEntityMethodProcessor: the rendered customer list response body
+    # request line with its query (the lastName value) and, with spring.mvc.log-request-details, the parameters and
+    # headers. WARN, not INFO: its only INFO lines are the servlet start-up pair, which a root WARN must silence.
+    org.springframework.web.servlet.DispatcherServlet: WARN
+    io.undertow.request.io: INFO                                  # request-parse failures quoting a query value that does not decode
