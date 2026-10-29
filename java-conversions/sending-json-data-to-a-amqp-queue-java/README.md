@@ -87,6 +87,7 @@ Status: `default` — a non-secret value the original fixed, overridable; `TODO`
 | `spring.rabbitmq.channel-rpc-timeout` | `Duration` | `10s` | none | fixed | each channel RPC (`channel.open`, the temporary reply `queue.declare`, `basic.consume`, `basic.cancel`; amqp-client default 10 min), separate from the reply wait. Must be positive: `0` is rejected at start-up by the same customizer |
 | `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | with the excluded `ErrorMvcAutoConfiguration`, sends every unserved path, `/error` included, to SC-1's 404 |
 | `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | sends `TRACE` to the 405 instead of the servlet's default 200 `TRACE` echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | the listener checked the method before reading the body, so a form body on `PUT`, `PATCH` or `DELETE` reaches the controller and gets the 405 unread, instead of being read whole by Boot's form-content filter before dispatch |
 | `spring.autoconfigure.exclude` | `String[]` (fully qualified class names) | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
 
 - Broker connection: Spring Boot's defaults (port `5672`, username `guest`, password `guest`, virtual host `/`) equal the Mule AMQP connector defaults the original relied on; its `amqp:connector` sets none of them (`json-to-rabbitmq.xml:3`). No credential is written in `application.yml` (AAP 0.4.6). To use other values, set `spring.rabbitmq.username` and `spring.rabbitmq.password` (both `String`; environment `SPRING_RABBITMQ_USERNAME`, `SPRING_RABBITMQ_PASSWORD`), `spring.rabbitmq.port` (`Integer`) or `spring.rabbitmq.virtual-host` (`String`).
@@ -144,7 +145,7 @@ There is no `mvn verify` live tier: this is not a connector project, so it has n
 | Test class | What it covers |
 |---|---|
 | `SendingJsonDataToAmqpQueueTest` | the ported original assertion: the body queued on `sales_queue` equals the sent body `test` (`SendingJsonDataToAmqpQueueIT.java:71-75`), against embedded Qpid Broker-J; also a responder's reply returned as the 200 body, and a missing exchange answered with the JSON 500 and left uncreated |
-| `controller/SalesControllerTest` | on the wire through ST-1: reply bytes with `Content-Length` and no `Content-Type`; empty 200 without a reply; an empty body published as an empty payload; `GET /` and `OPTIONS /` → 405; `/sales` → 404; a broker failure → JSON 500 |
+| `controller/SalesControllerTest` | on the wire through ST-1: reply bytes with `Content-Length` and no `Content-Type`; empty 200 without a reply; an empty body published as an empty payload; `GET /` and `OPTIONS /` → 405; a form declaring 300000 bytes sent with `PUT`, `PATCH` or `DELETE` → the whole 405 while only its first 1024 bytes have been written, nothing published, with no `FormContentFilter` bean in the context; `/sales` → 404; a broker failure → JSON 500 |
 | `service/SalesPublisherServiceTest` | INFO log line; passive checks before the send, nothing declared or bound; unchanged persistent body; reply body or `null` on timeout; failures propagated unchanged after one attempt, with the broker's reason logged |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: 404, 405 and 500 status lines, `Content-Type` headers and body bytes; `ErrorResponse` JSON escaping; one escaped ERROR log line per unhandled exception that names the matched route, never the request path, and carries no exception message except a JDBC driver's escaped, bounded diagnostic |
 | `config/AmqpConfigTest` | the defaults keep the original endpoint settings; the context starts without contacting a broker; a non-positive reply or transport timeout fails start-up; a broker withholding a channel RPC reply fails the call after the 10 s budget (stub AMQP peer) |
@@ -176,8 +177,8 @@ There is no `mvn verify` live tier: this is not a connector project, so it has n
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 185 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 185 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; 189 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 189 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 42 of 42 lines of `service/SalesPublisherService` (the project has no `mapper` package). Total project LINE coverage: 97.5% (394 of 404 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=4`, `failed=0`.
 

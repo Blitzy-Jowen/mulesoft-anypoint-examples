@@ -14,14 +14,18 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -42,12 +46,15 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.web.filter.FormContentFilter;
 
 import com.mulesoft.examples.http_multipart_request.service.UploadService;
 import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
@@ -59,7 +66,8 @@ import com.mulesoft.examples.http_multipart_request.support.HttpTestClient;
  * {@link HttpTestClient}, so status line, headers and body bytes are asserted as the listener writes them.
  *
  * <p>The cases cover what the listeners decide before and around the flows: methods admitted ignoring letter case, as
- * Mule 3.8's {@code MethodRequestMatcher} compared them; every other method answered with the listeners' 405; the
+ * Mule 3.8's {@code MethodRequestMatcher} compared them; every other method answered with the listeners' 405, also
+ * before a large form body has been sent, since the context holds no {@link FormContentFilter} that would read it; the
  * last of several parts named {@code file} uploaded, as Mule 3.8's {@code HashMap} of parts by name kept it; a
  * request without a {@code file} part answered with the 500 of the failing file-name expression; a non-ASCII file name
  * stored with each header byte read as one ISO-8859-1 character, as Mule 3.8's JavaMail parser read it; a file name
@@ -111,6 +119,12 @@ class UploadControllerTest {
     /** Stands, in a file name, for a temporary directory's absolute path less its leading {@code /}. */
     private static final String OUTSIDE_PLACEHOLDER = "<outside>";
 
+    /** A form body large enough that reading it whole before dispatch keeps the response back measurably. */
+    private static final int LARGE_FORM_BYTES = 300_000;
+
+    /** Bytes of a large form body written before its response is read; the rest is written only afterwards. */
+    private static final int LARGE_FORM_PREFIX_BYTES = 1024;
+
     @TempDir
     static Path uploadDir;
 
@@ -123,6 +137,10 @@ class UploadControllerTest {
 
     @Value("${upload.directory}")
     private String uploadDirectory;
+
+    /** The running application's context, inspected for the servlet filters it registers. */
+    @Autowired
+    private ApplicationContext applicationContext;
 
     /** Points the upload flow's {@code file:outbound-endpoint} directory at the class's temporary directory. */
     @DynamicPropertySource
@@ -323,6 +341,63 @@ class UploadControllerTest {
         assertEquals(List.of(String.valueOf(METHOD_NOT_ALLOWED_BODY.length)),
                 headerValues(headerLines, "Content-Length"), raw);
         assertEquals(List.of(), storedFiles());
+    }
+
+    /**
+     * The listeners checked the method before they read the body, so a large form body on a method neither accepts is
+     * never read: a form declaring {@value #LARGE_FORM_BYTES} bytes, of which only the first
+     * {@value #LARGE_FORM_PREFIX_BYTES} are written, gets the whole 405 before the rest is sent, and neither flow
+     * runs. Boot's form-content filter, which {@code spring.mvc.formcontent.filter.enabled: false} switches off,
+     * would read the whole body into memory before dispatch, so no response would arrive until the last byte had been
+     * sent.
+     *
+     * @param method a method whose form body Boot's form-content filter would read
+     */
+    @ParameterizedTest(name = "{0} /uploadFile")
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void largeFormOnOtherMethodGetsTheListenerMethodNotAllowedBeforeItsBodyIsSent(String method) throws IOException {
+        byte[] form = bytes("file=" + "x".repeat(LARGE_FORM_BYTES - "file=".length()));
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            out.write(bytes(method + " " + PATH + " HTTP/1.1" + CRLF
+                    + "Host: localhost:" + port + CRLF
+                    + "Content-Type: application/x-www-form-urlencoded" + CRLF
+                    + "Content-Length: " + form.length + CRLF
+                    + CRLF));
+            out.write(form, 0, LARGE_FORM_PREFIX_BYTES);
+            out.flush();
+
+            RawResponse refused;
+            try {
+                refused = readResponse(in);
+            } catch (SocketTimeoutException timeout) {
+                refused = fail(String.format("No response to %s %s within %d ms while %d of its %d form bytes were "
+                        + "sent: the body was buffered before dispatch", method, PATH, HttpTestClient.TIMEOUT_MILLIS,
+                        LARGE_FORM_PREFIX_BYTES, form.length), timeout);
+            }
+            writeRemainderIgnoringFailure(out, form, LARGE_FORM_PREFIX_BYTES);
+
+            assertEquals("HTTP/1.1 405 Method Not Allowed", refused.statusLine(), refused::toString);
+            assertEquals(List.of("text/plain"), headerValues(refused.headerLines(), "Content-Type"),
+                    refused::toString);
+            assertArrayEquals(METHOD_NOT_ALLOWED_BODY, refused.body(), refused::toString);
+        }
+        verifyNoInteractions(uploadService);
+        assertEquals(List.of(), storedFiles());
+    }
+
+    /**
+     * The application registers no {@link FormContentFilter}, the filter that reads a {@code PUT}, {@code PATCH} or
+     * {@code DELETE} form body before dispatch, because {@code spring.mvc.formcontent.filter.enabled} is
+     * {@code false}.
+     */
+    @Test
+    void contextHoldsNoFormContentFilter() {
+        assertArrayEquals(new String[0], applicationContext.getBeanNamesForType(FormContentFilter.class),
+                "FormContentFilter beans");
     }
 
     /**
@@ -561,6 +636,68 @@ class UploadControllerTest {
             }
         }
         return values;
+    }
+
+    /**
+     * Writes the bytes of {@code body} from {@code offset} to its end once the response has been read, so the server
+     * can finish the exchange; a failed write is ignored, because the server may close a connection whose body it
+     * refused unread.
+     */
+    private static void writeRemainderIgnoringFailure(OutputStream out, byte[] body, int offset) {
+        try {
+            out.write(body, offset, body.length - offset);
+            out.flush();
+        } catch (IOException closedByServer) {
+            // The response is already read; the server need not take the rest of a body it never reads.
+        }
+    }
+
+    /**
+     * Reads one response off the connection: its status line, its header lines and the {@code Content-Length} bytes
+     * of its body.
+     */
+    private static RawResponse readResponse(InputStream in) throws IOException {
+        String statusLine = readLine(in);
+        List<String> headerLines = new ArrayList<>();
+        for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+            headerLines.add(line);
+        }
+        String head = statusLine + " " + headerLines;
+        List<String> contentLength = headerValues(headerLines, "Content-Length");
+        assertEquals(1, contentLength.size(), head);
+        int length = Integer.parseInt(contentLength.get(0));
+        byte[] body = in.readNBytes(length);
+        assertEquals(length, body.length, head);
+        return new RawResponse(statusLine, headerLines, body);
+    }
+
+    /** One line of a response head without its CRLF; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
+    /**
+     * A response read off a raw connection.
+     *
+     * @param statusLine  the status line, such as {@code HTTP/1.1 405 Method Not Allowed}
+     * @param headerLines the header lines in arrival order
+     * @param body        the body bytes
+     */
+    private record RawResponse(String statusLine, List<String> headerLines, byte[] body) {
+
+        @Override
+        public String toString() {
+            return statusLine + " " + headerLines + " " + new String(body, StandardCharsets.UTF_8);
+        }
     }
 
     /**

@@ -12,12 +12,20 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.fail;
 
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -30,8 +38,11 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
+import org.springframework.web.filter.FormContentFilter;
 
 /**
  * Wire-level test of {@link DiscountController}, the HTTP trigger of flow {@code filteringFlow1}
@@ -44,7 +55,8 @@ import org.springframework.boot.test.web.server.LocalServerPort;
  *   <li>the granted reply of {@code set-payload} (filtering.xml:16) and the empty 200 a rejecting filter leaves
  *       (filtering.xml:9-15; FilteringMessageIT.java:61-67), for JSON, text, form, multipart and empty bodies;</li>
  *   <li>the listener's {@code allowedMethods="POST"} (filtering.xml:5): {@code POST} in any letter case runs the
- *       flow, every other method gets SC-1's 405, and every other path SC-1's no-listener 404;</li>
+ *       flow, every other method gets SC-1's 405, also before a large form body has been sent, since the context
+ *       holds no {@link FormContentFilter} that would read it first, and every other path SC-1's no-listener 404;</li>
  *   <li>the listener's own 400 for a form body it cannot decode, and the JSON 500 for a payload the
  *       {@code json-to-object-transformer} (filtering.xml:14) or the custom filter
  *       (FreeMembershipDiscountFilter.java:18-30) fails on, since the flow declares no exception strategy.</li>
@@ -63,8 +75,18 @@ class DiscountControllerTest {
 
     private static final String MULTIPART_BOUNDARY = "discount-boundary";
 
+    /** A form body large enough that reading it whole before dispatch keeps the response back measurably. */
+    private static final int LARGE_FORM_BYTES = 300_000;
+
+    /** Bytes of a large form body written before its response is read; the rest is written only afterwards. */
+    private static final int LARGE_FORM_PREFIX_BYTES = 1024;
+
     @LocalServerPort
     private int port;
+
+    /** The running application's context, inspected for the servlet filters it registers. */
+    @Autowired
+    private ApplicationContext applicationContext;
 
     private HttpTestClient client;
 
@@ -182,6 +204,59 @@ class DiscountControllerTest {
                 response::toString);
     }
 
+    /**
+     * The listener checked the method before it read the body, so a large form body on a method outside
+     * {@code allowedMethods} is never read: a form declaring {@value #LARGE_FORM_BYTES} bytes, of which only the first
+     * {@value #LARGE_FORM_PREFIX_BYTES} are written, gets SC-1's whole 405 before the rest is sent. Boot's
+     * form-content filter, which {@code spring.mvc.formcontent.filter.enabled: false} switches off, would read the
+     * whole body into memory before dispatch, so no response would arrive until the last byte had been sent.
+     *
+     * @param method a method whose form body Boot's form-content filter would read
+     * @throws IOException when the connection fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void largeFormOnMethodOtherThanPostReturns405BeforeItsBodyIsSent(String method) throws IOException {
+        byte[] form = utf8("months=" + "1".repeat(LARGE_FORM_BYTES - "months=".length()));
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", port), HttpTestClient.TIMEOUT_MILLIS);
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " " + LISTENER_PATH + " HTTP/1.1\r\nHost: localhost:" + port
+                    + "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + form.length
+                    + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+            out.write(form, 0, LARGE_FORM_PREFIX_BYTES);
+            out.flush();
+
+            RawResponse refused;
+            try {
+                refused = readResponse(in);
+            } catch (SocketTimeoutException timeout) {
+                refused = fail(String.format("No response to %s %s within %d ms while %d of its %d form bytes were "
+                        + "sent: the body was buffered before dispatch", method, LISTENER_PATH,
+                        HttpTestClient.TIMEOUT_MILLIS, LARGE_FORM_PREFIX_BYTES, form.length), timeout);
+            }
+            writeRemainderIgnoringFailure(out, form, LARGE_FORM_PREFIX_BYTES);
+
+            assertEquals("HTTP/1.1 405 Method Not Allowed", refused.statusLine(), refused::toString);
+            assertEquals(List.of("text/plain"), refused.headers("Content-Type"), refused::toString);
+            assertArrayEquals(utf8("Method not allowed for endpoint: " + LISTENER_PATH), refused.body(),
+                    refused::toString);
+        }
+    }
+
+    /**
+     * The application registers no {@link FormContentFilter}, the filter that reads a {@code PUT}, {@code PATCH} or
+     * {@code DELETE} form body before dispatch, because {@code spring.mvc.formcontent.filter.enabled} is
+     * {@code false}.
+     */
+    @Test
+    void contextHoldsNoFormContentFilter() {
+        assertArrayEquals(new String[0], applicationContext.getBeanNamesForType(FormContentFilter.class),
+                "FormContentFilter beans");
+    }
+
     @Test
     void postToOtherPathReturnsNoListener404() {
         HttpTestClient.Response response = client.send("POST", "/other", Map.of("Content-Type", JSON),
@@ -288,5 +363,79 @@ class DiscountControllerTest {
 
     private static byte[] utf8(String text) {
         return text.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Writes the bytes of {@code body} from {@code offset} to its end once the response has been read, so the server
+     * can finish the exchange; a failed write is ignored, because the server may close a connection whose body it
+     * refused unread.
+     */
+    private static void writeRemainderIgnoringFailure(OutputStream out, byte[] body, int offset) {
+        try {
+            out.write(body, offset, body.length - offset);
+            out.flush();
+        } catch (IOException closedByServer) {
+            // The response is already read; the server need not take the rest of a body it never reads.
+        }
+    }
+
+    /**
+     * Reads one response off the connection: its status line, its header lines and the {@code Content-Length} bytes
+     * of its body.
+     */
+    private static RawResponse readResponse(InputStream in) throws IOException {
+        String statusLine = readLine(in);
+        List<String> headerLines = new ArrayList<>();
+        for (String line = readLine(in); !line.isEmpty(); line = readLine(in)) {
+            headerLines.add(line);
+        }
+        RawResponse head = new RawResponse(statusLine, headerLines, new byte[0]);
+        List<String> contentLength = head.headers("Content-Length");
+        assertEquals(1, contentLength.size(), head::toString);
+        int length = Integer.parseInt(contentLength.get(0));
+        byte[] body = in.readNBytes(length);
+        assertEquals(length, body.length, head::toString);
+        return new RawResponse(statusLine, headerLines, body);
+    }
+
+    /** One line of a response head without its CRLF; fails when the connection ends first. */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder line = new StringBuilder();
+        for (int c = in.read(); c != '\n'; c = in.read()) {
+            if (c < 0) {
+                throw new EOFException("connection closed in a response head after \"" + line + "\"");
+            }
+            if (c != '\r') {
+                line.append((char) c);
+            }
+        }
+        return line.toString();
+    }
+
+    /**
+     * A response read off a raw connection.
+     *
+     * @param statusLine  the status line, such as {@code HTTP/1.1 405 Method Not Allowed}
+     * @param headerLines the header lines in arrival order
+     * @param body        the body bytes
+     */
+    private record RawResponse(String statusLine, List<String> headerLines, byte[] body) {
+
+        /** The trimmed values, in arrival order, of the header lines named {@code name}, compared ignoring case. */
+        List<String> headers(String name) {
+            List<String> values = new ArrayList<>();
+            for (String line : headerLines) {
+                int colon = line.indexOf(':');
+                if (colon > 0 && line.substring(0, colon).trim().equalsIgnoreCase(name)) {
+                    values.add(line.substring(colon + 1).trim());
+                }
+            }
+            return values;
+        }
+
+        @Override
+        public String toString() {
+            return statusLine + " " + headerLines + " " + new String(body, StandardCharsets.UTF_8);
+        }
     }
 }

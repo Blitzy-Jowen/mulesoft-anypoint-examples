@@ -12,9 +12,13 @@ spring:
     resources:
       add-mappings: false   # SC-1: unknown paths must raise NoHandlerFoundException -> 404 "No listener for endpoint: <path>"
   # The listener serves path / with allowedMethods GET only (production-code.xml:7). Beyond the General template,
-  # two Boot defaults are switched off because they answer requests the Mule listener rejected:
+  # three Boot defaults are switched off because they answer, or hold back the answer to, requests the Mule listener
+  # rejected:
   mvc:
     dispatch-trace-request: true   # TRACE reaches the dispatcher and gets SC-1's 405 instead of the servlet's 200 TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the listener checks the method before reading the body: a form body on PUT/PATCH/DELETE reaches ExampleController and gets SC-1's 405 unread instead of being buffered whole by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

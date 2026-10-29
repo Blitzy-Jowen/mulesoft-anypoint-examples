@@ -19,6 +19,9 @@ spring:
   # The listener accepts POST only (xml:6), so every other method, TRACE included, gets SC-1's 405:
   mvc:
     dispatch-trace-request: true   # TRACE reaches the dispatcher instead of the servlet's default 200 TRACE echo
+    formcontent:
+      filter:
+        enabled: false   # the listener checks the method before reading the body: a form body on PUT/PATCH/DELETE reaches SalesController and gets SC-1's 405 unread instead of being buffered whole by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path

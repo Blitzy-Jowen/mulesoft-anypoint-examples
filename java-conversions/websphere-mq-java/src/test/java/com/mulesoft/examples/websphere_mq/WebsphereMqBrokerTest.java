@@ -32,6 +32,7 @@ import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URLEncoder;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -81,6 +82,7 @@ import org.springframework.boot.test.context.assertj.AssertableApplicationContex
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.mock.mockito.SpyBean;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.ApplicationContext;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.io.ClassPathResource;
@@ -96,6 +98,7 @@ import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.filter.FormContentFilter;
 
 import com.mulesoft.examples.websphere_mq.client.MqQueueSender;
 import com.mulesoft.examples.websphere_mq.config.ContentSecurityPolicyFilter;
@@ -142,9 +145,12 @@ import com.mulesoft.examples.websphere_mq.support.HttpTestClient;
  *   <li>The SC-12 endpoint's hostile-input limits are checked on the same running Undertow server: a form body of
  *       300000 bytes is refused with 413 and {@code []}, whether it declares its length or is sent chunked; Undertow
  *       drains the rest of the chunked body refused part-way, so the client receives the whole 413 and its kept-alive
- *       connection then carries a handshake, which is answered, as the round-trip test's handshake is; and a
- *       client publication on the dequeue channel, which only flow {@code Output} publishes on, is denied in-band
- *       with {@code 403::Publish denied} and reaches no subscriber.</li>
+ *       connection then carries a handshake, which is answered, as the round-trip test's handshake is; a form of
+ *       300000 declared bytes sent with {@code PUT}, {@code PATCH} or {@code DELETE} gets SC-1's whole 405 while
+ *       only its first bytes have been written, because the context holds no {@link FormContentFilter} that would
+ *       read the body before dispatch; and a client publication on the dequeue channel, which only flow
+ *       {@code Output} publishes on, is denied in-band with {@code 403::Publish denied} and reaches no
+ *       subscriber.</li>
  *   <li>The IBM MQ factory configuration, which the embedded broker replaces at run time, is verified without a
  *       queue manager: {@link IbmMqConfig#mqConnectionFactory} against a {@link MockEnvironment}; the
  *       {@code connectionFactory} bean's condition, its {@code wmq.host} requirement and the start-up check of
@@ -217,6 +223,9 @@ class WebsphereMqBrokerTest {
     /** Size of each chunk of a chunked request body. */
     private static final int CHUNK_BYTES = 8192;
 
+    /** Bytes of an oversized form body written before its response is read; the rest is written only afterwards. */
+    private static final int FORM_PREFIX_BYTES = 1024;
+
     /**
      * Prefixes of the JVM-wide IBM client properties {@link IbmMqConfig#mqConnectionFactory} sets (transport budgets,
      * then log and trace locations) and of the configuration-file location the diagnostics tests set; they are
@@ -281,6 +290,10 @@ class WebsphereMqBrokerTest {
     @Autowired
     @Qualifier(IbmMqConfig.TRANSACTED_LISTENER_FACTORY)
     DefaultJmsListenerContainerFactory transactedListenerContainerFactory;
+
+    /** The running application's context, inspected for the servlet filters it registers. */
+    @Autowired
+    ApplicationContext applicationContext;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -543,6 +556,55 @@ class WebsphereMqBrokerTest {
             assertThat(answered.header("Content-Type")).as(answered.toString()).startsWith("text/json");
             assertSuccessful(reply(objectMapper.readTree(answered.body()), HANDSHAKE));
         }
+    }
+
+    /**
+     * A method the endpoint does not accept never has its form body read: a form declaring 300000 bytes, beyond the
+     * endpoint's 200000-byte bound, of which only the first {@value #FORM_PREFIX_BYTES} are written, gets SC-1's
+     * whole 405 before the rest is sent, as the original Ajax connector answered without reading the body. Boot's
+     * form-content filter, which {@code spring.mvc.formcontent.filter.enabled: false} switches off, would read the
+     * whole body into memory before dispatch, so no response would arrive until the last byte had been sent.
+     *
+     * @param method a method outside the endpoint's {@code GET} and {@code POST}
+     */
+    @ParameterizedTest(name = "{0} " + COMETD)
+    @ValueSource(strings = {"PUT", "PATCH", "DELETE"})
+    void oversizedFormOnAMethodOutsideGetAndPostGets405BeforeItsBodyIsSent(String method) throws IOException {
+        byte[] form = oversizedForm().getBytes(US_ASCII);
+        try (Socket socket = new Socket(LOOPBACK, port)) {
+            socket.setSoTimeout(HttpTestClient.TIMEOUT_MILLIS);
+            InputStream in = new BufferedInputStream(socket.getInputStream());
+            OutputStream out = socket.getOutputStream();
+            out.write((method + " " + COMETD + " HTTP/1.1\r\nHost: " + LOOPBACK + ":" + port + "\r\nContent-Type: "
+                    + FORM + "\r\nContent-Length: " + form.length + "\r\n\r\n").getBytes(US_ASCII));
+            out.write(form, 0, FORM_PREFIX_BYTES);
+            out.flush();
+
+            RawResponse refused;
+            try {
+                refused = readResponse(in);
+            } catch (SocketTimeoutException timeout) {
+                refused = fail(String.format("No response to %s %s within %d ms while %d of its %d form bytes were "
+                        + "sent: the body was buffered before dispatch", method, COMETD, HttpTestClient.TIMEOUT_MILLIS,
+                        FORM_PREFIX_BYTES, form.length), timeout);
+            }
+            writeRemainderIgnoringFailure(out, form, FORM_PREFIX_BYTES);
+
+            assertThat(refused.status()).as(refused.toString()).isEqualTo(405);
+            assertThat(refused.header("Content-Type")).as(refused.toString()).isEqualTo("text/plain");
+            assertThat(refused.body()).as(refused.toString()).isEqualTo("Method not allowed for endpoint: " + COMETD);
+        }
+    }
+
+    /**
+     * The application registers no {@link FormContentFilter}, the filter that reads a {@code PUT}, {@code PATCH} or
+     * {@code DELETE} form body before dispatch, because {@code spring.mvc.formcontent.filter.enabled} is
+     * {@code false}.
+     */
+    @Test
+    void contextHoldsNoFormContentFilter() {
+        assertThat(applicationContext.getBeanNamesForType(FormContentFilter.class)).as("FormContentFilter beans")
+                .isEmpty();
     }
 
     @Test
@@ -1174,6 +1236,20 @@ class WebsphereMqBrokerTest {
         writer.setDaemon(true);
         writer.start();
         return writer;
+    }
+
+    /**
+     * Writes the bytes of {@code body} from {@code offset} to its end once the response has been read, so the server
+     * can finish the exchange; a failed write is ignored, because the server may close a connection whose body it
+     * refused unread.
+     */
+    private static void writeRemainderIgnoringFailure(OutputStream out, byte[] body, int offset) {
+        try {
+            out.write(body, offset, body.length - offset);
+            out.flush();
+        } catch (IOException closedByServer) {
+            // The response is already read; the server need not take the rest of a body it never reads.
+        }
     }
 
     /**

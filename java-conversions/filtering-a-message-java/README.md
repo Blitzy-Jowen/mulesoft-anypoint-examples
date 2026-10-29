@@ -58,6 +58,7 @@ Every key of `src/main/resources/application.yml`. Status: `default` — a non-s
 | `spring.application.name` | `String` | `filtering-a-message-java` | none | fixed | application name in log lines |
 | `spring.web.resources.add-mappings` | `boolean` | `false` | none | fixed | an unserved path reaches SC-1's no-listener 404 instead of the static resource handler |
 | `spring.mvc.dispatch-trace-request` | `boolean` | `true` | none | fixed | `TRACE /` reaches the controller and gets the 405, instead of the servlet's `TRACE` echo |
+| `spring.mvc.formcontent.filter.enabled` | `boolean` | `false` | none | fixed | the listener checked the method before reading the body, so a form body on `PUT`, `PATCH` or `DELETE` reaches the controller and gets the 405 unread, instead of being read whole by Boot's form-content filter before dispatch |
 | `spring.autoconfigure.exclude` | `String[]` | `org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration` | none | fixed | no Boot `/error` endpoint; `/error` gets the no-listener 404 like any unserved path |
 
 - There are no secrets, credentials, hosts or tenant identifiers, so the configuration has no TODO placeholder, and the project has no `application-test.yml` or `application-it.yml`.
@@ -133,7 +134,7 @@ Send the `Content-Type` header: without it, curl labels `--data-binary` bodies `
 | Test class | What it asserts |
 |---|---|
 | `FilteringMessageTest` | the ported `FilteringMessageIT` (`filtering-a-message/src/test/java/org/mule/examples/FilteringMessageIT.java:54-68`): `POST /` with `message.json` returns a body equal to `the discount was granted.`; with `message1.json` the body is empty |
-| `controller/DiscountControllerTest` | on the wire through ST-1: the granted reply (`200 OK`, no `Content-Type`, `Content-Length: 25`) for `application/json`, `text/plain` and the methods `post` and `Post`; the empty 200 for `message1.json`, an empty body, a form-urlencoded and a multipart body; the form-decoding 400; the 405 for `GET`, `PUT`, `DELETE` and `OPTIONS`; the 404 for `/other`; the 500 bodies for malformed JSON, a JSON array, JSON `null`, a missing `membership` and a non-integer `months` |
+| `controller/DiscountControllerTest` | on the wire through ST-1: the granted reply (`200 OK`, no `Content-Type`, `Content-Length: 25`) for `application/json`, `text/plain` and the methods `post` and `Post`; the empty 200 for `message1.json`, an empty body, a form-urlencoded and a multipart body; the form-decoding 400; the 405 for `GET`, `PUT`, `DELETE` and `OPTIONS`, and the whole 405 for a form declaring 300000 bytes sent with `PUT`, `PATCH` or `DELETE` while only its first 1024 bytes have been written, with no `FormContentFilter` bean in the context; the 404 for `/other`; the 500 bodies for malformed JSON, a JSON array, JSON `null`, a missing `membership` and a non-integer `months` |
 | `service/DiscountServiceTest` | the And filter (empty or absent body, methods other than `post`, form parameter maps) rejecting without parsing; the `HashMap` handed to the filter; the custom-filter rejection; the fixed 500 messages, with the original failure kept as cause and no request bytes or internal names exposed |
 | `service/FreeMembershipDiscountFilterTest` | every rule boundary for `premium` and the other memberships, the case-sensitive `premium` comparison, numeric strings, a missing key (`NullPointerException`), a non-integer value (`NumberFormatException`), and the two original payloads |
 | `exception/GlobalExceptionHandlerTest` | SC-1, with MockMvc and on Undertow: the 404, 405 and 500 status lines, `Content-Type` headers, absent `Allow` header and body bytes; `ErrorResponse` JSON escaping; one escaped, length-bounded ERROR log line per unhandled exception that names the matched route, never the request path, and carries no stack trace |
@@ -173,8 +174,8 @@ Every `POST` row sends `Content-Type: application/json`; `SCENARIOS.md` gives ea
 
 Evidence of the run behind this row (Temurin JDK 17.0.21, Apache Maven 3.9.9):
 
-- `mvn -B clean package`: `BUILD SUCCESS`; 172 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
-- `mvn -B test`: `BUILD SUCCESS`; 172 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
+- `mvn -B clean install`, which runs every phase of `clean package`: `BUILD SUCCESS`; 176 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`); JaCoCo `All coverage checks have been met.`
+- `mvn -B test`: `BUILD SUCCESS`; 176 tests, 0 failures, 0 errors, 1 skipped (`FixtureParityTest`).
 - Coverage (service + mapper), from `target/site/jacoco/jacoco.csv`: 36 of 36 lines of `service/DiscountService` and `service/FreeMembershipDiscountFilter` (the project has no `mapper` package). Total project LINE coverage: 96.7% (265 of 274 lines).
 - `target/fixture-parity/summary.properties`: `verified=0`, `unverified=11`, `failed=0`.
 

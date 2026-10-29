@@ -9,6 +9,9 @@ spring:
       add-mappings: false          # SC-1: unknown paths reach GlobalExceptionHandler's no-listener 404; AjaxResourceConfig registers its own resource handlers
   mvc:
     dispatch-trace-request: true   # TRACE reaches the page, script and /ajax/cometd mappings and gets their 405 instead of the servlet's message/http echo
+    formcontent:
+      filter:
+        enabled: false   # /ajax/cometd reads at most 200000 body bytes itself: a form body on PUT/PATCH/DELETE gets SC-1's 405 unread instead of being buffered whole by Boot's filter before dispatch
   autoconfigure:
     exclude:
       - org.springframework.boot.autoconfigure.web.servlet.error.ErrorMvcAutoConfiguration   # no Boot /error endpoint; /error gets the no-listener 404 like any unserved path
